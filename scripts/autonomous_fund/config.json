@@ -1,0 +1,16 @@
+{
+  "model": "openai/gpt-6-luna",
+  "reasoning_effort": "medium",
+  "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 5, "drawdown": "0.08"},
+  "universe": {
+    "AAPL": "stock", "MSFT": "stock", "AMZN": "stock", "GOOGL": "stock",
+    "META": "stock", "NVDA": "stock", "BRK.B": "stock", "JPM": "stock",
+    "V": "stock", "MA": "stock", "UNH": "stock", "JNJ": "stock",
+    "XOM": "stock", "COST": "stock", "PG": "stock", "HD": "stock",
+    "SPY": "unlevered_etf", "QQQ": "unlevered_etf", "IWM": "unlevered_etf",
+    "DIA": "unlevered_etf", "VTI": "unlevered_etf", "XLK": "unlevered_etf",
+    "XLF": "unlevered_etf", "XLV": "unlevered_etf", "XLE": "unlevered_etf",
+    "XLP": "unlevered_etf", "XLI": "unlevered_etf"
+  },
+  "model_prices_per_million": null
+}

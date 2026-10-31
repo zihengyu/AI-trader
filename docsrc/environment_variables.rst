@@ -482,6 +482,7 @@ TRADING_BROKER
 
 - Purpose: Explicitly specify which broker to use for live trading.
 - Values (case-insensitive):
+
   - ``alpaca``, ``tradier``, ``ccxt``, ``coinbase``, ``kraken``, ``weex``
   - ``ib``, ``interactivebrokers``, ``ibrest``, ``interactivebrokersrest``
   - ``tradovate``, ``schwab``, ``bitunix``, ``polymarket``, ``polymarket_clob``
@@ -490,6 +491,7 @@ TRADING_BROKER
     ``<EXCHANGE>_API_KEY``, ``<EXCHANGE>_API_SECRET``, ``<EXCHANGE>_API_PASSPHRASE``, ``<EXCHANGE>_UID``,
     ``<EXCHANGE>_PRIVATE_KEY``, ``<EXCHANGE>_WALLET_ADDRESS`` (only the fields that exchange requires) and
     optional ``<EXCHANGE>_SANDBOX`` / ``<EXCHANGE>_MARGIN``. See the CCXT broker guide.
+
 - Note: If not set, broker is auto-detected based on available credentials.
 
 DATA_SOURCE
@@ -619,7 +621,7 @@ POLYMARKET_TEST_TOKEN_ID / POLYMARKET_LIVE_TRADING_ENABLED / POLYMARKET_TEST_MAX
   ``--websocket``.
 
 Kalshi connection and trading
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 - ``TRADING_BROKER=kalshi`` selects the native adapter. Standard order, position,
   quote, historical-price and account methods are implemented. Whole and fractional
@@ -1343,7 +1345,7 @@ rotate that secret. See
 
 
 MetaMask Agent Wallet (beta)
----------------------------
+----------------------------
 
 Set ``TRADING_BROKER=metamask`` and optionally ``DATA_SOURCE=metamask``.
 See :doc:`brokers.metamask` for local service setup and qualification limits.
@@ -1358,3 +1360,20 @@ See :doc:`brokers.metamask` for local service setup and qualification limits.
   onchain swaps.
 
 Keep the local admin token and MetaMask CLI session outside strategy environments.
+
+Local autonomous paper portfolio application
+--------------------------------------------
+
+The optional checkout application ``scripts/autonomous_fund`` reads ``AI_MODEL``
+to select a provider-qualified model, such as ``openai/<model-id>``,
+``anthropic/<model-id>`` or ``deepseek/<model-id>``. Its ``--model`` argument takes
+precedence, followed by ``AI_MODEL``, then its JSON configuration. This variable
+does not change other strategies' model defaults.
+
+OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
+DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.
+Paper execution requires ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` from a paper
+account. ``ALPACA_IS_PAPER`` defaults to true; an explicit false value is rejected.
+The application has no live mode and disables automatic dotenv discovery. Inject
+secrets through the process environment or your own secret manager. See
+``docs/AUTONOMOUS_PAPER_FUND.md`` in the source checkout for commands and limits.
