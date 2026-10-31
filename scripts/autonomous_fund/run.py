@@ -144,9 +144,73 @@ def run_paper(args, config):
         strategy.journal.export()
 
 
+def check_market(args, config):
+    """Read public data and credential presence; never invokes a model or broker."""
+    from lumibot.entities import Asset
+    from .market_data import YahooRealtimeData
+    from .risk import Limits
+    source = YahooRealtimeData()
+    now, observations = source.get_datetime(), {}
+    for symbol in ("SPY", "QQQ"):
+        asset = Asset(symbol, asset_type="stock")
+        quote = source.get_quote(asset)
+        daily = source.get_historical_prices(asset, 30, timestep="day").df
+        observations[symbol] = {"price": quote.price, "source_as_of": quote.timestamp.isoformat(),
+                                "age_seconds": (source.get_datetime() - instant(quote.timestamp)).total_seconds(),
+                                "completed_daily_rows": len(daily), "price_kind": quote.raw_data["price_kind"]}
+    try:
+        model_ready(args.model or config["model"])
+        ready, missing = True, None
+    except RiskError as exc:
+        ready, missing = False, str(exc)
+    result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
+              "source": source.SOURCE, "requires_broker_key": False, "model": args.model or config["model"],
+              "model_key_present": ready, "model_requirement": missing,
+              "model_inference_tested": False, "observations": observations,
+              "freshness_limit_seconds": Limits(**config["limits"]).quote_max_seconds}
+    (args.run_dir / "preflight.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print(json.dumps(result, indent=2))
+    return result
+
+
+def run_local(args, config):
+    from lumibot.traders import Trader
+    from .journal import Journal, encode
+    from .local_broker import LocalPaperBroker
+    from .market_data import YahooRealtimeData
+    from .risk import Limits
+    from .strategy import AutonomousFund
+    if not args.observe_only:
+        model_ready(args.model or config["model"])
+    if args.scripted:
+        raise RiskError("Scripted models are forbidden against the running market")
+    binding = hashlib.sha256(encode({"mode": "local", "account": "local-virtual-account", "config": config}).encode()).hexdigest()
+    journal = Journal(args.run_dir, binding)
+    broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
+                              matching_enabled=not args.observe_only)
+    strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
+        "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
+        "model": args.model, "observe_only": args.observe_only})
+    broker.do_polling()
+    print("Local virtual account active. No brokerage account is connected. Observe-only=" + str(args.observe_only))
+    print("Market session: " + json.dumps(broker.data_source.session.status()))
+    trader = Trader()
+    trader.add_strategy(strategy)
+    try:
+        trader.run_all(run_once=args.once)
+    finally:
+        broker._stop_event.set()
+        if getattr(broker, "stream", None):
+            broker.stream.stop()
+        broker.do_polling()  # Publish exited state without matching another order.
+        journal.export()
+        from .report import report
+        report(args.run_dir, config.get("model_prices_per_million"))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "report", "stop", "resume", "attach-order", "reset-drawdown"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -156,11 +220,20 @@ def main(argv=None):
     parser.add_argument("--scripted", action="store_true", help="Historical mechanical tests only; never paper")
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
+    parser.add_argument("--once", action="store_true", help="One native scheduler iteration then exit (local only)")
+    parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
+    parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
     args = parser.parse_args(argv)
+    if args.env_file:
+        from dotenv import load_dotenv
+        if not args.env_file.is_file():
+            raise RiskError("The explicitly selected environment file does not exist")
+        load_dotenv(args.env_file, override=False)
+        args.model = args.model or os.environ.get("AI_MODEL")
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
-    os.environ["IS_BACKTESTING"] = "false" if args.mode == "paper" else "true"
+    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check"} else "true"
     args.run_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
     if args.mode == "stop":
@@ -174,10 +247,14 @@ def main(argv=None):
     from .strategy import configuration
     from .report import report
     config = configuration(args.config)
+    if args.mode == "report":
+        # A read-only report must work while the trading process holds its lock.
+        print(json.dumps(report(args.run_dir, config.get("model_prices_per_million"), write_files=False), indent=2))
+        return
+    if args.mode == "check":
+        check_market(args, config)
+        return
     with FileLock(str(args.run_dir / "runner.lock"), timeout=0):
-        if args.mode == "report":
-            print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
-            return
         if args.mode == "reset-drawdown":
             with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
                 db.execute("DELETE FROM meta WHERE key IN ('peak','drawdown_paused')")
@@ -190,10 +267,14 @@ def main(argv=None):
             return
         if args.scripted and args.mode == "paper":
             raise RiskError("Scripted models are forbidden in paper mode")
-        if args.mode != "mock" and not args.scripted:
+        if (args.observe_only or args.once) and args.mode != "local":
+            raise RiskError("--observe-only and --once are local-mode options")
+        if args.mode != "mock" and not args.scripted and not args.observe_only:
             model_ready(args.model or config["model"])
         logging.getLogger().addHandler(logging.FileHandler(args.run_dir / "runtime.log", encoding="utf-8"))
-        if args.mode == "paper":
+        if args.mode == "local":
+            run_local(args, config)
+        elif args.mode == "paper":
             # One runner per credential, including different output directories.
             # Use a dedicated account: activity through other keys is external.
             credentials = paper_config()

@@ -2,9 +2,9 @@
 
 基于原生 LumiBot Agent、Strategy、Broker 和 BacktestingBroker 的纸面账户应用。
 
-**Last Updated:** 2026-10-31
+**Last Updated:** 2026-11-01
 
-**Status:** 本地测试及脚本决策历史回放通过；真实模型与 Alpaca 账户待凭证验证
+**Status:** 公开行情与本地虚拟账户启动已联网验证；模型推理和 Alpaca 账户待凭证验证
 
 **Audience:** 本地运行者和维护者
 
@@ -28,7 +28,7 @@
 
 ```powershell
 python -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt -r scripts/autonomous_fund/requirements.txt
 ```
 
 无需密钥的完整机械检查：
@@ -42,14 +42,76 @@ python -m venv .venv
 每次历史实验使用新的目录，防止混合账本。PowerShell 启动器对回测设置 1,200 秒上限。
 Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run --help`。
 
+## 无券商账户：真实行情本地模拟盘
+
+`local` 模式读取 Yahoo 公开行情，将 10,000 美元虚拟资金、持仓和订单保存在本地。
+它使用原生 `Broker`、`Order`、`Position`、`Strategy` 和 `Trader` 生命周期，
+不构造任何券商交易客户端，不需要 Alpaca／Schwab 账户或券商 Key。
+它不是券商 Paper 账户，成交属于明确标记的本地虚拟成交。
+
+先检查真实行情与所选模型的凭证是否存在，不调用模型：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode check -RunDir artifacts/fund-market-check
+```
+
+默认模型为 `deepseek/deepseek-flash`，需要你自己的 `DEEPSEEK_API_KEY`。
+可在当前 PowerShell 中安全输入，输入不会显示，也不会写进命令历史或仓库：
+
+```powershell
+$fundKey = Read-Host 'DeepSeek API Key' -AsSecureString
+$env:DEEPSEEK_API_KEY = [System.Net.NetworkCredential]::new('', $fundKey).Password
+Remove-Variable fundKey
+.\scripts\run_autonomous_fund.ps1 -Mode local -RunDir artifacts/fund-local
+```
+
+密钥最终仍是进程环境中的字符串；本例没有把它保存到文件。关闭终端后需重新注入。
+若使用自己管理的未跟踪秘密文件，显式指定 `-EnvFile <your-secret-file>`；
+现有进程环境优先，启动器不搜索其他 `.env` 文件。不要把真实密钥发到聊天或提交 Git。
+
+没有模型 Key 时，只读观察模式可先验证启动、资金记录和交易日历，完全不调用模型或提交订单：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode local -ObserveOnly -Once -RunDir artifacts/fund-local-check
+```
+
+去掉 `-Once` 可持续运行只读观察；有 Key 后去掉 `-ObserveOnly` 启动 AI 自主研究和虚拟交易。
+正常重启继续使用同一目录；不要通过换目录重置风险锁。`local` 的账户与券商账户彼此独立。
+进程需保持运行、电脑需联网且不休眠。NYSE 休市时等待下次开盘，日历包含节假日、夏令时与提前收盘。
+`status.json` 的 `heartbeat_at` 表示轮询活性；`runner_state=exited` 表示已退出，
+`stopped` 另指人工 STOP 标记。强制终止后应结合心跳年龄判断，旧状态文件不能证明进程仍在运行。
+
+行情与撮合的具体限制：
+
+- Yahoo 提供完成的一分钟 OHLCV，不保证交易所实时性、服务可用性或盘口覆盖；可能延迟或限流。
+  报价保留源时间，超过 60 秒时禁止成交，不会放宽阈值或用接收时间冒充新行情。
+  当前日线不进入技术分析／流动性样本，未完成的分钟线也不进入研究或撮合。
+- 买卖价是围绕最新完成分钟收盘价加减 10 基点总价差的代理值，明确标注为
+  `completed_minute_close_with_spread_proxy`，不是交易所实际 bid/ask。
+- 下单后必须等待开始时间晚于提交时刻的一根新分钟线完整结束。
+  买单用该分钟最高价再加半价差和 5 基点滑点，卖单用最低价减去同等摩擦，向不利方向取整。
+  价格超出限价则不成交；单分钟最多取观测成交量的 1%，可部分成交；默认另计 0.1% 模拟费用。
+  这些是保守的透明假设，不重放真实排队或订单簿，也不代表可实现收益。
+- 成交时重新核验持仓／总敞口、现金、回撤、STOP、有效期和所有持仓报价的新鲜度。
+  到期订单撤销，停机期间已过时的分钟线不追补成交。成交、现金、持仓和审计事件同一事务提交，
+  重启不会重复成交或重复扣费。本地已接受订单及意图 ID 同一事务保存，没有券商网络确认的不确定窗口。
+- 持有期间拆股同步调整数量和成本；无法整股表示的拆并股、供应商修改已处理动作时暂停撮合并记录异常。
+  分红仅按除息事件计入不可花费的应收款，因为此来源没有可靠付款日，首版不自动转为可交易现金。
+  分红数量从除息日前的成交账本重建，除息日新买入不参与；若迟报时相关持仓已清空或重开，可能漏计，需人工补核。
+  拆股迟报且已发生除息日后的交易时暂停撮合。复杂公司行动、退市、并购、换股和税务尚未完整覆盖，
+  本地报告不能视作完整的税后总收益账单。
+
+Yahoo 公开数据的使用还须符合其条款；本模式用于个人研究与功能验证。
+若正常交易时段行情长期超时或延迟，需要在后续阶段接入有权限的行情服务，届时再配置该服务的 Key。
+
 ## 模型与数据凭证
 
 | 用途 | 环境变量 | 说明 |
 |---|---|---|
-| 模型选择 | `AI_MODEL` | 如 `openai/<model-id>`、`anthropic/<model-id>`、`deepseek/<model-id>`；也可用 `--model` 或 JSON 配置 |
+| 模型选择 | `AI_MODEL` | 默认 `deepseek/deepseek-flash`；也支持 `openai/<model-id>`、`anthropic/<model-id>`；可用 `--model` 或 JSON 配置 |
 | OpenAI | `OPENAI_API_KEY` | 只需要所选提供方的 Key |
 | Claude | `ANTHROPIC_API_KEY` | 原生运行时通过 LiteLLM 调用 |
-| DeepSeek | `DEEPSEEK_API_KEY` | 原生运行时通过 LiteLLM 调用 |
+| DeepSeek | `DEEPSEEK_API_KEY` | 原生运行时通过 LiteLLM 调用；本地真实行情模拟盘只需这个 Key |
 | Alpaca Paper | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | 必须使用 Paper 账户自己的凭证 |
 | 模拟标识 | `ALPACA_IS_PAPER=true` | 若明确设成 false，应用拒绝启动 |
 | 可选宏观研究 | `FRED_API_KEY` | 没有时其他研究工具仍可用 |
@@ -57,6 +119,9 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 不需要同时填写全部模型 Key。模型 ID 必须是账户实际支持的 ID，切换提供方不会伪造兼容性测试。
 `AI_MODEL` 只影响此应用，不修改 LumiBot 其他策略的默认模型。
 真实模型运行可能产生提供方费用；本次交付没有做付费模型推理。
+应用附加依赖安装原生免费 `web_search` 所需的 `ddgs`，不需要额外搜索 Key。
+浏览器工具还需可选 Playwright 与浏览器运行时；未安装时仍可使用搜索及 HTTP 文档读取，
+网页反爬、付费墙或网络限流可能导致研究缺项，模型必须披露。没有把这些研究源伪装成完整市场覆盖。
 
 ## Alpaca Paper 运行
 
@@ -93,7 +158,7 @@ AI 的完整目标组合中，遗漏的已有持仓代表卖出，空目标列�
 拒绝非有限数值、重复证券、超额目标、未来／过期决策、陈旧账户或报价、缺失流动性证据。
 日限额按纽约交易日计算，买卖、失败和取消的提交均占用次数，采用比“新增买单”更保守的统计。
 
-订单数量根据真实账户净值、现金、实际持仓和限价计算，保留费用缓冲。
+订单数量根据所选账户的净值、现金、实际持仓和限价计算，保留费用缓冲。
 先执行减仓，每次最多提交一笔，再等待状态确认、重新读取资金和持仓后进行下一次决策。
 未成交卖单不能为买单提供资金；账户中任何未完成或未知订单都会阻止新的订单。
 达到回撤阈值后允许减仓，不自动强平，也不保证市场跳空后的实际损失止于 8%。
@@ -102,8 +167,9 @@ AI 的完整目标组合中，遗漏的已有持仓代表卖出，空目标列�
 SQLite 在下单前原子保存意图和日限额，写入失败则不下单。
 提交超时、响应丢失或程序崩溃后不自动重发。同目录进程锁和相同 API Key 的跨目录进程锁避免重复启动。
 请只用一个专用 Paper 账户、一个凭证及本应用交易；不同机器、不同 Key、外部手动交易或其他程序不受本地锁控制。
-订单列表达到原生适配器的 100 条返回上限时会拒绝继续，避免将截断列表误认为完整账户视图。
+Alpaca 订单列表达到原生适配器的 100 条返回上限时会拒绝继续，避免将截断列表误认为完整账户视图。
 这是一项已知运维限制，需要人工核对后安排后续适配器分页改进，不能简单删除账本绕过。
+本地虚拟适配器查询完整持久化订单历史，没有这个 100 条截断限制。
 
 正常重启继续使用同一 `--run-dir`、凭证和配置。账本与账户／模式／配置绑定，不会把另一账户的高水位或订单借来使用。
 已保存券商 ID 的订单逐笔向券商查询。完整成交可从券商累计数量和均价恢复，标记为
@@ -132,6 +198,7 @@ SQLite 在下单前原子保存意图和日限额，写入失败则不下单。
 不要把创建文件当成券商已确认撤单。模型或网络调用进行中可能延迟处理；紧急时同时去券商界面核验并撤单。
 Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单。
 `resume` 只移除人工停止，不清除回撤锁或不确定订单。
+本地模式将上述命令中的目录替换为 `artifacts/fund-local`；轮询器也在休市时处理本地 STOP 和到期撤单。
 回撤暂停需要操作员停掉进程后显式执行 `reset-drawdown`；新高水位从下一次净值开始，操作会留痕。
 
 `notify(kind, details)` 是通知扩展接口，默认输出控制台及持久化本地通知 outbox。
@@ -170,10 +237,12 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 | 输出文件 | 内容 |
 |---|---|
 | `state.sqlite3` | 权威账本、未决订单、累计提交次数、回撤锁、审计事件 |
+| `status.json` | 本地模式的进程心跳、交易日历、人工停止状态、现金／应收款、待处理订单及撮合错误 |
+| `preflight.json` | check 命令的真实行情时间戳、行情年龄、下次开盘时间、所缺环境变量；不含密钥 |
 | `events.jsonl` | 可重建的事件导出：研究、结构化决策、行情、账户、订单及异常 |
 | `fills.csv` | 原生回调成交或标记明确的累计成交核对；费用未知保留为空 |
 | `native_trade_events.csv` | 历史模式原生引擎交易事件 |
-| `equity.csv` | 每日净值、现金、持仓、收益率，可用于绘制资金曲线 |
+| `equity.csv` | 每日净值、现金、持仓、应收款、收益率，可用于绘制资金曲线 |
 | `report.json` | 收益率、观测／日采样最大回撤、零无风险利率日 Sharpe、SPY／QQQ 价格收益比较 |
 | `notifications.json`、`runtime.log` | 本地通知接口和运行日志 |
 | `cache/agent_runtime/traces/` | LumiBot 原生模型、工具调用、时间戳与 usage 明细 |
@@ -193,9 +262,33 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 另使用真实 Yahoo 历史价格完成 2025-01-06 至 2025-02-01 的脚本决策回放，生成实际引擎成交、费用和双基准记录。
 这是功能回归，不是 AI 收益证明。
 
+2026-11-01（北京时间）联网读取到真实 SPY、QQQ 的分钟与历史日线，且通过本地虚拟账户的
+原生调度器只读启动检查。当时为周末休市，源行情是前一交易日收盘；没有伪造成新报价。
+本地撮合的开盘、部分成交、费用、崩溃恢复、源数据故障、过期、拆股／分红及风控测试使用可控时钟与行情替身。
+真实模型工具调用、真实开盘时段持续运行、网络抖动下长期表现仍需配置模型 Key 后验证。
+最终相关回归 194 项通过，另有原生网络工具单测 27 项通过；原生免费网络搜索实际返回了公开结果。
+持续只读进程的心跳、运行中报告读取和 STOP 标记识别也已验证，测试后已结束该进程。
+
 未配置真实模型或 Alpaca Key；没有做真实模型研究、Alpaca 网络登录、Paper 下单／撤单／停机恢复或通知投递。
 这些需要你在本地填写凭证后单独验证。没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
+
+## 本次真实行情模式的代码范围
+
+| 文件 | 变动 |
+|---|---|
+| `scripts/autonomous_fund/market_data.py` | 新增公开行情、源时间戳、完成 K 线和 NYSE 日历适配器 |
+| `scripts/autonomous_fund/local_broker.py` | 新增原生 Broker 接口的持久化虚拟账户及撮合 |
+| `tests/test_autonomous_fund_local.py` | 新增可控时钟／行情、原生调度器和恢复回归测试 |
+| `scripts/autonomous_fund/run.py`、`scripts/run_autonomous_fund.ps1` | 扩展 local/check、只读观察、单次运行和显式秘密文件参数 |
+| `scripts/autonomous_fund/strategy.py` | 接入本地账户、原始行情时间和本地成交核对 |
+| `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款 |
+| `scripts/autonomous_fund/report.py` | 本地增量费用、观察模式、运行期间只读报告 |
+| `scripts/autonomous_fund/config.json` | 设置本应用的 DeepSeek Flash 默认模型 |
+| `scripts/autonomous_fund/requirements.txt` | 新增本应用需要的免费网络搜索附加依赖 |
+| `docsrc/environment_variables.rst`、`CHANGELOG.md`、本文 | 同步配置说明、使用限制及变更记录 |
+
+没有修改共享框架、官方 AI 示例、依赖主版本、包版本或发布配置。
 
 ## 未来 Schwab 阶段
 
@@ -211,6 +304,8 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 AI 不应拥有配置仓库、券商管理、API 权限或实盘启动入口的写权限。
 
 官方参考：[Alpaca Paper](https://docs.alpaca.markets/docs/paper-trading)、
+[DeepSeek API](https://api-docs.deepseek.com/)、
+[yfinance](https://ranaroussi.github.io/yfinance/reference/index.html)、
 [Alpaca 行情权限](https://docs.alpaca.markets/us/v1.1/docs/market-data-faq)、
 [LumiBot 混合 Agent 流程](https://lumibot.lumiwealth.com/agents_flows.html)、
 [Schwab Developer Portal](https://developer.schwab.com/user-guides/individual-developer/become-individual-developer)。

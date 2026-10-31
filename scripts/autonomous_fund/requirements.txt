@@ -1,0 +1,3 @@
+# Optional native keyless web-search backend for this checkout application.
+# Install alongside the repository requirements; no shared package pins change.
+ddgs==9.16.1

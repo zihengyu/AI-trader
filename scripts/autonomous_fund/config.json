@@ -1,6 +1,6 @@
 {
-  "model": "openai/gpt-6-luna",
-  "reasoning_effort": "medium",
+  "model": "deepseek/deepseek-flash",
+  "reasoning_effort": null,
   "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 5, "drawdown": "0.08"},
   "universe": {
     "AAPL": "stock", "MSFT": "stock", "AMZN": "stock", "GOOGL": "stock",

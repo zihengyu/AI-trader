@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 
-def report(root, prices=None):
+def report(root, prices=None, write_files=True):
     root = Path(root)
     with sqlite3.connect(root / "state.sqlite3") as db:
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
@@ -14,15 +14,15 @@ def report(root, prices=None):
     accounts, benchmarks, fills, usage, notifications, reconciled = [], {}, [], [], [], {}
     decisions = 0
     incomplete_fills = False
-    startup = next((body for _, kind, body in events if kind == "startup"), {})
+    startup = next((body for _, kind, body in reversed(events) if kind == "startup"), {})
     for at, kind, body in events:
         if kind == "account":
             accounts.append({"at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
-                             "positions": body["positions"]})
+                             "positions": body["positions"], "receivables": float(body.get("receivables", 0))})
         elif kind == "benchmark":
             benchmarks[at[:10]] = body
         elif kind == "fill":
-            fills.append({"at": at, **body, "evidence_kind": "native_fill_callback"})
+            fills.append({"at": at, **body, "evidence_kind": body.get("evidence_kind", "native_fill_callback")})
         elif kind == "fill_reconciled":
             reconciled[body["broker_id"]] = {"at": at, **body, "evidence_kind": "broker_cumulative_observation"}
         elif kind == "decision_validated":
@@ -65,13 +65,17 @@ def report(root, prices=None):
     # A partially filled order's trade_cost may be cumulative. Never sum repeated
     # cumulative observations. Missing broker fees remain unknown, not zero.
     fee_by_order = {}
+    local_fees = 0
     unknown_fee = incomplete_fills
     for row in fills:
         if row["trade_cost"] is None:
             unknown_fee = True
         else:
-            key = row["broker_id"]
-            fee_by_order[key] = max(fee_by_order.get(key, 0), float(row["trade_cost"]))
+            if row["evidence_kind"] == "local_completed_bar_simulation":
+                local_fees += float(row["trade_cost"])
+            else:
+                key = row["broker_id"]
+                fee_by_order[key] = max(fee_by_order.get(key, 0), float(row["trade_cost"]))
     totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "unknown_calls": 0}
     for row in usage:
         if row.get("cache_hit"):
@@ -90,6 +94,7 @@ def report(root, prices=None):
                     totals["output_tokens"] * float(prices["output"])) / 1_000_000
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
+        "observe_only": startup.get("observe_only", False),
         "validated_decisions": decisions,
         "blocked_iterations": sum(row["kind"] == "blocked" for row in notifications),
         "observations": len(curve), "starting_equity": initial,
@@ -98,20 +103,22 @@ def report(root, prices=None):
         "max_observed_drawdown": observed_drawdown, "max_daily_drawdown": max_drawdown,
         "daily_sharpe_zero_risk_free": sharpe,
         "benchmark_price_returns": comparison, "fills_observed": len(fills),
-        "observed_fees": sum(fee_by_order.values()) if not unknown_fee else None,
+        "observed_fees": local_fees + sum(fee_by_order.values()) if not unknown_fee else None,
         "fill_details_incomplete": incomplete_fills,
         "model_usage": totals, "model_cost_estimate_usd": estimate,
         "latest_account": accounts[-1] if accounts else None,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
                         "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."
     }
+    if not write_files:
+        return summary
     (root / "report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     for name, rows, fields in (
-        ("equity.csv", curve, ["at", "equity", "cash", "positions", "daily_return"]),
-        ("fills.csv", fills, ["at", "broker_id", "symbol", "side", "quantity", "price", "trade_cost", "evidence_kind"]),
+        ("equity.csv", curve, ["at", "equity", "cash", "positions", "receivables", "daily_return"]),
+        ("fills.csv", fills, ["at", "broker_id", "symbol", "side", "quantity", "price", "trade_cost", "evidence_kind", "execution_id", "bar_start"]),
     ):
         with (root / name).open("w", newline="", encoding="utf-8") as out:
-            writer = csv.DictWriter(out, fieldnames=fields)
+            writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
     (root / "notifications.json").write_text(json.dumps(notifications, indent=2, ensure_ascii=False), encoding="utf-8")

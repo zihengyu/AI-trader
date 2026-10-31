@@ -1368,12 +1368,20 @@ The optional checkout application ``scripts/autonomous_fund`` reads ``AI_MODEL``
 to select a provider-qualified model, such as ``openai/<model-id>``,
 ``anthropic/<model-id>`` or ``deepseek/<model-id>``. Its ``--model`` argument takes
 precedence, followed by ``AI_MODEL``, then its JSON configuration. This variable
-does not change other strategies' model defaults.
+does not change other strategies' model defaults. Its supplied configuration
+selects ``deepseek/deepseek-flash``.
 
 OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
 DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.
-Paper execution requires ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` from a paper
+The ``local`` mode combines public Yahoo observations with a durable local virtual
+account and requires no brokerage key. Delayed or unavailable data blocks fills;
+minute OHLCV and an explicit spread proxy are not exchange bid/ask quotes.
+``local --observe-only`` disables model calls and orders and needs no model key.
+The ``check`` command verifies public data and key presence without inference.
+Alpaca ``paper`` execution requires ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` from a paper
 account. ``ALPACA_IS_PAPER`` defaults to true; an explicit false value is rejected.
 The application has no live mode and disables automatic dotenv discovery. Inject
-secrets through the process environment or your own secret manager. See
+secrets through the process environment or your own secret manager; alternatively,
+select your own untracked secret file explicitly with ``--env-file`` (existing
+environment values take precedence). See
 ``docs/AUTONOMOUS_PAPER_FUND.md`` in the source checkout for commands and limits.

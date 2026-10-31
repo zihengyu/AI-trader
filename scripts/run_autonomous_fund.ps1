@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown')]
+    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown')]
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
@@ -7,7 +7,10 @@ param(
     [string]$Start = '2025-01-06',
     [string]$End = '2025-02-14',
     [string]$DataDir = '',
-    [switch]$Scripted
+    [switch]$Scripted,
+    [switch]$Once,
+    [switch]$ObserveOnly,
+    [string]$EnvFile = ''
 )
 $ErrorActionPreference = 'Stop'
 Push-Location (Split-Path $PSScriptRoot -Parent)
@@ -19,6 +22,9 @@ try {
     if ($Model) { $runArgs += @('--model', $Model) }
     if ($DataDir) { $runArgs += @('--data-dir', $DataDir) }
     if ($Scripted) { $runArgs += '--scripted' }
+    if ($Once) { $runArgs += '--once' }
+    if ($ObserveOnly) { $runArgs += '--observe-only' }
+    if ($EnvFile) { $runArgs += @('--env-file', $EnvFile) }
     if ($Mode -in @('mock', 'backtest')) {
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
         $stdoutPath = Join-Path $RunDir 'stdout.log'

@@ -77,6 +77,7 @@ class Account:
     positions: dict
     as_of: datetime
     open_orders: bool = False
+    receivables: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
@@ -91,9 +92,11 @@ def validate_evidence(evidence, now, historical):
     if not evidence:
         raise RiskError("No dated research evidence")
     for source in evidence:
-        published = instant(source["available_at"])
         observed = instant(source["observed_at"])
-        if historical and (published > now or observed > now):
+        if not historical:
+            continue
+        published = instant(source["available_at"])
+        if published > now or observed > now:
             raise RiskError("Research evidence is after the simulated cutoff")
         if source.get("estimated") and not source.get("estimate_reason", "").strip():
             raise RiskError("Estimated publication dates require an explanation")
@@ -145,7 +148,9 @@ def plan(targets, account, prices, universe, limits, now, paused=False, historic
         buy_limit = (mark * (1 + limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
         desired[symbol] = int((equity * targets.get(symbol, 0) / buy_limit).to_integral_value(rounding=ROUND_FLOOR))
     # Account reports and independent marks must describe the same dedicated account.
-    if abs(cash + sum(values.values()) - equity) > max(Decimal("5"), equity * Decimal("0.02")):
+    if number(account.receivables) < 0:
+        raise RiskError("Invalid receivable balance")
+    if abs(cash + sum(values.values()) + number(account.receivables) - equity) > max(Decimal("5"), equity * Decimal("0.02")):
         raise RiskError("Account balances and marked positions disagree")
     sells, buys = [], []
     for symbol in sorted(symbols):
