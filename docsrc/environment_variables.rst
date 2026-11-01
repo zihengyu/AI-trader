@@ -1437,7 +1437,9 @@ parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``). Values are
 validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.env`` file fails startup
 with a suggestion, and ``show-config`` prints effective values and their sources with
-secrets shown only as set or missing.
+secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of
+the day for purchases; sales count only sales against their own budget of the same size,
+with five more for protective exits, so purchases can never block de-risking.
 
 The application's read-only ``schwab-check`` command uses the native Schwab
 variables (``SCHWAB_ACCOUNT_NUMBER``, ``SCHWAB_APP_KEY``, ``SCHWAB_APP_SECRET``,

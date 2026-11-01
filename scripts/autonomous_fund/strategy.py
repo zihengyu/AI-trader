@@ -1391,9 +1391,8 @@ class AutonomousFund(Strategy):
             assert_paper(self.broker)
         cap = max_submissions or self.limits.daily_orders
         with self.journal.connection() as db:
-            unresolved = db.execute("SELECT 1 FROM intents WHERE status!='terminal'").fetchone()
-            submitted = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
-        if unresolved or submitted >= cap:
+            blocked = self.journal.blocked(db, intent, now, cap)
+        if blocked:
             # Do not ask the operator to approve an order a hard rule forbids.
             # The atomic reservation independently rechecks this after approval.
             raise RiskError("Unresolved intent or daily submission limit reached")

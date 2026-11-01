@@ -469,3 +469,36 @@ def test_protective_exits_use_a_marketable_limit_and_reprice_quickly(tmp_path, s
     strategy.session_orders[key].status = "new"
     strategy._manage_open_orders(at(1.5))
     assert len(canceled) == 1  # Stops reprice after 60 s, not the 180 s used for entries.
+
+
+def spend(journal, side, count, symbol="ALFA"):
+    for i in range(count):
+        key = journal.reserve(Intent(symbol, side, 1, number(100)), NOW, LIMITS)
+        journal.update(key, f"{side}-{i}", True, NOW)
+
+
+def test_purchases_cannot_starve_risk_reducing_sales_of_the_daily_budget(tmp_path):
+    journal = Journal(tmp_path, "synthetic-budget")
+    spend(journal, "buy", LIMITS.daily_orders)  # Purchases and their reprices used the day's budget.
+    with pytest.raises(RiskError, match="daily submission limit"):
+        journal.reserve(Intent("BETA", "buy", 1, number(100)), NOW, LIMITS)
+    spend(journal, "sell", LIMITS.daily_orders)  # De-risking sales (e.g. the drawdown budget) still run.
+    with pytest.raises(RiskError, match="daily submission limit"):
+        journal.reserve(Intent("ALFA", "sell", 1, number(100)), NOW, LIMITS)
+    with pytest.raises(RiskError, match="daily submission limit"):
+        journal.reserve(Intent("BETA", "buy", 1, number(100)), NOW, LIMITS)  # Selling never frees buys.
+
+
+def test_every_stop_exits_on_a_crash_day_after_the_allocation_budget_is_spent(tmp_path, sent_orders):
+    quotes = {s: quote(94) for s in ("ALFA", "BETA", "GAMMA", "DELTA")}
+    strategy = watching(tmp_path, quotes)
+    accept(strategy, [{"symbol": s, "weight": .05, "stop_loss": 95} for s in quotes], when=at(-30))
+    spend(strategy.journal, "buy", LIMITS.daily_orders)
+    spend(strategy.journal, "sell", LIMITS.daily_orders)
+    held = {s: 5 for s in quotes}
+    for minute in range(len(quotes)):
+        assert strategy._watch(account(9000, dict(held), price=94), at(minute))
+        sold = sent_orders[-1]
+        strategy.journal.update(strategy.journal.pending()[0]["id"], sold.identifier, True, at(minute))
+        held.pop(sold.asset.symbol)
+    assert held == {}

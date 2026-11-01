@@ -66,15 +66,29 @@ class Journal:
         with self.connection() as db:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(at), kind, encode(body)))
 
+    @staticmethod
+    def blocked(db, intent, now, cap):
+        """True when an unresolved intent exists or the side's daily budget is spent.
+
+        Purchases count every submission of the trading day, so heavy selling
+        never frees room to buy. Sales count only sales: purchases and their
+        reprices can never use up the budget that de-risking and protective
+        exits need on the day they matter most. Both remain hard caps.
+        """
+        if db.execute("SELECT 1 FROM intents WHERE status != 'terminal'").fetchone():
+            return True
+        bodies = [row[0] for row in db.execute("SELECT body FROM intents WHERE day=?", (trading_day(now),))]
+        if intent.side == "sell":
+            bodies = [body for body in bodies if json.loads(body)["side"] == "sell"]
+        return len(bodies) >= cap
+
     def reserve(self, intent, now, limits, guard=None, max_submissions=None):
         """Commit BEFORE contacting the broker. Ambiguous calls remain reserved."""
         key = uuid4().hex
         cap = max_submissions or limits.daily_orders
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
-            unresolved = db.execute("SELECT 1 FROM intents WHERE status != 'terminal'").fetchone()
-            count = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
-            if unresolved or count >= cap:
+            if self.blocked(db, intent, now, cap):
                 raise RiskError("Unresolved intent or daily submission limit reached")
             if guard:
                 guard(db)

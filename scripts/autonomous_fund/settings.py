@@ -94,7 +94,7 @@ SETTINGS = {
     "FUND_MAX_POSITION": (("limits", "max_position"), _decimal, False, "约束", "单只证券最大权重，例如 0.10"),
     "FUND_MAX_EXPOSURE": (("limits", "max_exposure"), _decimal, False, "约束", "证券总敞口上限，例如 0.70"),
     "FUND_MAX_DRAWDOWN": (("limits", "drawdown"), _decimal, False, "约束", "回撤硬锁阈值，例如 0.08"),
-    "FUND_DAILY_ORDERS": (("limits", "daily_orders"), _int, False, "约束", "每日最多提交次数（含改价重挂）"),
+    "FUND_DAILY_ORDERS": (("limits", "daily_orders"), _int, False, "约束", "每日提交上限（含改价重挂；卖出另有独立额度）"),
     "FUND_DAILY_LOSS_LIMIT": (("quant_risk", "daily_loss_limit"), _decimal, False, "约束", "当日亏损达到该比例停止买入"),
     "FUND_TARGET_VOL": (("quant_risk", "target_portfolio_vol"), _decimal, False, "约束", "组合年化波动率目标"),
     "FUND_MAX_ES": (("quant_risk", "max_portfolio_es"), _decimal, False, "约束", "1 日 97.5% 预期尾部损失上限"),
