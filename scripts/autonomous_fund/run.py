@@ -25,6 +25,13 @@ class ScriptedRuntime:
             body = {"summary": "SCRIPTED mechanical test; no investment research performed.", "evidence": [{
                 "source": "Scripted fixture, not news or fundamentals", "available_at": (now - timedelta(days=1)).isoformat(),
                 "observed_at": now.isoformat(), "estimated": False, "estimate_reason": ""}]}
+        elif context.get("phase") == "postmarket_review":
+            body = {"session_date": context["session"]["session_date"], "as_of": now.isoformat(),
+                    "summary": "SCRIPTED 复盘流程测试；未进行真实模型研究或策略优化。",
+                    "selection_adjustments": [], "timing_adjustments": [],
+                    "retained_lessons": ["样本不足，保留现金与独立风控约束。"], "retired_hypotheses": [],
+                    "data_gaps": ["脚本模型仅验证流程，不能验证投资判断。"], "confidence": "low",
+                    "strategy_memo": "SCRIPTED：后续研究应复查证据与执行情况；没有经过验证的选股或择时优势。"}
         else:
             symbol = sorted(context["eligible_universe"])[0]
             body = {"as_of": now.isoformat(), "expires_at": (now + timedelta(hours=8)).isoformat(),

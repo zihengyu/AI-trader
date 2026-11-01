@@ -153,7 +153,15 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
         def run(self, request):
             calls.append((request.agent_name, request.context))
             model_calls.append((request.agent_name, request.model))
-            return super().run(request)
+            result = super().run(request)
+            if (request.agent_name == "manager" and request.context.get("strategy_memory") and
+                    request.context.get("phase") != "postmarket_review"):
+                # A synthetic model changes its target after considering the
+                # memo. The production Python code does not choose this symbol.
+                body = json.loads(result.summary)
+                body["targets"] = [{"symbol": "QQQ", "weight": .05}]
+                result.summary = json.dumps(body)
+            return result
 
     def startup(run_once=True):
         broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
@@ -202,3 +210,33 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
     strategy.broker.do_polling()
     assert strategy.broker._pull_order(identifier, strategy.name).status == "fill"
     assert strategy.broker._get_balances_at_broker(None, strategy)[0] < 10000
+    strategy._snapshot()
+
+    # Exercise the native close callback, schema override on the SAME manager,
+    # and next-session feedback through a new independently validated target.
+    submitted_before = len([row for row in journal.export() if row["kind"] == "order_submitted"])
+    clock.value = datetime(2026, 11, 2, 21, 5, tzinfo=timezone.utc)
+    source._cache.clear()
+    strategy._executor._after_market_closes()
+    postmarket = [context for _, context in calls if context.get("phase") == "postmarket_review"]
+    assert len(postmarket) == 2
+    assert postmarket[-1]["orders_enabled"] is False
+    assert postmarket[-1]["session"]["counts"]["fill"] >= 1
+    assert model_calls[-2:] == [("researcher", "deepseek/deepseek-flash"), ("manager", "deepseek/deepseek-v4-pro")]
+    assert report(tmp_path, write_files=False)["strategy_memory_version"] == 1
+    assert len([row for row in journal.export() if row["kind"] == "order_submitted"]) == submitted_before
+    clock.value = datetime(2026, 11, 3, 13, 30, tzinfo=timezone.utc)
+    source._cache.clear()
+    strategy.before_market_opens()
+    assert calls[-1][1]["strategy_memory"]["version"] == 1
+    clock.value = datetime(2026, 11, 3, 15, 30, 5, tzinfo=timezone.utc)
+    source._cache.clear()
+    strategy.on_trading_iteration()
+    assert calls[-2][1]["strategy_memory"]["version"] == 1
+    assert calls[-1][1]["strategy_memory"]["version"] == 1
+    assert strategy.last_decision["targets"] == [{"symbol": "QQQ", "weight": .05}]
+    # The executor sells the old ALFA holding first, rather than interpreting
+    # the memo or replacement target as an immediate unchecked QQQ order.
+    last = [row for row in journal.export() if row["kind"] == "order_submitted"][-1]
+    assert last["body"]["symbol"] == "ALFA" and last["body"]["side"] == "sell"
+    strategy.broker._close_connection()

@@ -346,13 +346,17 @@ def test_real_native_backtest_runs_agents_fills_and_reports(tmp_path, monkeypatc
     from scripts.autonomous_fund.run import main
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     main(["mock", "--run-dir", str(tmp_path / "run"), "--start", "2025-01-06", "--end", "2025-01-14"])
-    result = json.loads((tmp_path / "run" / "report.json").read_text())
+    result = json.loads((tmp_path / "run" / "report.json").read_text(encoding="utf-8"))
     assert result["mode"] == "mock" and result["scripted_model"] is True
     assert result["fills_observed"] >= 1
     assert result["observed_fees"] > 0
     assert result["benchmark_price_returns"]["SPY"] is not None
     assert result["benchmark_price_returns"]["QQQ"] is not None
-    events = [json.loads(line) for line in (tmp_path / "run" / "events.jsonl").read_text().splitlines()]
+    assert result["postmarket_review_runs"] >= 1
+    assert result["latest_postmarket_review"]["mock"] is True
+    assert (tmp_path / "run" / "postmarket_review.md").exists()
+    assert (tmp_path / "run" / "strategy_memory.json").exists()
+    events = [json.loads(line) for line in (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["body"]["name"] for row in events if row["kind"] == "agent"} == {"researcher", "manager"}
     assert any(row["kind"] == "decision" for row in events)
     assert (tmp_path / "run" / "native_trade_events.csv").exists()

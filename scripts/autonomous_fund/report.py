@@ -16,6 +16,7 @@ def report(root, prices=None, write_files=True):
     incomplete_fills = False
     startup = next((body for _, kind, body in reversed(events) if kind == "startup"), {})
     premarket = [body for _, kind, body in events if kind == "premarket_research"]
+    reviews = [body for _, kind, body in events if kind == "postmarket_review"]
     for at, kind, body in events:
         if kind == "account":
             accounts.append({"at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
@@ -117,6 +118,9 @@ def report(root, prices=None, write_files=True):
         "validated_decisions": decisions,
         "premarket_research_runs": len(premarket),
         "latest_premarket_research": premarket[-1] if premarket else None,
+        "postmarket_review_runs": len(reviews),
+        "latest_postmarket_review": reviews[-1] if reviews else None,
+        "strategy_memory_version": reviews[-1]["version"] if reviews else None,
         "blocked_iterations": sum(row["kind"] == "blocked" for row in notifications),
         "observations": len(curve), "starting_equity": initial,
         "ending_equity": curve[-1]["equity"] if curve else None,
@@ -137,6 +141,8 @@ def report(root, prices=None, write_files=True):
     (root / "report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
     if premarket:
         (root / "premarket_research.json").write_text(json.dumps(premarket[-1], indent=2, ensure_ascii=False), encoding="utf-8")
+    from .review import export_reviews
+    export_reviews(root, reviews)
     for name, rows, fields in (
         ("equity.csv", curve, ["at", "equity", "cash", "positions", "receivables", "daily_return"]),
         ("fills.csv", fills, ["at", "broker_id", "symbol", "side", "quantity", "price", "trade_cost", "evidence_kind", "execution_id", "bar_start"]),
