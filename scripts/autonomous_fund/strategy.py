@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from lumibot.entities import Asset, Order
+from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
 from .journal import Journal, encode
@@ -20,6 +20,9 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation")
 NOTICE_WINDOWS = {"manual_stop": 21600}
+# A cancel request is asynchronous; repeat it only if the broker still shows the
+# order working this long after the last request (a lost request, not a slow one).
+CANCEL_RETRY_SECONDS = 240
 
 
 class Evidence(BaseModel):
@@ -980,7 +983,9 @@ class AutonomousFund(Strategy):
             if quantity <= 0:
                 self.execution.finish_level(symbol)
                 continue
-            limit = (number(price.bid) * (1 - self.limits.limit_buffer)).quantize(number("0.01"))
+            # A protective exit prioritizes getting out: a marketable limit below the bid.
+            buffer = number(getattr(self.execution_policy, "protective_limit_buffer", self.limits.limit_buffer))
+            limit = (number(price.bid) * (1 - buffer)).quantize(number("0.01"), rounding="ROUND_FLOOR")
             self._submit(Intent(symbol, "sell", quantity, limit), now, level["decision_id"], kind="protective",
                          max_submissions=self.limits.daily_orders + 5)
             return True
@@ -1082,24 +1087,50 @@ class AutonomousFund(Strategy):
         latest = self.execution.latest(now)
         expired = not latest or instant(now) >= instant(latest["until_at"])
         policy = getattr(self, "execution_policy", None)
+        # Broker cancellation is asynchronous ("cancelling" until confirmed): ask
+        # once, then only again after a retry interval, instead of every iteration.
+        requested = self.__dict__.setdefault("_cancel_requested", {})
+        levels = self.execution.levels() if getattr(self, "quant", None) is not None else {}
+
+        def cancel(pending, order, kind, detail):
+            last = requested.get(pending["id"])
+            if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
+                return
+            requested[pending["id"]] = instant(now)
+            self.cancel_order(order)
+            if kind:
+                self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **detail})
+
         for pending in self.journal.pending():
             order = self.session_orders.get(pending["id"])
             if self.mode in {"paper", "local"} and pending["broker_id"]:
                 order = self.broker._pull_order(pending["broker_id"], self.name)
             if not order or self._terminal(order):
+                requested.pop(pending["id"], None)
                 continue
             # A protective exit outlives the allocation that preceded it: it is
             # only repriced when stale, never canceled because a target expired.
             protective = self.execution.is_protective(pending["id"])
             if expired and not protective:
-                self.cancel_order(order)
+                cancel(pending, order, None, {})
                 continue
+            body = json.loads(pending["body"])
+            stop = (levels.get(body["symbol"]) or {}).get("stop_loss")
+            if body["side"] == "buy" and stop:
+                try:
+                    bid = self._price(body["symbol"], record=False).bid
+                except RiskError:
+                    bid = None
+                if bid is not None and number(bid) <= number(stop):
+                    # Never keep buying into the AI's own breached stop.
+                    cancel(pending, order, "buy_canceled_stop_breached", {"bid": str(bid), "stop_loss": stop})
+                    continue
             submitted = self.execution.submitted_at(pending["id"])
-            if (policy is not None and submitted is not None and (protective or latest["state"] == "active") and
-                    (instant(now) - submitted).total_seconds() >= policy.reprice_after_seconds):
-                self.cancel_order(order)
-                self.journal.event(now, "order_reprice_cancel", {"intent_id": pending["id"],
-                                   "broker_id": pending["broker_id"], "age_seconds": (instant(now) - submitted).total_seconds()})
+            interval = (getattr(policy, "protective_reprice_seconds", 60) if protective
+                        else getattr(policy, "reprice_after_seconds", None))
+            if (interval is not None and submitted is not None and (protective or latest["state"] == "active") and
+                    (instant(now) - submitted).total_seconds() >= interval):
+                cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_closes(self, symbol, now):
@@ -1225,8 +1256,16 @@ class AutonomousFund(Strategy):
         if stressed and policy.stress_requires_approval:
             auto_budget = number(0)
         blocked = set()
-        # AI entry levels: buy only while the ask is at or below the chosen price.
+        # AI entry levels: buy only while the ask is at or below the chosen price,
+        # and never below the AI's own stop for that symbol.
         for symbol, level in decision_levels(active["decision"]).items():
+            if "stop_loss" in level and symbol in prices and number(prices[symbol].bid) <= number(level["stop_loss"]):
+                blocked.add(symbol)
+                noted = self.__dict__.setdefault("_entry_noted", set())
+                if (active["id"], symbol, "stop") not in noted:
+                    noted.add((active["id"], symbol, "stop"))
+                    self.journal.event(now, "stop_breached_no_buy", {"decision_id": active["id"], "symbol": symbol,
+                                       "stop_loss": level["stop_loss"], "bid": str(prices[symbol].bid)})
             if "entry_limit" in level and symbol in prices and number(prices[symbol].ask) > number(level["entry_limit"]):
                 blocked.add(symbol)
                 noted = self.__dict__.setdefault("_entry_noted", set())

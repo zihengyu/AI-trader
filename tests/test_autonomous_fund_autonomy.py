@@ -2,7 +2,6 @@
 
 Synthetic accounts, prices and model answers only: no network, broker or inference.
 """
-import json
 from datetime import timedelta
 from types import SimpleNamespace
 
@@ -10,7 +9,7 @@ import pytest
 
 from lumibot.entities import Asset, Order
 from scripts.autonomous_fund.journal import Journal
-from scripts.autonomous_fund.risk import Account, Intent, Limits, Price, RiskError, number, validate_decision
+from scripts.autonomous_fund.risk import Intent, Limits, RiskError, number, validate_decision
 from .test_autonomous_fund_quant import DAYS, LIMITS, NOW, UNIVERSE, account, default_frames, harness, quote
 
 
@@ -225,10 +224,10 @@ def test_protective_exit_survives_an_expired_allocation_and_is_only_repriced_whe
     strategy.session_orders[key].status = "new"
     canceled = []
     strategy.cancel_order = canceled.append
-    strategy._manage_open_orders(at(1))
+    strategy._manage_open_orders(at(0.5))
     assert canceled == []  # Not canceled merely because the earlier target expired.
-    strategy._manage_open_orders(at(4))
-    assert len(canceled) == 1  # Stale after the reprice interval: cancel so it can be re-placed.
+    strategy._manage_open_orders(at(1.5))
+    assert len(canceled) == 1  # Stale after the protective reprice interval: cancel so it can be re-placed.
 
 
 def test_entry_limit_waits_for_the_ai_price_before_buying(tmp_path):
@@ -412,3 +411,61 @@ def test_operator_reserve_command_records_deposits_while_the_runner_is_stopped(t
     run.main(["adjust-reserve", "--run-dir", str(tmp_path), "--amount", "2500"])
     assert "42500" in capsys.readouterr().out
     assert journal.reserve_cash() == number(42500)
+
+
+# ----- Review-pass regressions -------------------------------------------------------------
+
+def pending_order(strategy, symbol="ALFA", side="buy", quantity=5, limit="100.10", decision_id="d", at=None):
+    key = strategy.journal.reserve(Intent(symbol, side, quantity, number(limit)), NOW, LIMITS)
+    strategy.session_orders[key] = Order("quant-test", Asset(symbol), quantity, side, limit_price=float(limit), status="new")
+    strategy.execution.record_submission(key, decision_id, Intent(symbol, side, quantity, number(limit)), at or NOW)
+    return key
+
+
+def test_cancel_requests_are_not_repeated_every_iteration_while_the_broker_confirms(tmp_path):
+    strategy = watching(tmp_path, {"ALFA": quote(100)})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05}], when=at(-30))
+    pending_order(strategy, decision_id=active["id"], at=at(-10))
+    canceled = []
+    strategy.cancel_order = canceled.append
+    for minute in range(4):  # The broker keeps reporting "cancelling" for a while.
+        strategy._manage_open_orders(at(minute))
+    assert len(canceled) == 1
+    events = [r for r in strategy.journal.all_events() if r["kind"] == "order_reprice_cancel"]
+    assert len(events) == 1
+    strategy._manage_open_orders(at(3))
+    strategy._manage_open_orders(at(5))  # Re-request only after the retry interval.
+    assert len(canceled) == 2
+
+
+def test_a_pending_buy_is_canceled_at_once_when_its_stop_is_breached(tmp_path):
+    strategy = watching(tmp_path, {"ALFA": quote(94)})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 95}], when=at(-30))
+    pending_order(strategy, decision_id=active["id"], at=at(-0.5))  # Fresh: not stale for repricing.
+    canceled = []
+    strategy.cancel_order = canceled.append
+    strategy._manage_open_orders(NOW)
+    assert len(canceled) == 1
+    assert any(r["kind"] == "buy_canceled_stop_breached" for r in strategy.journal.all_events())
+
+
+def test_no_purchase_below_the_ais_own_stop(tmp_path):
+    strategy = watching(tmp_path, {})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 95}])
+    below = strategy._candidates(active, account(), {"ALFA": quote(94)}, NOW)
+    assert below["orders"] == [] and not below["complete"]
+    above = strategy._candidates(active, account(), {"ALFA": quote(100)}, NOW)
+    assert above["orders"][0].side == "buy"
+
+
+def test_protective_exits_use_a_marketable_limit_and_reprice_quickly(tmp_path, sent_orders):
+    strategy = watching(tmp_path, {"ALFA": quote(94)})
+    accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 95}], when=at(-30))
+    strategy._watch(account(9530, {"ALFA": 5}, price=94), NOW)
+    assert sent_orders[-1].limit_price <= 94 * (1 - .005) + .01  # Prioritizes getting out over price.
+    canceled = []
+    strategy.cancel_order = canceled.append
+    key = strategy.journal.pending()[0]["id"]
+    strategy.session_orders[key].status = "new"
+    strategy._manage_open_orders(at(1.5))
+    assert len(canceled) == 1  # Stops reprice after 60 s, not the 180 s used for entries.

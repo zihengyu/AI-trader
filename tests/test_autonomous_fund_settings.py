@@ -7,7 +7,7 @@ import pytest
 from dotenv import dotenv_values
 
 from scripts.autonomous_fund.risk import RiskError
-from scripts.autonomous_fund.settings import SETTINGS, apply_environment
+from scripts.autonomous_fund.settings import SETTINGS
 from scripts.autonomous_fund.strategy import configuration, legacy_account_digest
 
 ROOT = Path(__file__).resolve().parents[1]

@@ -5,7 +5,6 @@ The replay tests use recorded market data shipped in this repository
 minute bars through the 2020 crash). No network, broker or model inference.
 """
 import json
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 

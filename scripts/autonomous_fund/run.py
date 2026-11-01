@@ -430,7 +430,7 @@ def main(argv=None):
 def validate_risk(args, config):
     """Replay fixed targets through the configured risk layer on recorded closes (offline)."""
     from .quant import QuantPolicy
-    from .risk import Limits, number, validate_decision
+    from .risk import Limits, number
     from .validation import load_closes, risk_replay
     if not args.data_dir or not args.targets:
         raise RiskError("validate-risk needs --data-dir and --targets SYMBOL=weight,...")

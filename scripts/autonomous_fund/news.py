@@ -229,7 +229,8 @@ class NewsWatch:
         return batches, held
 
     def poll_once(self):
-        now = instant(self.clock())
+        # Stored times are UTC: string comparison and ordering stay correct across DST.
+        now = instant(self.clock()).astimezone(timezone.utc)
         batches, held = self.collect()
         fresh_since = now - timedelta(hours=24)
         warm_before = set(self._seen_keys)
@@ -284,10 +285,11 @@ class NewsWatch:
 
     def recent(self, symbols, now, hours=24, limit=None):
         limit = limit or self.settings.max_items_per_context
-        since = (instant(now) - timedelta(hours=hours)).isoformat()
+        now = instant(now).astimezone(timezone.utc)
+        since = (now - timedelta(hours=hours)).isoformat()
         with self.journal.connection() as db:
             rows = [dict(r) for r in db.execute("SELECT * FROM fund_news WHERE observed_at>=? AND observed_at<=? "
-                                                "ORDER BY observed_at DESC LIMIT 500", (since, instant(now).isoformat()))]
+                                                "ORDER BY observed_at DESC LIMIT 500", (since, now.isoformat()))]
         wanted = set(symbols)
         relevant = [r for r in rows if r["kind"] in {"macro", "query"} or not json.loads(r["symbols"]) or
                     set(json.loads(r["symbols"])) & wanted]
