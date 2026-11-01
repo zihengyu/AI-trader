@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from lumibot.entities import Asset, Order
+from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
 from .journal import Journal, encode
@@ -20,6 +20,9 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation")
 NOTICE_WINDOWS = {"manual_stop": 21600}
+# A cancel request is asynchronous; repeat it only if the broker still shows the
+# order working this long after the last request (a lost request, not a slow one).
+CANCEL_RETRY_SECONDS = 240
 
 
 class Evidence(BaseModel):
@@ -153,8 +156,14 @@ def risk_settings(config, universe, limits):
             ModelBudget.from_config(config.get("model_budget")))
 
 
-def configuration(path):
-    result = json.loads(Path(path).read_text(encoding="utf-8"))
+def configuration(path, environ=None):
+    """config.json defaults with operator overrides from the environment / .env, validated together."""
+    import os
+    from .settings import apply_environment
+    result, overrides = apply_environment(json.loads(Path(path).read_text(encoding="utf-8")),
+                                          os.environ if environ is None else environ)
+    if overrides:
+        result["_environment_overrides"] = overrides
     limits = Limits(**result["limits"])
     model_selection(result)
     if not result["universe"] or any(v not in {"stock", "unlevered_etf"} for v in result["universe"].values()):
@@ -197,7 +206,7 @@ def account_digest(mode, account, config=None):
 
 def legacy_account_digest(mode, account, config):
     """Revision-2 binding: identity plus every non-policy configuration field."""
-    bound = {key: value for key, value in config.items() if key not in POLICY_SECTIONS}
+    bound = {key: value for key, value in config.items() if key not in POLICY_SECTIONS and not key.startswith("_")}
     return hashlib.sha256(encode({"mode": mode, "account": account, "config": bound}).encode()).hexdigest()
 
 
@@ -239,6 +248,7 @@ class AutonomousFund(Strategy):
         self.config = config
         self.limits = Limits(**config["limits"])
         self.universe = frozenset(config["universe"])
+        self._configured_universe = self.universe
         if mode not in {"mock", "backtest", "paper", "local"}:
             raise RiskError("Live trading is unavailable")
         if mode == "paper":
@@ -384,7 +394,8 @@ class AutonomousFund(Strategy):
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
                            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
-                           "mandate": asdict(self.mandate)})
+                           "mandate": asdict(self.mandate),
+                           "environment_overrides": config.get("_environment_overrides", [])})
         if mode == "local":
             # Native scheduling skips closed-market iterations. Record the real
             # virtual book immediately so weekend startup still has a report.
@@ -564,30 +575,23 @@ class AutonomousFund(Strategy):
         else:
             positions = self.get_positions()
             cash, equity = self.get_cash(), self.get_portfolio_value()
-        if positions is None:
-            raise RiskError("Positions unavailable")
+        if positions is None or getattr(getattr(self, "broker", None), "_last_positions_refresh_degraded", False):
+            # Some adapters return an empty or partial list on a failed read; never
+            # mistake that for "no holdings" (it would invite duplicate purchases).
+            raise RiskError("Positions unavailable or only partially refreshed")
         mandate = getattr(self, "mandate", None) or Mandate()
-        holdings, external = {}, {}
-        for position in positions:
-            if position.asset == self.quote_asset:
-                continue
-            symbol, stock = position.asset.symbol, str(position.asset.asset_type) == "stock"
-            if stock and symbol in self.universe:
-                holdings[symbol] = number(holdings.get(symbol, 0)) + number(position.quantity)
-            elif stock and mandate.allow_external_holdings:
-                external[symbol] = number(external.get(symbol, 0)) + number(position.quantity)
-            else:
-                raise RiskError("Dedicated account contains an unsupported asset")
-        external_value = number(0)
-        for symbol, quantity in external.items():
-            price = self.get_last_price(Asset(symbol, asset_type="stock"))
-            if price is None or not number(price) > 0:
-                raise RiskError("External holding cannot be valued; mandate sleeve unavailable")
-            external_value += quantity * number(price)
+        from .holdings import split_holdings
+        configured = getattr(self, "_configured_universe", None) or self.universe
+        baseline = self.journal.get_meta("mandate_external") if mandate.capital_usd is not None else None
+        holdings, external, external_value, shared = split_holdings(
+            positions, configured, quote_asset=self.quote_asset, allow_external=mandate.allow_external_holdings,
+            baseline=baseline, initialized=baseline is not None,
+            price=lambda symbol: self.get_last_price(Asset(symbol, asset_type="stock")))
         # Orders on external symbols are the operator's own; orders on eligible
         # symbols, or any unresolved intent of ours, block new submissions.
         open_orders = any(not self._terminal(order) and (not mandate.allow_external_holdings or
-                          order.asset.symbol in self.universe) for order in orders) or bool(self.journal.pending())
+                          (order.asset.symbol in configured and order.asset.symbol not in shared))
+                          for order in orders) or bool(self.journal.pending())
         receivables = self.broker.receivables() if self.mode == "local" else number(0)
         broker_cash, broker_equity = number(cash), number(equity)
         reserve = number(0)
@@ -596,6 +600,10 @@ class AutonomousFund(Strategy):
                                                  holdings, open_orders, external, self.mode == "paper")
         elif self.mode == "paper":
             self.journal.confirm_initial_paper_account(Account(broker_cash, broker_equity, holdings, start, open_orders))
+        if shared and self.universe != frozenset(configured) - shared:
+            # The operator's own symbols are never AI-tradable (tax lots, attribution).
+            self.universe = frozenset(configured) - shared
+            self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
         # The account the AI and every risk rule see is the operator's capital sleeve.
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
                           open_orders, receivables)
@@ -975,7 +983,9 @@ class AutonomousFund(Strategy):
             if quantity <= 0:
                 self.execution.finish_level(symbol)
                 continue
-            limit = (number(price.bid) * (1 - self.limits.limit_buffer)).quantize(number("0.01"))
+            # A protective exit prioritizes getting out: a marketable limit below the bid.
+            buffer = number(getattr(self.execution_policy, "protective_limit_buffer", self.limits.limit_buffer))
+            limit = (number(price.bid) * (1 - buffer)).quantize(number("0.01"), rounding="ROUND_FLOOR")
             self._submit(Intent(symbol, "sell", quantity, limit), now, level["decision_id"], kind="protective",
                          max_submissions=self.limits.daily_orders + 5)
             return True
@@ -1077,24 +1087,50 @@ class AutonomousFund(Strategy):
         latest = self.execution.latest(now)
         expired = not latest or instant(now) >= instant(latest["until_at"])
         policy = getattr(self, "execution_policy", None)
+        # Broker cancellation is asynchronous ("cancelling" until confirmed): ask
+        # once, then only again after a retry interval, instead of every iteration.
+        requested = self.__dict__.setdefault("_cancel_requested", {})
+        levels = self.execution.levels() if getattr(self, "quant", None) is not None else {}
+
+        def cancel(pending, order, kind, detail):
+            last = requested.get(pending["id"])
+            if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
+                return
+            requested[pending["id"]] = instant(now)
+            self.cancel_order(order)
+            if kind:
+                self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **detail})
+
         for pending in self.journal.pending():
             order = self.session_orders.get(pending["id"])
             if self.mode in {"paper", "local"} and pending["broker_id"]:
                 order = self.broker._pull_order(pending["broker_id"], self.name)
             if not order or self._terminal(order):
+                requested.pop(pending["id"], None)
                 continue
             # A protective exit outlives the allocation that preceded it: it is
             # only repriced when stale, never canceled because a target expired.
             protective = self.execution.is_protective(pending["id"])
             if expired and not protective:
-                self.cancel_order(order)
+                cancel(pending, order, None, {})
                 continue
+            body = json.loads(pending["body"])
+            stop = (levels.get(body["symbol"]) or {}).get("stop_loss")
+            if body["side"] == "buy" and stop:
+                try:
+                    bid = self._price(body["symbol"], record=False).bid
+                except RiskError:
+                    bid = None
+                if bid is not None and number(bid) <= number(stop):
+                    # Never keep buying into the AI's own breached stop.
+                    cancel(pending, order, "buy_canceled_stop_breached", {"bid": str(bid), "stop_loss": stop})
+                    continue
             submitted = self.execution.submitted_at(pending["id"])
-            if (policy is not None and submitted is not None and (protective or latest["state"] == "active") and
-                    (instant(now) - submitted).total_seconds() >= policy.reprice_after_seconds):
-                self.cancel_order(order)
-                self.journal.event(now, "order_reprice_cancel", {"intent_id": pending["id"],
-                                   "broker_id": pending["broker_id"], "age_seconds": (instant(now) - submitted).total_seconds()})
+            interval = (getattr(policy, "protective_reprice_seconds", 60) if protective
+                        else getattr(policy, "reprice_after_seconds", None))
+            if (interval is not None and submitted is not None and (protective or latest["state"] == "active") and
+                    (instant(now) - submitted).total_seconds() >= interval):
+                cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_closes(self, symbol, now):
@@ -1220,8 +1256,16 @@ class AutonomousFund(Strategy):
         if stressed and policy.stress_requires_approval:
             auto_budget = number(0)
         blocked = set()
-        # AI entry levels: buy only while the ask is at or below the chosen price.
+        # AI entry levels: buy only while the ask is at or below the chosen price,
+        # and never below the AI's own stop for that symbol.
         for symbol, level in decision_levels(active["decision"]).items():
+            if "stop_loss" in level and symbol in prices and number(prices[symbol].bid) <= number(level["stop_loss"]):
+                blocked.add(symbol)
+                noted = self.__dict__.setdefault("_entry_noted", set())
+                if (active["id"], symbol, "stop") not in noted:
+                    noted.add((active["id"], symbol, "stop"))
+                    self.journal.event(now, "stop_breached_no_buy", {"decision_id": active["id"], "symbol": symbol,
+                                       "stop_loss": level["stop_loss"], "bid": str(prices[symbol].bid)})
             if "entry_limit" in level and symbol in prices and number(prices[symbol].ask) > number(level["entry_limit"]):
                 blocked.add(symbol)
                 noted = self.__dict__.setdefault("_entry_noted", set())
@@ -1347,9 +1391,8 @@ class AutonomousFund(Strategy):
             assert_paper(self.broker)
         cap = max_submissions or self.limits.daily_orders
         with self.journal.connection() as db:
-            unresolved = db.execute("SELECT 1 FROM intents WHERE status!='terminal'").fetchone()
-            submitted = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
-        if unresolved or submitted >= cap:
+            blocked = self.journal.blocked(db, intent, now, cap)
+        if blocked:
             # Do not ask the operator to approve an order a hard rule forbids.
             # The atomic reservation independently rechecks this after approval.
             raise RiskError("Unresolved intent or daily submission limit reached")

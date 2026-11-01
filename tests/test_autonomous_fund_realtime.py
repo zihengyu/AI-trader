@@ -4,13 +4,12 @@ HTTP, websocket and Telegram are replaced by in-memory doubles: no network.
 """
 import base64
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
-import pandas as pd
 import pytest
 
-from scripts.autonomous_fund.execution import EXECUTION_REVISION, approval_code, resolve_approval
+from scripts.autonomous_fund.execution import approval_code
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.monitor import Monitor, approvers
 from scripts.autonomous_fund.risk import RiskError
@@ -404,3 +403,17 @@ def test_configured_iteration_interval_speeds_up_live_watching(tmp_path, monkeyp
     strategy._executor._initialize()
     assert strategy.sleeptime == "20S"
     broker._close_connection()
+
+
+def test_news_observation_times_are_stored_in_utc_across_daylight_saving_changes(tmp_path):
+    from zoneinfo import ZoneInfo
+    web = Web()
+    web.pages["https://www.federalreserve.gov"] = RSS
+    feed, clock = watch(tmp_path, web, lambda s: [], sources=("fed",))
+    clock[0] = datetime(2026, 11, 1, 1, 30, tzinfo=ZoneInfo("America/New_York"))  # EDT, before the change.
+    feed.poll_once()
+    with feed.journal.connection() as db:
+        stored = db.execute("SELECT observed_at FROM fund_news").fetchone()[0]
+    assert stored.endswith("+00:00")
+    later = datetime(2026, 11, 1, 1, 10, tzinfo=ZoneInfo("America/New_York")).replace(fold=1)  # EST, after it.
+    assert feed.recent(set(), later)["items"]  # 06:10 UTC is after 05:30 UTC: still visible.

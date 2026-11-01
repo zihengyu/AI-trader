@@ -79,8 +79,14 @@ class ExecutionPolicy:
     report_interval_seconds: int = 300
     review_on_move: str = "0.03"
     iteration_seconds: int = 60
+    protective_limit_buffer: str = "0.005"
+    protective_reprice_seconds: int = 60
 
     def __post_init__(self):
+        if not 0 <= number(self.protective_limit_buffer) <= number("0.05"):
+            raise RiskError("protective_limit_buffer must be at most 5%")
+        if type(self.protective_reprice_seconds) is not int or not 15 <= self.protective_reprice_seconds <= 3600:
+            raise RiskError("protective_reprice_seconds must be 15..3600")
         if type(self.iteration_seconds) is not int or not 15 <= self.iteration_seconds <= 300:
             raise RiskError("iteration_seconds must be 15..300")
         if not 0 <= number(self.review_on_move) <= number("0.5"):

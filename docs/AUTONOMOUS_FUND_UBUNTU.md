@@ -36,7 +36,10 @@ python3.12 -m venv .venv
 `prepare` 只生成 `artifacts/fund-systemd/` 中的两个 unit 文件，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。它不覆盖已有 `.env`，也不安装或启动任何服务。
 请在服务器本地编辑 `.env`，不要把密钥粘到聊天中。模板源是
-`scripts/autonomous_fund/.env.example`，真实 `.env` 已被 Git 忽略。
+`scripts/autonomous_fund/.env.example`，真实 `.env` 已被 Git 忽略。模板按“模型 Key 与模型选择、用户约束、审批额度、
+Telegram、外部数据与运行参数、券商”分节，所有可调项都有中文说明和默认值；优先级为进程环境 > `.env` > `config.json`，
+留空表示沿用 `config.json`，`.env` 中拼错的 `FUND_*` 名称会拒绝启动。完整变量表见 `docs/AUTONOMOUS_PAPER_FUND.md` 的 “`.env`：运营者配置入口”。
+修改后用 `bash scripts/run_autonomous_fund.sh show-config` 核对最终生效值和来源，再重启服务。
 
 | 变量 | 用途 |
 |---|---|
@@ -48,6 +51,7 @@ python3.12 -m venv .venv
 | `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
 | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | 仅选择 `paper` 时需要，使用专用模拟账户的 Paper Key |
 | `ALPACA_IS_PAPER=true` | 可选显式声明；设为 false 会拒绝启动，不会启用实盘 |
+| `FUND_CAPITAL_USD` 等约束 | 授权资金、仓位、回撤、单日亏损、禁买名单、文字约束、审批额度与外部参数，见模板各节 |
 
 本地虚拟账户不需要券商注册或 Key。其他模型与可选数据服务的变量见模板及
 `docsrc/environment_variables.rst`。不要设置 `AI_MODEL`，除非有意同时覆盖两个角色的默认模型。

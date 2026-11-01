@@ -1419,6 +1419,35 @@ writes the selected run directory's STOP file; recovery never clears it.
 ``notify-test`` explicitly sends one test message without modifying STOP or
 submitting an order; an API acknowledgement still requires confirmation on the
 operator's device. Telegram rate-limit delays apply to all queued messages.
+Operator settings for this application may also be supplied as ``FUND_*``
+variables in the process environment or the explicitly selected ``.env`` file
+(template ``scripts/autonomous_fund/.env.example``), with precedence process
+environment > ``.env`` > ``config.json``; blank values do not override. They
+cover model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
+``FUND_REASONING_EFFORT``, ``FUND_MAX_AGENT_RUNS_PER_DAY``,
+``FUND_MIN_REVIEW_MINUTES``, ``FUND_MODEL_PRICES_JSON``), user limits
+(``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
+``FUND_MAX_POSITION``, ``FUND_MAX_EXPOSURE``, ``FUND_MAX_DRAWDOWN``,
+``FUND_DAILY_ORDERS``, ``FUND_DAILY_LOSS_LIMIT``, ``FUND_TARGET_VOL``,
+``FUND_MAX_ES``, ``FUND_EXCLUDE_SYMBOLS``, ``FUND_INSTRUCTIONS``), the approval
+envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER``,
+``FUND_STRESS_REQUIRES_APPROVAL``, ``FUND_APPROVAL_VALID_MINUTES``) and external
+parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
+``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
+``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``). Values are
+validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.env`` file fails startup
+with a suggestion, and ``show-config`` prints effective values and their sources with
+secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of
+the day for purchases; sales count only sales against their own budget of the same size,
+with five more for protective exits, so purchases can never block de-risking.
+
+The application's read-only ``schwab-check`` command uses the native Schwab
+variables (``SCHWAB_ACCOUNT_NUMBER``, ``SCHWAB_APP_KEY``, ``SCHWAB_APP_SECRET``,
+``SCHWAB_BACKEND_CALLBACK_URL``, ``SCHWAB_TOKEN``, ``SCHWAB_TOKEN_PATH``; see
+:doc:`brokers.schwab`) with every order method disabled. It reports cash,
+settled cash, margin, holdings, open orders and the capital-sleeve preview; the
+application has no live execution entry.
+
 Operators may approve plan requests by replying ``同意`` or ``拒绝`` in Telegram
 (to the alert, with its six-character code, or as plain text when exactly one
 request is pending). Only the configured chat counts; a private chat's owner is

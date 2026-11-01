@@ -1,0 +1,203 @@
+"""Operator settings from the environment (.env): keys, user limits and external parameters.
+
+`config.json` holds the complete reviewed policy and its defaults. The operator
+normally changes a small set of knobs; those may also come from the process
+environment or the explicitly selected `.env` file. Precedence: process
+environment > `.env` > `config.json`.
+
+Every override is parsed strictly, validated by the same policy constructors as
+config.json, and reported (without secret values) in the startup audit event.
+An unknown FUND_* name in the selected .env file is an error with a suggestion:
+a mistyped limit must never be silently ignored.
+"""
+import copy
+import difflib
+import json
+
+from .risk import RiskError
+
+SEPARATOR = "|"
+
+
+def _decimal(text):
+    from .risk import number
+    number(text)  # Finite decimal; range is checked by the policy constructors.
+    return str(text).strip()
+
+
+def _int(text):
+    try:
+        return int(str(text).strip())
+    except ValueError:
+        raise RiskError("expected a whole number") from None
+
+
+def _bool(text):
+    value = str(text).strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise RiskError("expected true/false")
+
+
+def _list(text):
+    return [item.strip() for item in str(text).split(SEPARATOR) if item.strip()]
+
+
+def _capital(text):
+    value = str(text).strip()
+    return None if value.lower() in {"account", "all", "none"} else _decimal(value)
+
+
+def _optional(text):
+    value = str(text).strip()
+    return value or None
+
+
+def _feeds(text):
+    feeds = []
+    for item in _list(text):
+        name, _, url = item.partition("=")
+        if not name.strip() or not url.strip():
+            raise RiskError("use name=https://... entries separated by |")
+        feeds.append({"name": name.strip(), "url": url.strip()})
+    return feeds
+
+
+def _json(text):
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise RiskError("expected JSON") from None
+
+
+# name: (config path or None for a runtime-only value, parser, secret, section, Chinese description)
+SETTINGS = {
+    # ----- Model keys and model choice
+    "DEEPSEEK_API_KEY": (None, None, True, "模型", "DeepSeek API Key（默认研究员和基金经理都用 DeepSeek）"),
+    "OPENAI_API_KEY": (None, None, True, "模型", "OpenAI API Key（仅当选用 openai/ 模型时需要）"),
+    "ANTHROPIC_API_KEY": (None, None, True, "模型", "Anthropic API Key（仅当选用 anthropic/ 模型时需要）"),
+    "AI_MODEL": (None, None, False, "模型", "同时覆盖两个角色的模型（通常不设置）"),
+    "FUND_RESEARCH_MODEL": (("agent_models", "researcher"), str, False, "模型", "研究员模型，例如 deepseek/deepseek-flash"),
+    "FUND_DECISION_MODEL": (("agent_models", "manager"), str, False, "模型", "基金经理模型，例如 deepseek/deepseek-v4-pro"),
+    "FUND_REASONING_EFFORT": (("reasoning_effort",), _optional, False, "模型", "推理强度 low/medium/high，留空为模型默认"),
+    "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
+    "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
+    "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
+    # ----- User constraints (the operator's mandate and hard limits)
+    "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),
+    "FUND_ALLOW_EXTERNAL_HOLDINGS": (("mandate", "allow_external_holdings"), _bool, False, "约束", "账户里是否允许你自己的持仓（AI 不碰、数量冻结）"),
+    "FUND_LOCAL_ACCOUNT_USD": (("mandate", "local_account_usd"), _decimal, False, "约束", "本地虚拟账户初始资金（仅新账本生效）"),
+    "FUND_INSTRUCTIONS": (("mandate", "instructions"), _list, False, "约束", "给 AI 的文字约束，多条用 | 分隔"),
+    "FUND_EXCLUDE_SYMBOLS": (None, None, False, "约束", "禁止交易的代码，逗号分隔（从投资范围和分组中移除）"),
+    "FUND_MAX_POSITION": (("limits", "max_position"), _decimal, False, "约束", "单只证券最大权重，例如 0.10"),
+    "FUND_MAX_EXPOSURE": (("limits", "max_exposure"), _decimal, False, "约束", "证券总敞口上限，例如 0.70"),
+    "FUND_MAX_DRAWDOWN": (("limits", "drawdown"), _decimal, False, "约束", "回撤硬锁阈值，例如 0.08"),
+    "FUND_DAILY_ORDERS": (("limits", "daily_orders"), _int, False, "约束", "每日提交上限（含改价重挂；卖出另有独立额度）"),
+    "FUND_DAILY_LOSS_LIMIT": (("quant_risk", "daily_loss_limit"), _decimal, False, "约束", "当日亏损达到该比例停止买入"),
+    "FUND_TARGET_VOL": (("quant_risk", "target_portfolio_vol"), _decimal, False, "约束", "组合年化波动率目标"),
+    "FUND_MAX_ES": (("quant_risk", "max_portfolio_es"), _decimal, False, "约束", "1 日 97.5% 预期尾部损失上限"),
+    # ----- Approval envelope
+    "FUND_AUTO_DAILY_EXPOSURE_INCREASE": (("approval", "auto_daily_exposure_increase"), _decimal, False, "审批", "无需审批的单日敞口增幅；0 表示所有买入都要审批"),
+    "FUND_AUTO_DAILY_BUY_TURNOVER": (("approval", "auto_daily_buy_turnover"), _decimal, False, "审批", "无需审批的单日买入现金流（占净值）"),
+    "FUND_STRESS_REQUIRES_APPROVAL": (("approval", "stress_requires_approval"), _bool, False, "审批", "市场压力下买入是否需要审批"),
+    "FUND_APPROVAL_VALID_MINUTES": (("approval", "valid_minutes"), _int, False, "审批", "审批请求有效分钟数"),
+    "FUND_TELEGRAM_BOT_TOKEN": (None, None, True, "通知", "Telegram 机器人 Token"),
+    "FUND_TELEGRAM_CHAT_ID": (None, None, False, "通知", "接收通知并审批的 Telegram 会话 ID"),
+    "FUND_TELEGRAM_APPROVER_IDS": (None, None, False, "通知", "群组中可审批的用户 ID，逗号分隔（私聊不需要）"),
+    "FUND_TELEGRAM_APPROVALS": (None, None, False, "通知", "on/off：是否接受 Telegram 回复审批"),
+    # ----- External data and runtime parameters
+    "FUND_ITERATION_SECONDS": (("execution", "iteration_seconds"), _int, False, "外部", "盯盘迭代间隔（秒，15–300）"),
+    "FUND_LIVE_STREAM": (("market_data", "live_stream"), _bool, False, "外部", "是否使用 Yahoo 实时推送报价"),
+    "FUND_RESEARCH_RESOLVER": (("research_network", "resolver"), str, False, "外部", "研究网页解析方式 system/doh（Fake-IP 代理用 doh）"),
+    "FUND_NEWS_ENABLED": (("news", "enabled"), _bool, False, "外部", "是否开启实时资讯监控"),
+    "FUND_NEWS_POLL_SECONDS": (("news", "poll_seconds"), _int, False, "外部", "资讯轮询间隔（秒）"),
+    "FUND_NEWS_QUERIES": (("news", "queries"), _list, False, "外部", "长期关注的新闻搜索词，多条用 | 分隔"),
+    "FUND_NEWS_RSS_FEEDS": (("news", "rss_feeds"), _feeds, False, "外部", "自定义 RSS：名称=https://...，多条用 | 分隔"),
+    "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告"),
+    "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选）"),
+    "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
+    "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
+    "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
+    "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),
+    "LUMIWEALTH_API_KEY": (None, None, True, "券商", "可选：BotSpot／云端报告，本地交易不需要"),
+    "SCHWAB_ACCOUNT_NUMBER": (None, None, True, "Schwab", "AI 使用的 Schwab 账户号码（建议单独开一个账户）"),
+    "SCHWAB_APP_KEY": (None, None, True, "Schwab", "你自己的 Schwab 开发者应用 App Key（不填则用 LumiBot 默认应用）"),
+    "SCHWAB_APP_SECRET": (None, None, True, "Schwab", "App Secret，用于自动续期 token；不填约 7 天需重新登录"),
+    "SCHWAB_BACKEND_CALLBACK_URL": (None, None, False, "Schwab", "开发者应用中登记的回调地址，例如 https://127.0.0.1:8182"),
+    "SCHWAB_TOKEN": (None, None, True, "Schwab", "无浏览器服务器首次登录时粘贴的一次性 token"),
+    "SCHWAB_TOKEN_PATH": (None, None, False, "Schwab", "token.json 的保存位置（请放在私有目录）"),
+}
+
+
+def _set(config, path, value):
+    node = config
+    for key in path[:-1]:
+        node = node.setdefault(key, {})
+    node[path[-1]] = value
+
+
+def validate_names(names, origin="the selected .env file"):
+    """Refuse unknown FUND_* names: a mistyped limit must not be silently ignored."""
+    unknown = sorted(name for name in names if name.startswith("FUND_") and name not in SETTINGS)
+    if unknown:
+        hints = []
+        for name in unknown:
+            close = difflib.get_close_matches(name, [k for k in SETTINGS if k.startswith("FUND_")], n=1)
+            hints.append(f"{name}" + (f" (did you mean {close[0]}?)" if close else ""))
+        raise RiskError(f"Unknown FUND_* setting in {origin}: " + ", ".join(hints))
+
+
+def validate_env_file(path):
+    """Check the operator's .env names; other process variables are not this file's typos."""
+    from dotenv import dotenv_values
+    validate_names(dotenv_values(path).keys(), f"{path}")
+
+
+def apply_environment(config, environ):
+    """Return (effective config, audit rows). Raises with the variable name on any bad value."""
+    result, audit = copy.deepcopy(config), []
+    for name, (path, parser, secret, section, _) in SETTINGS.items():
+        raw = environ.get(name)
+        if path is None or raw is None or not str(raw).strip():
+            continue  # A blank template line means "not set": config.json keeps its value.
+        try:
+            value = parser(raw)
+        except RiskError as exc:
+            raise RiskError(f"{name}: {exc}") from None
+        _set(result, path, value)
+        audit.append({"variable": name, "path": ".".join(path), "value": value})
+    excluded = [s.strip().upper() for s in str(environ.get("FUND_EXCLUDE_SYMBOLS", "")).split(",") if s.strip()]
+    if excluded:
+        missing = sorted(set(excluded) - set(result["universe"]))
+        if missing:
+            raise RiskError("FUND_EXCLUDE_SYMBOLS: not in the eligible universe: " + ", ".join(missing))
+        result["universe"] = {s: kind for s, kind in result["universe"].items() if s not in excluded}
+        if not result["universe"]:
+            raise RiskError("FUND_EXCLUDE_SYMBOLS removes the whole universe")
+        groups = (result.get("quant_risk") or {}).get("groups")
+        if groups:
+            result["quant_risk"]["groups"] = {name: {**spec, "members": [m for m in spec["members"] if m not in excluded]}
+                                              for name, spec in groups.items()}
+        audit.append({"variable": "FUND_EXCLUDE_SYMBOLS", "path": "universe", "value": excluded})
+    return result, audit
+
+
+def describe(config, environ, audit):
+    """Effective settings with their source; secrets only as set/missing."""
+    overridden = {row["path"]: row["variable"] for row in audit}
+    rows = []
+    for name, (path, _, secret, section, text) in SETTINGS.items():
+        present = bool(str(environ.get(name, "")).strip())
+        if path is None:
+            value = ("set" if present else "missing") if secret else (environ.get(name) or None)
+            source = "environment" if present else "unset"
+        else:
+            node = config
+            for key in path:
+                node = node.get(key) if isinstance(node, dict) else None
+            value = node
+            source = f"environment ({name})" if ".".join(path) in overridden else "config.json"
+        rows.append({"section": section, "variable": name, "description": text, "value": value, "source": source})
+    return rows

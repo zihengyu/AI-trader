@@ -28,7 +28,7 @@ AI 的权重是上限：确定性量化风控只会把它们缩小（波动率�
 ## 安装和启动
 
 在项目根目录执行。示例中不包含真实密钥；请通过当前进程环境或自己的秘密管理器注入凭证。
-启动器主动禁用 `.env` 自动发现，避免意外加载已有实盘配置。
+启动器不使用 LumiBot 的 `.env` 自动发现，只显式选用本仓库根目录的 `.env`（见[`.env`：运营者配置入口](#env运营者配置入口)）。
 
 ```powershell
 python -m venv .venv
@@ -48,6 +48,41 @@ python -m venv .venv
 输出会明确标识 `mode=mock`、`scripted_model=true`，不证明投资收益。
 每次历史实验使用新的目录，防止混合账本。PowerShell 启动器对回测设置 1,200 秒上限。
 Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run --help`。
+
+## `.env`：运营者配置入口
+
+模型 Key、你给 AI 的约束和外部参数都可以写在仓库根目录的 `.env`（已被 Git 忽略；从
+`scripts/autonomous_fund/.env.example` 复制）。优先级为 **进程环境变量 > `.env` > `config.json`**：
+`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的值与默认值一致，留空表示不覆盖。
+每个覆盖都按与 `config.json` 相同的规则校验，记入启动审计（`startup.environment_overrides`），并且会使旧目标失效、由 AI 按新规则重新决策。
+`.env` 中写错的 `FUND_*` 名称会直接拒绝启动并提示正确名称，避免约束被静默忽略。
+
+| 类别 | 变量 | 作用 |
+|---|---|---|
+| 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
+| 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
+| 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
+| 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
+| 约束 | `FUND_MAX_POSITION`、`FUND_MAX_EXPOSURE`、`FUND_MAX_DRAWDOWN`、`FUND_DAILY_ORDERS` | 单只上限、总敞口、回撤硬锁、每日提交次数 |
+| 约束 | `FUND_DAILY_LOSS_LIMIT`、`FUND_TARGET_VOL`、`FUND_MAX_ES` | 单日亏损闸门、波动率目标、尾部损失上限 |
+| 约束 | `FUND_EXCLUDE_SYMBOLS`、`FUND_INSTRUCTIONS` | 禁止交易的代码（逗号分隔）、给 AI 的文字约束（`|` 分隔） |
+| 审批 | `FUND_AUTO_DAILY_EXPOSURE_INCREASE`、`FUND_AUTO_DAILY_BUY_TURNOVER`、`FUND_STRESS_REQUIRES_APPROVAL`、`FUND_APPROVAL_VALID_MINUTES` | 自动执行额度（设 0 则所有买入都审批）、压力下是否审批、有效期 |
+| 通知 | `FUND_TELEGRAM_BOT_TOKEN`、`FUND_TELEGRAM_CHAT_ID`、`FUND_TELEGRAM_APPROVER_IDS`、`FUND_TELEGRAM_APPROVALS` | Telegram 通知与回复审批 |
+| 外部 | `FUND_ITERATION_SECONDS`、`FUND_LIVE_STREAM`、`FUND_RESEARCH_RESOLVER` | 盯盘间隔、实时推送报价、研究网页解析（Fake-IP 用 `doh`） |
+| 外部 | `FUND_NEWS_ENABLED`、`FUND_NEWS_POLL_SECONDS`、`FUND_NEWS_QUERIES`、`FUND_NEWS_RSS_FEEDS`、`FUND_SEC_USER_AGENT`、`FRED_API_KEY` | 实时资讯监控与数据源 |
+| 外部 | `FUND_SHADOW_AB` | 影子 A/B 验证 AI 的复盘学习 |
+| 券商 | `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`ALPACA_IS_PAPER` | 仅 paper 模式 |
+| Schwab | `SCHWAB_ACCOUNT_NUMBER`、`SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL`、`SCHWAB_TOKEN`、`SCHWAB_TOKEN_PATH` | 仅用于只读体检 `schwab-check`（见“Schwab 实盘准备”） |
+
+投资范围的新增、行业分组和其余细节参数仍在 `config.json` 中修改（新增证券需要审阅分类）。
+查看最终生效的配置及每项来源（密钥只显示已设置／缺失）：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode show-config
+```
+
+Windows 和 Linux 启动器都会显式选用仓库根目录的 `.env`（解析而非执行，进程环境优先），也可用 `-EnvFile`／`--env-file` 指定其他文件。
+LumiBot 自身的 `.env` 自动发现仍保持关闭。
 
 ## 无券商账户：真实行情本地模拟盘
 
@@ -73,8 +108,8 @@ Remove-Variable fundKey
 ```
 
 密钥最终仍是进程环境中的字符串；本例没有把它保存到文件。关闭终端后需重新注入。
-若使用自己管理的未跟踪秘密文件，显式指定 `-EnvFile <your-secret-file>`；
-现有进程环境优先，启动器不搜索其他 `.env` 文件。不要把真实密钥发到聊天或提交 Git。
+推荐把 Key 写进仓库根目录的 `.env`（从 `scripts/autonomous_fund/.env.example` 复制），启动器会自动选用它；
+也可用 `-EnvFile <your-secret-file>` 指定其他文件。现有进程环境优先，启动器不搜索其他目录的 `.env`。不要把真实密钥发到聊天或提交 Git。
 
 没有模型 Key 时，只读观察模式可先验证启动、资金记录和交易日历，完全不调用模型或提交订单：
 
@@ -234,7 +269,8 @@ AI 的完整目标组合中，遗漏的已有持仓代表卖出，空目标列�
 已加载的行情／文档表仍可分析。研究浏览器只接受 HTTP(S) 导航，不能直接打开本地文件或脚本 URL，
 下载和上传保留在独立研究目录。浏览器为原生可选依赖，本次未做真实浏览器联网验证。
 禁止融资、卖空、期权和期货；只提交整股、当日有效限价单。
-硬上限：单证券 10%、总证券敞口 70%、每日最多 20 次提交（含改价重挂与卖出）、观测净值高点回撤 8% 锁定增仓。
+硬上限：单证券 10%、总证券敞口 70%、每日提交上限 20 次（含改价重挂）、观测净值高点回撤 8% 锁定增仓。
+提交上限按方向分开计算：买入计入当日**全部**提交（大量卖出不会腾出买入额度）；卖出只计卖出，另有同样大小的额度，保护性止损／止盈再多 5 次。这样买入和追价重挂用尽额度的当天（往往正是大跌日），回撤降仓和止损卖出仍能执行。
 拒绝非有限数值、重复证券、超额目标、未来／过期决策、陈旧账户或报价、缺失流动性证据。
 日限额按纽约交易日计算，买卖、失败和取消的提交均占用次数。
 上涨使持仓超过上限、或回撤使预算下降时，执行中按约束自动减持（超过再平衡带时）；
@@ -253,6 +289,8 @@ AI 的完整目标组合中，遗漏的已有持仓代表卖出，空目标列�
 
 - **改价重挂**：限价单挂出超过 `reprice_after_seconds`（默认 180 秒）仍未完成，就请求撤单；
   券商确认撤单后，下一次迭代按新报价和全部风控重新计算，而不是让一张不成交的单冻结整个组合。
+  撤单是异步的（券商会先显示“撤单中”）：同一订单只请求一次，确认前不会每次迭代重复请求；
+  若 240 秒后券商仍显示该单在工作中（请求可能丢失），才再请求一次。
 - **追价上限**：同一决策内同一证券的买入限价不能高于首次提交（到达价）的 `max_buy_chase`（默认 0.75%）；
   超出即停止追买该证券并记录 `buy_chase_limit`。卖出（降风险）不设追价上限。
 - **再平衡带**：小于 `max(min_trade_notional, rebalance_band × 净值)`（默认 max(100 美元, 0.5%)）的调整不交易，
@@ -322,8 +360,12 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 | `alerts`（`above`／`below`／`reason`） | 价格穿越时提前唤醒 AI 复核 | 只唤醒，不下单 |
 
 盯盘循环每次迭代（本地／Paper 为 1 分钟）运行，不调用模型：
-- 止损／止盈触发后立即按新报价挂卖单；未成交被改价撤单后会继续重挂直到减到目标，不会“触发一次就忘”。
+- 止损／止盈触发后立即挂**可成交的**卖出限价单：限价为买价下方 `execution.protective_limit_buffer`（默认 0.5%，
+  普通调仓只有 0.1%），并在 `execution.protective_reprice_seconds`（默认 60 秒，普通单 180 秒）后未成交就撤单，
+  按新报价重挂，直到减到目标，不会“触发一次就忘”。保护性卖出优先保证离场，而不是争取价格。
   同一决策内被止损的证券不会被重新买回，等 AI 下一次复核再决定。
+- 买价已经跌到 AI 自己给出的 `stop_loss` 或以下时，不会再新买入该证券（记录 `stop_breached_no_buy`），
+  已挂出的该证券买单会立即撤销（记录 `buy_canceled_stop_breached`），不等待 180 秒改价周期。
 - 价格提醒、持仓或目标证券相对本决策首次观测价的波动达到 `execution.review_on_move`（默认 3%）、
   市场进入压力状态时，会把下一次 AI 复核提前；提前复核仍遵守最短复核间隔、失败退避和每日模型预算。
   基金经理在 `watch_triggers` 中看到被唤醒的原因。
@@ -766,6 +808,14 @@ Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未�
 没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
 
+### 2026-11-01 Schwab 只读体检与共享账户归属
+
+新增 13 项回归（`tests/test_autonomous_fund_schwab.py`）：首次启动冻结全部已有持仓（含货币基金）并标记共享代码、
+之后只有 AI 买入的部分构成分仓、专用账户仍拒绝无法归属的资产、共享代码被移出 AI 可交易范围且你的挂单不阻挡 AI、
+你买卖外部持仓会暂停交易、部分持仓读取不会被当成空仓、体检预览保留现金／分仓／共享代码／续期提示、
+现金不足／保证金负债／现金账户已交割资金不足／未允许外部持仓被标记、`schwab-check` 生成报告且无法下单、未登录时拒绝。
+6 处新保护的变异检查全部被抓到。真实 Schwab 账户、OAuth 与行情未在本环境验证（无凭证、网络受限）。
+
 ### 2026-11-01 真实数据回放、影子 A/B 与运行验收
 
 新增 20 项验证回归（`tests/test_autonomous_fund_validation.py`），其中 6 项直接用仓库内真实行情：2020 暴跌中波动率目标与回撤分档把回撤减半、
@@ -831,6 +881,7 @@ DoH 解析与 Fake-IP 诊断、DoH 模式下 SSRF 保护仍有效、DuckDB 可�
 | `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
 | `tests/test_autonomous_fund_model_roles.py` | 分角色模型覆盖、全部凭证检查、旧账本及风险锁保留、按模型记录 usage 和费率 |
 | `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款；买入预算、再平衡带、参与率和追价封锁 |
+| `scripts/autonomous_fund/schwab.py`、`scripts/autonomous_fund/holdings.py`、`tests/test_autonomous_fund_schwab.py` | Schwab 只读体检与共享账户持仓归属 |
 | `scripts/autonomous_fund/validation.py`、`tests/test_autonomous_fund_validation.py`、`tests/test_autonomous_fund_soak.py` | 真实数据风控回放、影子 A/B 统计、运行验收报告与端到端浸泡测试 |
 | `scripts/autonomous_fund/news.py`、`tests/test_autonomous_fund_realtime.py` | 实时资讯监控；Telegram 回复审批、推送报价与资讯回归 |
 | `scripts/autonomous_fund/scorecard.py`、`tests/test_autonomous_fund_autonomy.py` | 预测与决策记分卡；授权资金、盯盘、研究网络回归 |
@@ -842,18 +893,45 @@ DoH 解析与 Fake-IP 诊断、DoH 模式下 SSRF 保护仍有效、DuckDB 可�
 
 没有修改共享框架、官方 AI 示例、依赖主版本、包版本或发布配置。
 
-## 未来 Schwab 阶段
+## Schwab 实盘准备
 
-原生实现已存在于 `lumibot/brokers/schwab.py` 和 `lumibot/data_sources/schwab_data.py`，
-本地说明是 `docsrc/brokers.schwab.rst`。现有适配器支持股票／ETF、OAuth、账户读取与订单生命周期。
-本应用刻意不构造 Schwab 实例；`TRADING_BROKER=schwab` 不会启用它。
+本应用**仍然没有实盘下单入口**，`TRADING_BROKER=schwab` 或任何 `.env` 设置都不会启用它。目前提供的是实盘前的零风险准备：
+
+**1. 账户选择**：强烈建议在 Schwab 为 AI 单独开一个账户（同一登录下可有多个账户，用 `SCHWAB_ACCOUNT_NUMBER` 指定），
+放入授权资金即可，`FUND_ALLOW_EXTERNAL_HOLDINGS=false`。这样 AI 的成交、税务批次和你的持仓完全分开。
+
+**2. 与你的持仓共用一个账户**（可行但次优）：设 `FUND_ALLOW_EXTERNAL_HOLDINGS=true`。
+- 首次启动时，账户里的**全部**持仓（股票、ETF、货币基金等）都记为你的外部持仓并冻结数量，按券商市值估值，不计入 AI 分仓；
+  分仓 = 现金 − 保留现金，AI 之后自己买入的才是分仓持仓。
+- 你已持有、且在 AI 投资范围内的代码（例如你持有 AAPL）会**自动从 AI 可交易范围中剔除**：否则 AI 卖出时，
+  券商可能按先进先出等批次规则卖掉你的长期持仓，带来税务后果，也无法区分归属。你在这些代码上的挂单不会阻挡 AI。
+- 你手动买卖了外部持仓，系统会暂停交易，核对后用 `adjust-reserve --rebaseline-external`（出入金同时用 `--amount`）重新确认。
+- 券商持仓读取失败或只返回部分结果时直接拒绝，不会把“读失败”当成“没有持仓”而重复买入。
+
+**3. 只读体检 `schwab-check`**：在 `.env` 填好 `SCHWAB_ACCOUNT_NUMBER`（以及自己的 `SCHWAB_APP_KEY`/`SCHWAB_APP_SECRET`/
+`SCHWAB_BACKEND_CALLBACK_URL`，或使用 LumiBot 默认应用）后运行：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode schwab-check -RunDir artifacts/schwab-check
+```
+
+它使用 LumiBot 原生 Schwab 适配器完成 OAuth 和账户读取，并在该实例上**禁用所有下单、撤单、改单方法**。输出 `schwab_check.json`：
+账户类型（现金／保证金）、现金、已交割可用现金、未交割现金、清算价值、每个持仓及是否在 AI 范围、挂单、
+预计保留现金与 AI 起始分仓、将被剔除的共享代码，以及需要处理的问题（现金少于授权资金、保证金负债、现金账户已交割现金不足、
+已有持仓但未允许外部持仓、存在挂单）和提示（未设 `SCHWAB_APP_SECRET` 时约 7 天需重新登录；未设 `SCHWAB_APP_KEY` 时 OAuth
+回调经过 LumiBot 默认应用的 `api.botspot.trade`，如需完全自控请注册自己的 Schwab 开发者应用）。
+
+**4. 拟议的实盘入口（需要你单独明确授权后才会实现）**：
+- 前置条件：本地或 Alpaca Paper 连续运行通过 `acceptance`（默认 20 个交易日），`schwab-check` 无问题；
+- 独立的 `schwab-live` 模式，必须同时满足：`.env` 中显式确认（如 `FUND_LIVE_CONFIRM=I-UNDERSTAND-REAL-MONEY`）、
+  账户号与上次体检一致、监控与 Telegram 健康、授权资金不超过你设定的上限；
+- 现金账户只用已交割资金买入（T+1），保证金账户也绝不借款或卖空；
+- 初期所有买入都需要审批（`FUND_AUTO_DAILY_EXPOSURE_INCREASE=0`），稳定后再放开自动额度；
+- 每笔订单与券商回报逐笔对账，任何不一致即 STOP；首周只允许很小的授权资金；
+- AI 仍然没有修改配置、权限或启动实盘的能力。
+
+Schwab 原生适配器的通用说明见 `docsrc/brokers.schwab.rst`（OAuth、token 续期、订单状态）。
 不要把框架通用文档中的 paper/live 描述当成 Schwab 提供独立 Paper 交易环境的保证。
-
-未来需要独立明确授权：申请 Schwab Trader API 访问和应用 OAuth，
-由你在券商页面授权并安全保存凭证；选择并核验确切账户，先只读读取现金、持仓和订单。
-随后验证账户选择、费用、结算现金、撤单、部分成交、断线恢复、通知及风控边界，
-再审阅一个单独的实盘执行入口。不能通过改一个环境变量把本应用切到实盘。
-AI 不应拥有配置仓库、券商管理、API 权限或实盘启动入口的写权限。
 
 官方参考：[Alpaca Paper](https://docs.alpaca.markets/docs/paper-trading)、
 [DeepSeek API](https://api-docs.deepseek.com/)、
