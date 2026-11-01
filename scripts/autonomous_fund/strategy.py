@@ -245,6 +245,7 @@ class AutonomousFund(Strategy):
         self.config = config
         self.limits = Limits(**config["limits"])
         self.universe = frozenset(config["universe"])
+        self._configured_universe = self.universe
         if mode not in {"mock", "backtest", "paper", "local"}:
             raise RiskError("Live trading is unavailable")
         if mode == "paper":
@@ -571,30 +572,23 @@ class AutonomousFund(Strategy):
         else:
             positions = self.get_positions()
             cash, equity = self.get_cash(), self.get_portfolio_value()
-        if positions is None:
-            raise RiskError("Positions unavailable")
+        if positions is None or getattr(getattr(self, "broker", None), "_last_positions_refresh_degraded", False):
+            # Some adapters return an empty or partial list on a failed read; never
+            # mistake that for "no holdings" (it would invite duplicate purchases).
+            raise RiskError("Positions unavailable or only partially refreshed")
         mandate = getattr(self, "mandate", None) or Mandate()
-        holdings, external = {}, {}
-        for position in positions:
-            if position.asset == self.quote_asset:
-                continue
-            symbol, stock = position.asset.symbol, str(position.asset.asset_type) == "stock"
-            if stock and symbol in self.universe:
-                holdings[symbol] = number(holdings.get(symbol, 0)) + number(position.quantity)
-            elif stock and mandate.allow_external_holdings:
-                external[symbol] = number(external.get(symbol, 0)) + number(position.quantity)
-            else:
-                raise RiskError("Dedicated account contains an unsupported asset")
-        external_value = number(0)
-        for symbol, quantity in external.items():
-            price = self.get_last_price(Asset(symbol, asset_type="stock"))
-            if price is None or not number(price) > 0:
-                raise RiskError("External holding cannot be valued; mandate sleeve unavailable")
-            external_value += quantity * number(price)
+        from .holdings import split_holdings
+        configured = getattr(self, "_configured_universe", None) or self.universe
+        baseline = self.journal.get_meta("mandate_external") if mandate.capital_usd is not None else None
+        holdings, external, external_value, shared = split_holdings(
+            positions, configured, quote_asset=self.quote_asset, allow_external=mandate.allow_external_holdings,
+            baseline=baseline, initialized=baseline is not None,
+            price=lambda symbol: self.get_last_price(Asset(symbol, asset_type="stock")))
         # Orders on external symbols are the operator's own; orders on eligible
         # symbols, or any unresolved intent of ours, block new submissions.
         open_orders = any(not self._terminal(order) and (not mandate.allow_external_holdings or
-                          order.asset.symbol in self.universe) for order in orders) or bool(self.journal.pending())
+                          (order.asset.symbol in configured and order.asset.symbol not in shared))
+                          for order in orders) or bool(self.journal.pending())
         receivables = self.broker.receivables() if self.mode == "local" else number(0)
         broker_cash, broker_equity = number(cash), number(equity)
         reserve = number(0)
@@ -603,6 +597,10 @@ class AutonomousFund(Strategy):
                                                  holdings, open_orders, external, self.mode == "paper")
         elif self.mode == "paper":
             self.journal.confirm_initial_paper_account(Account(broker_cash, broker_equity, holdings, start, open_orders))
+        if shared and self.universe != frozenset(configured) - shared:
+            # The operator's own symbols are never AI-tradable (tax lots, attribution).
+            self.universe = frozenset(configured) - shared
+            self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
         # The account the AI and every risk rule see is the operator's capital sleeve.
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
                           open_orders, receivables)

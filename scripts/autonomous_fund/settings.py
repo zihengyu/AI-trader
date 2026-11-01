@@ -122,6 +122,12 @@ SETTINGS = {
     "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),
     "LUMIWEALTH_API_KEY": (None, None, True, "券商", "可选：BotSpot／云端报告，本地交易不需要"),
+    "SCHWAB_ACCOUNT_NUMBER": (None, None, True, "Schwab", "AI 使用的 Schwab 账户号码（建议单独开一个账户）"),
+    "SCHWAB_APP_KEY": (None, None, True, "Schwab", "你自己的 Schwab 开发者应用 App Key（不填则用 LumiBot 默认应用）"),
+    "SCHWAB_APP_SECRET": (None, None, True, "Schwab", "App Secret，用于自动续期 token；不填约 7 天需重新登录"),
+    "SCHWAB_BACKEND_CALLBACK_URL": (None, None, False, "Schwab", "开发者应用中登记的回调地址，例如 https://127.0.0.1:8182"),
+    "SCHWAB_TOKEN": (None, None, True, "Schwab", "无浏览器服务器首次登录时粘贴的一次性 token"),
+    "SCHWAB_TOKEN_PATH": (None, None, False, "Schwab", "token.json 的保存位置（请放在私有目录）"),
 }
 
 

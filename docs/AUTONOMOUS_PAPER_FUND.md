@@ -72,6 +72,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 外部 | `FUND_NEWS_ENABLED`、`FUND_NEWS_POLL_SECONDS`、`FUND_NEWS_QUERIES`、`FUND_NEWS_RSS_FEEDS`、`FUND_SEC_USER_AGENT`、`FRED_API_KEY` | 实时资讯监控与数据源 |
 | 外部 | `FUND_SHADOW_AB` | 影子 A/B 验证 AI 的复盘学习 |
 | 券商 | `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`ALPACA_IS_PAPER` | 仅 paper 模式 |
+| Schwab | `SCHWAB_ACCOUNT_NUMBER`、`SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL`、`SCHWAB_TOKEN`、`SCHWAB_TOKEN_PATH` | 仅用于只读体检 `schwab-check`（见“Schwab 实盘准备”） |
 
 投资范围的新增、行业分组和其余细节参数仍在 `config.json` 中修改（新增证券需要审阅分类）。
 查看最终生效的配置及每项来源（密钥只显示已设置／缺失）：
@@ -800,6 +801,14 @@ Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未�
 没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
 
+### 2026-11-01 Schwab 只读体检与共享账户归属
+
+新增 13 项回归（`tests/test_autonomous_fund_schwab.py`）：首次启动冻结全部已有持仓（含货币基金）并标记共享代码、
+之后只有 AI 买入的部分构成分仓、专用账户仍拒绝无法归属的资产、共享代码被移出 AI 可交易范围且你的挂单不阻挡 AI、
+你买卖外部持仓会暂停交易、部分持仓读取不会被当成空仓、体检预览保留现金／分仓／共享代码／续期提示、
+现金不足／保证金负债／现金账户已交割资金不足／未允许外部持仓被标记、`schwab-check` 生成报告且无法下单、未登录时拒绝。
+6 处新保护的变异检查全部被抓到。真实 Schwab 账户、OAuth 与行情未在本环境验证（无凭证、网络受限）。
+
 ### 2026-11-01 真实数据回放、影子 A/B 与运行验收
 
 新增 20 项验证回归（`tests/test_autonomous_fund_validation.py`），其中 6 项直接用仓库内真实行情：2020 暴跌中波动率目标与回撤分档把回撤减半、
@@ -865,6 +874,7 @@ DoH 解析与 Fake-IP 诊断、DoH 模式下 SSRF 保护仍有效、DuckDB 可�
 | `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
 | `tests/test_autonomous_fund_model_roles.py` | 分角色模型覆盖、全部凭证检查、旧账本及风险锁保留、按模型记录 usage 和费率 |
 | `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款；买入预算、再平衡带、参与率和追价封锁 |
+| `scripts/autonomous_fund/schwab.py`、`scripts/autonomous_fund/holdings.py`、`tests/test_autonomous_fund_schwab.py` | Schwab 只读体检与共享账户持仓归属 |
 | `scripts/autonomous_fund/validation.py`、`tests/test_autonomous_fund_validation.py`、`tests/test_autonomous_fund_soak.py` | 真实数据风控回放、影子 A/B 统计、运行验收报告与端到端浸泡测试 |
 | `scripts/autonomous_fund/news.py`、`tests/test_autonomous_fund_realtime.py` | 实时资讯监控；Telegram 回复审批、推送报价与资讯回归 |
 | `scripts/autonomous_fund/scorecard.py`、`tests/test_autonomous_fund_autonomy.py` | 预测与决策记分卡；授权资金、盯盘、研究网络回归 |
@@ -876,18 +886,45 @@ DoH 解析与 Fake-IP 诊断、DoH 模式下 SSRF 保护仍有效、DuckDB 可�
 
 没有修改共享框架、官方 AI 示例、依赖主版本、包版本或发布配置。
 
-## 未来 Schwab 阶段
+## Schwab 实盘准备
 
-原生实现已存在于 `lumibot/brokers/schwab.py` 和 `lumibot/data_sources/schwab_data.py`，
-本地说明是 `docsrc/brokers.schwab.rst`。现有适配器支持股票／ETF、OAuth、账户读取与订单生命周期。
-本应用刻意不构造 Schwab 实例；`TRADING_BROKER=schwab` 不会启用它。
+本应用**仍然没有实盘下单入口**，`TRADING_BROKER=schwab` 或任何 `.env` 设置都不会启用它。目前提供的是实盘前的零风险准备：
+
+**1. 账户选择**：强烈建议在 Schwab 为 AI 单独开一个账户（同一登录下可有多个账户，用 `SCHWAB_ACCOUNT_NUMBER` 指定），
+放入授权资金即可，`FUND_ALLOW_EXTERNAL_HOLDINGS=false`。这样 AI 的成交、税务批次和你的持仓完全分开。
+
+**2. 与你的持仓共用一个账户**（可行但次优）：设 `FUND_ALLOW_EXTERNAL_HOLDINGS=true`。
+- 首次启动时，账户里的**全部**持仓（股票、ETF、货币基金等）都记为你的外部持仓并冻结数量，按券商市值估值，不计入 AI 分仓；
+  分仓 = 现金 − 保留现金，AI 之后自己买入的才是分仓持仓。
+- 你已持有、且在 AI 投资范围内的代码（例如你持有 AAPL）会**自动从 AI 可交易范围中剔除**：否则 AI 卖出时，
+  券商可能按先进先出等批次规则卖掉你的长期持仓，带来税务后果，也无法区分归属。你在这些代码上的挂单不会阻挡 AI。
+- 你手动买卖了外部持仓，系统会暂停交易，核对后用 `adjust-reserve --rebaseline-external`（出入金同时用 `--amount`）重新确认。
+- 券商持仓读取失败或只返回部分结果时直接拒绝，不会把“读失败”当成“没有持仓”而重复买入。
+
+**3. 只读体检 `schwab-check`**：在 `.env` 填好 `SCHWAB_ACCOUNT_NUMBER`（以及自己的 `SCHWAB_APP_KEY`/`SCHWAB_APP_SECRET`/
+`SCHWAB_BACKEND_CALLBACK_URL`，或使用 LumiBot 默认应用）后运行：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode schwab-check -RunDir artifacts/schwab-check
+```
+
+它使用 LumiBot 原生 Schwab 适配器完成 OAuth 和账户读取，并在该实例上**禁用所有下单、撤单、改单方法**。输出 `schwab_check.json`：
+账户类型（现金／保证金）、现金、已交割可用现金、未交割现金、清算价值、每个持仓及是否在 AI 范围、挂单、
+预计保留现金与 AI 起始分仓、将被剔除的共享代码，以及需要处理的问题（现金少于授权资金、保证金负债、现金账户已交割现金不足、
+已有持仓但未允许外部持仓、存在挂单）和提示（未设 `SCHWAB_APP_SECRET` 时约 7 天需重新登录；未设 `SCHWAB_APP_KEY` 时 OAuth
+回调经过 LumiBot 默认应用的 `api.botspot.trade`，如需完全自控请注册自己的 Schwab 开发者应用）。
+
+**4. 拟议的实盘入口（需要你单独明确授权后才会实现）**：
+- 前置条件：本地或 Alpaca Paper 连续运行通过 `acceptance`（默认 20 个交易日），`schwab-check` 无问题；
+- 独立的 `schwab-live` 模式，必须同时满足：`.env` 中显式确认（如 `FUND_LIVE_CONFIRM=I-UNDERSTAND-REAL-MONEY`）、
+  账户号与上次体检一致、监控与 Telegram 健康、授权资金不超过你设定的上限；
+- 现金账户只用已交割资金买入（T+1），保证金账户也绝不借款或卖空；
+- 初期所有买入都需要审批（`FUND_AUTO_DAILY_EXPOSURE_INCREASE=0`），稳定后再放开自动额度；
+- 每笔订单与券商回报逐笔对账，任何不一致即 STOP；首周只允许很小的授权资金；
+- AI 仍然没有修改配置、权限或启动实盘的能力。
+
+Schwab 原生适配器的通用说明见 `docsrc/brokers.schwab.rst`（OAuth、token 续期、订单状态）。
 不要把框架通用文档中的 paper/live 描述当成 Schwab 提供独立 Paper 交易环境的保证。
-
-未来需要独立明确授权：申请 Schwab Trader API 访问和应用 OAuth，
-由你在券商页面授权并安全保存凭证；选择并核验确切账户，先只读读取现金、持仓和订单。
-随后验证账户选择、费用、结算现金、撤单、部分成交、断线恢复、通知及风控边界，
-再审阅一个单独的实盘执行入口。不能通过改一个环境变量把本应用切到实盘。
-AI 不应拥有配置仓库、券商管理、API 权限或实盘启动入口的写权限。
 
 官方参考：[Alpaca Paper](https://docs.alpaca.markets/docs/paper-trading)、
 [DeepSeek API](https://api-docs.deepseek.com/)、

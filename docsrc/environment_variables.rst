@@ -1439,6 +1439,13 @@ validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.en
 with a suggestion, and ``show-config`` prints effective values and their sources with
 secrets shown only as set or missing.
 
+The application's read-only ``schwab-check`` command uses the native Schwab
+variables (``SCHWAB_ACCOUNT_NUMBER``, ``SCHWAB_APP_KEY``, ``SCHWAB_APP_SECRET``,
+``SCHWAB_BACKEND_CALLBACK_URL``, ``SCHWAB_TOKEN``, ``SCHWAB_TOKEN_PATH``; see
+:doc:`brokers.schwab`) with every order method disabled. It reports cash,
+settled cash, margin, holdings, open orders and the capital-sleeve preview; the
+application has no live execution entry.
+
 Operators may approve plan requests by replying ``同意`` or ``拒绝`` in Telegram
 (to the alert, with its six-character code, or as plain text when exactly one
 request is pending). Only the configured chat counts; a private chat's owner is

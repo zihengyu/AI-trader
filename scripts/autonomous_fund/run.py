@@ -270,7 +270,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -356,6 +356,13 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "schwab-check":
+        from .schwab import schwab_check
+        result = schwab_check(args, config)
+        print(json.dumps({k: result[k] for k in ("verdict", "account_type", "cash_balance", "settled_cash_available",
+                          "capital_usd", "reserved_cash", "excluded_shared_symbols", "issues", "notices")
+                          if k in result}, indent=2, ensure_ascii=False))
         return
     if args.mode == "show-config":
         from .settings import apply_environment, describe
