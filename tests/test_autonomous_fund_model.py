@@ -11,7 +11,8 @@ TOOL = {"type": "function", "function": {
     "parameters": {"type": "object", "properties": {"symbol": {"type": "string"}}, "required": ["symbol"]}}}
 
 
-@pytest.mark.parametrize("model", ["deepseek/deepseek-flash", "openai/gpt-6-luna", "anthropic/claude-sonnet-4-5"])
+@pytest.mark.parametrize("model", ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro",
+                                 "openai/gpt-6-luna", "anthropic/claude-sonnet-4-5"])
 def test_installed_sdk_accepts_plain_function_tools_with_mcp_one(model, monkeypatch):
     import litellm
 
@@ -62,7 +63,8 @@ def test_installed_sdk_preserves_tool_call_and_followup_json(monkeypatch):
     asyncio.run(roundtrip())
 
 
-def test_native_adk_deepseek_tool_roundtrip_through_mock_http(monkeypatch):
+@pytest.mark.parametrize("provider_model", ["deepseek-flash", "deepseek-v4-pro"])
+def test_native_adk_deepseek_tool_roundtrip_through_mock_http(monkeypatch, provider_model):
     import importlib
     import requests as requests_library
     import tiktoken
@@ -84,24 +86,27 @@ def test_native_adk_deepseek_tool_roundtrip_through_mock_http(monkeypatch):
         assert request.url.host == "api.deepseek.com"
         assert request.url.path.endswith("/chat/completions")
         body = json.loads(request.content)
-        assert body["model"] == "deepseek-flash"
+        assert body["model"] == provider_model
         requests.append(body)
         if len(requests) == 1:
             assert any(t["function"]["name"] == "fixture_lookup" for t in body["tools"])
-            message = {"role": "assistant", "content": None, "tool_calls": [{
+            message = {"role": "assistant", "content": None,
+                "reasoning_content": "Synthetic reasoning before the tool.", "tool_calls": [{
                 "id": "fixture-call", "type": "function", "function": {
                     "name": "fixture_lookup", "arguments": json.dumps({
                         "symbol": "ALFA", "agent_purpose": "Read a synthetic test fixture."})}}]}
             finish_reason = "tool_calls"
         else:
             assert len(requests) == 2
+            assistant = next(m for m in body["messages"] if m["role"] == "assistant" and m.get("tool_calls"))
+            assert assistant["reasoning_content"] == "Synthetic reasoning before the tool."
             tool_result = next(m for m in body["messages"] if m["role"] == "tool")
             assert json.loads(tool_result["content"])["price"] == 100
             message = {"role": "assistant", "content": '{"summary":"fixture observed"}'}
             finish_reason = "stop"
         return httpx.Response(200, request=request, json={
             "id": "synthetic-completion", "object": "chat.completion", "created": 1,
-            "model": "deepseek-flash", "choices": [{"index": 0, "message": message,
+            "model": provider_model, "choices": [{"index": 0, "message": message,
                 "finish_reason": finish_reason}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})
 
@@ -117,7 +122,7 @@ def test_native_adk_deepseek_tool_roundtrip_through_mock_http(monkeypatch):
     monkeypatch.setattr(httpx.Client, "send", no_network)
     monkeypatch.setattr(httpx.AsyncClient, "send", fake_send)
     request = RuntimeRequest(
-        agent_name="fixture_researcher", model="deepseek/deepseek-flash",
+        agent_name="fixture_researcher", model="deepseek/" + provider_model,
         system_prompt="Read the synthetic fixture and return its summary as JSON.",
         task_prompt="Look up ALFA.", context={}, runtime_context={}, memory_state=None,
         memory_notes=[], bound_tools=[BoundTool("fixture_lookup", "Read a synthetic fixture", lookup)],

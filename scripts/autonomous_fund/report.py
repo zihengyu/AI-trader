@@ -78,23 +78,41 @@ def report(root, prices=None, write_files=True):
                 key = row["broker_id"]
                 fee_by_order[key] = max(fee_by_order.get(key, 0), float(row["trade_cost"]))
     totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "unknown_calls": 0}
+    by_model = {}
     for row in usage:
         if row.get("cache_hit"):
             continue
+        counts = by_model.setdefault(row.get("model") or "unknown", dict.fromkeys(totals, 0))
         raw = row.get("usage")
         if not raw:
             totals["unknown_calls"] += 1
+            counts["unknown_calls"] += 1
             continue
-        totals["input_tokens"] += int(raw.get("prompt_tokens", raw.get("input_tokens", raw.get("prompt_token_count", 0))))
-        totals["output_tokens"] += int(raw.get("completion_tokens", raw.get("output_tokens", raw.get("candidates_token_count", 0))))
-        totals["cached_input_tokens"] += int(raw.get("cache_read_input_tokens", (raw.get("prompt_tokens_details") or {}).get("cached_tokens", 0)))
+        values = {
+            "input_tokens": int(raw.get("prompt_tokens", raw.get("input_tokens", raw.get("prompt_token_count", 0)))),
+            "output_tokens": int(raw.get("completion_tokens", raw.get("output_tokens", raw.get("candidates_token_count", 0)))),
+            "cached_input_tokens": int(raw.get("cache_read_input_tokens") or raw.get("cached_content_token_count") or
+                (raw.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+        }
+        for key, value in values.items():
+            totals[key] += value
+            counts[key] += value
     estimate = None
+    estimates_by_model = None
     if prices and not totals["unknown_calls"]:
         # Operator-supplied rates only. This is an estimate, not a provider bill.
-        estimate = (totals["input_tokens"] * float(prices["input"]) +
-                    totals["output_tokens"] * float(prices["output"])) / 1_000_000
+        # A legacy single-model rate must never silently price two models alike.
+        rates = ({model: prices for model in by_model} if len(by_model) == 1 and "input" in prices
+                 else prices)
+        if by_model and all(model in rates for model in by_model):
+            estimates_by_model = {
+                model: (counts["input_tokens"] * float(rates[model]["input"]) +
+                        counts["output_tokens"] * float(rates[model]["output"])) / 1_000_000
+                for model, counts in by_model.items()}
+            estimate = sum(estimates_by_model.values())
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
+        "models": startup.get("models"),
         "observe_only": startup.get("observe_only", False),
         "validated_decisions": decisions,
         "premarket_research_runs": len(premarket),
@@ -108,7 +126,8 @@ def report(root, prices=None, write_files=True):
         "benchmark_price_returns": comparison, "fills_observed": len(fills),
         "observed_fees": local_fees + sum(fee_by_order.values()) if not unknown_fee else None,
         "fill_details_incomplete": incomplete_fills,
-        "model_usage": totals, "model_cost_estimate_usd": estimate,
+        "model_usage": totals, "model_usage_by_model": by_model,
+        "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
         "latest_account": accounts[-1] if accounts else None,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
                         "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."

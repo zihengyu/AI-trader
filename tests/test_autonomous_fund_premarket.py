@@ -1,5 +1,4 @@
 """Closed-market research and native lifecycle handoff; no paid inference."""
-import hashlib
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -9,7 +8,7 @@ import pytest
 from scripts.autonomous_fund.journal import Journal, encode
 from scripts.autonomous_fund.report import report
 from scripts.autonomous_fund.risk import Account, Intent, Limits, RiskError, number
-from scripts.autonomous_fund.strategy import AutonomousFund, Research
+from scripts.autonomous_fund.strategy import AutonomousFund, Research, account_digest
 
 
 SUNDAY = datetime(2026, 11, 1, 17, tzinfo=timezone.utc)
@@ -143,14 +142,17 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
     clock.value = SUNDAY
     source = YahooRealtimeData(now=clock, fetch=clock.fetch)
     config = {"model": "deepseek/deepseek-flash", "reasoning_effort": None, "limits": {},
+              "agent_models": {"researcher": "deepseek/deepseek-flash", "manager": "deepseek/deepseek-v4-pro"},
               "universe": {"ALFA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
-    binding = hashlib.sha256(encode({"mode": "local", "account": "local-virtual-account", "config": config}).encode()).hexdigest()
+    binding = account_digest("local", "local-virtual-account", config)
     journal = Journal(tmp_path, binding)
     calls = []
+    model_calls = []
 
     class RecordingRuntime(ScriptedRuntime):
         def run(self, request):
             calls.append((request.agent_name, request.context))
+            model_calls.append((request.agent_name, request.model))
             return super().run(request)
 
     def startup(run_once=True):
@@ -189,6 +191,9 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
     source._cache.clear()
     strategy.on_trading_iteration()
     assert [name for name, _ in calls] == ["researcher", "researcher", "researcher", "manager"]
+    assert model_calls == [("researcher", "deepseek/deepseek-flash")] * 3 + [("manager", "deepseek/deepseek-v4-pro")]
+    assert strategy.agents["researcher"].allow_trading is False
+    assert strategy.agents["manager"].allow_trading is False
     assert calls[-1][1]["premarket_research"]["phase"] == "before_market_opens"
     assert len(journal.pending()) == 1
     identifier = journal.pending()[0]["broker_id"]

@@ -1366,10 +1366,18 @@ Local autonomous paper portfolio application
 
 The optional checkout application ``scripts/autonomous_fund`` reads ``AI_MODEL``
 to select a provider-qualified model, such as ``openai/<model-id>``,
-``anthropic/<model-id>`` or ``deepseek/<model-id>``. Its ``--model`` argument takes
-precedence, followed by ``AI_MODEL``, then its JSON configuration. This variable
-does not change other strategies' model defaults. Its supplied configuration
-selects ``deepseek/deepseek-flash``.
+``anthropic/<model-id>`` or ``deepseek/<model-id>``. Role-specific
+``--research-model`` / ``--decision-model`` arguments take precedence over the
+common ``--model`` / ``AI_MODEL`` selection, followed by the JSON
+``agent_models.researcher`` / ``agent_models.manager`` settings and finally the
+legacy ``model`` field. ``--model`` takes precedence over ``AI_MODEL`` and both
+override both roles unless a role-specific argument is supplied. This variable
+does not change other strategies' model defaults. The supplied role configuration
+uses ``deepseek/deepseek-flash`` for research and ``deepseek/deepseek-v4-pro`` for
+portfolio decisions; both use the same ``DEEPSEEK_API_KEY``. The PowerShell
+launcher exposes these overrides as ``-ResearchModel`` and ``-DecisionModel``.
+Role model changes preserve the account journal and its risk state. Restart the
+runner to load new settings; no real-money execution is enabled by changing models.
 
 OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
 DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.

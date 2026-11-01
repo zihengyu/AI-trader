@@ -1,5 +1,9 @@
 {
   "model": "deepseek/deepseek-flash",
+  "agent_models": {
+    "researcher": "deepseek/deepseek-flash",
+    "manager": "deepseek/deepseek-v4-pro"
+  },
   "reasoning_effort": null,
   "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 5, "drawdown": "0.08"},
   "universe": {

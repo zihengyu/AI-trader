@@ -47,9 +47,35 @@ class Decision(BaseModel):
 def configuration(path):
     result = json.loads(Path(path).read_text(encoding="utf-8"))
     Limits(**result["limits"])
+    model_selection(result)
     if not result["universe"] or any(v not in {"stock", "unlevered_etf"} for v in result["universe"].values()):
         raise RiskError("Only operator-reviewed stocks and unlevered ETFs may be admitted")
     return result
+
+
+def model_selection(config, model=None, research_model=None, decision_model=None):
+    roles = config.get("agent_models", {})
+    if not isinstance(roles, dict) or set(roles) - {"researcher", "manager"}:
+        raise RiskError("agent_models accepts only researcher and manager model IDs")
+    selected = {
+        "researcher": research_model or model or roles.get("researcher", config["model"]),
+        "manager": decision_model or model or roles.get("manager", config["model"]),
+    }
+    for role, value in selected.items():
+        if (not isinstance(value, str) or value.count("/") != 1 or
+                value.split("/", 1)[0] not in {"openai", "anthropic", "deepseek"} or
+                not value.split("/", 1)[1] or any(c.isspace() for c in value)):
+            raise RiskError(f"Invalid {role} model: use openai/, anthropic/ or deepseek/ with an exact model ID")
+    return selected
+
+
+def account_digest(mode, account, config):
+    # New role-specific model settings are operational, like --model already
+    # was. Retain the EXACT legacy hash when this field is absent: adopting
+    # role models cannot reset cash, order reservations or the drawdown latch.
+    # Every existing config field, including limits and universe, stays bound.
+    bound = {key: value for key, value in config.items() if key != "agent_models"}
+    return hashlib.sha256(encode({"mode": mode, "account": account, "config": bound}).encode()).hexdigest()
 
 
 def assert_paper(broker):
@@ -66,7 +92,8 @@ def assert_paper(broker):
 class AutonomousFund(Strategy):
     parameters = {}
 
-    def initialize(self, config, run_dir, mode, account_binding, model=None, runtime=None, observe_only=False):
+    def initialize(self, config, run_dir, mode, account_binding, model=None, runtime=None, observe_only=False,
+                   research_model=None, decision_model=None):
         self.mode = mode
         self.config = config
         self.limits = Limits(**config["limits"])
@@ -85,7 +112,7 @@ class AutonomousFund(Strategy):
         from lumibot.macro import FREDMacroData
         self.macro = FREDMacroData(self, cache_dir=self.run_dir / "cache" / "fred")
         self.halt_path = self.run_dir / "STOP"
-        binding = hashlib.sha256(encode({"mode": mode, "account": account_binding, "config": config}).encode()).hexdigest()
+        binding = account_digest(mode, account_binding, config)
         self.journal = Journal(self.run_dir, binding)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         self.observe_only = observe_only
@@ -96,16 +123,17 @@ class AutonomousFund(Strategy):
         self.premarket_research = json.loads(saved[0]) if saved else None
         self.session_orders = {}
         self.scripted = runtime is not None
-        self.model = model or config["model"]
+        self.agent_models = model_selection(config, model, research_model, decision_model)
+        self.model = self.agent_models["manager"]
         from .boundary import isolate_research
         isolate_research(self, self.run_dir / "cache")
-        common = dict(model=self.model, allow_trading=False, allow_network=True,
+        common = dict(allow_trading=False, allow_network=True,
                       reasoning_effort=config.get("reasoning_effort"), _runtime=runtime,
                       model_request_timeout_seconds=120, run_timeout_seconds=300)
         # Both roles are read-only by the user's explicit structured-target contract.
         # Native permissions remove every tool marked as mutating trading state.
         self.agents.create(
-            name="researcher", output_schema=Research, **common,
+            name="researcher", model=self.agent_models["researcher"], output_schema=Research, **common,
             system_prompt=(
                 "Research US stocks and nonleveraged ETFs in the supplied eligible universe. "
                 "Use native market/history, technical analysis, fundamentals and news/web tools. "
@@ -121,7 +149,7 @@ class AutonomousFund(Strategy):
             ),
         )
         self.agents.create(
-            name="manager", output_schema=Decision, **common,
+            name="manager", model=self.agent_models["manager"], output_schema=Decision, **common,
             system_prompt=(
                 "You are the sole investment decision maker for this long-only paper portfolio. "
                 "Pursue long-term risk-adjusted returns, without a fixed signal or obligation to trade. "
@@ -137,7 +165,8 @@ class AutonomousFund(Strategy):
                 "subsequent outcomes; disclose uncertain historical evidence."
             ),
         )
-        self.journal.event(self.get_datetime(), "startup", {"mode": mode, "model": self.model,
+        self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}")
+        self.journal.event(self.get_datetime(), "startup", {"mode": mode, "model": self.model, "models": self.agent_models,
                            "limits": asdict(self.limits), "mock_model": runtime is not None,
                            "observe_only": observe_only})
         if mode == "local":
@@ -182,14 +211,16 @@ class AutonomousFund(Strategy):
                        "account": account, "previous_premarket_research": previous}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
-            research = self._record_agent("researcher", self.agents["researcher"].run(
+            result = self.agents["researcher"].run(
                 task_prompt="Prepare or update market research for the next regular session. Review news, filings, "
                             "completed historical prices, opportunities and risks. Disclose source times and data gaps. "
                             "Last regular-session prices may be old; they are research context, not executable quotes. "
-                            "Do not submit orders or treat this research as an executable portfolio decision.", context=context))
+                            "Do not submit orders or treat this research as an executable portfolio decision.", context=context)
+            research = self._record_agent("researcher", result)
             validate_evidence(research["evidence"], self.get_datetime(), False)
             packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
-                      "session_open": opens_at.isoformat(), "phase": slot, "research": research}
+                      "session_open": opens_at.isoformat(), "phase": slot, "research": research,
+                      "model": result.model, "cache_hit": result.cache_hit}
             self.journal.event(self.get_datetime(), "premarket_research", packet)
             self.premarket_research = packet
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")

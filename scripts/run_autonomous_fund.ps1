@@ -3,6 +3,8 @@ param(
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
+    [string]$ResearchModel = '',
+    [string]$DecisionModel = '',
     [string]$Config = 'scripts/autonomous_fund/config.json',
     [string]$Start = '2025-01-06',
     [string]$End = '2025-02-14',
@@ -20,6 +22,8 @@ try {
     $runArgs = @('-m', 'scripts.autonomous_fund.run', $Mode, '--run-dir', $RunDir, '--config', $Config,
                  '--start', $Start, '--end', $End)
     if ($Model) { $runArgs += @('--model', $Model) }
+    if ($ResearchModel) { $runArgs += @('--research-model', $ResearchModel) }
+    if ($DecisionModel) { $runArgs += @('--decision-model', $DecisionModel) }
     if ($DataDir) { $runArgs += @('--data-dir', $DataDir) }
     if ($Scripted) { $runArgs += '--scripted' }
     if ($Once) { $runArgs += '--once' }

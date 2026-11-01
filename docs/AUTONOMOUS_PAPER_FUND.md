@@ -58,7 +58,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 .\scripts\run_autonomous_fund.ps1 -Mode check -RunDir artifacts/fund-market-check
 ```
 
-默认模型为 `deepseek/deepseek-flash`，需要你自己的 `DEEPSEEK_API_KEY`。
+默认研究员使用 `deepseek/deepseek-flash`，基金经理使用 `deepseek/deepseek-v4-pro`，共用你自己的 `DEEPSEEK_API_KEY`。
 可在当前 PowerShell 中安全输入，输入不会显示，也不会写进命令历史或仓库：
 
 ```powershell
@@ -132,9 +132,39 @@ Yahoo 公开数据的使用还须符合其条款；本模式用于个人研究�
 
 ## 模型与数据凭证
 
+模型分工在 `config.json` 的 `agent_models` 中配置：
+
+```json
+"agent_models": {
+  "researcher": "deepseek/deepseek-flash",
+  "manager": "deepseek/deepseek-v4-pro"
+}
+```
+
+研究员负责盘前及正常时段的研究；基金经理在正常交易时段自主复核组合并输出结构化目标。
+两者都没有直接下单权限，订单仍由独立风控执行层处理。决策遵循现有分钟轮询及经理指定的复核时间，
+实际耗时还取决于模型和工具响应，不承诺逐笔行情级的延迟。
+DeepSeek 官方当前的 `deepseek-flash` 对应 V4.1-Flash；旧 `deepseek-v4-flash` 名称虽兼容，
+实际已路由到现行 Flash，不能用旧名字固定已退役的 V4 Flash。`deepseek-v4-pro` 是另一项独立模型。
+参见[官方模型说明](https://api-docs.deepseek.com/quick_start/pricing/)。
+
+覆盖优先级依次为：角色专用命令参数、通用 `--model`／`AI_MODEL`、`agent_models`、旧的 `model` 字段。
+通用模型参数会同时覆盖两个角色。需要明确指定分工时使用：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode local -RunDir artifacts/fund-local -ResearchModel deepseek/deepseek-flash -DecisionModel deepseek/deepseek-v4-pro
+```
+
+Python 对应参数是 `--research-model` 和 `--decision-model`。启动时打印实际选择的两个模型；
+每个研究／决策事件保存调用结果的模型 ID 和 usage，报告还提供 `models` 与 `model_usage_by_model`。
+模型配置修改需要停掉旧进程后重启。新增的 `agent_models` 不改变旧账户绑定：
+同目录恢复现金、持仓、提交次数、不确定订单和回撤锁；风险参数、范围、模式和账户仍保持绑定校验。
+旧的 `model` 字段保留兼容，不要为了换角色模型修改它或删除账本。
+历史盘前研究保留原来的模型来源，重启不把既有结论重新标记成新模型生成。
+
 | 用途 | 环境变量 | 说明 |
 |---|---|---|
-| 模型选择 | `AI_MODEL` | 默认 `deepseek/deepseek-flash`；也支持 `openai/<model-id>`、`anthropic/<model-id>`；可用 `--model` 或 JSON 配置 |
+| 模型选择 | `AI_MODEL` | 可选的双角色通用覆盖；默认按 `agent_models` 分工，也支持 `openai/<model-id>`、`anthropic/<model-id>` |
 | OpenAI | `OPENAI_API_KEY` | 只需要所选提供方的 Key |
 | Claude | `ANTHROPIC_API_KEY` | 原生运行时通过 LiteLLM 调用 |
 | DeepSeek | `DEEPSEEK_API_KEY` | 原生运行时通过 LiteLLM 调用；本地真实行情模拟盘只需这个 Key |
@@ -296,9 +326,11 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 基准采用同一观察日的买入持有价格收益，暂不包含分红、费用及执行摩擦，不是完整总收益基准。
 每日资金曲线采用当天最后一次账户观测，回撤只能覆盖采样到的高点。
 首版收益计算不剔除外部出入金；运行期间不要入金、出金或重置 Paper 账户，否则报告需要资金流调整。
-模型账本保存提供方原始 usage、缓存标记和已报告 token 数，不重复叠加推理 token。
-若在配置里填写 `model_prices_per_million={"input":...,"output":...}`，报告提供近似费用估算；
-无 usage 或无价格时成本显示 null，绝不声称是提供方实际账单。缓存读写费率需另行核对。
+模型账本保存提供方原始 usage、缓存标记和已报告 token 数，不重复叠加推理 token，并按实际模型 ID 汇总。
+单模型运行仍支持 `model_prices_per_million={"input":...,"output":...}`；多模型须提供
+`model_prices_per_million={"<provider/model>":{"input":...,"output":...},...}`，为每个模型填写自己的每百万 token 费率。
+混用模型却只给单一费率、缺少某个模型的价格或 usage 时，费用估算为 null，避免把 Flash 的费率套给 Pro。
+它始终是粗略估算，绝不声称是提供方实际账单；高低峰、缓存读写和提供方计费 token 口径仍需核对。
 运行输出属于私人账户数据，放在已被 Git 忽略的 `artifacts/` 中，不要提交或公开。
 
 ## 本地验证与待验证范围
@@ -312,9 +344,11 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 原生调度器只读启动检查。当时为周末休市，源行情是前一交易日收盘；没有伪造成新报价。
 本地撮合的开盘、部分成交、费用、崩溃恢复、源数据故障、过期、拆股／分红及风控测试使用可控时钟与行情替身。
 真实开盘时段持续运行、真实模型投资决策到本地成交、网络抖动下长期表现仍需后续验证。
-相关回归 302 项通过，覆盖盘前研究到正常时段决策下单、原生指标历史请求、休市退出、进程锁冲突、提供方配置及真实 SDK 的工具请求路径；另有原生网络工具单测 27 项通过。
+相关回归 319 项通过，覆盖分角色模型到正常时段决策下单、原生指标历史请求、休市退出、进程锁冲突、提供方配置、分模型费用及真实 SDK 的工具请求路径；另有原生网络工具单测 27 项通过。
 SDK 回归先在 LiteLLM 1.106.2 下复现导入异常，再在 1.105.1 下验证修复；
 SDK 模拟响应与原生 ADK 的 HTTP 替身测试均不产生模型推理费用，不证明真实提供方已鉴权或返回研究结果。
+Flash 和 V4 Pro 均通过原生 ADK＋LiteLLM 的 HTTP 替身工具往返测试，保留思考内容的多轮传递；
+PowerShell 分角色启动参数也已通过原生回测引擎＋脚本模型验证。真实 V4 Pro 接口及开盘决策仍待验证。
 原生免费网络搜索实际返回了公开结果。自动化盘前研究测试使用模型替身；真实运行的证据另述如下。
 持续只读进程的心跳、运行中报告读取和 STOP 标记识别也已验证，测试后已结束该进程。
 
@@ -345,6 +379,7 @@ Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未�
 | `tests/test_autonomous_fund_premarket.py` | 休市启动研究、持久化去重、原生盘前钩子到开盘执行的回归测试 |
 | `tests/test_autonomous_fund_shutdown.py` | 原生关闭钩子唤醒休市等待、SIGINT 退出和真实进程锁冲突回归 |
 | `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
+| `tests/test_autonomous_fund_model_roles.py` | 分角色模型覆盖、全部凭证检查、旧账本及风险锁保留、按模型记录 usage 和费率 |
 | `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款 |
 | `scripts/autonomous_fund/report.py` | 本地增量费用、观察模式、运行期间只读报告 |
 | `scripts/autonomous_fund/config.json` | 设置本应用的 DeepSeek Flash 默认模型 |

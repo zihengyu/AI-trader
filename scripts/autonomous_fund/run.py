@@ -53,6 +53,24 @@ def model_ready(model):
         raise RiskError("Missing model environment variable: " + names[prefix])
 
 
+def selected_models(args, config):
+    from .strategy import model_selection
+    return model_selection(config, args.model, args.research_model, args.decision_model)
+
+
+def models_ready(args, config):
+    selected = selected_models(args, config)
+    missing = []
+    for role, model in selected.items():
+        try:
+            model_ready(model)
+        except RiskError as exc:
+            missing.append(f"{role}: {exc}")
+    if missing:
+        raise RiskError("; ".join(missing))
+    return selected
+
+
 def mock_data():
     import pandas as pd
     from lumibot.entities import Asset, Data
@@ -112,7 +130,8 @@ def run_backtest(args, config):
         budget=10_000, benchmark_asset=None, risk_free_rate=0.0, analyze_backtest=False,
         buy_trading_fees=[TradingFee(percent_fee=0.001)], sell_trading_fees=[TradingFee(percent_fee=0.001)],
         parameters={"config": config, "run_dir": str(args.run_dir), "mode": args.mode,
-                    "account_binding": "historical", "model": args.model, "runtime": runtime},
+                    "account_binding": "historical", "model": args.model, "runtime": runtime,
+                    "research_model": args.research_model, "decision_model": args.decision_model},
         show_plot=False, show_tearsheet=False, save_tearsheet=False, show_indicators=False,
         save_logfile=False, show_progress_bar=False, **data)
     strategy.broker._trade_event_log_df.to_csv(args.run_dir / "native_trade_events.csv", index=False)
@@ -129,13 +148,13 @@ def run_paper(args, config):
     from lumibot.traders import Trader
     from .strategy import AutonomousFund, assert_paper
     credentials = paper_config()
-    model_ready(args.model or config["model"])
+    models_ready(args, config)
     broker = Alpaca(credentials)
     assert_paper(broker)
     binding = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
     strategy = AutonomousFund(broker=broker, name="AutonomousPaperFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "paper", "account_binding": binding,
-        "model": args.model})
+        "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model})
     trader = Trader()
     trader.add_strategy(strategy)
     try:
@@ -159,12 +178,13 @@ def check_market(args, config):
                                 "age_seconds": (source.get_datetime() - instant(quote.timestamp)).total_seconds(),
                                 "completed_daily_rows": len(daily), "price_kind": quote.raw_data["price_kind"]}
     try:
-        model_ready(args.model or config["model"])
+        models_ready(args, config)
         ready, missing = True, None
     except RiskError as exc:
         ready, missing = False, str(exc)
     result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
-              "source": source.SOURCE, "requires_broker_key": False, "model": args.model or config["model"],
+              "source": source.SOURCE, "requires_broker_key": False, "model": selected_models(args, config)["manager"],
+              "models": selected_models(args, config),
               "model_key_present": ready, "model_requirement": missing,
               "model_inference_tested": False, "observations": observations,
               "freshness_limit_seconds": Limits(**config["limits"]).quote_max_seconds}
@@ -175,22 +195,23 @@ def check_market(args, config):
 
 def run_local(args, config):
     from lumibot.traders import Trader
-    from .journal import Journal, encode
+    from .journal import Journal
     from .local_broker import LocalPaperBroker
     from .market_data import YahooRealtimeData
     from .risk import Limits
-    from .strategy import AutonomousFund
+    from .strategy import AutonomousFund, account_digest
     if not args.observe_only:
-        model_ready(args.model or config["model"])
+        models_ready(args, config)
     if args.scripted:
         raise RiskError("Scripted models are forbidden against the running market")
-    binding = hashlib.sha256(encode({"mode": "local", "account": "local-virtual-account", "config": config}).encode()).hexdigest()
+    binding = account_digest("local", "local-virtual-account", config)
     journal = Journal(args.run_dir, binding)
     broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
                               matching_enabled=not args.observe_only)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
-        "model": args.model, "observe_only": args.observe_only})
+        "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
+        "observe_only": args.observe_only})
     broker.do_polling()
     print("Local virtual account active. No brokerage account is connected. Observe-only=" + str(args.observe_only))
     print("Market session: " + json.dumps(broker.data_source.session.status()))
@@ -212,6 +233,8 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
+    parser.add_argument("--research-model", help="Researcher override; takes precedence over --model/AI_MODEL")
+    parser.add_argument("--decision-model", help="Portfolio manager override; takes precedence over --model/AI_MODEL")
     parser.add_argument("--start", default="2025-01-06")
     parser.add_argument("--end", default="2025-02-14")
     parser.add_argument("--data-dir", type=Path)
@@ -268,7 +291,7 @@ def main(argv=None):
         if (args.observe_only or args.once) and args.mode != "local":
             raise RiskError("--observe-only and --once are local-mode options")
         if args.mode != "mock" and not args.scripted and not args.observe_only:
-            model_ready(args.model or config["model"])
+            models_ready(args, config)
         logging.getLogger().addHandler(logging.FileHandler(args.run_dir / "runtime.log", encoding="utf-8"))
         if args.mode == "local":
             run_local(args, config)
@@ -297,11 +320,9 @@ def attach_order(args):
     assert_paper(broker)
     order = broker._pull_order(args.broker_order_id, "AutonomousPaperFund")
     with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
-        from .journal import encode
-        from .strategy import configuration
+        from .strategy import configuration, account_digest
         account_key = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
-        expected = hashlib.sha256(encode({"mode": "paper", "account": account_key,
-                                         "config": configuration(args.config)}).encode()).hexdigest()
+        expected = account_digest("paper", account_key, configuration(args.config))
         binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
         if not binding or binding[0] != expected:
             raise RiskError("Recovery credentials/configuration do not match this account journal")
