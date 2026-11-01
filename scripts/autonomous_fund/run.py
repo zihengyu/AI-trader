@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from filelock import FileLock, Timeout as FileLockTimeout
@@ -37,7 +37,7 @@ class ScriptedRuntime:
             body = {"as_of": now.isoformat(), "expires_at": (now + timedelta(hours=8)).isoformat(),
                     "next_review_at": (now + timedelta(hours=1)).isoformat(),
                     "rationale": "SCRIPTED test target; not an AI investment decision.",
-                    "targets": [{"symbol": symbol, "weight": 0.09}]}
+                    "targets": [{"symbol": symbol, "weight": 0.05}]}
         return AgentRunResult(summary=json.dumps(body), model="scripted/no-inference", events=[],
                               usage={"input_tokens": 0, "output_tokens": 0})
 
@@ -138,7 +138,8 @@ def run_backtest(args, config):
         buy_trading_fees=[TradingFee(percent_fee=0.001)], sell_trading_fees=[TradingFee(percent_fee=0.001)],
         parameters={"config": config, "run_dir": str(args.run_dir), "mode": args.mode,
                     "account_binding": "historical", "model": args.model, "runtime": runtime,
-                    "research_model": args.research_model, "decision_model": args.decision_model},
+                    "research_model": args.research_model, "decision_model": args.decision_model,
+                    "memory_mode": getattr(args, "memory_mode", "rolling"), "frozen_memory": getattr(args, "frozen_memory", None)},
         show_plot=False, show_tearsheet=False, save_tearsheet=False, show_indicators=False,
         save_logfile=False, show_progress_bar=False, **data)
     strategy.broker._trade_event_log_df.to_csv(args.run_dir / "native_trade_events.csv", index=False)
@@ -165,7 +166,9 @@ def run_paper(args, config):
     trader = Trader()
     trader.add_strategy(strategy)
     try:
-        trader.run_all()
+        from .monitor import RunnerHeartbeat
+        with RunnerHeartbeat(args.run_dir):
+            trader.run_all()
     finally:
         strategy.journal.export()
 
@@ -236,7 +239,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -248,9 +251,15 @@ def main(argv=None):
     parser.add_argument("--scripted", action="store_true", help="Historical mechanical tests only; never paper")
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
-    parser.add_argument("--once", action="store_true", help="One native scheduler iteration then exit (local only)")
+    parser.add_argument("--once", action="store_true", help="One local scheduler iteration or monitor poll, then exit")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
     parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
+    parser.add_argument("--approval-id")
+    parser.add_argument("--approval-digest", help="Exact digest shown by approvals; approval never submits an order")
+    parser.add_argument("--console-only", action="store_true", help="Run watchdog without Telegram delivery")
+    parser.add_argument("--heartbeat-seconds", type=int, default=180)
+    parser.add_argument("--agent-seconds", type=int, default=900)
+    parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
     args = parser.parse_args(argv)
     if args.env_file:
         from dotenv import load_dotenv
@@ -271,6 +280,31 @@ def main(argv=None):
     if args.mode == "resume":
         (args.run_dir / "STOP").unlink(missing_ok=True)
         print("Manual stop removed; drawdown and ambiguous-order locks remain.")
+        return
+    if args.mode in {"approvals", "approve", "reject"}:
+        from .execution import operator_connection, resolve_approval
+        now = datetime.now(timezone.utc)
+        if args.mode == "approvals":
+            with operator_connection(args.run_dir) as db:
+                exists = db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_approvals'").fetchone()
+                rows = db.execute("SELECT * FROM fund_approvals ORDER BY rowid DESC LIMIT 30").fetchall() if exists else []
+                result = [{**dict(row), "body": json.loads(row["body"])} for row in rows]
+                for row in result:
+                    if row["state"] in {"pending", "approved"} and now >= instant(row["body"]["expires_at"]):
+                        row["effective_state"] = "expired"
+            print(json.dumps(result, indent=2, ensure_ascii=True))
+        else:
+            if not args.approval_id or not args.approval_digest:
+                raise RiskError("Both --approval-id and --approval-digest from the reviewed request are required")
+            print(resolve_approval(args.run_dir, args.approval_id, args.approval_digest, args.mode == "approve", now))
+        return
+    if args.mode == "monitor":
+        from .monitor import run_monitor
+        run_monitor(args)
+        return
+    if args.mode == "notify-test":
+        from .monitor import send_test
+        print(json.dumps(send_test(args.run_dir), indent=2))
         return
     from .strategy import configuration
     from .report import report
@@ -300,7 +334,11 @@ def main(argv=None):
         if args.mode != "mock" and not args.scripted and not args.observe_only:
             models_ready(args, config)
         logging.getLogger().addHandler(logging.FileHandler(args.run_dir / "runtime.log", encoding="utf-8"))
-        if args.mode == "local":
+        if args.mode == "qualify":
+            from .evaluation import qualify
+            print(json.dumps(qualify(args, config), indent=2, ensure_ascii=True))
+            return
+        elif args.mode == "local":
             run_local(args, config)
         elif args.mode == "paper":
             # One runner per credential, including different output directories.

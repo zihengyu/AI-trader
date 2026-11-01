@@ -13,6 +13,13 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 
 ## Backtesting selection + dates
 
+### `FUND_TELEGRAM_BOT_TOKEN` / `FUND_TELEGRAM_CHAT_ID`
+- Purpose: Explicit credentials/recipient for the optional autonomous paper portfolio's separate `monitor` process.
+- Neither value is needed by local market simulation, approval commands or console-only monitoring. No automatic dotenv search or other-process credential loading is performed.
+- Errors list both required variable names; logs, model contexts and delivery status omit token values. Keep them in the operator's environment or an explicitly selected untracked secret file.
+- Telegram supplies notifications only. Local operator approval is bound to a reviewed digest, account, decision, session, quantity/price bounds and expiry; it never routes real-money orders.
+- Watchdog intervals are explicit command parameters, with 180-second heartbeat and 900-second model-call defaults. Start the separate process for independent protection; missing configuration is not successful delivery.
+
 ### `LUMIBOT_CHATGPT_HOME` / `LUMIBOT_CHATGPT_PROFILE` / `LUMIBOT_CHATGPT_PROFILE_PATH`
 - Purpose: Select the private directory, existing profile ID, or explicitly protected profile file for `chatgpt/<model>` agents and subscription-funded evaluations.
 - Default directory: `~/.config/lumibot-chatgpt`; never source-control this directory.

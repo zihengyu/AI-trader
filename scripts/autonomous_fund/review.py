@@ -114,7 +114,8 @@ def _inputs(rows, session, now):
         aligned = (first and last and first[-1]["at"] == baseline["at"] and last[-1]["at"] == ending["at"])
         benchmarks[symbol] = float(last[-1]["body"][symbol]) / float(first[-1]["body"][symbol]) - 1 if aligned else None
     kinds = {"account", "decision", "decision_validated", "fill", "fill_reconciled", "order_submitted",
-             "order_observed", "notification", "market_observation", "local_corporate_action"}
+             "order_observed", "notification", "market_observation", "local_corporate_action",
+             "decision_accepted", "allocation_complete", "operator_approval"}
     evidence = [r for r in owned if r["kind"] in kinds or
                 (r["kind"] == "agent" and r["body"].get("name") == "researcher" and
                  r["body"].get("phase") != "postmarket_review")]
@@ -159,6 +160,8 @@ def _save_once(journal, now, kind, packet):
 
 
 def _run_stage(strategy, name, **kwargs):
+    if hasattr(strategy, "_agent_call"):
+        return strategy._agent_call(name, **kwargs)
     try:
         return strategy.agents[name].run(**kwargs)
     except Exception as exc:
@@ -191,6 +194,7 @@ def review_after_close(strategy):
     context = {"as_of": now.isoformat(), "historical": historical, "phase": "postmarket_review",
                "orders_enabled": False, "eligible_universe": sorted(strategy.universe),
                "limits": asdict(strategy.limits), "strategy_memory": memory,
+               "strategy_followup": strategy._strategy_evaluations(),
                "session": _inputs(rows, session, now)}
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)

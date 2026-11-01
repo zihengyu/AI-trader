@@ -48,7 +48,7 @@ class Journal:
         with self.connection() as db:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(at), kind, encode(body)))
 
-    def reserve(self, intent, now, limits):
+    def reserve(self, intent, now, limits, guard=None):
         """Commit BEFORE contacting the broker. Ambiguous calls remain reserved."""
         key = uuid4().hex
         with self.connection() as db:
@@ -57,6 +57,8 @@ class Journal:
             count = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
             if unresolved or count >= limits.daily_orders:
                 raise RiskError("Unresolved intent or daily submission limit reached")
+            if guard:
+                guard(db)
             db.execute("INSERT INTO intents VALUES(?,?,?,?,?,?)", (
                 key, trading_day(now), encode(asdict(intent)), None, "reserved", str(now)))
         self.event(now, "intent_reserved", {"id": key, **asdict(intent)})

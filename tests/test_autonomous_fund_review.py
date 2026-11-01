@@ -62,6 +62,7 @@ def events(strategy, kind):
 
 def test_after_close_review_produces_auditable_feedback_without_orders(tmp_path):
     strategy, calls = review_harness(tmp_path)
+    strategy.journal.event(TRADE + timedelta(hours=3), "operator_approval", {"id": "synthetic-request", "state": "rejected"})
     strategy.after_market_closes()
     assert [name for name, _ in calls] == ["researcher", "manager"]
     assert calls[-1][1]["output_schema"] is PostmarketReview
@@ -69,6 +70,7 @@ def test_after_close_review_produces_auditable_feedback_without_orders(tmp_path)
     packet = events(strategy, "postmarket_review")[0]
     assert packet["version"] == 1 and packet["previous_version"] is None
     assert packet["session"]["observed_pnl_usd"] == 20
+    assert any(r["kind"] == "operator_approval" and r["body"]["state"] == "rejected" for r in packet["session"]["events"])
     assert packet["session"]["last_observed_account"]["at"] == str(TRADE + timedelta(hours=2))
     assert any("早于收盘" in gap for gap in packet["session"]["account_observation_gaps"])
     assert not strategy.journal.pending() and not events(strategy, "order_submitted")

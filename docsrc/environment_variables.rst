@@ -1393,3 +1393,25 @@ secrets through the process environment or your own secret manager; alternativel
 select your own untracked secret file explicitly with ``--env-file`` (existing
 environment values take precedence). See
 ``docs/AUTONOMOUS_PAPER_FUND.md`` in the source checkout for commands and limits.
+
+The separate ``monitor`` process optionally delivers account alerts through
+Telegram. It requires ``FUND_TELEGRAM_BOT_TOKEN`` and ``FUND_TELEGRAM_CHAT_ID``
+in that process's local environment, or its explicitly selected ``--env-file``.
+Neither value is discovered from another process or sent to a model. These are
+application-specific variables, not defaults for other LumiBot strategies.
+``monitor --console-only`` runs the watchdog without external delivery and
+requires neither variable. Without the monitor process, the trader records
+alerts locally but cannot claim Telegram delivery or independent liveness
+supervision. ``--heartbeat-seconds`` (180) and ``--agent-seconds`` (900) are
+explicit watchdog settings, not environment variables. Persistent health failure
+writes the selected run directory's STOP file; recovery never clears it.
+``notify-test`` explicitly sends one test message without modifying STOP or
+submitting an order; an API acknowledgement still requires confirmation on the
+operator's device. Telegram rate-limit delays apply to all queued messages.
+
+Major-transaction approval uses the local ``approvals``, ``approve`` and
+``reject`` commands and needs no provider/broker key. Telegram is notification
+only; messages never approve trades. Operator approval cannot change risk limits
+or enable a real-money destination. Historical ``qualify`` experiments require
+explicit frozen CSV inputs and a memo available before their start, and do not
+change a running account or automatically promote a candidate.

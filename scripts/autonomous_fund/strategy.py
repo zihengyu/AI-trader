@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -11,7 +12,7 @@ from lumibot.entities import Asset, Order
 from lumibot.strategies import Strategy
 
 from .journal import Journal, encode
-from .risk import Account, Limits, Price, RiskError, instant, number, plan, validate_decision, validate_evidence
+from .risk import Account, Limits, Price, RiskError, desired_shares, instant, number, plan, trading_day, validate_decision, validate_evidence
 
 
 class Evidence(BaseModel):
@@ -93,7 +94,7 @@ class AutonomousFund(Strategy):
     parameters = {}
 
     def initialize(self, config, run_dir, mode, account_binding, model=None, runtime=None, observe_only=False,
-                   research_model=None, decision_model=None):
+                   research_model=None, decision_model=None, memory_mode="rolling", frozen_memory=None):
         self.mode = mode
         self.config = config
         self.limits = Limits(**config["limits"])
@@ -116,8 +117,19 @@ class AutonomousFund(Strategy):
         self.journal = Journal(self.run_dir, binding)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         self.observe_only = observe_only
+        if memory_mode not in {"rolling", "disabled", "frozen"}:
+            raise RiskError("Unknown strategy memory mode")
+        if mode in {"local", "paper"} and memory_mode != "rolling":
+            raise RiskError("Memory experiment overrides are historical-only")
+        self.memory_mode, self.frozen_memory = memory_mode, frozen_memory
         self.next_review = None
         self.last_decision = None
+        from .execution import ExecutionState
+        self.execution = ExecutionState(self.journal)
+        saved_target = self.execution.latest(self.get_datetime())
+        if saved_target:
+            self.last_decision = json.loads(saved_target["body"])
+            self.next_review = instant(self.last_decision["next_review_at"])
         with self.journal.connection() as db:
             saved = db.execute("SELECT body FROM events WHERE kind='premarket_research' ORDER BY sequence DESC LIMIT 1").fetchone()
         self.premarket_research = json.loads(saved[0]) if saved else None
@@ -166,6 +178,9 @@ class AutonomousFund(Strategy):
                 "In historical mode do not use information from after as_of, including learned "
                 "subsequent outcomes; disclose uncertain historical evidence. "
                 "Use strategy_memory to reconsider selection and timing, not as mandatory signals. "
+                "strategy_followup reports observed subsequent outcomes, not causal proof; sample gaps "
+                "must lower certainty. Major orders require bounded operator approval. Never split or "
+                "redesign transactions merely to evade the supplied approval policy. "
                 "In phase=postmarket_review return the requested review schema instead of portfolio targets: "
                 "assess actual outcomes and update a provisional strategy memo, with no orders or permission changes."
             ),
@@ -173,7 +188,7 @@ class AutonomousFund(Strategy):
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}")
         self.journal.event(self.get_datetime(), "startup", {"mode": mode, "model": self.model, "models": self.agent_models,
                            "limits": asdict(self.limits), "mock_model": runtime is not None,
-                           "observe_only": observe_only})
+                           "observe_only": observe_only, "execution_revision": 2, "memory_mode": memory_mode})
         if mode == "local":
             # Native scheduling skips closed-market iterations. Record the real
             # virtual book immediately so weekend startup still has a report.
@@ -191,10 +206,23 @@ class AutonomousFund(Strategy):
         self._research_before_open()
 
     def _strategy_memory(self):
+        if getattr(self, "memory_mode", "rolling") == "disabled":
+            return None
+        if getattr(self, "memory_mode", "rolling") == "frozen":
+            from .evaluation import frozen_memory
+            return frozen_memory(self.frozen_memory, self.get_datetime())
         from .review import strategy_memory
         return strategy_memory(self.journal, self.get_datetime())
 
+    def _strategy_evaluations(self):
+        from .evaluation import forward_outcomes
+        from .review import _events
+        rows = _events(self.journal, instant(self.get_datetime()))
+        return forward_outcomes([(r["at"], r["kind"], r["body"]) for r in rows])[-3:]
+
     def _review_after_close(self):
+        if getattr(self, "memory_mode", "rolling") != "rolling":
+            return
         try:
             from .review import review_after_close
             review_after_close(self)
@@ -227,10 +255,10 @@ class AutonomousFund(Strategy):
                        "market": market, "orders_enabled": False,
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
-                       "strategy_memory": self._strategy_memory()}
+                       "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
-            result = self.agents["researcher"].run(
+            result = self._agent_call("researcher",
                 task_prompt="Prepare or update market research for the next regular session. Review news, filings, "
                             "completed historical prices, opportunities and risks. Disclose source times and data gaps. "
                             "Last regular-session prices may be old; they are research context, not executable quotes. "
@@ -379,12 +407,29 @@ class AutonomousFund(Strategy):
         parsed = result.parsed
         return parsed.model_dump() if hasattr(parsed, "model_dump") else parsed
 
+    def _agent_call(self, name, **kwargs):
+        key = uuid4().hex
+        self.journal.event(self.get_datetime(), "agent_call_started", {"id": key, "name": name})
+        try:
+            return self.agents[name].run(**kwargs)
+        except BaseException as exc:
+            # Interrupting a paid request must also retain unknown usage. The
+            # interrupt is re-raised so Ctrl+C still stops the runner normally.
+            self.journal.event(self.get_datetime(), "agent", {
+                "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "cache_hit": False, "usage": None,
+                "summary": "Agent attempt failed; provider usage unknown.", "parse_error": type(exc).__name__,
+                "mock": self.scripted, "phase": (kwargs.get("context") or {}).get("phase")})
+            raise
+        finally:
+            self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
+
     def notify(self, kind, details):
-        # Local outbox is a notification interface. No external send is configured.
+        # The separately running monitor delivers this persistent outbox.
         self.journal.event(self.get_datetime(), "notification", {"kind": kind, "details": details})
         self.log_message(f"FUND {kind}: {details}", color="yellow")
 
     def on_trading_iteration(self):
+        self.journal.event(self.get_datetime(), "iteration_started", {})
         try:
             if self.mode == "paper":
                 assert_paper(self.broker)
@@ -417,48 +462,81 @@ class AutonomousFund(Strategy):
             paused = self.journal.mark_equity(now, account.equity, self.limits)
             if paused:
                 self.notify("drawdown_pause", "New risk is paused until explicit operator reset")
-            if account.open_orders or (self.next_review and now < self.next_review):
+            if account.open_orders:
+                self._cancel_expired_allocation_orders(now)
+                return
+            active = self.execution.active(now, self.universe, self.limits)
+            if active:
+                self._continue_allocation(active)
+                return
+            if self.next_review and now < self.next_review:
                 return
             context = {"as_of": now.isoformat(), "historical": self.mode not in {"paper", "local"},
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": asdict(account), "previous_decision": self.last_decision,
                        "premarket_research": getattr(self, "premarket_research", None),
                        "strategy_memory": self._strategy_memory(),
+                       "approval_policy": asdict(self.execution.policy),
+                       "strategy_followup": self._strategy_evaluations(),
                        "risk_increase_paused": paused}
-            research = self._record_agent("researcher", self.agents["researcher"].run(
+            research = self._record_agent("researcher", self._agent_call("researcher",
                 task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
             validate_evidence(research["evidence"], now, self.mode not in {"paper", "local"})
             context["as_of"] = self.get_datetime().isoformat()
-            decision = self._record_agent("manager", self.agents["manager"].run(
+            decision = self._record_agent("manager", self._agent_call("manager",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
                 context={**context, "research": research}))
             self.journal.event(now, "decision", decision)
-            self.last_decision = decision
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
-            targets = validate_decision(decision, now, self.universe, self.limits)
+            validate_decision(decision, now, self.universe, self.limits)
+            self.execution.accept(decision, now, self.universe, self.limits)
             self.journal.event(now, "decision_validated", decision)
+            self.last_decision = decision
             self.next_review = instant(decision["next_review_at"])
-            account = self._snapshot()
-            prices = {symbol: self._price(symbol) for symbol in set(targets) | set(account.positions)}
-            now = self.get_datetime()
-            if now >= instant(decision["expires_at"]) or (now - instant(decision["as_of"])).total_seconds() > 300:
-                raise RiskError("Decision expired during market-data refresh")
-            paused = self.journal.mark_equity(now, account.equity, self.limits)
-            candidates = plan(targets, account, prices, self.universe, self.limits, now, paused, self.mode not in {"paper", "local"})
-            if candidates:
-                self._execute(candidates[0], now)
+            self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         except Exception as exc:
+            from .execution import ApprovalPending
+            if isinstance(exc, ApprovalPending):
+                # Request creation already persisted a single actionable alert.
+                self.log_message("Major transaction waiting for local operator approval.", color="yellow")
+                return
             # Never retry an uncertain submit. Reservation remains durable.
             # Third-party exceptions may contain authenticated URLs or headers.
             self.notify("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         finally:
+            self.journal.event(self.get_datetime(), "iteration_finished", {})
             self.journal.export()
             if self.mode == "local":
                 from .report import report
                 report(self.run_dir, self.config.get("model_prices_per_million"))
 
-    def _execute(self, intent, now):
+    def _cancel_expired_allocation_orders(self, now):
+        latest = self.execution.latest(now)
+        if not latest or instant(now) < instant(latest["until_at"]):
+            return
+        for pending in self.journal.pending():
+            order = self.session_orders.get(pending["id"])
+            if self.mode in {"paper", "local"} and pending["broker_id"]:
+                order = self.broker._pull_order(pending["broker_id"], self.name)
+            if order and not self._terminal(order):
+                self.cancel_order(order)
+
+    def _continue_allocation(self, active):
+        if not active:
+            return
+        account = self._snapshot()
+        prices = {symbol: self._price(symbol) for symbol in set(active["weights"]) | set(account.positions)}
+        now = self.get_datetime()
+        paused = self.journal.mark_equity(now, account.equity, self.limits)
+        candidates = plan(active["weights"], account, prices, self.universe, self.limits, now, paused,
+                          self.mode not in {"paper", "local"})
+        if candidates:
+            self._execute(candidates[0], now, account, prices)
+        elif not paused:
+            self.execution.complete(active["id"], now)
+
+    def _execute(self, intent, now, account=None, prices=None):
         if getattr(self, "observe_only", False):
             raise RiskError("Observation-only mode cannot submit orders")
         if self.halt_path.exists():
@@ -467,10 +545,33 @@ class AutonomousFund(Strategy):
             raise RiskError("Orders require an open regular market session")
         if self.mode == "paper":
             assert_paper(self.broker)
-        key = self.journal.reserve(intent, now, self.limits)
+        if account is None or prices is None:
+            raise RiskError("Execution requires independent current account and price checks")
+        active = self.execution.active(now, self.universe, self.limits)
+        if not active:
+            raise RiskError("No valid accepted allocation")
+        paused = self.journal.mark_equity(now, account.equity, self.limits)
+        candidates = plan(active["weights"], account, prices, self.universe, self.limits, now, paused,
+                          self.mode not in {"paper", "local"})
+        if not candidates or intent != candidates[0]:
+            raise RiskError("Order differs from the independently recomputed allocation")
+        with self.journal.connection() as db:
+            unresolved = db.execute("SELECT 1 FROM intents WHERE status!='terminal'").fetchone()
+            submitted = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
+        if unresolved or submitted >= self.limits.daily_orders:
+            # Do not ask the operator to approve an order a hard rule forbids.
+            # The atomic reservation independently rechecks this after approval.
+            raise RiskError("Unresolved intent or daily submission limit reached")
+        # A dust target can still mean all cash after whole-share rounding.
+        liquidates_all = any(number(q) > 0 for q in account.positions.values()) and not any(
+            desired_shares(account.equity, weight, prices[symbol].ask, self.limits)
+            for symbol, weight in active["weights"].items())
+        approval = self.execution.prepare(active, intent, account, now, liquidates_all)
+        key = self.journal.reserve(intent, now, self.limits, guard=self.execution.guard(
+            active, intent, account, now, approval, self.universe, self.limits, liquidates_all))
         order = self.create_order(Asset(intent.symbol, asset_type="stock"), intent.quantity, intent.side,
                                   order_type="limit", limit_price=float(intent.limit), time_in_force="day",
-                                  custom_params={"local_intent": key, "decision_expires_at": self.last_decision["expires_at"]}
+                                  custom_params={"local_intent": key, "decision_expires_at": active["until_at"]}
                                   if self.mode == "local" else None)
         self.session_orders[key] = order
         if self.halt_path.exists():
@@ -484,7 +585,8 @@ class AutonomousFund(Strategy):
         self.journal.update(key, broker_id, False, now)
         if not broker_id:
             raise RiskError("Broker acknowledgement missing; intent is locked for manual reconciliation")
-        self.journal.event(now, "order_submitted", {"intent_id": key, "broker_id": str(broker_id), **asdict(intent)})
+        self.journal.event(now, "order_submitted", {"intent_id": key, "broker_id": str(broker_id),
+                           "decision_id": active["id"], "approval_id": approval["id"] if approval else None, **asdict(intent)})
 
     def submit_order(self, *args, **kwargs):
         raise RiskError("Direct order submission is disabled; use validated portfolio targets")

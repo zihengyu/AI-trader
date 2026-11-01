@@ -179,14 +179,22 @@ def test_timeout_then_restart_never_replays_submission(tmp_path, monkeypatch):
     from lumibot.entities import Order
     from lumibot.strategies import Strategy
     strategy = harness(tmp_path)
-    strategy.create_order = lambda *args, **kw: Order("test", "ALFA", 1, "buy", limit_price=100)
+    from scripts.autonomous_fund.execution import ExecutionState
+    strategy.universe = UNIVERSE
+    strategy.execution = ExecutionState(strategy.journal)
+    strategy.execution.accept(decision([("ALFA", .02)]), NOW, UNIVERSE, LIMITS)
+    # Exercise the actual validated target path; direct unchecked intents are
+    # now refused even when small enough to need no human approval.
+    prices = {"ALFA": quote()}
+    intent = plan({"ALFA": number(".02")}, account(), prices, UNIVERSE, LIMITS, NOW)[0]
+    strategy.create_order = lambda *args, **kw: Order("test", "ALFA", 1, "buy", limit_price=float(intent.limit))
     calls = []
     def timeout(*args, **kwargs):
         calls.append("attempted")
         raise TimeoutError("acknowledgement lost")
     monkeypatch.setattr(Strategy, "submit_order", timeout)
     with pytest.raises(TimeoutError):
-        strategy._execute(Intent("ALFA", "buy", 1, number(100)), NOW)
+        strategy._execute(intent, NOW, account(), prices)
     assert len(strategy.journal.pending()) == 1
     restored = harness(tmp_path)
     with pytest.raises(RiskError, match="identity"):
@@ -214,6 +222,12 @@ def test_stop_arriving_during_preparation_prevents_broker_call(tmp_path, monkeyp
     from lumibot.entities import Order
     from lumibot.strategies import Strategy
     strategy = harness(tmp_path)
+    from scripts.autonomous_fund.execution import ExecutionState
+    strategy.universe = UNIVERSE
+    strategy.execution = ExecutionState(strategy.journal)
+    strategy.execution.accept(decision([("ALFA", .02)]), NOW, UNIVERSE, LIMITS)
+    prices = {"ALFA": quote()}
+    intent = plan({"ALFA": number(".02")}, account(), prices, UNIVERSE, LIMITS, NOW)[0]
     def prepare(*args, **kwargs):
         strategy.halt_path.touch()
         return Order("test", "ALFA", 1, "buy", limit_price=100)
@@ -221,7 +235,7 @@ def test_stop_arriving_during_preparation_prevents_broker_call(tmp_path, monkeyp
     calls = []
     monkeypatch.setattr(Strategy, "submit_order", lambda *args, **kwargs: calls.append("sent"))
     with pytest.raises(RiskError, match="before submission"):
-        strategy._execute(Intent("ALFA", "buy", 1, number(100)), NOW)
+        strategy._execute(intent, NOW, account(), prices)
     assert not calls
     assert not strategy.journal.pending()
 

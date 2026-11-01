@@ -4,6 +4,9 @@ import json
 import math
 import sqlite3
 from pathlib import Path
+from datetime import datetime, timezone
+
+from .risk import instant
 
 
 def report(root, prices=None, write_files=True):
@@ -11,6 +14,22 @@ def report(root, prices=None, write_files=True):
     with sqlite3.connect(root / "state.sqlite3") as db:
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
             "SELECT at,kind,body FROM events ORDER BY sequence")]
+        tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        approval_rows = [dict(zip(("id", "digest", "state", "body"), r)) for r in db.execute(
+            "SELECT id,digest,state,body FROM fund_approvals ORDER BY rowid")] if "fund_approvals" in tables else []
+        target = db.execute("SELECT id,state,until_at,body FROM fund_decisions ORDER BY rowid DESC LIMIT 1").fetchone() if "fund_decisions" in tables else None
+    now = datetime.now(timezone.utc)
+    for row in approval_rows:
+        row["body"] = json.loads(row["body"])
+        row["effective_state"] = "expired" if row["state"] in {"pending", "approved"} and instant(row["body"]["expires_at"]) <= now else row["state"]
+    from .evaluation import forward_outcomes
+    outcomes = forward_outcomes(events)
+    monitor = None
+    if (root / "monitor.json").is_file():
+        try:
+            monitor = json.loads((root / "monitor.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            monitor = {"status": "unavailable"}
     accounts, benchmarks, fills, usage, notifications, reconciled = [], {}, [], [], [], {}
     decisions = 0
     incomplete_fills = False
@@ -114,6 +133,12 @@ def report(root, prices=None, write_files=True):
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
         "models": startup.get("models"),
+        "execution_revision": startup.get("execution_revision"),
+        "active_allocation": {"id": target[0], "state": target[1], "until_at": target[2], "decision": json.loads(target[3])} if target else None,
+        "approval_requests": approval_rows,
+        "pending_approval_count": sum(r["effective_state"] == "pending" for r in approval_rows),
+        "monitor": monitor,
+        "strategy_followup": outcomes,
         "observe_only": startup.get("observe_only", False),
         "validated_decisions": decisions,
         "premarket_research_runs": len(premarket),
@@ -143,6 +168,8 @@ def report(root, prices=None, write_files=True):
         (root / "premarket_research.json").write_text(json.dumps(premarket[-1], indent=2, ensure_ascii=False), encoding="utf-8")
     from .review import export_reviews
     export_reviews(root, reviews)
+    (root / "approvals.json").write_text(json.dumps(approval_rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    (root / "strategy_evaluations.json").write_text(json.dumps(outcomes, indent=2, ensure_ascii=False), encoding="utf-8")
     for name, rows, fields in (
         ("equity.csv", curve, ["at", "equity", "cash", "positions", "receivables", "daily_return"]),
         ("fills.csv", fills, ["at", "broker_id", "symbol", "side", "quantity", "price", "trade_cost", "evidence_kind", "execution_id", "bar_start"]),

@@ -230,7 +230,11 @@ AI 的完整目标组合中，遗漏的已有持仓代表卖出，空目标列�
 日限额按纽约交易日计算，买卖、失败和取消的提交均占用次数，采用比“新增买单”更保守的统计。
 
 订单数量根据所选账户的净值、现金、实际持仓和限价计算，保留费用缓冲。
-先执行减仓，每次最多提交一笔，再等待状态确认、重新读取资金和持仓后进行下一次决策。
+先执行减仓，每次最多提交一笔，再等待状态确认、重新读取资金和持仓，继续执行仍有效的目标。
+目标在新鲜模型回答通过校验时持久化，后续每次迭代可继续调仓，不必等待下一次模型复核。
+新回答仍须在五分钟内接受；已接受目标只保留到 `next_review_at` 与 `expires_at` 较早者，
+每一笔继续执行都重验账户、报价、流动性、回撤、订单次数和审批。重启恢复目标与复核时间，不重置账户。
+目标到期时尝试撤销本应用的未完成订单，并等待券商确认后再接受替代目标。
 未成交卖单不能为买单提供资金；账户中任何未完成或未知订单都会阻止新的订单。
 达到回撤阈值后允许减仓，不自动强平，也不保证市场跳空后的实际损失止于 8%。
 仓位上限约束下单准入；成交后的价格上涨或跳空仍可能使市值比例超过上限。
@@ -258,6 +262,33 @@ Alpaca 订单列表达到原生适配器的 100 条返回上限时会拒绝继�
 恢复程序校验相同凭证／配置、证券、方向、完整数量、限价及创建时间窗口，只绑定已有订单，不发单。
 若确认从未发出订单，保留证据并人工维护该预留；首版不提供一键“假装失败后重试”。
 
+## 重大交易人工审批
+
+以下任一条件触发独立 Python 审批门槛，普通交易自动执行：
+
+- 单笔限价乘数量达到当前净值的 8%。
+- 本次加上当日已预留／提交买卖金额达到当前净值的 20%。取消或不确定提交也计入，防止拆单绕过。
+- 完整目标按整股取整后将清空已有组合；不能用极小非零目标绕过清仓审批。
+
+这些是额外审批门槛，不能批准超过 10%／70% 仓位、5 单、回撤锁或禁止资产等硬限制的交易。
+默认审批有效期不超过 30 分钟、目标有效期或本交易日收盘；卖买方向、证券、最大股数、
+最大限价和金额均在请求中列出。价格容忍度默认 0.5%，只允许此范围内重新取行情后的新订单。
+超出数量／价格范围、出现新的审批原因、替换目标、改变策略权限或过期，都不能复用旧批准。
+审批消费与下单预留在同一 SQLite 事务内完成，不能一份批准发送两笔订单。
+
+查看后再复制准确的请求 ID 和 digest；命令只记录批准，交易进程在下一迭代重新风控后才提交：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode approvals -RunDir artifacts/fund-local
+Get-Content artifacts/fund-local/approvals.json -Encoding UTF8
+.\scripts\run_autonomous_fund.ps1 -Mode approve -RunDir artifacts/fund-local -ApprovalId <request-id> -ApprovalDigest <reviewed-digest>
+.\scripts\run_autonomous_fund.ps1 -Mode reject -RunDir artifacts/fund-local -ApprovalId <request-id> -ApprovalDigest <reviewed-digest>
+```
+
+不批准则不下单。拒绝／撤回未使用的批准会停止该目标，等下一次正常复核；已经提交的订单须通过撤单流程处理。
+STOP 激活时不能批准开启交易，但可以拒绝未使用的批准。历史实验不假设人工同意，重大交易仍会挂起。
+审批命令可以在运行进程持锁期间使用，不需要模型或券商 Key。Telegram 消息不会批准交易。
+
 ## 停止、恢复与异常通知
 
 ```powershell
@@ -278,8 +309,33 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 回撤暂停需要操作员停掉进程后显式执行 `reset-drawdown`；新高水位从下一次净值开始，操作会留痕。
 
 `notify(kind, details)` 是通知扩展接口，默认输出控制台及持久化本地通知 outbox。
-`notifications.json` 可交给你的通知程序处理。当前没有配置邮件、短信或聊天推送，也没有发送外部消息。
-本地告警不能等同于已送达手机；无人值守前应单独接入和验证通知送达。
+`notifications.json` 与 SQLite 通知事件是权威 outbox。可用独立进程接入 Telegram；
+先在自己的 Telegram 客户端通过 BotFather 创建机器人并向其发送 `/start`，准备明确的 Chat ID。
+密钥只放本地；第二个 PowerShell 窗口安全输入：
+
+```powershell
+$fundTelegramToken = Read-Host 'Telegram Bot Token' -AsSecureString
+$env:FUND_TELEGRAM_BOT_TOKEN = [System.Net.NetworkCredential]::new('', $fundTelegramToken).Password
+Remove-Variable fundTelegramToken
+$env:FUND_TELEGRAM_CHAT_ID = Read-Host 'Telegram Chat ID'
+.\scripts\run_autonomous_fund.ps1 -Mode notify-test -RunDir artifacts/fund-local
+.\scripts\run_autonomous_fund.ps1 -Mode monitor -RunDir artifacts/fund-local
+```
+
+Telegram 持久化发送状态、重试和限流等待；相同告警在 30 分钟内抑制重复，未变化时保持安静。
+`notify-test` 只向所选账户的通知收件人发送一条测试消息，不修改 STOP、不执行订单；
+显示 `sent` 表示 Telegram API 已确认，仍须在自己的客户端确认收到。健康恢复后的新一轮故障会再次通知，
+不会被重复告警抑制；限流等待对新旧消息全局生效。
+发送确认丢失仍可能造成重复通知，事件序号用于辨认；不能保证恰好一次送达。
+没有 Telegram 配置时可用 `-Mode monitor -ConsoleOnly`，只有本地保护，不代表手机已收到。
+监控第一次启动忽略超过一小时的旧告警；请同时查看现有审批、回撤和订单状态。
+
+独立监控默认检测 180 秒心跳失效、开盘后迭代停滞、900 秒模型调用未结束，以及旧执行器版本。
+发现异常就写 STOP 并通知，旧状态未恢复时持续重申 STOP，不能只靠人工删除文件继续交易。
+恢复后也不自动解除 STOP；核验订单后由操作员显式 `resume`。
+本地模式使用撮合心跳；Alpaca Paper 使用独立运行心跳，原生迭代／模型开始结束事件提供额外进度证据。
+监控必须在另一进程运行；本机断电、系统整体挂起、断网或 Telegram 故障仍会影响送达。
+写 STOP 不等于券商确认撤单，紧急时仍须核对券商订单。未运行监控时，主程序保留本地告警，但没有独立保护。
 
 ## 自动盘后复盘与策略反馈
 
@@ -331,6 +387,29 @@ Get-Content -LiteralPath artifacts/fund-local/strategy_memory.json -Encoding UTF
 每个成功复盘通常增加一轮 Flash 和一轮 Pro Agent 运行；每轮可能含多个工具调用或提供方重试，使用量按实际模型记录。
 盘后调用失败且没有返回 usage 时也记录一次未知用量，费用估算保持 null，不把可能已经计费的失败视为零成本。
 
+## 复盘调整的后续评估与对照回放
+
+`strategy_evaluations.json` 自动跟踪每版备忘之后的实际账户观测，分别显示 5／20 个观测交易日的结果。
+没有足够交易日就显示 `insufficient_observations`；不填充休市或缺失数据，不把日内最后观测包装成收盘净值。
+该结果与后续研究、决策和复盘共享。组合同时受到后续多次决策影响，不能把这份跟踪当成某版备忘的因果效果。
+
+可显式进行一次原生对照实验：两次回放使用相同冻结 CSV 行情、资金、费用、投资范围、风控和模型设置；
+基线不带备忘，候选仅带选定的冻结备忘，期间不激活新的滚动备忘。
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode qualify -RunDir artifacts/fund-qualification -DataDir <frozen-history-directory> -MemoryFile <earlier-postmarket-review.json> -Start <later-start-date> -End <end-date>
+```
+
+CSV 须覆盖完整投资范围及 SPY／QQQ，遵循下面的历史数据格式。备忘的完成时间和所评交易日收盘必须不晚于起点，
+输入 CSV 在两次回放前后核对 SHA-256，发生变化就拒绝输出可比结论。每天的历史数据仍由原生引擎按模拟时钟提供。
+`-Scripted` 可无付费模型调用检查流程，不能验证投资判断；不带此选项会产生真实模型调用费用。
+审批规则同样生效，实验不会假设人工批准重大交易，也不会向运行中的模拟账户发单。
+
+输出 `qualification.json` 和 `baseline/`、`candidate/` 的独立成交／净值／用量记录。
+少于 20 个日采样标为 `insufficient_sample`；样本足够时仅报告该窗口收益／回撤是否改善。
+单次对照含模型随机性、样本选择和训练知识污染风险，不证明未来盈利；不会自动推广候选或改变运行权限。
+更严格的多窗口、独立保留样本和统计检验仍需独立研究，不能把这个功能当成已认证的策略优化器。
+
 ## 历史回测与记录
 
 Yahoo 真实历史行情、脚本决策替身，无模型费用：
@@ -370,6 +449,9 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 | `postmarket_review.md`、`.json` | 最近完成的中文盘后复盘、选股／择时假设及验证条件 |
 | `reviews/YYYY-MM-DD.md`、`.json` | 按交易日归档的不可变复盘导出，可从 SQLite 重建 |
 | `strategy_memory.json` | 已激活的策略备忘、版本、可用时间和 Mock 标记 |
+| `approvals.json` | 审批 ID、digest、交易范围、有效期与状态；SQLite 是权威状态 |
+| `monitor.json`、`runner_health.json` | 独立监控状态、Telegram 确认统计与 Paper 运行心跳 |
+| `strategy_evaluations.json` | 每版备忘之后实际组合的观测跟踪，明确样本不足与归因限制 |
 | `fills.csv` | 原生回调成交或标记明确的累计成交核对；费用未知保留为空 |
 | `native_trade_events.csv` | 历史模式原生引擎交易事件 |
 | `equity.csv` | 每日净值、现金、持仓、应收款、收益率，可用于绘制资金曲线 |
@@ -398,12 +480,17 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 原生调度器只读启动检查。当时为周末休市，源行情是前一交易日收盘；没有伪造成新报价。
 本地撮合的开盘、部分成交、费用、崩溃恢复、源数据故障、过期、拆股／分红及风控测试使用可控时钟与行情替身。
 真实开盘时段持续运行、真实模型投资决策到本地成交、网络抖动下长期表现仍需后续验证。
-相关回归 337 项通过，覆盖分角色模型到正常时段决策下单、原生指标历史请求、休市退出、进程锁冲突、提供方配置、分模型费用及真实 SDK 的工具请求路径；另有原生网络工具单测 27 项通过。
+相关回归 384 项通过，覆盖分角色模型到正常时段决策下单、原生指标历史请求、休市退出、进程锁冲突、提供方配置、分模型费用及真实 SDK 的工具请求路径；另有原生网络工具单测 27 项通过。
+新增运行闭环测试验证原生账户从重大交易挂起、人工批准到重新风控成交，以及十分钟后重启继续第二只证券的目标，均不重复调用模型。
+审批、Telegram HTTP、全局限流、重新故障通知、独立 STOP 保护与对照回放使用可控时间、行情或提供方替身；
+没有向 Telegram 真实收件人发送消息，也没有验证真实 Telegram 鉴权。部署进程尚未提供 Telegram 环境变量。
 其中 18 项新增盘后回归验证逐阶段恢复、跨日记忆、证据引用、未来隔离、休市／提前收盘、STOP、观察模式与可重建导出。
 原生本地生命周期测试已从实际虚拟成交进入盘后复盘，并确认下一交易日研究和决策收到备忘，新的目标仍经风控先卖出旧持仓。
 另外通过 PowerShell 启动器执行 2025-01-06 至 2025-01-14 的合成行情／脚本模型回放，生成四次复盘及四版备忘，
 所有结果明确标记 `mock=true` 和 `scripted/no-inference`；未调用付费模型，不能据此证明选股或择时效果。
 新增的完整真实模型盘后复盘及后续市场开盘反馈循环仍待实际运行验证。
+另通过 PowerShell `qualify -Scripted` 对同一份四证券合成 CSV 行情执行 25 个日采样的双运行检查，
+结果为 `no_demonstrated_improvement`、`auto_promoted=false`；这验证比较流程没有把相同脚本决策包装成策略改善。
 SDK 回归先在 LiteLLM 1.106.2 下复现导入异常，再在 1.105.1 下验证修复；
 SDK 模拟响应与原生 ADK 的 HTTP 替身测试均不产生模型推理费用，不证明真实提供方已鉴权或返回研究结果。
 Flash 和 V4 Pro 均通过原生 ADK＋LiteLLM 的 HTTP 替身工具往返测试，保留思考内容的多轮传递；
@@ -421,7 +508,8 @@ PowerShell 分角色启动参数也已通过原生回测引擎＋脚本模型验
 该轮工具日志披露了网页 Fake-IP 地址校验、SEC TLS 请求、未安装可选浏览器和 SQL 请求失败；
 应结合这些缺项审阅研究，不能把保存成功视为基本面／新闻覆盖完整。
 
-开发测试进程未读取或注入用户的真实模型 Key，也未配置 Alpaca Key。
+开发测试进程未读取或注入用户的真实模型 Key，也未配置 Alpaca Key。原有账户进程未被开发测试重启或迁移，
+新功能需要操作员在原目录重启，并单独启动监控后生效。文档 HTML 构建完成；全站仍报告未修改数据源 docstring 等处的诊断，不能声称全站无警告。
 Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未验证，需配置相应凭证后单独验证。
 没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
@@ -437,6 +525,9 @@ Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未�
 | `scripts/autonomous_fund/strategy.py` | 接入本地账户、原始行情时间和本地成交核对 |
 | `tests/test_autonomous_fund_premarket.py` | 休市启动研究、持久化去重、原生盘前钩子到开盘执行的回归测试 |
 | `scripts/autonomous_fund/review.py`、`tests/test_autonomous_fund_review.py` | 两角色盘后复盘、版本化反馈、逐阶段恢复、证据校验与时间隔离回归 |
+| `scripts/autonomous_fund/execution.py`、`tests/test_autonomous_fund_execution.py` | 持久化调仓、重大操作审批、范围／摘要绑定、原子消费与重启恢复 |
+| `scripts/autonomous_fund/monitor.py`、`tests/test_autonomous_fund_monitor.py` | 独立 STOP 保护、Telegram 脱敏、持久化投递、去重与限流重试 |
+| `scripts/autonomous_fund/evaluation.py`、`tests/test_autonomous_fund_evaluation.py` | 时间受限的后验观测、冻结备忘与相同行情的原生对照回放 |
 | `tests/test_autonomous_fund_shutdown.py` | 原生关闭钩子唤醒休市等待、SIGINT 退出和真实进程锁冲突回归 |
 | `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
 | `tests/test_autonomous_fund_model_roles.py` | 分角色模型覆盖、全部凭证检查、旧账本及风险锁保留、按模型记录 usage 和费率 |
@@ -463,6 +554,7 @@ AI 不应拥有配置仓库、券商管理、API 权限或实盘启动入口的�
 
 官方参考：[Alpaca Paper](https://docs.alpaca.markets/docs/paper-trading)、
 [DeepSeek API](https://api-docs.deepseek.com/)、
+[Telegram Bot API](https://core.telegram.org/bots/api#sendmessage)、
 [yfinance](https://ranaroussi.github.io/yfinance/reference/index.html)、
 [Alpaca 行情权限](https://docs.alpaca.markets/us/v1.1/docs/market-data-faq)、
 [LumiBot 混合 Agent 流程](https://lumibot.lumiwealth.com/agents_flows.html)、

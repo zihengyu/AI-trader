@@ -18,6 +18,21 @@ PRO = "deepseek/deepseek-v4-pro"
 NOW = datetime(2026, 11, 2, 15, tzinfo=timezone.utc)
 
 
+def test_interrupted_provider_attempt_records_unknown_usage_and_propagates(tmp_path):
+    from scripts.autonomous_fund.strategy import AutonomousFund
+    strategy = object.__new__(AutonomousFund)
+    strategy.journal = Journal(tmp_path, "synthetic-interrupted-call")
+    strategy.get_datetime = lambda: NOW
+    strategy.agent_models = {"manager": PRO}
+    strategy.scripted = False
+    strategy.agents = {"manager": SimpleNamespace(run=lambda **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()))}
+    with pytest.raises(KeyboardInterrupt):
+        strategy._agent_call("manager", context={"as_of": NOW.isoformat()})
+    result = report(tmp_path, write_files=False)
+    assert result["model_usage"]["unknown_calls"] == 1
+    assert result["model_cost_estimate_usd"] is None
+
+
 def config():
     return {"model": FLASH, "reasoning_effort": None, "limits": {}, "universe": {"ALFA": "stock"}}
 

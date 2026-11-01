@@ -122,6 +122,11 @@ def validate_decision(decision, now, universe, limits):
     return targets
 
 
+def desired_shares(equity, weight, ask, limits):
+    buy_limit = (number(ask) * (1 + limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
+    return int((number(equity) * number(weight) / buy_limit).to_integral_value(rounding=ROUND_FLOOR))
+
+
 def plan(targets, account, prices, universe, limits, now, paused=False, historical=False):
     """Sell first; return candidates. The caller rechecks before EACH submission.
 
@@ -145,8 +150,7 @@ def plan(targets, account, prices, universe, limits, now, paused=False, historic
         prices[symbol].validate(now, limits, historical)
         mark = number(prices[symbol].ask)
         values[symbol] = held * mark
-        buy_limit = (mark * (1 + limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
-        desired[symbol] = int((equity * targets.get(symbol, 0) / buy_limit).to_integral_value(rounding=ROUND_FLOOR))
+        desired[symbol] = desired_shares(equity, targets.get(symbol, 0), mark, limits)
     # Account reports and independent marks must describe the same dedicated account.
     if number(account.receivables) < 0:
         raise RiskError("Invalid receivable balance")

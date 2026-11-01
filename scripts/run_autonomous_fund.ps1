@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown')]
+    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
@@ -12,7 +12,11 @@ param(
     [switch]$Scripted,
     [switch]$Once,
     [switch]$ObserveOnly,
-    [string]$EnvFile = ''
+    [string]$EnvFile = '',
+    [string]$ApprovalId = '',
+    [string]$ApprovalDigest = '',
+    [switch]$ConsoleOnly,
+    [string]$MemoryFile = ''
 )
 $ErrorActionPreference = 'Stop'
 Push-Location (Split-Path $PSScriptRoot -Parent)
@@ -29,7 +33,11 @@ try {
     if ($Once) { $runArgs += '--once' }
     if ($ObserveOnly) { $runArgs += '--observe-only' }
     if ($EnvFile) { $runArgs += @('--env-file', $EnvFile) }
-    if ($Mode -in @('mock', 'backtest')) {
+    if ($ApprovalId) { $runArgs += @('--approval-id', $ApprovalId) }
+    if ($ApprovalDigest) { $runArgs += @('--approval-digest', $ApprovalDigest) }
+    if ($ConsoleOnly) { $runArgs += '--console-only' }
+    if ($MemoryFile) { $runArgs += @('--memory-file', $MemoryFile) }
+    if ($Mode -in @('mock', 'backtest', 'qualify')) {
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
         $stdoutPath = Join-Path $RunDir 'stdout.log'
         $stderrPath = Join-Path $RunDir 'stderr.log'
