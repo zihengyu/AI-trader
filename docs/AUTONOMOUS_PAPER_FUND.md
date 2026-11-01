@@ -28,7 +28,7 @@ AI 的权重是上限：确定性量化风控只会把它们缩小（波动率�
 ## 安装和启动
 
 在项目根目录执行。示例中不包含真实密钥；请通过当前进程环境或自己的秘密管理器注入凭证。
-启动器主动禁用 `.env` 自动发现，避免意外加载已有实盘配置。
+启动器不使用 LumiBot 的 `.env` 自动发现，只显式选用本仓库根目录的 `.env`（见[`.env`：运营者配置入口](#env运营者配置入口)）。
 
 ```powershell
 python -m venv .venv
@@ -48,6 +48,40 @@ python -m venv .venv
 输出会明确标识 `mode=mock`、`scripted_model=true`，不证明投资收益。
 每次历史实验使用新的目录，防止混合账本。PowerShell 启动器对回测设置 1,200 秒上限。
 Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run --help`。
+
+## `.env`：运营者配置入口
+
+模型 Key、你给 AI 的约束和外部参数都可以写在仓库根目录的 `.env`（已被 Git 忽略；从
+`scripts/autonomous_fund/.env.example` 复制）。优先级为 **进程环境变量 > `.env` > `config.json`**：
+`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的值与默认值一致，留空表示不覆盖。
+每个覆盖都按与 `config.json` 相同的规则校验，记入启动审计（`startup.environment_overrides`），并且会使旧目标失效、由 AI 按新规则重新决策。
+`.env` 中写错的 `FUND_*` 名称会直接拒绝启动并提示正确名称，避免约束被静默忽略。
+
+| 类别 | 变量 | 作用 |
+|---|---|---|
+| 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
+| 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
+| 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
+| 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
+| 约束 | `FUND_MAX_POSITION`、`FUND_MAX_EXPOSURE`、`FUND_MAX_DRAWDOWN`、`FUND_DAILY_ORDERS` | 单只上限、总敞口、回撤硬锁、每日提交次数 |
+| 约束 | `FUND_DAILY_LOSS_LIMIT`、`FUND_TARGET_VOL`、`FUND_MAX_ES` | 单日亏损闸门、波动率目标、尾部损失上限 |
+| 约束 | `FUND_EXCLUDE_SYMBOLS`、`FUND_INSTRUCTIONS` | 禁止交易的代码（逗号分隔）、给 AI 的文字约束（`|` 分隔） |
+| 审批 | `FUND_AUTO_DAILY_EXPOSURE_INCREASE`、`FUND_AUTO_DAILY_BUY_TURNOVER`、`FUND_STRESS_REQUIRES_APPROVAL`、`FUND_APPROVAL_VALID_MINUTES` | 自动执行额度（设 0 则所有买入都审批）、压力下是否审批、有效期 |
+| 通知 | `FUND_TELEGRAM_BOT_TOKEN`、`FUND_TELEGRAM_CHAT_ID`、`FUND_TELEGRAM_APPROVER_IDS`、`FUND_TELEGRAM_APPROVALS` | Telegram 通知与回复审批 |
+| 外部 | `FUND_ITERATION_SECONDS`、`FUND_LIVE_STREAM`、`FUND_RESEARCH_RESOLVER` | 盯盘间隔、实时推送报价、研究网页解析（Fake-IP 用 `doh`） |
+| 外部 | `FUND_NEWS_ENABLED`、`FUND_NEWS_POLL_SECONDS`、`FUND_NEWS_QUERIES`、`FUND_NEWS_RSS_FEEDS`、`FUND_SEC_USER_AGENT`、`FRED_API_KEY` | 实时资讯监控与数据源 |
+| 外部 | `FUND_SHADOW_AB` | 影子 A/B 验证 AI 的复盘学习 |
+| 券商 | `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`ALPACA_IS_PAPER` | 仅 paper 模式 |
+
+投资范围的新增、行业分组和其余细节参数仍在 `config.json` 中修改（新增证券需要审阅分类）。
+查看最终生效的配置及每项来源（密钥只显示已设置／缺失）：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode show-config
+```
+
+Windows 和 Linux 启动器都会显式选用仓库根目录的 `.env`（解析而非执行，进程环境优先），也可用 `-EnvFile`／`--env-file` 指定其他文件。
+LumiBot 自身的 `.env` 自动发现仍保持关闭。
 
 ## 无券商账户：真实行情本地模拟盘
 
@@ -73,8 +107,8 @@ Remove-Variable fundKey
 ```
 
 密钥最终仍是进程环境中的字符串；本例没有把它保存到文件。关闭终端后需重新注入。
-若使用自己管理的未跟踪秘密文件，显式指定 `-EnvFile <your-secret-file>`；
-现有进程环境优先，启动器不搜索其他 `.env` 文件。不要把真实密钥发到聊天或提交 Git。
+推荐把 Key 写进仓库根目录的 `.env`（从 `scripts/autonomous_fund/.env.example` 复制），启动器会自动选用它；
+也可用 `-EnvFile <your-secret-file>` 指定其他文件。现有进程环境优先，启动器不搜索其他目录的 `.env`。不要把真实密钥发到聊天或提交 Git。
 
 没有模型 Key 时，只读观察模式可先验证启动、资金记录和交易日历，完全不调用模型或提交订单：
 

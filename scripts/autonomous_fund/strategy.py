@@ -153,8 +153,14 @@ def risk_settings(config, universe, limits):
             ModelBudget.from_config(config.get("model_budget")))
 
 
-def configuration(path):
-    result = json.loads(Path(path).read_text(encoding="utf-8"))
+def configuration(path, environ=None):
+    """config.json defaults with operator overrides from the environment / .env, validated together."""
+    import os
+    from .settings import apply_environment
+    result, overrides = apply_environment(json.loads(Path(path).read_text(encoding="utf-8")),
+                                          os.environ if environ is None else environ)
+    if overrides:
+        result["_environment_overrides"] = overrides
     limits = Limits(**result["limits"])
     model_selection(result)
     if not result["universe"] or any(v not in {"stock", "unlevered_etf"} for v in result["universe"].values()):
@@ -197,7 +203,7 @@ def account_digest(mode, account, config=None):
 
 def legacy_account_digest(mode, account, config):
     """Revision-2 binding: identity plus every non-policy configuration field."""
-    bound = {key: value for key, value in config.items() if key not in POLICY_SECTIONS}
+    bound = {key: value for key, value in config.items() if key not in POLICY_SECTIONS and not key.startswith("_")}
     return hashlib.sha256(encode({"mode": mode, "account": account, "config": bound}).encode()).hexdigest()
 
 
@@ -384,7 +390,8 @@ class AutonomousFund(Strategy):
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
                            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
-                           "mandate": asdict(self.mandate)})
+                           "mandate": asdict(self.mandate),
+                           "environment_overrides": config.get("_environment_overrides", [])})
         if mode == "local":
             # Native scheduling skips closed-market iterations. Record the real
             # virtual book immediately so weekend startup still has a report.

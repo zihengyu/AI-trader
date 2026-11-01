@@ -270,7 +270,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -301,8 +301,13 @@ def main(argv=None):
         raise RiskError("--require-monitor is available only for local/paper execution")
     if args.env_file:
         from .environment import load_environment
+        from .settings import validate_env_file
+        validate_env_file(args.env_file)  # Before loading: a typo never half-applies.
         load_environment(args.env_file)
         args.model = args.model or os.environ.get("AI_MODEL")
+    # Role models from the environment rank with the role CLI arguments, above AI_MODEL.
+    args.research_model = args.research_model or os.environ.get("FUND_RESEARCH_MODEL") or None
+    args.decision_model = args.decision_model or os.environ.get("FUND_DECISION_MODEL") or None
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
@@ -351,6 +356,15 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "show-config":
+        from .settings import apply_environment, describe
+        _, audit = apply_environment(json.loads(args.config.read_text(encoding="utf-8")), os.environ)
+        rows = describe(config, os.environ, audit)
+        print(json.dumps({"config_file": str(args.config), "env_file": str(args.env_file) if args.env_file else None,
+                          "precedence": "process environment > .env > config.json",
+                          "models": selected_models(args, config), "settings": rows},
+                         indent=2, ensure_ascii=False, default=str))
         return
     if args.mode == "validate-risk":
         print(json.dumps(validate_risk(args, config), indent=2, ensure_ascii=False))

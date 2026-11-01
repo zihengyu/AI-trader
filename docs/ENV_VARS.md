@@ -27,6 +27,15 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 - `FUND_TELEGRAM_APPROVALS=off` keeps Telegram notification-only; the CLI `approve`/`reject` always works. Enable Telegram two-step verification: control of the Telegram account is control of approvals.
 - The monitor short-polls `getUpdates`; do not configure a webhook or share the bot with another consumer.
 
+### Autonomous paper fund operator settings (`FUND_*`)
+- Purpose: Let the operator keep model choice, user limits and external parameters in the explicitly selected `.env` (template: `scripts/autonomous_fund/.env.example`). Precedence: process environment > `.env` > `config.json`; blank values do not override.
+- Models: `FUND_RESEARCH_MODEL`, `FUND_DECISION_MODEL` (rank with the role CLI arguments, above `AI_MODEL`), `FUND_REASONING_EFFORT`, `FUND_MAX_AGENT_RUNS_PER_DAY`, `FUND_MIN_REVIEW_MINUTES`, `FUND_MODEL_PRICES_JSON`.
+- User limits: `FUND_CAPITAL_USD` (`account` = whole dedicated account), `FUND_ALLOW_EXTERNAL_HOLDINGS`, `FUND_LOCAL_ACCOUNT_USD`, `FUND_MAX_POSITION`, `FUND_MAX_EXPOSURE`, `FUND_MAX_DRAWDOWN`, `FUND_DAILY_ORDERS`, `FUND_DAILY_LOSS_LIMIT`, `FUND_TARGET_VOL`, `FUND_MAX_ES`, `FUND_EXCLUDE_SYMBOLS` (comma-separated; removes from universe and groups only), `FUND_INSTRUCTIONS` (`|`-separated).
+- Approval: `FUND_AUTO_DAILY_EXPOSURE_INCREASE`, `FUND_AUTO_DAILY_BUY_TURNOVER`, `FUND_STRESS_REQUIRES_APPROVAL`, `FUND_APPROVAL_VALID_MINUTES`.
+- External/runtime: `FUND_ITERATION_SECONDS`, `FUND_LIVE_STREAM`, `FUND_RESEARCH_RESOLVER`, `FUND_NEWS_ENABLED`, `FUND_NEWS_POLL_SECONDS`, `FUND_NEWS_QUERIES` (`|`-separated), `FUND_NEWS_RSS_FEEDS` (`name=https://...|...`), `FUND_SHADOW_AB`.
+- Every override is parsed strictly and validated by the same policy constructors as `config.json`; an unknown `FUND_*` name in the selected `.env` fails startup with a suggestion (unrelated process variables are ignored). Overrides are recorded (without secrets) in the startup audit event, change the risk-policy digest and therefore retire active targets. `show-config` prints effective values and sources with secrets shown only as set/missing.
+- Implemented in `scripts/autonomous_fund/settings.py`; the template/registry consistency is enforced by `tests/test_autonomous_fund_settings.py`.
+
 ### `FUND_SEC_USER_AGENT`
 - Purpose: Declared contact (name and email) sent to SEC EDGAR, as SEC fair-access rules require, so the news watch can fetch 8-K filings for held companies. Without it, SEC filings are skipped and other sources continue.
 - Keep it in the operator's environment or untracked `.env`; never commit a personal contact.

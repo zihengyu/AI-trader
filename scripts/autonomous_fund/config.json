@@ -56,7 +56,7 @@
     "allow_external_holdings": false,
     "local_account_usd": "10000",
     "instructions": [
-      "只用授权资金 capital_usd 交易，账户中其余现金和持仓不属于你，不得动用。",
+      "只用授权资金交易，账户中其余现金和持仓不属于你，不得动用。",
       "不使用杠杆、融资、卖空、期权、期货或杠杆/反向 ETF。"
     ]
   },

@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'acceptance', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
+    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'acceptance', 'show-config', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
@@ -35,6 +35,12 @@ try {
     if ($Scripted) { $runArgs += '--scripted' }
     if ($Once) { $runArgs += '--once' }
     if ($ObserveOnly) { $runArgs += '--observe-only' }
+    # Like the Linux launcher: explicitly select this checkout's .env when present.
+    # The file is parsed (never executed); process environment values take precedence.
+    if (-not $EnvFile) {
+        $checkoutEnv = Join-Path (Get-Location) '.env'
+        if (Test-Path -LiteralPath $checkoutEnv) { $EnvFile = $checkoutEnv }
+    }
     if ($EnvFile) { $runArgs += @('--env-file', $EnvFile) }
     if ($ApprovalId) { $runArgs += @('--approval-id', $ApprovalId) }
     if ($ApprovalDigest) { $runArgs += @('--approval-digest', $ApprovalDigest) }
