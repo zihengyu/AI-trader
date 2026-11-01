@@ -76,6 +76,40 @@ def test_local_data_excludes_forming_minute_and_today_daily_close(tmp_path):
     assert quote.timestamp == minute.index[-1] + timedelta(minutes=1)
 
 
+def test_native_agent_indicator_can_load_its_full_history_fallback(tmp_path, monkeypatch):
+    from lumibot.components.agents.builtins import _bind_get_indicator
+    from lumibot.strategies import Strategy
+
+    monkeypatch.setenv("IS_BACKTESTING", "false")
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("LUMIBOT_FRED_CACHE_DIR", str(tmp_path / "cache" / "fred"))
+    clock, source, _, broker = setup_book(tmp_path)
+    requested = []
+
+    def fetch(symbol, interval, period):
+        requested.append((interval, period))
+        return clock.fetch(symbol, interval, period)
+
+    source.fetch = fetch
+    strategy = Strategy(broker=broker, name="IndicatorHistory")
+    result = _bind_get_indicator(strategy, strategy.agents).function(
+        symbol="ALFA", indicator="ema", parameters_json='{"length":14}')
+    # Native recursive indicators ask for 10,000 observations to seed their
+    # calculation; a source returns the actual available history, never padding.
+    assert result["value"] == pytest.approx(clock.price)
+    assert ("1d", "max") in requested
+    frame = source.get_historical_prices(Asset("ALFA"), 10000, timestep="day").df
+    assert 14 < len(frame) < 10000
+    assert all(day < source.get_datetime().date() for day in frame.index.date)
+
+
+@pytest.mark.parametrize("length", [0, -1, True, 1.5, "10000"])
+def test_history_requires_a_positive_integer_length(tmp_path, length):
+    _, source, _, _ = setup_book(tmp_path)
+    with pytest.raises(RiskError, match="positive integer"):
+        source.get_historical_prices(Asset("ALFA"), length, timestep="day")
+
+
 def test_order_requires_a_new_complete_bar_and_realistic_adverse_fill(tmp_path):
     clock, source, journal, broker = setup_book(tmp_path)
     _, order = submit(broker, journal, clock.value)

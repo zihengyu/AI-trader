@@ -135,8 +135,11 @@ class YahooRealtimeData(DataSource):
 
     def get_historical_prices(self, asset, length, timestep="minute", timeshift=None, quote=None,
                               exchange=None, include_after_hours=False, **kwargs):
-        if not isinstance(length, int) or not 1 <= length <= 2000:
-            raise RiskError("History length must be between 1 and 2000")
+        # Native recursive indicators request 10,000 bars for warmup. Return
+        # however many completed source bars exist instead of rejecting that
+        # request or manufacturing enough rows to satisfy it.
+        if type(length) is not int or length < 1:
+            raise RiskError("History length must be a positive integer")
         if timestep not in {"day", "minute", "1d", "1m"}:
             raise RiskError("Local source supports completed daily and minute bars")
         daily = timestep in {"day", "1d"}
