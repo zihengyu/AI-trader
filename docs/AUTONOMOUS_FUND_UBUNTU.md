@@ -43,6 +43,9 @@ python3.12 -m venv .venv
 | `DEEPSEEK_API_KEY` | Flash 研究及 V4 Pro 决策／复盘，共用一个 Key |
 | `FUND_TELEGRAM_BOT_TOKEN` | 自己创建的 Telegram Bot token |
 | `FUND_TELEGRAM_CHAT_ID` | 已与 Bot 建立会话的接收者或群组；先在 Telegram 中启动 Bot |
+| `FUND_TELEGRAM_APPROVER_IDS` | 可选；群组中可回复审批的用户 ID（逗号分隔）。私聊默认由聊天本人审批 |
+| `FUND_TELEGRAM_APPROVALS` | 可选；设为 `off` 时 Telegram 只通知、不接受回复审批 |
+| `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
 | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | 仅选择 `paper` 时需要，使用专用模拟账户的 Paper Key |
 | `ALPACA_IS_PAPER=true` | 可选显式声明；设为 false 会拒绝启动，不会启用实盘 |
 
@@ -65,10 +68,13 @@ sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.run check \
 ```
 
 `check` 只验证公开行情、源时间及 Key 是否存在，不调用付费模型，也不证明提供方鉴权成功。
+它还会报告 `research_network`：若研究站点解析为 Fake-IP（198.18.0.0/15）或私有地址，网页研究会被安全检查拒绝，
+按提示让服务器不走 Fake-IP，或在 `config.json` 设置 `"research_network": {"resolver": "doh"}`。
 如将来选择 Alpaca Paper，先在本地 `.env` 填写专用 Paper Key，再用
 `deploy prepare --user "<service-user>" --mode paper --run-dir artifacts/fund-paper`
-生成另一套配置；不要用 `fund-local` 的账本连接券商账户。首次 Paper 账户还须满足应用要求的
-10,000 美元现金及空证券持仓，并完成原有 Paper 验收。
+生成另一套配置；不要用 `fund-local` 的账本连接券商账户。首次 Paper 启动时账户不能持有投资范围内的证券或未完成订单，
+现金不少于 `mandate.capital_usd`；超出部分自动记为 AI 不能动用的保留现金。之后账户出入金须先停止交易服务，再执行
+`bash scripts/run_autonomous_fund.sh adjust-reserve --run-dir artifacts/fund-paper --amount <金额>` 记入保留现金。
 如果父目录不允许服务用户遍历，需由管理员调整目录权限；不要用放开所有文件读写的方式解决。
 可选浏览器的安装和外部数据订阅仍按 LumiBot 原有说明配置；缺少这些工具会影响研究覆盖面。
 
@@ -94,7 +100,8 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh notify-test --run-d
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh resume --run-dir artifacts/fund-local
 ```
 
-之后普通模拟交易无需逐笔审批；系统按 AI 的下次复核时间重新研究和决策。
+之后普通模拟交易无需审批；系统按 AI 的下次复核时间（不早于 15 分钟）重新研究和决策，
+模型失败时按 5／15／60 分钟退避，并受每日 Agent 运行次数预算约束。
 所有服务启动／重启都保留或设置 STOP，必须核对账户、订单、心跳后显式 resume。
 因此服务器重启会恢复进程，交易恢复需要人工核对；不会把“进程已恢复”当作“订单状态已确认”。
 休市时不撮合；恢复后按原生市场调度运行，盘前研究和盘后复盘在对应钩子触发。
@@ -103,15 +110,18 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh resume --run-dir ar
 子进程卡死也由独立进程检测；关闭先发 SIGINT，30 秒未退出再强制结束。
 交易子进程带 `--require-monitor`：独立监控心跳超过 45 秒、状态异常或未配置 Telegram 时，
 每次提交前及每次本地模拟成交前都会拒绝执行。监督进程还会回收失去监控或卡住的子进程。
-STOP、回撤锁、审批状态、模糊订单和每日订单计数都存在原账本中，重启不会清空。
+STOP、回撤锁、审批状态、模糊订单、每日订单计数、单日亏损闸门、模型失败退避和每日模型预算都存在原账本中，重启不会清空。
 券商端已挂出的 Paper 订单可能在断线／撤单确认前成交；恢复时必须核对，不能假定停进程等于已撤单。
 
 ## 审批、日报和日常检查
 
-单笔达到净值 8%、当日累计预留／提交买卖额达到 20%，或清空全部证券时，等待人工审批。
-通知包括买卖方向、标的、当前持股、目标比例、数量／限价范围、金额、触发条件、有效期、
-AI 的买卖依据和风险。长理由用文本附件保留全文。卖出限价不能跌破审批范围后继续沿用旧批准。
-超时、价格或数量超范围、目标变更时重新审批。审批不放宽单股 10%、总敞口 70%、每日 5 单和 8% 回撤锁。
+卖出和减仓始终自动执行。买入在每日自动额度内（总敞口较开盘增加不超过 25%、买入现金流不超过净值 40%）
+直接执行；只有超出额度的买入，或市场压力（SPY 大跌／高波动）下的买入，才生成一份覆盖整个调仓计划的审批请求。
+通知包括触发原因、拟买入证券及权重上限和限价上界（±2% 领口）、批准后最高敞口、当日买入现金流上限、
+组合波动和 ES、压力详情及 AI 的理由，长理由用文本附件保留全文。一份批准覆盖该计划的多笔买入，
+有效期最长 60 分钟。新证券、更高权重、新触发原因、价格超出领口或目标变更时重新审批。
+审批不放宽量化约束、单股 10%、总敞口 70%、每日 20 次提交、单日 50% 敞口增幅和 8% 回撤锁。
+详细原则见 `docs/AUTONOMOUS_PAPER_FUND.md` 的“量化风控原则”和“例外审批”。
 
 ```bash
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh approvals --run-dir artifacts/fund-local
@@ -119,12 +129,18 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh approve --run-dir a
   --approval-id "<reviewed-id>" --approval-digest "<reviewed-digest>"
 ```
 
-拒绝时将 `approve` 改为 `reject`。Telegram 仅通知，聊天回复不会执行审批；命令中的 ID／摘要必须来自完整请求。
+拒绝时将 `approve` 改为 `reject`。更方便的方式是在 Telegram 里**直接回复审批提醒「同意」或「拒绝」**，
+或发送「同意 代码」／「拒绝 代码」（代码是提醒里的 6 位字符）；只有一个待审请求时也可以直接发「同意」。
+只接受配置的会话和审批人；早于请求的消息、STOP 期间、过期或已被替换的请求都会被拒绝，机器人会回复处理结果，
+每条指令都记入账本。发送「状态」可查看监控状态、待审批数和分仓净值。请给 Telegram 账号开启两步验证。
 
 每次成功完成盘后复盘，独立监控自动发送对应日期的 Markdown 日报附件：账户与现金／持仓、
 观测盈亏与收益率、对齐窗口的 SPY／QQQ、运行至截止的回撤和费用、模型 usage、订单／成交／审批记录、
 选股与择时调整、验证和失效条件、次日策略备忘及数据缺项。
 不是交易日不虚构日报；停机、STOP 或模型失败可能导致复盘尚未完成，应查看异常通知和日志。
+运行一段时间后执行 `bash scripts/run_autonomous_fund.sh acceptance --run-dir artifacts/fund-local` 生成验收报告
+（`acceptance.md`）：连续交易日数、迭代完成率、监控 STOP、未结束委托、成交明细、模型失败率、复盘完成率和平均滑点都达标后，
+再考虑进入下一阶段。
 本地文件仍在 `reviews/YYYY-MM-DD.md`、`postmarket_review.md`、`report.json`、`equity.csv`、`fills.csv`。
 
 日报从固定账本生成，不读取 AI 指定的文件路径；原始研究和估值时间保留，缺少收盘估值会明确披露。

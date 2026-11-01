@@ -10,7 +10,9 @@ from scripts.autonomous_fund.journal import Journal, encode
 from scripts.autonomous_fund.report import report
 from scripts.autonomous_fund.risk import Intent, Limits, RiskError, number
 from scripts.autonomous_fund.run import models_ready
-from scripts.autonomous_fund.strategy import account_digest, configuration, model_selection
+from scripts.autonomous_fund.strategy import (
+    account_digest, configuration, legacy_account_digest, model_selection, open_journal,
+)
 
 
 FLASH = "deepseek/deepseek-flash"
@@ -57,40 +59,73 @@ def test_invalid_role_configuration_fails_explicitly(roles):
         model_selection({**config(), "agent_models": roles})
 
 
-def test_switching_role_models_retains_legacy_book_and_drawdown_latch(tmp_path):
+def test_revision2_book_migrates_to_identity_binding_and_keeps_latches(tmp_path):
+    # Revision 2 hashed identity plus non-policy configuration. Adopting role
+    # models and the new risk sections must keep the SAME book: reservations,
+    # peak and drawdown latch survive, and the migration itself is audited.
     old = config()
     legacy_digest = hashlib.sha256(encode({"mode": "local", "account": "fixture-account", "config": old}).encode()).hexdigest()
+    assert legacy_account_digest("local", "fixture-account", old) == legacy_digest
     journal = Journal(tmp_path, legacy_digest)
     intent = journal.reserve(Intent("ALFA", "buy", 1, number(100)), NOW, Limits())
     journal.mark_equity(NOW, number(12000), Limits())
     assert journal.mark_equity(NOW, number(10500), Limits())
-    new = {**old, "agent_models": {"researcher": FLASH, "manager": PRO}}
-    assert account_digest("local", "fixture-account", new) == legacy_digest
-    restored = Journal(tmp_path, account_digest("local", "fixture-account", new))
+    new = {**old, "agent_models": {"researcher": FLASH, "manager": PRO}, "quant_risk": {"daily_loss_limit": "0.01"},
+           "approval": {"valid_minutes": 30}, "execution": {}, "model_budget": {}}
+    restored = open_journal(tmp_path, "local", "fixture-account", new)
     assert restored.pending()[0]["id"] == intent
     assert restored.mark_equity(NOW, number(10500), Limits())
     with restored.connection() as db:
-        assert dict(db.execute("SELECT key,value FROM meta"))["peak"] == "12000"
+        meta = dict(db.execute("SELECT key,value FROM meta"))
+        assert meta["peak"] == "12000" and meta["binding"] == account_digest("local", "fixture-account")
         assert db.execute("SELECT count(*) FROM intents").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM events WHERE kind='binding_migrated'").fetchone()[0] == 1
+    # Reopening is idempotent and no longer needs the legacy proof.
+    open_journal(tmp_path, "local", "fixture-account", {**new, "limits": {"max_position": "0.05"}})
 
 
-@pytest.mark.parametrize("change", ["limits", "universe", "account", "mode"])
-def test_role_configuration_cannot_rebind_a_different_account_or_risk_policy(tmp_path, change):
+@pytest.mark.parametrize("change", ["account", "mode"])
+def test_identity_change_cannot_rebind_another_account(tmp_path, change):
     base = config()
-    Journal(tmp_path, account_digest("local", "fixture-account", base))
+    open_journal(tmp_path, "local", "fixture-account", base)
+    account, mode = ("other-account", "local") if change == "account" else ("fixture-account", "paper")
+    with pytest.raises(RiskError, match="another mode, account or configuration"):
+        open_journal(tmp_path, mode, account, base)
+
+
+@pytest.mark.parametrize("change", ["limits", "universe", "quant_risk"])
+def test_operator_policy_change_keeps_the_same_audited_account_book(tmp_path, change):
+    base = config()
+    journal = open_journal(tmp_path, "local", "fixture-account", base)
+    intent = journal.reserve(Intent("ALFA", "buy", 1, number(100)), NOW, Limits())
     modified = copy.deepcopy(base)
-    modified["agent_models"] = {"manager": PRO}
-    account, mode = "fixture-account", "local"
     if change == "limits":
-        modified["limits"] = {"max_position": "0.20"}
+        modified["limits"] = {"max_position": "0.05"}
     elif change == "universe":
         modified["universe"]["BETA"] = "stock"
-    elif change == "account":
-        account = "other-account"
     else:
-        mode = "paper"
+        modified["quant_risk"] = {"target_portfolio_vol": "0.08"}
+    assert open_journal(tmp_path, "local", "fixture-account", modified).pending()[0]["id"] == intent
+
+
+def test_unprovable_legacy_paper_book_is_refused_but_local_book_migrates(tmp_path):
+    old = config()
+    paper = tmp_path / "paper"
+    Journal(paper, legacy_account_digest("paper", "key-hash", old))
+    edited = {**old, "universe": {"ALFA": "stock", "BETA": "stock"}}
+    # A paper book is an external account: migration needs an exact legacy proof.
     with pytest.raises(RiskError, match="another mode, account or configuration"):
-        Journal(tmp_path, account_digest(mode, account, modified))
+        open_journal(paper, "paper", "key-hash", edited)
+    assert open_journal(paper, "paper", "key-hash", old)
+    local = tmp_path / "local"
+    Journal(local, legacy_account_digest("local", "local-virtual-account", old)).event(NOW, "startup", {"mode": "local"})
+    # A local virtual book IS its account; its history proves the identity.
+    open_journal(local, "local", "local-virtual-account", edited)
+    other = tmp_path / "mixed"
+    mixed = Journal(other, legacy_account_digest("local", "local-virtual-account", old))
+    mixed.event(NOW, "startup", {"mode": "paper"})
+    with pytest.raises(RiskError, match="another mode, account or configuration"):
+        open_journal(other, "local", "local-virtual-account", edited)
 
 
 def test_selected_providers_require_all_role_keys(monkeypatch):

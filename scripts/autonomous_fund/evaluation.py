@@ -35,16 +35,18 @@ def forward_outcomes(events):
     zone = ZoneInfo("America/New_York")
     schedule = mcal.get_calendar("NYSE").schedule(start_date=min(at.date() for at, _ in accounts), end_date=now.date())
     completed = {day.date(): market.market_close for day, market in schedule.iterrows() if market.market_close <= now}
+    # The last observation of each completed session, computed once. For a memo
+    # available at time T, a session counts when its last observation is >= T.
+    last_by_day = {}
+    for at, body in accounts:
+        day = at.astimezone(zone).date()
+        if day in completed and (day not in last_by_day or at >= last_by_day[day][0]):
+            last_by_day[day] = (at, body)
+    sessions = sorted(last_by_day.values(), key=lambda item: item[0])
     result = []
     for packet in reviews:
         available = instant(packet["completed_at"])
-        observations = [(at, b) for at, b in accounts if at >= available]
-        daily = {}
-        for at, body in observations:
-            day = at.astimezone(zone).date()
-            if day in completed:
-                daily[day] = (at, body)
-        daily = sorted(daily.values(), key=lambda item: item[0])
+        daily = [item for item in sessions if item[0] >= available]
         row = {"version": packet["version"], "available_at": packet["completed_at"], "mock": packet["mock"],
                "observed_sessions": len(daily), "horizons": {},
                "interpretation": "Following portfolio observations include later decisions and memos; no causal attribution. "

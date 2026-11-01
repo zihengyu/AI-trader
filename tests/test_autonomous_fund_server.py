@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from scripts.autonomous_fund.execution import EXECUTION_REVISION
 from scripts.autonomous_fund.deploy import backup, generate, unit_quote
 from scripts.autonomous_fund.environment import load_environment
 from scripts.autonomous_fund.journal import Journal, encode
@@ -205,7 +206,7 @@ def test_restart_does_not_inherit_killed_agent_liveness_but_retains_audit(tmp_pa
     from .test_autonomous_fund_monitor import setup, heartbeat
     journal = setup(tmp_path)
     journal.event(NOW - timedelta(hours=2), 'agent_call_started', {'id': 'interrupted-synthetic-call'})
-    journal.event(NOW, 'startup', {'mode': 'local', 'execution_revision': 2})
+    journal.event(NOW, 'startup', {'mode': 'local', 'execution_revision': EXECUTION_REVISION})
     heartbeat(tmp_path, NOW)
     assert Monitor(tmp_path).poll(NOW)['health'] == 'healthy'
     with journal.connection() as db:

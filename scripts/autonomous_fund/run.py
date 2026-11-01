@@ -127,7 +127,11 @@ def run_backtest(args, config):
     runtime = ScriptedRuntime() if args.scripted or args.mode == "mock" else None
     source = YahooDataBacktesting
     if args.mode == "mock":
-        config = {**config, "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
+        # Synthetic symbols replace the operator universe, so its symbol groups
+        # cannot apply; the default groups filter themselves to this universe.
+        quant = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
+        config = {**config, "quant_risk": quant,
+                  "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
         data, source = {"pandas_data": mock_data()}, PandasDataBacktesting
     elif args.data_dir:
         data, source = {"pandas_data": csv_data(args.data_dir)}, PandasDataBacktesting
@@ -178,10 +182,19 @@ def run_paper(args, config):
 def check_market(args, config):
     """Read public data and credential presence; never invokes a model or broker."""
     from lumibot.entities import Asset
-    from .market_data import YahooRealtimeData
+    from .market_data import LiveTape, MarketDataSettings, YahooRealtimeData
     from .risk import Limits
-    source = YahooRealtimeData()
+    import time
+    market = MarketDataSettings.from_config(config.get("market_data"))
+    tape = LiveTape() if market.live_stream else None
+    source = YahooRealtimeData(tape=tape, live_seconds=market.live_seconds)
     now, observations = source.get_datetime(), {}
+    if tape is not None:
+        # Give the unofficial stream a short window to deliver a first trade.
+        tape.watch(["SPY", "QQQ"])
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (tape.tick("SPY") and tape.tick("QQQ")):
+            time.sleep(0.5)
     for symbol in ("SPY", "QQQ"):
         asset = Asset(symbol, asset_type="stock")
         quote = source.get_quote(asset)
@@ -189,12 +202,23 @@ def check_market(args, config):
         observations[symbol] = {"price": quote.price, "source_as_of": quote.timestamp.isoformat(),
                                 "age_seconds": (source.get_datetime() - instant(quote.timestamp)).total_seconds(),
                                 "completed_daily_rows": len(daily), "price_kind": quote.raw_data["price_kind"]}
+    if tape is not None:
+        observations["live_tape"] = {**tape.diagnostics(), "note": "Live ticks are used only inside the regular "
+                                     "session and within live_seconds of their source time; otherwise bars are used."}
+        tape.close()
     try:
         models_ready(args, config)
         ready, missing = True, None
     except RiskError as exc:
         ready, missing = False, str(exc)
+    from .boundary import DohResolver, ResearchNetwork, diagnose
+    from lumibot.components.agents.web_tools import _default_resolver
+    network = ResearchNetwork.from_config(config.get("research_network"))
+    research = {"system_resolver": diagnose(_default_resolver), "configured_resolver": network.resolver}
+    if network.resolver == "doh":
+        research["doh_resolver"] = diagnose(DohResolver(network.doh_url, network.timeout_seconds))
     result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
+              "research_network": research,
               "source": source.SOURCE, "requires_broker_key": False, "model": selected_models(args, config)["manager"],
               "models": selected_models(args, config),
               "model_key_present": ready, "model_requirement": missing,
@@ -207,19 +231,22 @@ def check_market(args, config):
 
 def run_local(args, config):
     from lumibot.traders import Trader
-    from .journal import Journal
     from .local_broker import LocalPaperBroker
     from .market_data import YahooRealtimeData
     from .risk import Limits
-    from .strategy import AutonomousFund, account_digest
+    from .strategy import AutonomousFund, open_journal
     if not args.observe_only:
         models_ready(args, config)
     if args.scripted:
         raise RiskError("Scripted models are forbidden against the running market")
-    binding = account_digest("local", "local-virtual-account", config)
-    journal = Journal(args.run_dir, binding)
-    broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
-                              matching_enabled=not args.observe_only, require_monitor=args.require_monitor)
+    journal = open_journal(args.run_dir, "local", "local-virtual-account", config)
+    from .strategy import Mandate
+    from .market_data import LiveTape, MarketDataSettings
+    market = MarketDataSettings.from_config(config.get("market_data"))
+    tape = LiveTape() if market.live_stream else None
+    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds), journal, Limits(**config["limits"]),
+                              matching_enabled=not args.observe_only, require_monitor=args.require_monitor,
+                              starting_cash=Mandate.from_config(config.get("mandate")).local_account_usd)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
         "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
@@ -232,6 +259,8 @@ def run_local(args, config):
     try:
         trader.run_all(run_once=args.once)
     finally:
+        if tape is not None:
+            tape.close()
         broker._close_connection()
         broker.do_polling()  # Publish exited state without matching another order.
         journal.export()
@@ -241,7 +270,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -263,6 +292,10 @@ def main(argv=None):
     parser.add_argument("--heartbeat-seconds", type=int, default=180)
     parser.add_argument("--agent-seconds", type=int, default=900)
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
+    parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
+    parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
+    parser.add_argument("--rebaseline-external", action="store_true",
+                        help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
     if args.require_monitor and args.mode not in {"local", "paper"}:
         raise RiskError("--require-monitor is available only for local/paper execution")
@@ -319,6 +352,18 @@ def main(argv=None):
     if args.mode == "check":
         check_market(args, config)
         return
+    if args.mode == "validate-risk":
+        print(json.dumps(validate_risk(args, config), indent=2, ensure_ascii=False))
+        return
+    if args.mode == "acceptance":
+        from .validation import ValidationSettings, acceptance, acceptance_markdown
+        result = acceptance(args.run_dir, ValidationSettings.from_config(config.get("validation")).acceptance)
+        (args.run_dir / "acceptance.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
+                                                      encoding="utf-8")
+        (args.run_dir / "acceptance.md").write_text(acceptance_markdown(result), encoding="utf-8")
+        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"]}, indent=2,
+                         ensure_ascii=False, default=str))
+        return
     with FileLock(str(args.run_dir / "runner.lock"), timeout=0):
         if args.mode == "reset-drawdown":
             with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
@@ -329,6 +374,9 @@ def main(argv=None):
             return
         if args.mode == "attach-order":
             attach_order(args)
+            return
+        if args.mode == "adjust-reserve":
+            adjust_reserve(args)
             return
         if args.scripted and args.mode == "paper":
             raise RiskError("Scripted models are forbidden in paper mode")
@@ -358,6 +406,53 @@ def main(argv=None):
         print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
 
 
+def validate_risk(args, config):
+    """Replay fixed targets through the configured risk layer on recorded closes (offline)."""
+    from .quant import QuantPolicy
+    from .risk import Limits, number, validate_decision
+    from .validation import load_closes, risk_replay
+    if not args.data_dir or not args.targets:
+        raise RiskError("validate-risk needs --data-dir and --targets SYMBOL=weight,...")
+    targets = {}
+    for pair in args.targets.split(","):
+        symbol, _, weight = pair.partition("=")
+        targets[symbol.strip().upper()] = float(number(weight))
+    limits = Limits(**config["limits"])
+    universe = {s: config["universe"].get(s, "unlevered_etf") for s in targets}
+    if any(w > float(limits.max_position) for w in targets.values()) or sum(targets.values()) > float(limits.max_exposure):
+        raise RiskError("Targets exceed the configured position or exposure limits")
+    section = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
+    groups = {name: {"limit": spec["limit"], "members": [m for m in spec["members"] if m in targets]}
+              for name, spec in ((config.get("quant_risk") or {}).get("groups") or {}).items()}
+    policy = QuantPolicy.from_config({**section, "groups": groups}, universe, limits)
+    result = risk_replay(load_closes(args.data_dir, sorted(targets)), targets, policy, limits)
+    summary = {k: v for k, v in result.items() if k != "daily"}
+    (args.run_dir / "validation_risk.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
+                                                       encoding="utf-8")
+    return summary
+
+
+def adjust_reserve(args):
+    """Operator-only: account cash moved outside the AI sleeve (deposit/withdrawal)."""
+    from .journal import Journal
+    from .risk import number
+    if args.amount is None and not args.rebaseline_external:
+        raise RiskError("Provide --amount and/or --rebaseline-external")
+    with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
+        binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+    if not binding:
+        raise RiskError("No existing account journal at the selected run directory")
+    journal = Journal(args.run_dir, binding[0])
+    external = None
+    if args.rebaseline_external:
+        latest = [row["body"] for row in journal.all_events() if row["kind"] == "broker_account"]
+        if not latest:
+            raise RiskError("No observed external holdings to re-baseline")
+        external = {k: number(v) for k, v in latest[-1]["external_holdings"].items()}
+    reserve = journal.adjust_reserve(datetime.now(timezone.utc), number(args.amount or 0), external)
+    print(f"Reserved cash is now {reserve}; the AI capital sleeve is unchanged.")
+
+
 def attach_order(args):
     """Operator resolves the crash window by exact broker identity, never a retry."""
     from lumibot.brokers import Alpaca
@@ -369,11 +464,12 @@ def attach_order(args):
     assert_paper(broker)
     order = broker._pull_order(args.broker_order_id, "AutonomousPaperFund")
     with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
-        from .strategy import configuration, account_digest
+        from .strategy import configuration, account_digest, legacy_account_digest
         account_key = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
-        expected = account_digest("paper", account_key, configuration(args.config))
+        expected = {account_digest("paper", account_key),
+                    legacy_account_digest("paper", account_key, configuration(args.config))}
         binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
-        if not binding or binding[0] != expected:
+        if not binding or binding[0] not in expected:
             raise RiskError("Recovery credentials/configuration do not match this account journal")
         row = db.execute("SELECT body,updated_at FROM intents WHERE id=? AND status!='terminal'", (args.intent_id,)).fetchone()
         if not row:

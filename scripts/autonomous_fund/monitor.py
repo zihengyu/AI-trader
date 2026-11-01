@@ -10,7 +10,7 @@ from pathlib import Path
 
 import requests
 
-from .execution import operator_connection
+from .execution import EXECUTION_REVISION, approval_code, operator_connection, resolve_approval
 from .journal import encode
 from .risk import RiskError, instant
 
@@ -27,17 +27,50 @@ def require_monitor(root, now):
         raise RiskError("Independent monitor unavailable or unhealthy; server execution blocked") from None
 
 
+APPROVE_WORDS = {"同意", "批准", "APPROVE"}
+REJECT_WORDS = {"拒绝", "否决", "REJECT"}
+STATUS_WORDS = {"状态", "STATUS"}
+
+
+def approvers(chat_id, configured=None):
+    """Who may approve: explicit user IDs, else the owner of a private chat."""
+    raw = configured if configured is not None else os.environ.get("FUND_TELEGRAM_APPROVER_IDS", "")
+    ids = {item.strip() for item in str(raw).split(",") if item.strip()}
+    if not ids and not str(chat_id).startswith("-"):
+        ids = {str(chat_id)}  # A private chat's ID is its user's ID; groups need explicit approvers.
+    return ids
+
+
 class Telegram:
-    def __init__(self, token=None, chat_id=None, post=None):
+    def __init__(self, token=None, chat_id=None, post=None, approver_ids=None, replies_enabled=None):
         self.token = token or os.environ.get("FUND_TELEGRAM_BOT_TOKEN")
         self.chat_id = chat_id or os.environ.get("FUND_TELEGRAM_CHAT_ID")
         if not self.token or not self.chat_id:
             raise RiskError("Telegram requires FUND_TELEGRAM_BOT_TOKEN and FUND_TELEGRAM_CHAT_ID in the local environment")
         self.post = post or requests.post
+        self.approver_ids = approvers(self.chat_id, approver_ids)
+        if replies_enabled is None:
+            replies_enabled = os.environ.get("FUND_TELEGRAM_APPROVALS", "on").strip().lower() not in {"off", "false", "0", "no"}
+        self.replies_enabled = replies_enabled
 
-    def send(self, text):
-        return self._request("sendMessage", json={"chat_id": self.chat_id, "text": text[:4000],
-            "link_preview_options": {"is_disabled": True}})
+    def send(self, text, reply_to=None):
+        payload = {"chat_id": self.chat_id, "text": text[:4000], "link_preview_options": {"is_disabled": True}}
+        if reply_to:
+            payload["reply_parameters"] = {"message_id": int(reply_to), "allow_sending_without_reply": True}
+        return self._request("sendMessage", json=payload)
+
+    def updates(self, offset):
+        """Fetch new messages sent to the bot (short poll; never blocks the watchdog)."""
+        try:
+            response = self.post(f"https://api.telegram.org/bot{self.token}/getUpdates",
+                                 json={"offset": int(offset), "timeout": 0, "allowed_updates": ["message"]},
+                                 timeout=10, allow_redirects=False)
+            body = response.json()
+        except Exception:
+            return None  # Exceptions may contain the token-bearing URL.
+        if response.status_code != 200 or not isinstance(body, dict) or body.get("ok") is not True:
+            return None
+        return [row for row in body.get("result") or [] if isinstance(row, dict)]
 
     def send_document(self, caption, filename, document):
         return self._request("sendDocument", data={"chat_id": self.chat_id, "caption": caption[:1000]},
@@ -94,7 +127,7 @@ class Monitor:
             raise RiskError("Monitor requires an existing local or Alpaca paper run")
         startup = json.loads(saved[1])
         state = "healthy"
-        if startup.get("execution_revision") != 2:
+        if startup.get("execution_revision") != EXECUTION_REVISION:
             state = "runner_upgrade_required"
         else:
             try:
@@ -149,23 +182,30 @@ class Monitor:
             state = self._health(db, now)
             # Recover even if the trader exited between persisting the review
             # and exporting it. One durable notification per completed review.
-            reviews = db.execute("SELECT sequence,at,body FROM events WHERE kind='postmarket_review'").fetchall()
+            # One indexed pass per poll; never a full-table scan per review.
+            notified = {row[0] for row in db.execute(
+                "SELECT json_extract(body,'$.details.review_sequence') FROM events WHERE kind='notification' "
+                "AND json_extract(body,'$.kind')='postmarket_report'")}
+            reviews = db.execute("SELECT sequence,at FROM events WHERE kind='postmarket_review'").fetchall()
             for review in reviews:
-                packet = json.loads(review["body"])
+                if review["sequence"] in notified:
+                    continue
+                packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
                 if instant(packet["completed_at"]) > now:
                     continue
-                existing = db.execute("SELECT 1 FROM events WHERE kind='notification' AND "
-                    "json_extract(body,'$.kind')='postmarket_report' AND json_extract(body,'$.details.review_sequence')=?",
-                    (review["sequence"],)).fetchone()
-                if not existing:
-                    db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
-                        "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
-                        "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
+                    "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
+                    "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
             # Drop stale first-start alerts; retain recent requests and failures.
-            rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' ORDER BY sequence").fetchall()
+            # A durable cursor bounds each poll to new notifications. It never
+            # advances past one stamped in the future, which is revisited later.
+            cursor = db.execute("SELECT value FROM fund_monitor_meta WHERE key='notification_cursor'").fetchone()
+            rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' AND sequence>? ORDER BY sequence",
+                              (int(cursor[0]) if cursor else 0,)).fetchall()
             for row in rows:
                 if instant(row["at"]) > now:
-                    continue
+                    break
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('notification_cursor',?)", (str(row["sequence"]),))
                 exists = db.execute("SELECT 1 FROM fund_deliveries WHERE sequence=?", (row["sequence"],)).fetchone()
                 if exists:
                     continue
@@ -182,6 +222,8 @@ class Monitor:
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
         if self.transport is not None:
             self._deliver(now)
+            if getattr(self.transport, "replies_enabled", False):
+                self._commands(now)
         with operator_connection(self.root) as db:
             counts = dict(db.execute("SELECT state,count(*) FROM fund_deliveries GROUP BY state"))
         status = {"at": now.isoformat(), "health": state, "telegram_configured": self.transport is not None,
@@ -223,7 +265,8 @@ class Monitor:
                     result = self.transport.send_document(
                         f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
                         filename, document)
-                elif body.get("kind") == "approval_required" and "side" in body.get("details", {}):
+                elif body.get("kind") == "approval_required" and (
+                        "side" in body.get("details", {}) or "buys" in body.get("details", {})):
                     message = approval_message(body["details"])
                     result = (self.transport.send(message) if len(message) <= 4000 else
                               self.transport.send_document(message[:900] + "\n完整理由见附件。",
@@ -243,6 +286,108 @@ class Monitor:
                                ((now + timedelta(seconds=delay)).isoformat(),))
             if not result["ok"]:
                 break  # Respect rate limits and outages across the whole batch.
+
+
+    def _commands(self, now):
+        """Telegram replies as an approval channel: authenticated, request-bound, auditable.
+
+        Accepted only from the configured chat and an authorized approver, for a
+        request created before the message, identified by replying to its alert,
+        by its short code, or (when exactly one request is pending) by plain text.
+        Approval is the same digest-bound operator action as the CLI: it never
+        relaxes a hard limit, cannot approve while STOP is active and expires.
+        """
+        with operator_connection(self.root) as db:
+            row = db.execute("SELECT value FROM fund_monitor_meta WHERE key='telegram_offset'").fetchone()
+        offset = int(row[0]) if row else 0
+        updates = self.transport.updates(offset)
+        if not updates:
+            return
+        for update in updates:
+            offset = max(offset, int(update.get("update_id", 0)) + 1)
+            message = update.get("message") or {}
+            text = str(message.get("text") or "").strip()
+            words = text.replace("，", " ").replace(",", " ").split()
+            if not words:
+                continue
+            verb = words[0].upper()
+            if verb not in APPROVE_WORDS | REJECT_WORDS | STATUS_WORDS:
+                continue
+            chat = str((message.get("chat") or {}).get("id"))
+            sender = str((message.get("from") or {}).get("id"))
+            reply_to = message.get("message_id")
+            if chat != str(self.transport.chat_id):
+                continue  # Never answer or act on another conversation.
+            if sender not in self.transport.approver_ids:
+                self._answer(now, "未授权的审批人：本操作已忽略。", reply_to, {"sender": sender, "result": "unauthorized"})
+                continue
+            if verb in STATUS_WORDS:
+                self._answer(now, self._status_text(now), reply_to, {"sender": sender, "result": "status"})
+                continue
+            sent_at = datetime.fromtimestamp(int(message.get("date", 0)), timezone.utc)
+            target, problem = self._target(words[1:], (message.get("reply_to_message") or {}).get("message_id"), sent_at, now)
+            if target is None:
+                self._answer(now, problem, reply_to, {"sender": sender, "result": "unresolved", "text": text[:100]})
+                continue
+            approve = verb in APPROVE_WORDS
+            try:
+                state = resolve_approval(self.root, target["id"], target["digest"], approve, now,
+                                         authority=f"telegram:{sender}")
+            except RiskError as exc:
+                self._answer(now, f"未执行：{exc}", reply_to, {"sender": sender, "result": "refused",
+                                                             "approval_id": target["id"]})
+                continue
+            word = "已批准" if state == "approved" else "已拒绝"
+            follow = ("交易进程将在下一次迭代重新通过全部风控后执行；硬性上限不受影响。" if state == "approved"
+                      else "该目标已停止，等待 AI 下一次复核；已提交的订单须撤单处理。")
+            self._answer(now, f"{word} {approval_code(target['id'])}。{follow}", reply_to,
+                         {"sender": sender, "result": state, "approval_id": target["id"]})
+        with operator_connection(self.root) as db:
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('telegram_offset',?)", (str(offset),))
+
+    def _target(self, args, replied_message, sent_at, now):
+        with operator_connection(self.root) as db:
+            rows = [dict(r) for r in db.execute("SELECT id,digest,body,state FROM fund_approvals WHERE state='pending'")]
+            delivered = {}
+            if replied_message:
+                for sequence, body in db.execute(
+                        "SELECT e.sequence,e.body FROM events e JOIN fund_deliveries d ON d.sequence=e.sequence "
+                        "WHERE e.kind='notification' AND d.message_id=?", (str(replied_message),)):
+                    delivered = json.loads(body).get("details") or {}
+        live = [r for r in rows if instant(json.loads(r["body"])["expires_at"]) > now]
+        candidates = live
+        if args:
+            code = args[0].strip().upper()
+            candidates = [r for r in live if approval_code(r["id"]) == code]
+        elif replied_message:
+            candidates = [r for r in live if r["id"] == delivered.get("id")]
+        if len(candidates) != 1:
+            if not live:
+                return None, "没有待审批的请求，或请求已过期／被替换。"
+            codes = "、".join(approval_code(r["id"]) for r in live)
+            return None, f"有多个待审批请求，请回复对应提醒消息，或发送「同意 代码」／「拒绝 代码」：{codes}"
+        target = candidates[0]
+        if sent_at < instant(json.loads(target["body"])["created_at"]):
+            return None, "这条回复早于审批请求，已忽略；请对新请求重新回复。"
+        return target, None
+
+    def _status_text(self, now):
+        with operator_connection(self.root) as db:
+            pending = db.execute("SELECT count(*) FROM fund_approvals WHERE state='pending'").fetchone()[0]
+            account = db.execute("SELECT at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
+            health = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health'").fetchone()
+        lines = [f"监控状态：{health[0] if health else 'unknown'}；STOP：{(self.root / 'STOP').exists()}",
+                 f"待审批请求：{pending}"]
+        if account:
+            body = json.loads(account[1])
+            lines.append(f"最新分仓净值 ${body.get('equity')}，现金 ${body.get('cash')}，持仓 {encode(body.get('positions'))}"
+                         f"（{account[0]}）")
+        return "\n".join(lines)
+
+    def _answer(self, now, text, reply_to, audit):
+        with operator_connection(self.root) as db:
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "telegram_command", encode(audit)))
+        self.transport.send(text, reply_to=reply_to)
 
 
 class RunnerHeartbeat:

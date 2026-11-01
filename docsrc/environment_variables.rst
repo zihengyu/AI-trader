@@ -1376,8 +1376,13 @@ does not change other strategies' model defaults. The supplied role configuratio
 uses ``deepseek/deepseek-flash`` for research and ``deepseek/deepseek-v4-pro`` for
 portfolio decisions; both use the same ``DEEPSEEK_API_KEY``. The PowerShell
 launcher exposes these overrides as ``-ResearchModel`` and ``-DecisionModel``.
-Role model changes preserve the account journal and its risk state. Restart the
-runner to load new settings; no real-money execution is enabled by changing models.
+Role model changes preserve the account journal and its risk state. Quantitative
+risk limits, the approval envelope, execution controls, the model budget, the
+operator mandate (the capital the AI may use and binding text constraints) and
+the research DNS resolver are configured in the application's ``config.json``,
+not through environment variables; changing them also keeps the same account journal and is recorded as
+an audited policy change. Restart the runner to load new settings; no real-money
+execution is enabled by changing models or policies.
 
 OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
 DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.
@@ -1414,6 +1419,15 @@ writes the selected run directory's STOP file; recovery never clears it.
 ``notify-test`` explicitly sends one test message without modifying STOP or
 submitting an order; an API acknowledgement still requires confirmation on the
 operator's device. Telegram rate-limit delays apply to all queued messages.
+Operators may approve plan requests by replying ``同意`` or ``拒绝`` in Telegram
+(to the alert, with its six-character code, or as plain text when exactly one
+request is pending). Only the configured chat counts; a private chat's owner is
+the approver, while group chats require ``FUND_TELEGRAM_APPROVER_IDS``
+(comma-separated user IDs). ``FUND_TELEGRAM_APPROVALS=off`` makes Telegram
+notification-only. Replies older than the request, STOP, expiry and changed scope
+are refused, every command is journaled, and approval never relaxes hard limits.
+``FUND_SEC_USER_AGENT`` is the declared contact SEC EDGAR requires; without it the
+optional news watch skips company filings and keeps its other sources.
 Completed postmarket reviews are also delivered as dated report attachments,
 including recovered unsent reviews after monitor restart. Major-transaction
 alerts include investment rationale and reviewed scope; long reasons are sent
