@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
+    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
@@ -16,7 +16,9 @@ param(
     [string]$ApprovalId = '',
     [string]$ApprovalDigest = '',
     [switch]$ConsoleOnly,
-    [string]$MemoryFile = ''
+    [string]$MemoryFile = '',
+    [string]$Amount = '',
+    [switch]$RebaselineExternal
 )
 $ErrorActionPreference = 'Stop'
 Push-Location (Split-Path $PSScriptRoot -Parent)
@@ -37,6 +39,8 @@ try {
     if ($ApprovalDigest) { $runArgs += @('--approval-digest', $ApprovalDigest) }
     if ($ConsoleOnly) { $runArgs += '--console-only' }
     if ($MemoryFile) { $runArgs += @('--memory-file', $MemoryFile) }
+    if ($Amount) { $runArgs += @('--amount', $Amount) }
+    if ($RebaselineExternal) { $runArgs += '--rebaseline-external' }
     if ($Mode -in @('mock', 'backtest', 'qualify')) {
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
         $stdoutPath = Join-Path $RunDir 'stdout.log'

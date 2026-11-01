@@ -65,10 +65,13 @@ sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.run check \
 ```
 
 `check` 只验证公开行情、源时间及 Key 是否存在，不调用付费模型，也不证明提供方鉴权成功。
+它还会报告 `research_network`：若研究站点解析为 Fake-IP（198.18.0.0/15）或私有地址，网页研究会被安全检查拒绝，
+按提示让服务器不走 Fake-IP，或在 `config.json` 设置 `"research_network": {"resolver": "doh"}`。
 如将来选择 Alpaca Paper，先在本地 `.env` 填写专用 Paper Key，再用
 `deploy prepare --user "<service-user>" --mode paper --run-dir artifacts/fund-paper`
-生成另一套配置；不要用 `fund-local` 的账本连接券商账户。首次 Paper 账户还须满足应用要求的
-10,000 美元现金及空证券持仓，并完成原有 Paper 验收。
+生成另一套配置；不要用 `fund-local` 的账本连接券商账户。首次 Paper 启动时账户不能持有投资范围内的证券或未完成订单，
+现金不少于 `mandate.capital_usd`；超出部分自动记为 AI 不能动用的保留现金。之后账户出入金须先停止交易服务，再执行
+`bash scripts/run_autonomous_fund.sh adjust-reserve --run-dir artifacts/fund-paper --amount <金额>` 记入保留现金。
 如果父目录不允许服务用户遍历，需由管理员调整目录权限；不要用放开所有文件读写的方式解决。
 可选浏览器的安装和外部数据订阅仍按 LumiBot 原有说明配置；缺少这些工具会影响研究覆盖面。
 

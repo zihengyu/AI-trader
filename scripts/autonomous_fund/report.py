@@ -12,7 +12,9 @@ from .risk import instant
 
 REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_validated", "fill_details_unavailable",
                 "agent", "notification", "startup", "premarket_research", "postmarket_review",
-                "agent_call_started", "agent_call_finished", "risk_overlay", "decision_backoff")
+                "agent_call_started", "agent_call_finished", "risk_overlay", "decision_backoff", "scorecard",
+                "protective_trigger", "price_alert", "review_triggered", "mandate_initialized",
+                "mandate_capital_changed", "operator_reserve_adjusted")
 
 
 def report(root, prices=None, write_files=True, *, as_of=None):
@@ -29,6 +31,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         approval_rows = [dict(zip(("id", "digest", "state", "body"), r)) for r in db.execute(
             "SELECT id,digest,state,body FROM fund_approvals ORDER BY rowid")] if "fund_approvals" in tables else []
         target = db.execute("SELECT id,state,until_at,body FROM fund_decisions ORDER BY rowid DESC LIMIT 1").fetchone() if "fund_decisions" in tables else None
+        mandate_meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('mandate_reserve_cash','mandate_capital_basis')"))
     if as_of is not None:
         events = [row for row in events if instant(row[0]) <= instant(as_of)]
     now = datetime.now(timezone.utc)
@@ -49,6 +52,11 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     startup = next((body for _, kind, body in reversed(events) if kind == "startup"), {})
     premarket = [body for _, kind, body in events if kind == "premarket_research"]
     risk_overlays = [{"at": at, **body} for at, kind, body in events if kind == "risk_overlay"]
+    scorecards = [body for _, kind, body in events if kind == "scorecard"]
+    triggers = {name: [{"at": at, **body} for at, kind, body in events if kind == name]
+                for name in ("protective_trigger", "price_alert", "review_triggered")}
+    mandate_events = [{"at": at, "kind": kind, **body} for at, kind, body in events
+                      if kind in {"mandate_initialized", "mandate_capital_changed", "operator_reserve_adjusted"}]
     backoffs = sum(kind == "decision_backoff" for _, kind, _ in events)
     reviews = [body for _, kind, body in events if kind == "postmarket_review"]
     for at, kind, body in events:
@@ -170,6 +178,12 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         # Identical consecutive blocks are journaled once per 30 minutes.
         "blocked_iterations": sum(row["kind"] == "blocked" for row in notifications),
         "latest_risk_overlay": risk_overlays[-1] if risk_overlays else None,
+        "latest_scorecard": scorecards[-1] if scorecards else None,
+        "protective_triggers": triggers["protective_trigger"][-20:],
+        "price_alerts": triggers["price_alert"][-20:],
+        "review_triggers": {"count": len(triggers["review_triggered"]), "recent": triggers["review_triggered"][-10:]},
+        "mandate": {"capital_usd": mandate_meta.get("mandate_capital_basis"),
+                    "reserved_cash": mandate_meta.get("mandate_reserve_cash"), "events": mandate_events[-10:]},
         "decision_backoffs": backoffs,
         "observations": len(curve), "starting_equity": initial,
         "ending_equity": curve[-1]["equity"] if curve else None,

@@ -198,7 +198,14 @@ def check_market(args, config):
         ready, missing = True, None
     except RiskError as exc:
         ready, missing = False, str(exc)
+    from .boundary import DohResolver, ResearchNetwork, diagnose
+    from lumibot.components.agents.web_tools import _default_resolver
+    network = ResearchNetwork.from_config(config.get("research_network"))
+    research = {"system_resolver": diagnose(_default_resolver), "configured_resolver": network.resolver}
+    if network.resolver == "doh":
+        research["doh_resolver"] = diagnose(DohResolver(network.doh_url, network.timeout_seconds))
     result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
+              "research_network": research,
               "source": source.SOURCE, "requires_broker_key": False, "model": selected_models(args, config)["manager"],
               "models": selected_models(args, config),
               "model_key_present": ready, "model_requirement": missing,
@@ -220,8 +227,10 @@ def run_local(args, config):
     if args.scripted:
         raise RiskError("Scripted models are forbidden against the running market")
     journal = open_journal(args.run_dir, "local", "local-virtual-account", config)
+    from .strategy import Mandate
     broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
-                              matching_enabled=not args.observe_only, require_monitor=args.require_monitor)
+                              matching_enabled=not args.observe_only, require_monitor=args.require_monitor,
+                              starting_cash=Mandate.from_config(config.get("mandate")).local_account_usd)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
         "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
@@ -243,7 +252,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -265,6 +274,9 @@ def main(argv=None):
     parser.add_argument("--heartbeat-seconds", type=int, default=180)
     parser.add_argument("--agent-seconds", type=int, default=900)
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
+    parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
+    parser.add_argument("--rebaseline-external", action="store_true",
+                        help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
     if args.require_monitor and args.mode not in {"local", "paper"}:
         raise RiskError("--require-monitor is available only for local/paper execution")
@@ -332,6 +344,9 @@ def main(argv=None):
         if args.mode == "attach-order":
             attach_order(args)
             return
+        if args.mode == "adjust-reserve":
+            adjust_reserve(args)
+            return
         if args.scripted and args.mode == "paper":
             raise RiskError("Scripted models are forbidden in paper mode")
         if (args.observe_only or args.once) and args.mode != "local":
@@ -358,6 +373,27 @@ def main(argv=None):
         else:
             run_backtest(args, config)
         print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
+
+
+def adjust_reserve(args):
+    """Operator-only: account cash moved outside the AI sleeve (deposit/withdrawal)."""
+    from .journal import Journal
+    from .risk import number
+    if args.amount is None and not args.rebaseline_external:
+        raise RiskError("Provide --amount and/or --rebaseline-external")
+    with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
+        binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+    if not binding:
+        raise RiskError("No existing account journal at the selected run directory")
+    journal = Journal(args.run_dir, binding[0])
+    external = None
+    if args.rebaseline_external:
+        latest = [row["body"] for row in journal.all_events() if row["kind"] == "broker_account"]
+        if not latest:
+            raise RiskError("No observed external holdings to re-baseline")
+        external = {k: number(v) for k, v in latest[-1]["external_holdings"].items()}
+    reserve = journal.adjust_reserve(datetime.now(timezone.utc), number(args.amount or 0), external)
+    print(f"Reserved cash is now {reserve}; the AI capital sleeve is unchanged.")
 
 
 def attach_order(args):

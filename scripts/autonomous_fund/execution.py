@@ -20,7 +20,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .journal import encode
-from .risk import RiskError, instant, number, trading_day, validate_decision
+from .risk import RiskError, decision_levels, instant, number, trading_day, validate_decision
 
 # Runner/monitor contract version: a monitor refuses older runners.
 EXECUTION_REVISION = 3
@@ -77,8 +77,11 @@ class ExecutionPolicy:
     reprice_after_seconds: int = 180
     max_buy_chase: str = "0.0075"
     report_interval_seconds: int = 300
+    review_on_move: str = "0.03"
 
     def __post_init__(self):
+        if not 0 <= number(self.review_on_move) <= number("0.5"):
+            raise RiskError("review_on_move must be between 0 and 50%")
         if type(self.reprice_after_seconds) is not int or not 30 <= self.reprice_after_seconds <= 3600:
             raise RiskError("reprice_after_seconds must be 30..3600")
         if not 0 <= number(self.max_buy_chase) <= number("0.05"):
@@ -113,6 +116,21 @@ class ExecutionState:
                 CREATE TABLE IF NOT EXISTS fund_orders (
                     intent_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL, symbol TEXT NOT NULL,
                     side TEXT NOT NULL, submitted_at TEXT NOT NULL, reference TEXT NOT NULL);
+                -- Standing AI levels (stop / take-profit / entry) of the latest AI decision.
+                CREATE TABLE IF NOT EXISTS fund_levels (
+                    symbol TEXT PRIMARY KEY, decision_id TEXT NOT NULL, body TEXT NOT NULL,
+                    state TEXT NOT NULL, set_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS fund_alerts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, symbol TEXT NOT NULL,
+                    body TEXT NOT NULL, state TEXT NOT NULL, set_at TEXT NOT NULL);
+                -- Deterministic caps applied to one decision after a protective exit.
+                CREATE TABLE IF NOT EXISTS fund_overrides (
+                    decision_id TEXT NOT NULL, symbol TEXT NOT NULL, max_weight TEXT NOT NULL,
+                    reason TEXT NOT NULL, at TEXT NOT NULL, PRIMARY KEY(decision_id, symbol));
+                CREATE TABLE IF NOT EXISTS fund_protective_orders (intent_id TEXT PRIMARY KEY, at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS fund_refs (
+                    decision_id TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT NOT NULL,
+                    at TEXT NOT NULL, PRIMARY KEY(decision_id, symbol));
             """)
 
     def latest(self, now, db=None):
@@ -148,6 +166,14 @@ class ExecutionState:
             db.execute("UPDATE fund_approvals SET state='superseded' WHERE state IN ('pending','approved')")
             db.execute("INSERT INTO fund_decisions VALUES(?,?,?,?,?,?)",
                        (key, str(now), until.isoformat(), encode(body), self.digest, "active"))
+            # The newest AI decision replaces every standing level and alert.
+            db.execute("DELETE FROM fund_levels")
+            for symbol, levels in decision_levels(body).items():
+                db.execute("INSERT INTO fund_levels VALUES(?,?,?,?,?)", (symbol, key, encode(levels), "active", str(now)))
+            db.execute("UPDATE fund_alerts SET state='superseded' WHERE state='active'")
+            for alert in body.get("alerts") or []:
+                db.execute("INSERT INTO fund_alerts(decision_id,symbol,body,state,set_at) VALUES(?,?,?,?,?)",
+                           (key, alert["symbol"], encode(alert), "active", str(now)))
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)",
                        (str(now), "decision_accepted", encode({"id": key, "until_at": until, "decision": body})))
         return key
@@ -157,11 +183,78 @@ class ExecutionState:
             db.execute("UPDATE fund_decisions SET state='complete' WHERE id=? AND state='active'", (key,))
         self.journal.event(now, "allocation_complete", {"decision_id": key})
 
+    def levels(self):
+        """Standing levels; a triggered level stays until its protective exit completes."""
+        with self.journal.connection() as db:
+            return {row["symbol"]: {**json.loads(row["body"]), "decision_id": row["decision_id"], "state": row["state"]}
+                    for row in db.execute("SELECT * FROM fund_levels WHERE state IN ('active','triggered')")}
+
+    def set_protective_target(self, symbol, weight):
+        with self.journal.connection() as db:
+            row = db.execute("SELECT body FROM fund_levels WHERE symbol=?", (symbol,)).fetchone()
+            if row:
+                body = {**json.loads(row[0]), "protective_target": str(weight)}
+                db.execute("UPDATE fund_levels SET body=? WHERE symbol=?", (encode(body), symbol))
+
+    def finish_level(self, symbol):
+        with self.journal.connection() as db:
+            db.execute("UPDATE fund_levels SET state='done' WHERE symbol=? AND state='triggered'", (symbol,))
+
+    def trigger_level(self, symbol, kind, now, detail):
+        with self.journal.connection() as db:
+            changed = db.execute("UPDATE fund_levels SET state='triggered' WHERE symbol=? AND state='active'",
+                                 (symbol,)).rowcount
+            if changed:
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "protective_trigger", encode({
+                    "symbol": symbol, "trigger": kind, **detail})))
+        return bool(changed)
+
+    def alerts(self):
+        with self.journal.connection() as db:
+            return [{**json.loads(row["body"]), "id": row["id"], "decision_id": row["decision_id"]}
+                    for row in db.execute("SELECT * FROM fund_alerts WHERE state='active' ORDER BY id")]
+
+    def trigger_alert(self, alert_id, now, detail):
+        with self.journal.connection() as db:
+            changed = db.execute("UPDATE fund_alerts SET state='triggered' WHERE id=? AND state='active'",
+                                 (alert_id,)).rowcount
+            if changed:
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "price_alert", encode(detail)))
+        return bool(changed)
+
+    def override(self, decision_id, symbol, max_weight, reason, now):
+        with self.journal.connection() as db:
+            old = db.execute("SELECT max_weight FROM fund_overrides WHERE decision_id=? AND symbol=?",
+                             (decision_id, symbol)).fetchone()
+            value = min(number(max_weight), number(old[0])) if old else number(max_weight)
+            db.execute("INSERT OR REPLACE INTO fund_overrides VALUES(?,?,?,?,?)",
+                       (decision_id, symbol, str(value), reason, str(now)))
+
+    def overrides(self, decision_id):
+        with self.journal.connection() as db:
+            return {row["symbol"]: number(row["max_weight"]) for row in
+                    db.execute("SELECT symbol,max_weight FROM fund_overrides WHERE decision_id=?", (decision_id,))}
+
+    def reference(self, decision_id, symbol, price, now):
+        """First observed price of a symbol under a decision (for move-triggered reviews)."""
+        with self.journal.connection() as db:
+            db.execute("INSERT OR IGNORE INTO fund_refs VALUES(?,?,?,?)", (decision_id, symbol, str(price), str(now)))
+            return number(db.execute("SELECT price FROM fund_refs WHERE decision_id=? AND symbol=?",
+                                     (decision_id, symbol)).fetchone()[0])
+
     # Execution-quality memory: arrival price and submission time per order.
     def record_submission(self, intent_id, decision_id, intent, now):
         with self.journal.connection() as db:
             db.execute("INSERT OR REPLACE INTO fund_orders VALUES(?,?,?,?,?,?)", (
                 intent_id, decision_id, intent.symbol, intent.side, str(now), str(intent.limit)))
+
+    def mark_protective(self, intent_id, now):
+        with self.journal.connection() as db:
+            db.execute("INSERT OR IGNORE INTO fund_protective_orders VALUES(?,?)", (intent_id, str(now)))
+
+    def is_protective(self, intent_id):
+        with self.journal.connection() as db:
+            return db.execute("SELECT 1 FROM fund_protective_orders WHERE intent_id=?", (intent_id,)).fetchone() is not None
 
     def submitted_at(self, intent_id):
         with self.journal.connection() as db:

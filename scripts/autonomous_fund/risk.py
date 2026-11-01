@@ -115,12 +115,46 @@ def validate_decision(decision, now, universe, limits):
         if symbol in targets or symbol not in universe or not 0 <= weight <= limits.max_position:
             raise RiskError("Duplicate, ineligible or overweight target")
         targets[symbol] = weight
+        _validate_levels(row, weight)
     if sum(targets.values()) > limits.max_exposure:
         raise RiskError("Target exposure exceeds portfolio limit")
     review = instant(decision["next_review_at"])
     if not now + timedelta(minutes=1) <= review <= now + timedelta(days=1):
         raise RiskError("Next review must be within one minute to one day")
+    for alert in decision.get("alerts") or []:
+        if alert["symbol"] not in universe:
+            raise RiskError("Price alerts may watch only eligible symbols")
+        bounds = [number(alert[k]) for k in ("above", "below") if alert.get(k) is not None]
+        if not bounds or any(b <= 0 for b in bounds):
+            raise RiskError("A price alert needs a positive above or below level")
+        if alert.get("above") is not None and alert.get("below") is not None and number(alert["below"]) >= number(alert["above"]):
+            raise RiskError("A price alert's below level must be under its above level")
     return targets
+
+
+def _validate_levels(row, weight):
+    """AI-chosen execution levels; executed only by deterministic code."""
+    levels = {k: number(row[k]) for k in ("entry_limit", "stop_loss", "take_profit") if row.get(k) is not None}
+    if any(value <= 0 for value in levels.values()):
+        raise RiskError("Entry, stop and take-profit levels must be positive prices")
+    if "stop_loss" in levels and "entry_limit" in levels and levels["stop_loss"] >= levels["entry_limit"]:
+        raise RiskError("A stop-loss must be below the entry limit")
+    if "stop_loss" in levels and "take_profit" in levels and levels["stop_loss"] >= levels["take_profit"]:
+        raise RiskError("A stop-loss must be below the take-profit level")
+    if row.get("take_profit_weight") is not None:
+        if "take_profit" not in levels or not 0 <= number(row["take_profit_weight"]) < weight:
+            raise RiskError("take_profit_weight needs a take-profit level and must be below the target weight")
+
+
+def decision_levels(decision):
+    """{symbol: levels} for targets that carry any AI execution level."""
+    result = {}
+    for row in decision["targets"]:
+        levels = {k: str(number(row[k])) for k in ("entry_limit", "stop_loss", "take_profit", "take_profit_weight")
+                  if row.get(k) is not None}
+        if levels:
+            result[row["symbol"]] = levels
+    return result
 
 
 def desired_shares(equity, weight, ask, limits):

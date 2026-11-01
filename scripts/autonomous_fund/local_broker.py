@@ -26,7 +26,8 @@ class LocalPaperBroker(Broker):
     LOCAL_SIMULATION = True
 
     def __init__(self, data_source, journal, limits, *, connect_stream=True,
-                 fee_rate="0.001", slippage_bps=5, volume_fraction="0.01", matching_enabled=True, require_monitor=False):
+                 fee_rate="0.001", slippage_bps=5, volume_fraction="0.01", matching_enabled=True, require_monitor=False,
+                 starting_cash="10000"):
         self.journal, self.limits = journal, limits
         self.matching_enabled = matching_enabled
         self.require_monitor = require_monitor
@@ -38,10 +39,12 @@ class LocalPaperBroker(Broker):
         self._poll_lock = threading.RLock()
         if not 0 <= self.fee_rate <= number("0.01") or not 0 <= self.slippage <= number("0.01") or not 0 < self.volume_fraction <= number("0.01"):
             raise RiskError("Invalid local simulation cost or volume parameters")
+        if not 0 < number(starting_cash) <= number("10000000"):
+            raise RiskError("Invalid local virtual account size")
         with journal.connection() as db:
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS local_account (id INTEGER PRIMARY KEY CHECK(id=1), cash TEXT NOT NULL, receivables TEXT NOT NULL);
-                INSERT OR IGNORE INTO local_account VALUES(1,'10000','0');
+                INSERT OR IGNORE INTO local_account VALUES(1,'%s','0');
                 CREATE TABLE IF NOT EXISTS local_positions (symbol TEXT PRIMARY KEY, quantity INTEGER NOT NULL, average TEXT NOT NULL, opened_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS local_orders (
                     id TEXT PRIMARY KEY, intent_id TEXT UNIQUE NOT NULL, strategy TEXT NOT NULL, body TEXT NOT NULL,
@@ -52,7 +55,7 @@ class LocalPaperBroker(Broker):
                     price TEXT NOT NULL, fee TEXT NOT NULL, observed_at TEXT NOT NULL,
                     PRIMARY KEY(order_id,bar_start));
                 CREATE TABLE IF NOT EXISTS local_actions (id TEXT PRIMARY KEY, amount TEXT NOT NULL);
-            """)
+            """ % str(number(starting_cash)))
         super().__init__(name="local-paper", data_source=data_source, config={"MARKET": "NYSE"},
                          connect_stream=connect_stream, start_orders_thread=False)
         # A crash before local order creation is provably a non-submission: all
@@ -286,6 +289,9 @@ class LocalPaperBroker(Broker):
         raw = number(bar.high) * (1 + friction) if buy else number(bar.low) * (1 - friction)
         price = raw.quantize(Decimal("0.01"), rounding=ROUND_CEILING if buy else ROUND_FLOOR)
         cash, _, equity = self._get_balances_at_broker(None, order.strategy)
+        # Fill-time checks use the operator's capital sleeve, never reserved cash.
+        reserve = self.journal.reserve_cash()
+        equity = number(equity) - reserve
         paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
         # Every holding used to admit a fill needs a fresh source observation.
         marks = {}
@@ -316,12 +322,13 @@ class LocalPaperBroker(Broker):
                 return
             account = db.execute("SELECT cash FROM local_account WHERE id=1").fetchone()
             cash = number(account[0])
+            sleeve_cash = cash - reserve
             position = db.execute("SELECT * FROM local_positions WHERE symbol=?", (order.asset.symbol,)).fetchone()
             held = position["quantity"] if position else 0
             notional, fee = price * quantity, price * quantity * self.fee_rate
             if buy:
                 net_equity = number(equity) - fee
-                if (paused or cash < notional + fee or marks.get(order.asset.symbol, 0) + notional > net_equity * self.limits.max_position
+                if (paused or sleeve_cash < notional + fee or marks.get(order.asset.symbol, 0) + notional > net_equity * self.limits.max_position
                         or sum(marks.values()) + notional > net_equity * self.limits.max_exposure):
                     raise VirtualRiskCancellation("Virtual fill exceeds current risk capacity")
                 average = (number(position["average"]) * held + notional) / (held + quantity) if position else price

@@ -83,6 +83,9 @@ def daily_document(root, sequence):
     day_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
                   if instant(at).astimezone(zone).date().isoformat() == day and
                   kind in {"order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval"}]
+    watch_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
+                    if instant(at).astimezone(zone).date().isoformat() == day and
+                    kind in {"protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit"}]
     lines = [f"# {day} 模拟账户日报及盘后复盘", "",
              f"报告截止：{packet['completed_at']}；模式：{snapshot['mode']}；Mock：{packet['mock']}",
              f"模型：{encode(packet['models'])}；策略备忘版本：{packet['version']}", "",
@@ -99,7 +102,25 @@ def daily_document(root, sequence):
              "## 买卖、成交及人工审批记录", "",
              "```json", json.dumps(day_events, ensure_ascii=False, indent=2), "```", "",
              "fill_reconciled 是券商累计成交观测，不能与成交回调重复相加；未成交订单不算实际交易。", "",
-             "## 复盘结论", "", review["summary"], ""]
+             "## 授权资金与约束", "",
+             f"AI 授权资金（初始/当前基数）USD：{snapshot['mandate']['capital_usd']}；账户中保留不动用的现金 USD："
+             f"{snapshot['mandate']['reserved_cash']}（为空表示整个专用账户都由 AI 管理）",
+             "约束遵守情况（AI 自评，需人工抽查）：" + (review.get("mandate_compliance") or "本次未填写"), "",
+             "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
+             "```json", json.dumps(watch_events, ensure_ascii=False, indent=2), "```", "",
+             "## AI 记分卡（只用已完成收盘价客观打分）", ""]
+    card = next((body for at, kind, body in reversed(events) if kind == "scorecard"), None)
+    if card:
+        predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
+        lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
+                  f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
+                  "决策相对同敞口基准的超额收益（1/5/20 个交易日）：" + json.dumps(decisions, ensure_ascii=False),
+                  "样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
+    else:
+        lines += ["尚无可打分的样本。", ""]
+    lines += ["## 下一交易日预测（将被自动打分）", "",
+              "```json", json.dumps(review.get("predictions", []), ensure_ascii=False, indent=2), "```", "",
+              "## 复盘结论", "", review["summary"], ""]
     for title, key in (("选股调整", "selection_adjustments"), ("择时调整", "timing_adjustments")):
         lines.extend([f"## {title}", ""])
         for change in review[key]:

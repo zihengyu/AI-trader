@@ -169,6 +169,75 @@ class Journal:
                 "drawdown": max(number(0), 1 - equity / peak) if peak > 0 else number(0),
                 "drawdown_latched": rows.get("drawdown_paused") == "true"}
 
+    def reserve_cash(self):
+        """Account cash excluded from the AI's capital sleeve (0 when no mandate)."""
+        with self.connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key='mandate_reserve_cash'").fetchone()
+        return number(row[0]) if row else number(0)
+
+    def apply_mandate(self, now, capital, cash, sleeve_value, holdings, open_orders, external, clean_start):
+        """Carve the operator's capital sleeve out of the account; return reserved cash.
+
+        First start: reserve = (cash + sleeve holdings value) - capital, so the AI
+        starts with exactly `capital`. A later capital change moves cash between
+        reserve and sleeve. External holdings (outside the universe) are frozen
+        at their first observed quantities; any change needs operator review.
+        Nothing is inferred: an account smaller than the mandate is refused.
+        """
+        capital = number(capital)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            rows = dict(db.execute("SELECT key,value FROM meta WHERE key LIKE 'mandate_%'"))
+            event = None
+            if "mandate_reserve_cash" not in rows:
+                if clean_start and (holdings or open_orders):
+                    raise RiskError("First mandate start requires no eligible-universe positions or open orders")
+                reserve = number(sleeve_value) - capital
+                if reserve < 0:
+                    raise RiskError("Account value is below the mandate capital")
+                if reserve > number(cash):
+                    raise RiskError("Existing eligible positions exceed the mandate capital; reduce them or raise capital_usd")
+                rows = {"mandate_reserve_cash": str(reserve), "mandate_capital_basis": str(capital),
+                        "mandate_external": encode({k: str(v) for k, v in sorted(external.items())})}
+                event = ("mandate_initialized", {"capital_usd": str(capital), "reserved_cash": str(reserve),
+                                                 "external_holdings": rows["mandate_external"]})
+            elif number(rows["mandate_capital_basis"]) != capital:
+                delta = capital - number(rows["mandate_capital_basis"])
+                reserve = number(rows["mandate_reserve_cash"]) - delta
+                if reserve < 0:
+                    raise RiskError("Raised mandate capital exceeds the account's reserved cash")
+                if reserve > number(cash):
+                    raise RiskError("Lowered mandate capital exceeds the sleeve's cash; reduce positions first")
+                event = ("mandate_capital_changed", {"from": rows["mandate_capital_basis"], "to": str(capital),
+                                                     "reserved_cash": str(reserve)})
+                rows.update(mandate_reserve_cash=str(reserve), mandate_capital_basis=str(capital))
+            baseline = {k: number(v) for k, v in json.loads(rows["mandate_external"]).items()}
+            if baseline != {k: number(v) for k, v in external.items()}:
+                raise RiskError("External holdings changed; review the account and run adjust-reserve to re-baseline")
+            for key, value in rows.items():
+                db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+            if event:
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), event[0], encode(event[1])))
+        return number(rows["mandate_reserve_cash"])
+
+    def adjust_reserve(self, now, amount, external=None):
+        """Operator-only: record a deposit (+) / withdrawal (-) of reserved cash, or re-baseline externals."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM meta WHERE key='mandate_reserve_cash'").fetchone()
+            if not row:
+                raise RiskError("No mandate reserve is recorded for this account yet")
+            reserve = number(row[0]) + number(amount)
+            if reserve < 0:
+                raise RiskError("Reserve cannot become negative; the sleeve's capital is not withdrawable here")
+            db.execute("INSERT OR REPLACE INTO meta VALUES ('mandate_reserve_cash',?)", (str(reserve),))
+            if external is not None:
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('mandate_external',?)",
+                           (encode({k: str(v) for k, v in sorted(external.items())}),))
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "operator_reserve_adjusted", encode({
+                "amount": str(amount), "reserved_cash": str(reserve), "external_rebaselined": external is not None})))
+        return reserve
+
     def counter(self, key, now, increment=0):
         """Per-trading-day durable counter, e.g. model runs; survives restarts."""
         day = trading_day(now)

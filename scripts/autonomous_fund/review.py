@@ -21,6 +21,16 @@ class Adjustment(BaseModel):
     invalidated_when: str = Field(min_length=1, max_length=1200)
 
 
+class Prediction(BaseModel):
+    """A falsifiable call, scored later against completed closes only."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    symbol: str = Field(min_length=1, max_length=12)
+    direction: Literal["up", "down", "outperform", "underperform"]
+    horizon_sessions: int = Field(ge=1, le=20)
+    benchmark: str = Field(default="SPY", min_length=1, max_length=12)
+    hypothesis_ref: str = Field(default="", max_length=200)
+
+
 class PostmarketReview(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     session_date: str
@@ -33,6 +43,8 @@ class PostmarketReview(BaseModel):
     data_gaps: list[str] = Field(max_length=12)
     confidence: Literal["low", "medium", "high"]
     strategy_memo: str = Field(min_length=1, max_length=6000)
+    predictions: list[Prediction] = Field(default_factory=list, max_length=10)
+    mandate_compliance: str = Field(default="", max_length=2000)
 
 
 def _events(journal, now, kinds=None):
@@ -195,10 +207,18 @@ def review_after_close(strategy):
     if any(r["kind"] == "postmarket_review" and r["body"]["session_date"] == day for r in rows):
         return
     memory = strategy_memory(strategy.journal, now)
+    scorecards = None
+    if hasattr(strategy, "_scorecards"):
+        try:
+            scorecards = strategy._scorecards(now)
+        except Exception as exc:
+            scorecards = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+    mandate = getattr(strategy, "mandate", None)
     context = {"as_of": now.isoformat(), "historical": historical, "phase": "postmarket_review",
                "orders_enabled": False, "eligible_universe": sorted(strategy.universe),
                "limits": asdict(strategy.limits), "strategy_memory": memory,
                "strategy_followup": strategy._strategy_evaluations(),
+               "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
                "session": _inputs(rows, session, now)}
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
@@ -230,6 +250,11 @@ def review_after_close(strategy):
                     "给出保留教训、撤回假设、数据缺项及下一交易日完整 strategy_memo，继承仍有效的经验。"
                     "不因单日盈亏宣称策略有效，不追涨杀跌式过拟合，说明样本不足和置信度。"
                     "备忘仅供下一次 AI 研究和完整目标持仓决策参考，不能修改风险上限、投资范围、权限或代码。"
+                    "必须阅读 scorecards（已用收盘价客观打分的历史预测命中率、各决策相对同敞口基准的超额收益），"
+                    "据此保留、修正或撤回假设；记分差的假设应撤回。给出最多 10 条可证伪的 predictions"
+                    "（symbol、direction=up/down/outperform/underperform、horizon_sessions 1-20、benchmark、"
+                    "hypothesis_ref 指向对应调整），之后会被自动打分。"
+                    "在 mandate_compliance 中逐条核对当日决策是否遵守 operator_mandate 的约束，如有偏离必须说明。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。", context=context,
         output_schema=PostmarketReview)
     review = PostmarketReview.model_validate(strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()
@@ -247,6 +272,8 @@ def review_after_close(strategy):
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)
+    if scorecards:
+        strategy.journal.event(strategy.get_datetime(), "scorecard", {"session_date": day, **scorecards})
     strategy.log_message(f"Post-market review saved for {day}; strategy memory v{packet['version']} is available.")
 
 
@@ -274,6 +301,14 @@ def export_reviews(root, packets):
                 lines.extend(["本次没有新增调整。", ""])
         for title, key in (("保留教训", "retained_lessons"), ("撤回假设", "retired_hypotheses"), ("数据缺项", "data_gaps")):
             lines.extend([f"## {title}", "", *[f"- {item}" for item in review[key]], ""])
+        lines.extend(["## 约束遵守（AI 自评）", "", review.get("mandate_compliance") or "本次未填写。", "",
+                      "## 可证伪预测（之后按收盘价自动打分）", ""])
+        for item in review.get("predictions", []):
+            lines.append(f"- {item['symbol']} {item['direction']}（{item['horizon_sessions']} 个交易日，"
+                         f"基准 {item.get('benchmark', 'SPY')}；对应 {item.get('hypothesis_ref') or '未标注'}）")
+        if not review.get("predictions"):
+            lines.append("本次没有给出预测。")
+        lines.append("")
         lines.extend(["## 下一交易日策略备忘", "", review["strategy_memo"], "",
                       f"置信度：{review['confidence']}。复盘调整是待验证的假设，不保证收益改善。", ""])
         body = json.dumps(packet, indent=2, ensure_ascii=False)
