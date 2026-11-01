@@ -26,9 +26,10 @@ class LocalPaperBroker(Broker):
     LOCAL_SIMULATION = True
 
     def __init__(self, data_source, journal, limits, *, connect_stream=True,
-                 fee_rate="0.001", slippage_bps=5, volume_fraction="0.01", matching_enabled=True):
+                 fee_rate="0.001", slippage_bps=5, volume_fraction="0.01", matching_enabled=True, require_monitor=False):
         self.journal, self.limits = journal, limits
         self.matching_enabled = matching_enabled
+        self.require_monitor = require_monitor
         self.fee_rate, self.slippage = number(fee_rate), number(slippage_bps) / 10000
         self.volume_fraction = number(volume_fraction)
         self._last_poll_error = None
@@ -163,6 +164,9 @@ class LocalPaperBroker(Broker):
         return {}
 
     def _submit_order(self, order):
+        if self.require_monitor:
+            from .monitor import require_monitor
+            require_monitor(self.journal.root, self.data_source.get_datetime())
         if not self.matching_enabled or not self.is_market_open() or (self.journal.root / "STOP").exists():
             raise RiskError("Local simulator is stopped or market is closed")
         if str(order.asset.asset_type) != "stock" or str(order.order_type) != "limit" or str(order.side) not in {"buy", "sell"} or order.child_orders:
@@ -244,6 +248,8 @@ class LocalPaperBroker(Broker):
                         "matching_enabled": self.matching_enabled,
                         "market": self.data_source.session.status(), "stopped": (self.journal.root / "STOP").exists(),
                         "matching_error": self._last_poll_error, "pending_orders": pending, **account}
+                if hasattr(self.data_source, "diagnostics"):
+                    body["market_data"] = self.data_source.diagnostics()
                 target = self.journal.root / "status.json"
                 temporary = target.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
                 temporary.write_text(encode(body), encoding="utf-8")
@@ -268,6 +274,9 @@ class LocalPaperBroker(Broker):
                 return
 
     def _fill_bar(self, identifier, order, start, bar):
+        if self.require_monitor:
+            from .monitor import require_monitor
+            require_monitor(self.journal.root, self.data_source.get_datetime())
         if not self.matching_enabled:
             raise RiskError("Observation-only broker cannot simulate executions")
         # Conservative complete-bar execution: high plus friction for buys, low

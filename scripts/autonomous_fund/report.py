@@ -9,7 +9,9 @@ from datetime import datetime, timezone
 from .risk import instant
 
 
-def report(root, prices=None, write_files=True):
+def report(root, prices=None, write_files=True, *, as_of=None):
+    if as_of is not None and write_files:
+        raise ValueError("Historical report snapshots must not overwrite current reports")
     root = Path(root)
     with sqlite3.connect(root / "state.sqlite3") as db:
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
@@ -18,6 +20,8 @@ def report(root, prices=None, write_files=True):
         approval_rows = [dict(zip(("id", "digest", "state", "body"), r)) for r in db.execute(
             "SELECT id,digest,state,body FROM fund_approvals ORDER BY rowid")] if "fund_approvals" in tables else []
         target = db.execute("SELECT id,state,until_at,body FROM fund_decisions ORDER BY rowid DESC LIMIT 1").fetchone() if "fund_decisions" in tables else None
+    if as_of is not None:
+        events = [row for row in events if instant(row[0]) <= instant(as_of)]
     now = datetime.now(timezone.utc)
     for row in approval_rows:
         row["body"] = json.loads(row["body"])
@@ -98,6 +102,12 @@ def report(root, prices=None, write_files=True):
                 key = row["broker_id"]
                 fee_by_order[key] = max(fee_by_order.get(key, 0), float(row["trade_cost"]))
     totals = {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0, "unknown_calls": 0}
+    unfinished = {}
+    for at, kind, body in events:
+        if kind == "agent_call_started":
+            unfinished[body["id"]] = {"at": at, **body}
+        elif kind == "agent_call_finished":
+            unfinished.pop(body["id"], None)
     by_model = {}
     for row in usage:
         if row.get("cache_hit"):
@@ -119,7 +129,7 @@ def report(root, prices=None, write_files=True):
             counts[key] += value
     estimate = None
     estimates_by_model = None
-    if prices and not totals["unknown_calls"]:
+    if prices and not totals["unknown_calls"] and not unfinished:
         # Operator-supplied rates only. This is an estimate, not a provider bill.
         # A legacy single-model rate must never silently price two models alike.
         rates = ({model: prices for model in by_model} if len(by_model) == 1 and "input" in prices
@@ -156,6 +166,7 @@ def report(root, prices=None, write_files=True):
         "observed_fees": local_fees + sum(fee_by_order.values()) if not unknown_fee else None,
         "fill_details_incomplete": incomplete_fills,
         "model_usage": totals, "model_usage_by_model": by_model,
+        "unfinished_model_calls": list(unfinished.values()),
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
         "latest_account": accounts[-1] if accounts else None,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "

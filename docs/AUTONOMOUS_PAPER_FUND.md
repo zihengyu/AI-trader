@@ -11,6 +11,8 @@
 ## Overview
 
 本应用位于 `scripts/autonomous_fund/`，不修改 LumiBot 核心、原有 AI 示例、版本或发布流程。
+Ubuntu 的 `.env` 模板、systemd 双服务、审批理由、自动日报和恢复验收步骤见
+[服务器部署说明](AUTONOMOUS_FUND_UBUNTU.md)。该入口启动时保持 STOP，独立监控正常后由操作员恢复。
 `researcher` 研究行情、技术指标、基本面、新闻与持仓；`manager` 自主选择完整目标组合、现金比例和下次复核时间。
 两者复用原生 `self.agents.create()` 和结构化 `output_schema`，均设置 `allow_trading=False`。
 这是用户指定的混合策略：唯一的投资决策者输出目标，独立 Python 代码执行风险准入与订单。

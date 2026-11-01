@@ -1391,7 +1391,13 @@ account. ``ALPACA_IS_PAPER`` defaults to true; an explicit false value is reject
 The application has no live mode and disables automatic dotenv discovery. Inject
 secrets through the process environment or your own secret manager; alternatively,
 select your own untracked secret file explicitly with ``--env-file`` (existing
-environment values take precedence). See
+environment values take precedence). On Linux the file must have private
+permissions (0600 or stricter). The application ships
+``scripts/autonomous_fund/.env.example``; ``deploy prepare`` creates an ignored
+empty-value ``.env`` only when absent. The Linux shell launcher explicitly
+selects that checkout file; it never shell-sources it. Generated systemd services
+load the selected file explicitly and require Telegram credentials as well as
+the selected execution mode's keys. See ``docs/AUTONOMOUS_FUND_UBUNTU.md`` and
 ``docs/AUTONOMOUS_PAPER_FUND.md`` in the source checkout for commands and limits.
 
 The separate ``monitor`` process optionally delivers account alerts through
@@ -1408,6 +1414,17 @@ writes the selected run directory's STOP file; recovery never clears it.
 ``notify-test`` explicitly sends one test message without modifying STOP or
 submitting an order; an API acknowledgement still requires confirmation on the
 operator's device. Telegram rate-limit delays apply to all queued messages.
+Completed postmarket reviews are also delivered as dated report attachments,
+including recovered unsent reviews after monitor restart. Major-transaction
+alerts include investment rationale and reviewed scope; long reasons are sent
+as attachments. Report uploads are generated from the selected account journal,
+not from model-supplied file paths. No new secret variables are required.
+
+The server runner passes ``--require-monitor``: local/paper submissions and local
+virtual fills require an independent, Telegram-configured monitor heartbeat no
+older than 45 seconds. Services restart processes but preserve STOP for explicit
+operator recovery. These are application CLI settings, not platform defaults or
+environment-based permission bypasses.
 
 Major-transaction approval uses the local ``approvals``, ``approve`` and
 ``reject`` commands and needs no provider/broker key. Telegram is notification

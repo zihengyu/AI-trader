@@ -1,5 +1,6 @@
 * linguist-vendored 
 *.py linguist-vendored=false
+scripts/run_autonomous_fund.sh text eol=lf
 
 # Preserve machine-produced proof artifacts byte-for-byte. Treating them as
 # binary prevents Git from normalizing CRLF CSV output or raw tool log spacing.

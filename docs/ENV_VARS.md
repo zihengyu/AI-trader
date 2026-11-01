@@ -19,6 +19,8 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 - Errors list both required variable names; logs, model contexts and delivery status omit token values. Keep them in the operator's environment or an explicitly selected untracked secret file.
 - Telegram supplies notifications only. Local operator approval is bound to a reviewed digest, account, decision, session, quantity/price bounds and expiry; it never routes real-money orders.
 - Watchdog intervals are explicit command parameters, with 180-second heartbeat and 900-second model-call defaults. Start the separate process for independent protection; missing configuration is not successful delivery.
+- The Linux server services require these two variables and explicitly load the selected private `.env`. `deploy prepare` creates a blank template only if absent; process environment wins, and the file is parsed rather than shell-sourced. POSIX group/other access is rejected. No extra key names or automatic discovery were added.
+- Completed reviews generate persistent daily report attachments; approval alerts expose trade rationale and bounded scope. The server's `--require-monitor` execution gate needs a healthy monitor heartbeat within 45 seconds; restarting services preserves STOP. See `docs/AUTONOMOUS_FUND_UBUNTU.md` for deployment and recovery.
 
 ### `LUMIBOT_CHATGPT_HOME` / `LUMIBOT_CHATGPT_PROFILE` / `LUMIBOT_CHATGPT_PROFILE_PATH`
 - Purpose: Select the private directory, existing profile ID, or explicitly protected profile file for `chatgpt/<model>` agents and subscription-funded evaluations.

@@ -4,6 +4,7 @@ import json
 import os
 import time
 import threading
+import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -12,6 +13,18 @@ import requests
 from .execution import operator_connection
 from .journal import encode
 from .risk import RiskError, instant
+
+
+def require_monitor(root, now):
+    """Server execution gate, independent of AI and the supervising PID."""
+    try:
+        body = json.loads((Path(root) / "monitor.json").read_text(encoding="utf-8"))
+        age = (instant(now) - instant(body["at"])).total_seconds()
+        if (not 0 <= age <= 45 or body["health"] not in {"healthy", "stopped"} or
+                not body.get("telegram_configured")):
+            raise ValueError("Unhealthy independent monitor")
+    except Exception:
+        raise RiskError("Independent monitor unavailable or unhealthy; server execution blocked") from None
 
 
 class Telegram:
@@ -23,10 +36,17 @@ class Telegram:
         self.post = post or requests.post
 
     def send(self, text):
+        return self._request("sendMessage", json={"chat_id": self.chat_id, "text": text[:4000],
+            "link_preview_options": {"is_disabled": True}})
+
+    def send_document(self, caption, filename, document):
+        return self._request("sendDocument", data={"chat_id": self.chat_id, "caption": caption[:1000]},
+                             files={"document": (filename, document.encode("utf-8"), "text/plain; charset=utf-8")})
+
+    def _request(self, method, **payload):
         try:
-            response = self.post(f"https://api.telegram.org/bot{self.token}/sendMessage",
-                json={"chat_id": self.chat_id, "text": text[:4000], "link_preview_options": {"is_disabled": True}},
-                timeout=10, allow_redirects=False)
+            response = self.post(f"https://api.telegram.org/bot{self.token}/{method}",
+                **payload, timeout=10, allow_redirects=False)
             body = response.json()
         except Exception:
             # Exceptions often include the token-bearing URL. Never propagate it.
@@ -69,7 +89,7 @@ class Monitor:
                 db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('recipient',?)", (recipient,))
 
     def _health(self, db, now):
-        saved = db.execute("SELECT at,body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+        saved = db.execute("SELECT at,body,sequence FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not saved or json.loads(saved[1]).get("mode") not in {"local", "paper"}:
             raise RiskError("Monitor requires an existing local or Alpaca paper run")
         startup = json.loads(saved[1])
@@ -88,17 +108,23 @@ class Monitor:
                     state = "matching_error"
             except Exception:
                 state = "heartbeat_unavailable"
-        latest = db.execute("SELECT at,kind,body FROM events WHERE kind IN ('agent_call_started','agent_call_finished') ORDER BY sequence DESC LIMIT 1").fetchone()
+        # A killed provider call remains an audit fact, not a permanently hung
+        # call in every subsequent process. Scope liveness to THIS startup.
+        latest = db.execute("SELECT at,kind,body FROM events WHERE sequence>? AND kind IN "
+            "('agent_call_started','agent_call_finished') ORDER BY sequence DESC LIMIT 1", (saved["sequence"],)).fetchone()
         if latest and latest[1] == "agent_call_started" and (now - instant(latest[0])).total_seconds() > self.agent_seconds:
             state = "agent_call_stalled"
         if state == "healthy" and not (latest and latest[1] == "agent_call_started"):
             from .market_data import SessionClock
             market = SessionClock(now=lambda: now).status()
-            iteration = db.execute("SELECT at FROM events WHERE kind IN ('iteration_started','iteration_finished') ORDER BY sequence DESC LIMIT 1").fetchone()
+            iteration = db.execute("SELECT at FROM events WHERE sequence>? AND kind IN "
+                "('iteration_started','iteration_finished') ORDER BY sequence DESC LIMIT 1", (saved["sequence"],)).fetchone()
             observed_at = instant(iteration[0] if iteration else saved[0])
             if (market["open"] and (now - instant(market["next_open"])).total_seconds() > 300 and
                     (now - observed_at).total_seconds() > self.heartbeat_seconds):
                 state = "iteration_stalled"
+        if shutil.disk_usage(self.root).free < 200_000_000:
+            state = "low_disk_space"
         if state not in {"healthy", "stopped"}:
             # Reassert every poll even after someone resumes an unhealthy run;
             # deduplication applies to alerts, never to the protective STOP.
@@ -121,6 +147,20 @@ class Monitor:
         now = instant(now or datetime.now(timezone.utc))
         with operator_connection(self.root) as db:
             state = self._health(db, now)
+            # Recover even if the trader exited between persisting the review
+            # and exporting it. One durable notification per completed review.
+            reviews = db.execute("SELECT sequence,at,body FROM events WHERE kind='postmarket_review'").fetchall()
+            for review in reviews:
+                packet = json.loads(review["body"])
+                if instant(packet["completed_at"]) > now:
+                    continue
+                existing = db.execute("SELECT 1 FROM events WHERE kind='notification' AND "
+                    "json_extract(body,'$.kind')='postmarket_report' AND json_extract(body,'$.details.review_sequence')=?",
+                    (review["sequence"],)).fetchone()
+                if not existing:
+                    db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
+                        "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
+                        "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
             # Drop stale first-start alerts; retain recent requests and failures.
             rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' ORDER BY sequence").fetchall()
             for row in rows:
@@ -137,7 +177,7 @@ class Monitor:
                     if previous["body"] == row["body"] and abs((instant(row["at"]) - instant(previous["at"])).total_seconds()) < 1800:
                         duplicate = True
                         break
-                stale = now - instant(row["at"]) > timedelta(hours=1)
+                stale = body.get("kind") != "postmarket_report" and now - instant(row["at"]) > timedelta(hours=1)
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
         if self.transport is not None:
@@ -145,7 +185,8 @@ class Monitor:
         with operator_connection(self.root) as db:
             counts = dict(db.execute("SELECT state,count(*) FROM fund_deliveries GROUP BY state"))
         status = {"at": now.isoformat(), "health": state, "telegram_configured": self.transport is not None,
-                  "delivery_counts": counts, "stop_active": (self.root / "STOP").exists()}
+                  "delivery_counts": counts, "stop_active": (self.root / "STOP").exists(),
+                  "disk_free_bytes": shutil.disk_usage(self.root).free}
         temporary = self.root / "monitor.tmp"
         temporary.write_text(encode(status), encoding="utf-8")
         temporary.replace(self.root / "monitor.json")
@@ -160,7 +201,9 @@ class Monitor:
             if gate and instant(gate[0]) > now:
                 return
             rows = db.execute("SELECT d.*,e.body FROM fund_deliveries d JOIN events e ON e.sequence=d.sequence WHERE d.state IN ('pending','retry','sending') ORDER BY d.sequence").fetchall()
-        for row in [r for r in rows if instant(r["next_at"]) <= now and (only is None or r["sequence"] == only)][:5]:
+        # Bound delivery work so the independent health gate stays fresh while
+        # sending slow uploads; remaining durable messages wait for the next poll.
+        for row in [r for r in rows if instant(r["next_at"]) <= now and (only is None or r["sequence"] == only)][:2]:
             body = json.loads(row["body"])
             text = f"LumiBot 模拟账户 · 事件 #{row['sequence']}\n{body.get('kind')}\n{encode(body.get('details'))}"
             with operator_connection(self.root) as db:
@@ -173,7 +216,23 @@ class Monitor:
                     ((now + timedelta(seconds=60)).isoformat(), row["sequence"], row["next_at"]))
                 if claimed.rowcount != 1:
                     continue  # Another monitor/test sender already claimed it.
-            result = self.transport.send(text)
+            try:
+                from .notifications import approval_message, daily_document
+                if body.get("kind") == "postmarket_report":
+                    filename, document = daily_document(self.root, body["details"]["review_sequence"])
+                    result = self.transport.send_document(
+                        f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
+                        filename, document)
+                elif body.get("kind") == "approval_required" and "side" in body.get("details", {}):
+                    message = approval_message(body["details"])
+                    result = (self.transport.send(message) if len(message) <= 4000 else
+                              self.transport.send_document(message[:900] + "\n完整理由见附件。",
+                                  f"approval-{body['details']['id']}.txt", message))
+                else:
+                    result = self.transport.send(text)
+            except Exception:
+                # Never persist third-party exceptions (may contain credentials).
+                result = {"ok": False, "error": "report_or_delivery_error", "retry_after": 30}
             delay = max(result.get("retry_after", 0), min(1800, 5 * 2 ** min(row["attempts"], 8)))
             with operator_connection(self.root) as db:
                 db.execute("UPDATE fund_deliveries SET state=?,next_at=?,last_error=?,message_id=? WHERE sequence=?", (

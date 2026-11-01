@@ -3,6 +3,7 @@ import argparse
 import hashlib
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -162,7 +163,8 @@ def run_paper(args, config):
     binding = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
     strategy = AutonomousFund(broker=broker, name="AutonomousPaperFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "paper", "account_binding": binding,
-        "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model})
+        "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
+        "require_monitor": args.require_monitor})
     trader = Trader()
     trader.add_strategy(strategy)
     try:
@@ -217,11 +219,11 @@ def run_local(args, config):
     binding = account_digest("local", "local-virtual-account", config)
     journal = Journal(args.run_dir, binding)
     broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
-                              matching_enabled=not args.observe_only)
+                              matching_enabled=not args.observe_only, require_monitor=args.require_monitor)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
         "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
         "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
-        "observe_only": args.observe_only})
+        "observe_only": args.observe_only, "require_monitor": args.require_monitor})
     broker.do_polling()
     print("Local virtual account active. No brokerage account is connected. Observe-only=" + str(args.observe_only))
     print("Market session: " + json.dumps(broker.data_source.session.status()))
@@ -253,6 +255,7 @@ def main(argv=None):
     parser.add_argument("--broker-order-id")
     parser.add_argument("--once", action="store_true", help="One local scheduler iteration or monitor poll, then exit")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
+    parser.add_argument("--require-monitor", action="store_true", help="Block local/paper orders unless an independent Telegram monitor is fresh")
     parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
     parser.add_argument("--approval-id")
     parser.add_argument("--approval-digest", help="Exact digest shown by approvals; approval never submits an order")
@@ -261,11 +264,11 @@ def main(argv=None):
     parser.add_argument("--agent-seconds", type=int, default=900)
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
     args = parser.parse_args(argv)
+    if args.require_monitor and args.mode not in {"local", "paper"}:
+        raise RiskError("--require-monitor is available only for local/paper execution")
     if args.env_file:
-        from dotenv import load_dotenv
-        if not args.env_file.is_file():
-            raise RiskError("The explicitly selected environment file does not exist")
-        load_dotenv(args.env_file, override=False)
+        from .environment import load_environment
+        load_environment(args.env_file)
         args.model = args.model or os.environ.get("AI_MODEL")
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
@@ -333,7 +336,8 @@ def main(argv=None):
             raise RiskError("--observe-only and --once are local-mode options")
         if args.mode != "mock" and not args.scripted and not args.observe_only:
             models_ready(args, config)
-        logging.getLogger().addHandler(logging.FileHandler(args.run_dir / "runtime.log", encoding="utf-8"))
+        logging.getLogger().addHandler(RotatingFileHandler(args.run_dir / "runtime.log", encoding="utf-8",
+                                                        maxBytes=20_000_000, backupCount=5))
         if args.mode == "qualify":
             from .evaluation import qualify
             print(json.dumps(qualify(args, config), indent=2, ensure_ascii=True))

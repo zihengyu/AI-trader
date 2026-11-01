@@ -119,6 +119,7 @@ class ExecutionState:
                 body["day"] == trading_day(now) and instant(body["created_at"]) <= instant(now) < instant(body["expires_at"]) and
                 body["symbol"] == intent.symbol and body["side"] == intent.side and
                 0 < intent.quantity <= body["max_quantity"] and number(intent.limit) <= number(body["max_limit"]) and
+                (intent.side != "sell" or ("min_limit" in body and number(intent.limit) >= number(body["min_limit"]))) and
                 number(intent.quantity) * number(intent.limit) <= number(body["max_notional"]))
 
     def prepare(self, active, intent, account, now, liquidates_all=None):
@@ -147,7 +148,10 @@ class ExecutionState:
                     "day": trading_day(now), "created_at": instant(now).isoformat(), "expires_at": expires.isoformat(),
                     "symbol": intent.symbol, "side": intent.side, "max_quantity": intent.quantity,
                     "max_limit": str(maximum), "max_notional": str(maximum * intent.quantity),
+                    "min_limit": str(number(intent.limit) * (1 - number(self.policy.price_tolerance))),
                     "observed_equity": str(account.equity), "daily_reserved_notional": str(self.turnover(db, now)),
+                    "current_quantity": str(account.positions.get(intent.symbol, 0)),
+                    "target_weight": str(active["weights"].get(intent.symbol, 0)),
                     "reasons": reasons, "target_portfolio": active["decision"]["targets"],
                     "rationale": active["decision"]["rationale"]}
             checksum = digest(body)
@@ -155,7 +159,11 @@ class ExecutionState:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                 "kind": "approval_required", "details": {"id": key, "digest": checksum, "symbol": intent.symbol,
                 "side": intent.side, "max_quantity": intent.quantity, "max_notional": body["max_notional"],
-                "expires_at": body["expires_at"], "reasons": reasons}})))
+                "expires_at": body["expires_at"], "reasons": reasons,
+                "rationale": body["rationale"], "observed_equity": body["observed_equity"],
+                "current_quantity": body["current_quantity"], "target_weight": body["target_weight"],
+                "max_limit": body["max_limit"], "min_limit": body["min_limit"],
+                "target_portfolio": body["target_portfolio"]}})))
             return {"id": key, "body": encode(body), "digest": checksum, "state": "pending"}
 
     def guard(self, active, intent, account, now, approval, universe, limits, liquidates_all=None):
