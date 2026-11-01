@@ -79,6 +79,18 @@ class LocalPaperBroker(Broker):
         self._stream_established()
         self.stream.run(self.name)
 
+    def sleep(self, sleeptime):
+        # Native market-open waits can span a weekend. An ordinary time.sleep
+        # keeps Trader.join() and the account lock alive after Ctrl+C.
+        self._stop_event.wait(max(0, float(sleeptime)))
+
+    def _close_connection(self):
+        # StrategyExecutor.gracefully_exit() invokes this native broker hook.
+        # Wake market waits before stopping the polling stream; both are local.
+        self._stop_event.set()
+        if getattr(self, "stream", None):
+            self.stream.stop()
+
     def _pull_broker_order(self, identifier):
         with self.journal.connection() as db:
             row = db.execute("SELECT * FROM local_orders WHERE id=?", (str(identifier),)).fetchone()

@@ -1,3 +1,6 @@
-# Optional native keyless web-search backend for this checkout application.
-# Install alongside the repository requirements; no shared package pins change.
+# Checkout application add-ons and tested SDK constraint; shared pins stay intact.
 ddgs==9.16.1
+# LiteLLM 1.106.2 imports MCP 2-only symbols on plain function-tool requests.
+# LumiBot requires MCP 1.x. Reproduce with test_autonomous_fund_model.py.
+# https://github.com/BerriAI/litellm/issues/46045
+litellm==1.105.1

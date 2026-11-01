@@ -388,6 +388,9 @@ def test_local_mode_runs_through_native_strategy_executor_with_scripted_model(tm
     assert strategy.is_backtesting is False
     assert journal.pending()
     advance(clock, source)
-    broker.do_polling()
-    observed = broker._pull_order(journal.pending()[0]["broker_id"], strategy.name)
+    # run_once closes its broker. Continue through a new connection to the same
+    # durable account, as a restarted running process would.
+    restored = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
+    restored.do_polling()
+    observed = restored._pull_order(journal.pending()[0]["broker_id"], strategy.name)
     assert observed.status == "fill"

@@ -8,7 +8,7 @@ import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from filelock import FileLock
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from .risk import RiskError, instant
 
@@ -199,9 +199,7 @@ def run_local(args, config):
     try:
         trader.run_all(run_once=args.once)
     finally:
-        broker._stop_event.set()
-        if getattr(broker, "stream", None):
-            broker.stream.stop()
+        broker._close_connection()
         broker.do_polling()  # Publish exited state without matching another order.
         journal.export()
         from .report import report
@@ -330,5 +328,11 @@ def attach_order(args):
 if __name__ == "__main__":
     try:
         main()
+    except FileLockTimeout as exc:
+        raise SystemExit(
+            f"Run directory or paper account is already in use ({exc.lock_file}). "
+            "Stop the previous runner and wait for it to exit before restarting. "
+            "Keep the same account directory; do not delete its lock or journal."
+        ) from None
     except (RiskError, ValueError) as exc:
         raise SystemExit(str(exc))

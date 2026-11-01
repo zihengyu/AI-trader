@@ -31,6 +31,9 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt -r scripts/autonomous_fund/requirements.txt
 ```
 
+应用依赖固定 `litellm==1.105.1`，与框架要求的 MCP 1.x 配合使用；不修改共享依赖或升级 MCP 主版本。
+修改依赖前先停止正在运行的模拟盘。以后重新安装共享依赖后，也需重新应用本应用的依赖约束。
+
 无需密钥的完整机械检查：
 
 ```powershell
@@ -136,6 +139,20 @@ Yahoo 公开数据的使用还须符合其条款；本模式用于个人研究�
 浏览器工具还需可选 Playwright 与浏览器运行时；未安装时仍可使用搜索及 HTTP 文档读取，
 网页反爬、付费墙或网络限流可能导致研究缺项，模型必须披露。没有把这些研究源伪装成完整市场覆盖。
 
+若模型调用重复报 `cannot import name 'CacheableResult' from 'mcp.types'`，这是已复现的
+LiteLLM 1.106.2 与 MCP 1.x 工具调用路径不兼容，不是更换 Key 或等待重试可以解决的问题。
+停止旧进程后，在项目根目录执行以下命令，再用原终端、原运行目录重新启动：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r scripts/autonomous_fund/requirements.txt
+.\scripts\run_autonomous_fund.ps1 -Mode local -RunDir artifacts/fund-local
+```
+
+不要升级到框架不支持的 MCP 2.x，也不要手动修改 SDK 源码补造缺失类型。
+`pip check` 和单独导入模块不能发现这类运行时不兼容；对应测试会实际经过 LiteLLM 的工具请求路径，
+并通过原生 ADK 执行一次工具调用和结果回传。HTTP 响应是合成的，不访问提供方。
+上游记录：[LiteLLM issue 46045](https://github.com/BerriAI/litellm/issues/46045)。
+
 ## Alpaca Paper 运行
 
 先在 Alpaca 端准备一个独立、空仓、无未完成订单、净值为 **10,000 美元** 的 Paper 账户。
@@ -210,6 +227,11 @@ Alpaca 订单列表达到原生适配器的 100 条返回上限时会拒绝继�
 `stop` 创建 STOP 文件；运行进程下一次迭代停止新单并尝试取消本应用已知未完成订单。
 不要把创建文件当成券商已确认撤单。模型或网络调用进行中可能延迟处理；紧急时同时去券商界面核验并撤单。
 Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单。
+本地模拟盘的休市等待可被原生关闭钩子唤醒，Ctrl+C 后会退出等待并释放进程锁；
+正在进行的模型或数据请求仍可能需要结束后才能退出。`-Once` 结束也会关闭撮合连接，后续撮合需重启同一账本。
+若提示 `already in use`／`runner.lock could not be acquired`，说明另一个实例仍持有操作系统锁。
+先结束原来的进程并等待退出，再使用原目录重启；不要删除锁文件、账本或更换目录来绕过互斥。
+升级前已在休市长时间等待的旧进程不会自动获得修复，必要时由操作员核验命令行、项目路径与运行目录后，仅结束那个实例。
 `resume` 只移除人工停止，不清除回撤锁或不确定订单。
 本地模式将上述命令中的目录替换为 `artifacts/fund-local`；轮询器也在休市时处理本地 STOP 和到期撤单。
 回撤暂停需要操作员停掉进程后显式执行 `reset-drawdown`；新高水位从下一次净值开始，操作会留痕。
@@ -279,12 +301,14 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 2026-11-01（北京时间）联网读取到真实 SPY、QQQ 的分钟与历史日线，且通过本地虚拟账户的
 原生调度器只读启动检查。当时为周末休市，源行情是前一交易日收盘；没有伪造成新报价。
 本地撮合的开盘、部分成交、费用、崩溃恢复、源数据故障、过期、拆股／分红及风控测试使用可控时钟与行情替身。
-真实模型工具调用、真实开盘时段持续运行、网络抖动下长期表现仍需配置模型 Key 后验证。
-最终相关回归 205 项通过，覆盖盘前研究到正常时段决策下单；另有原生网络工具单测 27 项通过。
+真实模型工具调用、真实开盘时段持续运行、网络抖动下长期表现仍需在运行终端配置模型 Key 后验证。
+相关回归 296 项通过，覆盖盘前研究到正常时段决策下单、休市退出、进程锁冲突、提供方配置及真实 SDK 的工具请求路径；另有原生网络工具单测 27 项通过。
+SDK 回归先在 LiteLLM 1.106.2 下复现导入异常，再在 1.105.1 下验证修复；
+SDK 模拟响应与原生 ADK 的 HTTP 替身测试均不产生模型推理费用，不证明真实提供方已鉴权或返回研究结果。
 原生免费网络搜索实际返回了公开结果。盘前模型研究测试使用明确的模型替身，不代表真实 DeepSeek 接口已验证。
 持续只读进程的心跳、运行中报告读取和 STOP 标记识别也已验证，测试后已结束该进程。
 
-未配置真实模型或 Alpaca Key；没有做真实模型研究、Alpaca 网络登录、Paper 下单／撤单／停机恢复或通知投递。
+开发测试进程未注入真实模型或 Alpaca Key；没有做真实模型研究、Alpaca 网络登录、Paper 下单／撤单／停机恢复或通知投递。
 这些需要你在本地填写凭证后单独验证。没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
 
@@ -298,10 +322,12 @@ CSV 时间表示纽约交易日开始，不是收盘后才可用的数据时间�
 | `scripts/autonomous_fund/run.py`、`scripts/run_autonomous_fund.ps1` | 扩展 local/check、只读观察、单次运行和显式秘密文件参数 |
 | `scripts/autonomous_fund/strategy.py` | 接入本地账户、原始行情时间和本地成交核对 |
 | `tests/test_autonomous_fund_premarket.py` | 休市启动研究、持久化去重、原生盘前钩子到开盘执行的回归测试 |
+| `tests/test_autonomous_fund_shutdown.py` | 原生关闭钩子唤醒休市等待、SIGINT 退出和真实进程锁冲突回归 |
+| `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
 | `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款 |
 | `scripts/autonomous_fund/report.py` | 本地增量费用、观察模式、运行期间只读报告 |
 | `scripts/autonomous_fund/config.json` | 设置本应用的 DeepSeek Flash 默认模型 |
-| `scripts/autonomous_fund/requirements.txt` | 新增本应用需要的免费网络搜索附加依赖 |
+| `scripts/autonomous_fund/requirements.txt` | 本应用需要的免费网络搜索依赖与已验证的 LiteLLM 兼容版本约束 |
 | `docsrc/environment_variables.rst`、`CHANGELOG.md`、本文 | 同步配置说明、使用限制及变更记录 |
 
 没有修改共享框架、官方 AI 示例、依赖主版本、包版本或发布配置。

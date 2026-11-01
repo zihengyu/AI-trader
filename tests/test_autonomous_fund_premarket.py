@@ -153,18 +153,24 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
             calls.append((request.agent_name, request.context))
             return super().run(request)
 
-    def startup():
+    def startup(run_once=True):
         broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
         strategy = AutonomousFund(broker=broker, name="ResearchSession", parameters={
             "config": config, "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account",
             "runtime": RecordingRuntime()})
         trader = Trader()
         trader.add_strategy(strategy)
-        trader.run_all(run_once=True)
+        if run_once:
+            trader.run_all(run_once=True)
+        else:
+            # Enter the native continuous-session setup without a run_once exit
+            # closing the connection before the simulated session begins.
+            strategy._executor._initialize()
+            strategy._executor._initialize_live_market_calendars(broker.market)
         return strategy
 
     startup()
-    strategy = startup()
+    strategy = startup(run_once=False)
     assert [name for name, _ in calls] == ["researcher"]
     assert not journal.pending()
     assert strategy.premarket_research["phase"] == "closed_startup"
