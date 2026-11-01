@@ -15,6 +15,7 @@ def report(root, prices=None, write_files=True):
     decisions = 0
     incomplete_fills = False
     startup = next((body for _, kind, body in reversed(events) if kind == "startup"), {})
+    premarket = [body for _, kind, body in events if kind == "premarket_research"]
     for at, kind, body in events:
         if kind == "account":
             accounts.append({"at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
@@ -96,6 +97,8 @@ def report(root, prices=None, write_files=True):
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
         "observe_only": startup.get("observe_only", False),
         "validated_decisions": decisions,
+        "premarket_research_runs": len(premarket),
+        "latest_premarket_research": premarket[-1] if premarket else None,
         "blocked_iterations": sum(row["kind"] == "blocked" for row in notifications),
         "observations": len(curve), "starting_equity": initial,
         "ending_equity": curve[-1]["equity"] if curve else None,
@@ -113,6 +116,8 @@ def report(root, prices=None, write_files=True):
     if not write_files:
         return summary
     (root / "report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if premarket:
+        (root / "premarket_research.json").write_text(json.dumps(premarket[-1], indent=2, ensure_ascii=False), encoding="utf-8")
     for name, rows, fields in (
         ("equity.csv", curve, ["at", "equity", "cash", "positions", "receivables", "daily_return"]),
         ("fills.csv", fills, ["at", "broker_id", "symbol", "side", "quantity", "price", "trade_cost", "evidence_kind", "execution_id", "bar_start"]),

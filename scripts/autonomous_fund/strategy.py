@@ -91,6 +91,9 @@ class AutonomousFund(Strategy):
         self.observe_only = observe_only
         self.next_review = None
         self.last_decision = None
+        with self.journal.connection() as db:
+            saved = db.execute("SELECT body FROM events WHERE kind='premarket_research' ORDER BY sequence DESC LIMIT 1").fetchone()
+        self.premarket_research = json.loads(saved[0]) if saved else None
         self.session_orders = {}
         self.scripted = runtime is not None
         self.model = model or config["model"]
@@ -144,6 +147,58 @@ class AutonomousFund(Strategy):
                 self._snapshot()
             except Exception as exc:
                 self.notify("initial_snapshot_unavailable", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        self._research_before_open()
+
+    def before_market_opens(self):
+        # The native lifecycle wakes one hour before the regular session by
+        # default. Research has read-only tools and never invokes the executor.
+        self._research_before_open()
+
+    def _research_before_open(self):
+        if self.mode not in {"local", "paper"} or self.observe_only or self.halt_path.exists():
+            return
+        try:
+            from .market_data import SessionClock
+            now = self.get_datetime()
+            market = SessionClock(now=self.get_datetime).status()
+            if market["open"] or self.broker.is_market_open():
+                return
+            opens_at = instant(market["next_open"])
+            slot = "before_market_opens" if opens_at - now <= timedelta(minutes=self.minutes_before_opening) else "closed_startup"
+            # Persist the completed work so a restart does not pay for the same
+            # session/phase again. The native pre-open phase refreshes older work.
+            previous = self.premarket_research
+            if previous and previous["session_open"] == opens_at.isoformat() and previous["phase"] == slot:
+                return
+            try:
+                account = asdict(self._snapshot())
+            except Exception as exc:
+                # Missing account data must be disclosed, but does not prevent
+                # ordinary read-only market research while orders are disabled.
+                account = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+            context = {"as_of": now.isoformat(), "historical": False, "phase": slot,
+                       "market": market, "orders_enabled": False,
+                       "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
+                       "account": account, "previous_premarket_research": previous}
+            self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
+            self.log_message("Researching before the regular market opens; order submission is disabled.")
+            research = self._record_agent("researcher", self.agents["researcher"].run(
+                task_prompt="Prepare or update market research for the next regular session. Review news, filings, "
+                            "completed historical prices, opportunities and risks. Disclose source times and data gaps. "
+                            "Last regular-session prices may be old; they are research context, not executable quotes. "
+                            "Do not submit orders or treat this research as an executable portfolio decision.", context=context))
+            validate_evidence(research["evidence"], self.get_datetime(), False)
+            packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
+                      "session_open": opens_at.isoformat(), "phase": slot, "research": research}
+            self.journal.event(self.get_datetime(), "premarket_research", packet)
+            self.premarket_research = packet
+            self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
+        except Exception as exc:
+            self.notify("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        finally:
+            from .report import report
+            self.journal.export()
+            report(self.run_dir, self.config.get("model_prices_per_million"))
 
     def _orders(self):
         if self.mode not in {"paper", "local"}:
@@ -312,6 +367,7 @@ class AutonomousFund(Strategy):
             context = {"as_of": now.isoformat(), "historical": self.mode not in {"paper", "local"},
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": asdict(account), "previous_decision": self.last_decision,
+                       "premarket_research": getattr(self, "premarket_research", None),
                        "risk_increase_paused": paused}
             research = self._record_agent("researcher", self.agents["researcher"].run(
                 task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
@@ -351,6 +407,8 @@ class AutonomousFund(Strategy):
             raise RiskError("Observation-only mode cannot submit orders")
         if self.halt_path.exists():
             raise RiskError("Emergency stop active")
+        if self.mode in {"local", "paper"} and not self.broker.is_market_open():
+            raise RiskError("Orders require an open regular market session")
         if self.mode == "paper":
             assert_paper(self.broker)
         key = self.journal.reserve(intent, now, self.limits)

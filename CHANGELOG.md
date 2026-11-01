@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- Autonomous paper portfolio research can run on closed-market startup and refresh through the native pre-open hook. Persist session/phase research for restart recovery, include it in later regular-session research and reports, and independently reject out-of-session execution without consuming an order reservation.
 - Credential-free public-market local simulation mode for the optional autonomous portfolio application: a native-interface virtual broker with durable partial fills, adverse complete-minute execution assumptions, costs, NYSE calendar, corporate-action reconciliation and heartbeat monitoring. Add public-data preflight, observation-only startup, explicit secret-file loading and a configurable DeepSeek Flash default; no live brokerage route is added.
 - Optional local autonomous paper-portfolio application under `scripts/autonomous_fund`: native read-only research and structured allocation agents, independent position/exposure/drawdown limits, durable submission reservations, paper-only Alpaca startup, offline/native backtest checks and local account, fill, benchmark and usage reports. Schwab remains documentation-only; no live execution entry point is provided.
 - Update the scoped MetaMask vendor JSON-RPC client to Jayson 5, removing vulnerable stream-json while retaining the SDK's HTTP and browser request contracts. Default to script-free companion installs and refuse the unpatched optional bigint-buffer native addon at provider startup.
