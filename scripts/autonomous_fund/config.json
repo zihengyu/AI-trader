@@ -48,7 +48,7 @@
     }
   },
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
-  "execution": {"reprice_after_seconds": 180, "max_buy_chase": "0.0075", "report_interval_seconds": 300, "review_on_move": "0.03"},
+  "execution": {"reprice_after_seconds": 180, "max_buy_chase": "0.0075", "report_interval_seconds": 300, "review_on_move": "0.03", "iteration_seconds": 30},
   "model_budget": {"max_agent_runs_per_day": 60, "reserved_review_runs": 4, "min_review_minutes": 15, "failure_backoff_minutes": [5, 15, 60]},
   "mandate": {
     "capital_usd": "10000",
@@ -60,5 +60,16 @@
     ]
   },
   "research_network": {"resolver": "system"},
+  "market_data": {"live_stream": true, "live_seconds": 60},
+  "news": {
+    "enabled": true,
+    "poll_seconds": 300,
+    "sources": ["yahoo", "google", "fed", "sec"],
+    "rss_feeds": [],
+    "queries": ["Federal Reserve interest rate decision", "US CPI inflation report", "US jobs report nonfarm payrolls"],
+    "burst_threshold": 3,
+    "burst_minutes": 60,
+    "max_items_per_context": 30
+  },
   "model_prices_per_million": null
 }

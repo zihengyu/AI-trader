@@ -39,7 +39,8 @@ def test_plan_approval_notification_explains_triggers_scope_and_expiry(tmp_path)
     assert 'ALFA' in message and '9.00%' in message and '$102.10' in message
     assert '年化波动' in message and 'ES' in message
     assert request['digest'] in message and request['id'] in message
-    assert 'Telegram 回复不会批准' in message and '卖出/减仓已自动执行' in message
+    assert '直接回复本消息「同意」或「拒绝」' in message and '卖出/减仓已自动执行' in message
+    assert f"同意 {request['id'][:6].upper()}" in message
     assert not journal.pending()
 
 

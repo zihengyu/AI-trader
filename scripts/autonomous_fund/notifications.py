@@ -29,7 +29,9 @@ def _pct(value):
 def approval_message(details):
     reasons = "；".join(TRIGGERS.get(r, r) for r in details["reasons"])
     if "buys" in details:
+        code = str(details["id"])[:6].upper()
         lines = ["量化风控：调仓计划超出自动额度，待一次性审批（只覆盖新增买入；卖出/减仓已自动执行）",
+                 f"审批代码 {code}：直接回复本消息「同意」或「拒绝」，或发送「同意 {code}」／「拒绝 {code}」。",
                  f"审批触发：{reasons}",
                  f"参考净值：${details.get('observed_equity')}；开盘敞口 {_pct(details.get('start_exposure'))}，"
                  f"当前 {_pct(details.get('current_exposure'))}，批准后最高 {_pct(details.get('max_exposure_after'))}",
@@ -44,9 +46,9 @@ def approval_message(details):
         lines.append("拟买入（权重上限 / 限价上界）：")
         for symbol, scope in sorted(details["buys"].items()):
             lines.append(f"- {symbol}: {_pct(scope['max_weight'])} / ${scope['max_limit']}")
-        lines += [f"有效期至（UTC）：{details['expires_at']}", f"请求 ID：{details['id']}", f"摘要：{details['digest']}",
+        lines += [f"有效期至（UTC）：{details['expires_at']}", f"请求 ID {details['id']}，摘要 {details['digest']}",
                   "批准不放宽任何硬性风控；每笔仍实时复核波动率、ES、行业、回撤与报价。"
-                  "Telegram 回复不会批准；超时只停止超额部分，已在自动额度内的买入不受影响。", "",
+                  "超时只停止超额部分，已在自动额度内的买入不受影响。", "",
                   "AI 理由（可能包含不确定判断）：", str(details.get("rationale") or "")]
         return "\n".join(lines)
     side = {"buy": "买入", "sell": "卖出"}.get(details["side"], details["side"])

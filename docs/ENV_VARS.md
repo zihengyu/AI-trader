@@ -17,10 +17,19 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 - Purpose: Explicit credentials/recipient for the optional autonomous paper portfolio's separate `monitor` process.
 - Neither value is needed by local market simulation, approval commands or console-only monitoring. No automatic dotenv search or other-process credential loading is performed.
 - Errors list both required variable names; logs, model contexts and delivery status omit token values. Keep them in the operator's environment or an explicitly selected untracked secret file.
-- Telegram supplies notifications only. Local operator approval is exception-based and plan-level: it is bound to a reviewed digest, account, decision, session, risk policy, purchase symbols with weight caps and a price collar, an exposure/turnover envelope and an expiry; sales never wait for approval and it never routes real-money orders. Risk and approval policy live in `scripts/autonomous_fund/config.json`, not in environment variables.
+- Telegram replies are an approval channel: replying 同意/拒绝 to an alert, sending 同意/拒绝 with the 6-character code, or plain 同意/拒绝 when exactly one request is pending resolves the same digest-bound request as the CLI. Only the configured chat and authorized approvers count; messages older than the request, STOP, expiry and superseded scopes are refused; every command is journaled (`telegram_command`, authority `telegram:<user id>`). Approval never relaxes a hard limit. Local operator approval is exception-based and plan-level: it is bound to a reviewed digest, account, decision, session, risk policy, purchase symbols with weight caps and a price collar, an exposure/turnover envelope and an expiry; sales never wait for approval and it never routes real-money orders. Risk and approval policy live in `scripts/autonomous_fund/config.json`, not in environment variables.
 - Watchdog intervals are explicit command parameters, with 180-second heartbeat and 900-second model-call defaults. Start the separate process for independent protection; missing configuration is not successful delivery.
 - The Linux server services require these two variables and explicitly load the selected private `.env`. `deploy prepare` creates a blank template only if absent; process environment wins, and the file is parsed rather than shell-sourced. POSIX group/other access is rejected. No extra key names or automatic discovery were added.
 - Completed reviews generate persistent daily report attachments; approval alerts expose trade rationale and bounded scope. The server's `--require-monitor` execution gate needs a healthy monitor heartbeat within 45 seconds; restarting services preserves STOP. See `docs/AUTONOMOUS_FUND_UBUNTU.md` for deployment and recovery.
+
+### `FUND_TELEGRAM_APPROVER_IDS` / `FUND_TELEGRAM_APPROVALS`
+- Purpose: Who may approve by Telegram reply, and an off switch. In a private chat the chat owner (chat ID) is the approver by default; group chats (negative IDs) require explicit comma-separated user IDs, otherwise replies are refused.
+- `FUND_TELEGRAM_APPROVALS=off` keeps Telegram notification-only; the CLI `approve`/`reject` always works. Enable Telegram two-step verification: control of the Telegram account is control of approvals.
+- The monitor short-polls `getUpdates`; do not configure a webhook or share the bot with another consumer.
+
+### `FUND_SEC_USER_AGENT`
+- Purpose: Declared contact (name and email) sent to SEC EDGAR, as SEC fair-access rules require, so the news watch can fetch 8-K filings for held companies. Without it, SEC filings are skipped and other sources continue.
+- Keep it in the operator's environment or untracked `.env`; never commit a personal contact.
 
 ### `LUMIBOT_CHATGPT_HOME` / `LUMIBOT_CHATGPT_PROFILE` / `LUMIBOT_CHATGPT_PROFILE_PATH`
 - Purpose: Select the private directory, existing profile ID, or explicitly protected profile file for `chatgpt/<model>` agents and subscription-funded evaluations.

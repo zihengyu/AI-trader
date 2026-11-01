@@ -78,8 +78,11 @@ class ExecutionPolicy:
     max_buy_chase: str = "0.0075"
     report_interval_seconds: int = 300
     review_on_move: str = "0.03"
+    iteration_seconds: int = 60
 
     def __post_init__(self):
+        if type(self.iteration_seconds) is not int or not 15 <= self.iteration_seconds <= 300:
+            raise RiskError("iteration_seconds must be 15..300")
         if not 0 <= number(self.review_on_move) <= number("0.5"):
             raise RiskError("review_on_move must be between 0 and 50%")
         if type(self.reprice_after_seconds) is not int or not 30 <= self.reprice_after_seconds <= 3600:
@@ -372,8 +375,13 @@ def operator_connection(root):
         db.close()
 
 
-def resolve_approval(root, key, checksum, approve, now):
-    """Only the local operator CLI calls this; it is never an agent tool."""
+def approval_code(key):
+    """Short, human-typable reference shown in Telegram (first 6 hex digits)."""
+    return str(key)[:6].upper()
+
+
+def resolve_approval(root, key, checksum, approve, now, authority="local_operator_cli"):
+    """Operator CLI or the authenticated Telegram reply channel; never an agent tool."""
     with operator_connection(root) as db:
         db.execute("BEGIN IMMEDIATE")
         startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
@@ -398,5 +406,5 @@ def resolve_approval(root, key, checksum, approve, now):
             db.execute("UPDATE fund_decisions SET state='rejected' WHERE id=?", (row["decision_id"],))
             db.execute("UPDATE fund_approvals SET state='superseded' WHERE decision_id=? AND state IN ('pending','approved')", (row["decision_id"],))
         db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "operator_approval", encode({
-            "id": key, "digest": checksum, "state": state, "authority": "local_operator_cli"})))
+            "id": key, "digest": checksum, "state": state, "authority": authority})))
     return state

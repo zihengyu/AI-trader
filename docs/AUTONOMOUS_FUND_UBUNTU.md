@@ -43,6 +43,9 @@ python3.12 -m venv .venv
 | `DEEPSEEK_API_KEY` | Flash 研究及 V4 Pro 决策／复盘，共用一个 Key |
 | `FUND_TELEGRAM_BOT_TOKEN` | 自己创建的 Telegram Bot token |
 | `FUND_TELEGRAM_CHAT_ID` | 已与 Bot 建立会话的接收者或群组；先在 Telegram 中启动 Bot |
+| `FUND_TELEGRAM_APPROVER_IDS` | 可选；群组中可回复审批的用户 ID（逗号分隔）。私聊默认由聊天本人审批 |
+| `FUND_TELEGRAM_APPROVALS` | 可选；设为 `off` 时 Telegram 只通知、不接受回复审批 |
+| `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
 | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | 仅选择 `paper` 时需要，使用专用模拟账户的 Paper Key |
 | `ALPACA_IS_PAPER=true` | 可选显式声明；设为 false 会拒绝启动，不会启用实盘 |
 
@@ -126,7 +129,10 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh approve --run-dir a
   --approval-id "<reviewed-id>" --approval-digest "<reviewed-digest>"
 ```
 
-拒绝时将 `approve` 改为 `reject`。Telegram 仅通知，聊天回复不会执行审批；命令中的 ID／摘要必须来自完整请求。
+拒绝时将 `approve` 改为 `reject`。更方便的方式是在 Telegram 里**直接回复审批提醒「同意」或「拒绝」**，
+或发送「同意 代码」／「拒绝 代码」（代码是提醒里的 6 位字符）；只有一个待审请求时也可以直接发「同意」。
+只接受配置的会话和审批人；早于请求的消息、STOP 期间、过期或已被替换的请求都会被拒绝，机器人会回复处理结果，
+每条指令都记入账本。发送「状态」可查看监控状态、待审批数和分仓净值。请给 Telegram 账号开启两步验证。
 
 每次成功完成盘后复盘，独立监控自动发送对应日期的 Markdown 日报附件：账户与现金／持仓、
 观测盈亏与收益率、对齐窗口的 SPY／QQQ、运行至截止的回撤和费用、模型 usage、订单／成交／审批记录、

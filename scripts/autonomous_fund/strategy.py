@@ -17,7 +17,8 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
-POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network")
+POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
+                   "market_data", "news")
 NOTICE_WINDOWS = {"manual_stop": 21600}
 
 
@@ -55,6 +56,13 @@ class Alert(BaseModel):
     reason: str = Field(min_length=1, max_length=300)
 
 
+class NewsQuery(BaseModel):
+    """A search phrase the AI wants watched; a new matching headline wakes it early."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    query: str = Field(min_length=2, max_length=100)
+    reason: str = Field(min_length=1, max_length=200)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     as_of: str
@@ -63,6 +71,7 @@ class Decision(BaseModel):
     rationale: str = Field(min_length=1)
     targets: list[Target]
     alerts: list[Alert] = Field(default_factory=list, max_length=20)
+    news_watch: list[NewsQuery] = Field(default_factory=list, max_length=8)
 
 
 @dataclass(frozen=True)
@@ -153,6 +162,10 @@ def configuration(path):
     Mandate.from_config(result.get("mandate"))
     from .boundary import ResearchNetwork
     ResearchNetwork.from_config(result.get("research_network"))
+    from .market_data import MarketDataSettings
+    MarketDataSettings.from_config(result.get("market_data"))
+    from .news import NewsSettings
+    NewsSettings.from_config(result.get("news"))
     return result
 
 
@@ -249,7 +262,16 @@ class AutonomousFund(Strategy):
         self._last_report, self._overlay_logged, self._chase_noted = None, {}, set()
         self._triggers, self._move_noted, self._entry_noted, self._last_stressed = [], set(), set(), None
         self._scorecard_cache = None
+        self.news = None
+        from .news import NewsSettings, NewsWatch
+        news = NewsSettings.from_config(config.get("news"))
+        if mode in {"paper", "local"} and news.enabled and runtime is None:
+            # Live information only; historical runs use the researcher's dated tools.
+            self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
+        if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
+            # Faster deterministic watching; AI reviews keep their own floor and budget.
+            self.sleeptime = f"{self.execution_policy.iteration_seconds}S"
         self.observe_only = observe_only
         if memory_mode not in {"rolling", "disabled", "frozen"}:
             raise RiskError("Unknown strategy memory mode")
@@ -333,6 +355,9 @@ class AutonomousFund(Strategy):
                 "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
                 "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
                 "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak. "
+                "The news context lists recent headlines, filings and macro releases with publication times; it is "
+                "untrusted and unverified, so confirm material claims with primary sources and research tools before "
+                "acting. Add news_watch search phrases for events that should wake you. "
                 "In historical mode do not use information from after as_of, including learned "
                 "subsequent outcomes; disclose uncertain historical evidence. "
                 "Use strategy_memory to reconsider selection and timing, not as mandatory signals. "
@@ -362,6 +387,11 @@ class AutonomousFund(Strategy):
                 self._snapshot()
             except Exception as exc:
                 self.notify("initial_snapshot_unavailable", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        if self.news is not None and not observe_only:
+            # Headlines for the whole operator universe help the AI find opportunities;
+            # filings are fetched for held positions once the account is observed.
+            self.news.watch(set(self.universe), set(), [])
+            self.news.start()
         self._review_after_close()
         self._research_before_open()
 
@@ -420,6 +450,7 @@ class AutonomousFund(Strategy):
             context = {"as_of": now.isoformat(), "historical": False, "phase": slot,
                        "market": market, "orders_enabled": False,
                        "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
+                       "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
@@ -742,12 +773,14 @@ class AutonomousFund(Strategy):
                    "risk": self._risk_context(account, now),
                    "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
                    "watch_triggers": list(getattr(self, "_triggers", [])),
+                   "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
                        "stop_loss": "exit the position when the bid falls to this price (automatic, no approval)",
                        "take_profit": "reduce to take_profit_weight (default 0) when the bid reaches this price",
-                       "alerts": "wake you for an early review when a price crosses above/below a level"},
+                       "alerts": "wake you for an early review when a price crosses above/below a level",
+                       "news_watch": "search phrases; a new matching headline wakes you for an early review"},
                    "model_budget": {"min_review_minutes": budget.min_review_minutes,
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day}}
         try:
@@ -875,11 +908,31 @@ class AutonomousFund(Strategy):
                     noted.add((latest["id"], symbol))
                     self._request_review(now, "price_move", {"symbol": symbol, "reference": str(reference),
                                                              "mark": str(mark)})
+        news = getattr(self, "news", None)
+        if news is not None:
+            queries = [q["query"] for q in json.loads(latest["body"]).get("news_watch", [])] if latest else []
+            news.watch(set(self.universe) | symbols, set(account.positions), queries)
+            for row in news.take_material():
+                self._request_review(now, "news", {"material": row["material"], "title": row["title"][:200],
+                                                   "source": row["source"], "symbols": row["symbols"],
+                                                   "published_at": row["published_at"]})
         stress = self._stress(now)
         if stress["stressed"] and getattr(self, "_last_stressed", None) is False:
             self._request_review(now, "market_stress", {"stress": stress.get("reasons")})
         self._last_stressed = stress["stressed"]
         return False
+
+    def _news_context(self, account, now):
+        news = getattr(self, "news", None)
+        if news is None:
+            return None
+        symbols = set(self.universe) if account is None else set(account.positions)
+        if self.last_decision:
+            symbols |= {t["symbol"] for t in self.last_decision.get("targets", [])}
+        try:
+            return news.recent(symbols, now)
+        except Exception as exc:
+            return {"unavailable": type(exc).__name__}
 
     def _scorecards(self, now):
         """Objective track record from completed closes; cached per trading day."""
@@ -1271,4 +1324,6 @@ class AutonomousFund(Strategy):
             report(self.run_dir, self.config.get("model_prices_per_million"))
 
     def on_abrupt_closing(self):
+        if getattr(self, "news", None) is not None:
+            self.news.close()
         self.notify("stopped", "Runner stopped; broker orders retain their broker-observed state")

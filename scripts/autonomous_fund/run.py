@@ -182,10 +182,19 @@ def run_paper(args, config):
 def check_market(args, config):
     """Read public data and credential presence; never invokes a model or broker."""
     from lumibot.entities import Asset
-    from .market_data import YahooRealtimeData
+    from .market_data import LiveTape, MarketDataSettings, YahooRealtimeData
     from .risk import Limits
-    source = YahooRealtimeData()
+    import time
+    market = MarketDataSettings.from_config(config.get("market_data"))
+    tape = LiveTape() if market.live_stream else None
+    source = YahooRealtimeData(tape=tape, live_seconds=market.live_seconds)
     now, observations = source.get_datetime(), {}
+    if tape is not None:
+        # Give the unofficial stream a short window to deliver a first trade.
+        tape.watch(["SPY", "QQQ"])
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline and not (tape.tick("SPY") and tape.tick("QQQ")):
+            time.sleep(0.5)
     for symbol in ("SPY", "QQQ"):
         asset = Asset(symbol, asset_type="stock")
         quote = source.get_quote(asset)
@@ -193,6 +202,10 @@ def check_market(args, config):
         observations[symbol] = {"price": quote.price, "source_as_of": quote.timestamp.isoformat(),
                                 "age_seconds": (source.get_datetime() - instant(quote.timestamp)).total_seconds(),
                                 "completed_daily_rows": len(daily), "price_kind": quote.raw_data["price_kind"]}
+    if tape is not None:
+        observations["live_tape"] = {**tape.diagnostics(), "note": "Live ticks are used only inside the regular "
+                                     "session and within live_seconds of their source time; otherwise bars are used."}
+        tape.close()
     try:
         models_ready(args, config)
         ready, missing = True, None
@@ -228,7 +241,10 @@ def run_local(args, config):
         raise RiskError("Scripted models are forbidden against the running market")
     journal = open_journal(args.run_dir, "local", "local-virtual-account", config)
     from .strategy import Mandate
-    broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
+    from .market_data import LiveTape, MarketDataSettings
+    market = MarketDataSettings.from_config(config.get("market_data"))
+    tape = LiveTape() if market.live_stream else None
+    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds), journal, Limits(**config["limits"]),
                               matching_enabled=not args.observe_only, require_monitor=args.require_monitor,
                               starting_cash=Mandate.from_config(config.get("mandate")).local_account_usd)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
@@ -243,6 +259,8 @@ def run_local(args, config):
     try:
         trader.run_all(run_once=args.once)
     finally:
+        if tape is not None:
+            tape.close()
         broker._close_connection()
         broker.do_polling()  # Publish exited state without matching another order.
         journal.export()
