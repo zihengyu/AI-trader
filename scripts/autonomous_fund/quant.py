@@ -64,6 +64,10 @@ class QuantPolicy:
     target_portfolio_vol: Decimal = Decimal("0.12")
     max_portfolio_es: Decimal = Decimal("0.02")
     max_name_risk: Decimal = Decimal("0.025")
+    # Diversified unlevered ETFs carry little idiosyncratic jump risk; a wider
+    # budget avoids cutting broad-market exposure in calm markets (see the
+    # 2019 real-data replay in docs/AUTONOMOUS_PAPER_FUND.md).
+    max_etf_name_risk: Decimal = Decimal("0.05")
     max_adv_participation: Decimal = Decimal("0.01")
     drawdown_soft: Decimal = Decimal("0.04")
     drawdown_floor_scale: Decimal = Decimal("0.25")
@@ -74,12 +78,13 @@ class QuantPolicy:
     rebalance_band: Decimal = Decimal("0.005")
     min_trade_notional: Decimal = Decimal("100")
     groups: tuple = ()
+    etf_symbols: tuple = ()
 
     @classmethod
     def from_config(cls, section, universe, limits):
         section = dict(section or {})
         groups_config = section.pop("groups", None)
-        unknown = set(section) - {f for f in cls.__dataclass_fields__ if f != "groups"}
+        unknown = set(section) - {f for f in cls.__dataclass_fields__ if f not in {"groups", "etf_symbols"}}
         if unknown:
             raise RiskError("Unknown quantitative risk settings: " + ", ".join(sorted(unknown)))
         if groups_config is None:
@@ -93,14 +98,16 @@ class QuantPolicy:
                 raise RiskError(f"Risk group {name} contains symbols outside the eligible universe")
             if members:
                 groups.append((name, str(_fraction(spec["limit"], f"groups.{name}.limit")), tuple(sorted(members))))
-        policy = cls(**{**section, "groups": tuple(groups)})
+        # The operator's universe classification (stock / unlevered_etf) selects the name budget.
+        etfs = tuple(sorted(s for s, kind in universe.items() if kind == "unlevered_etf")) if isinstance(universe, dict) else ()
+        policy = cls(**{**section, "groups": tuple(groups), "etf_symbols": etfs})
         policy.validate(limits)
         return policy
 
     def __post_init__(self):
         for key, value in asdict(self).items():
             if key in {"vol_lookback_days", "es_lookback_days", "min_history_days", "es_min_observations",
-                       "stress_benchmark", "groups"}:
+                       "stress_benchmark", "groups", "etf_symbols"}:
                 continue
             object.__setattr__(self, key, number(value))
 
@@ -112,7 +119,7 @@ class QuantPolicy:
             raise RiskError("min_history_days must not exceed the risk lookbacks")
         _fraction(self.ewma_lambda, "ewma_lambda", Decimal("0.5"), Decimal("0.999"))
         for key in ("min_annual_vol", "unknown_annual_vol", "target_portfolio_vol", "max_portfolio_es",
-                    "max_name_risk", "max_adv_participation", "drawdown_soft", "daily_loss_limit",
+                    "max_name_risk", "max_etf_name_risk", "max_adv_participation", "drawdown_soft", "daily_loss_limit",
                     "stress_day_drop", "stress_annual_vol"):
             _fraction(getattr(self, key), key, high=Decimal("5"))
         _fraction(self.drawdown_floor_scale, "drawdown_floor_scale", inclusive_low=True)
@@ -125,6 +132,9 @@ class QuantPolicy:
             raise RiskError("drawdown_soft must be below the hard drawdown latch")
         if not isinstance(self.stress_benchmark, str) or not self.stress_benchmark:
             raise RiskError("A stress benchmark symbol is required")
+
+    def name_risk(self, symbol):
+        return self.max_etf_name_risk if symbol in self.etf_symbols else self.max_name_risk
 
     @property
     def group_map(self):
@@ -271,7 +281,7 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
                 binding.append(f"missing_history:{symbol}")
             weights[symbol] = allowed
             continue
-        cap = min(float(limits.max_position), float(policy.max_name_risk) / estimate.annual_vol(symbol))
+        cap = min(float(limits.max_position), float(policy.name_risk(symbol)) / estimate.annual_vol(symbol))
         if weights[symbol] > cap:
             weights[symbol] = cap
             binding.append(f"name_risk:{symbol}")
@@ -320,7 +330,7 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
         "binding": binding, "scale": scale, "exposure_budget": budget,
         "requested_metrics": estimate.metrics({s: float(w) for s, w in targets.items()}),
         "constructed_metrics": after,
-        "name_caps": {s: min(float(limits.max_position), float(policy.max_name_risk) / estimate.annual_vol(s))
+        "name_caps": {s: min(float(limits.max_position), float(policy.name_risk(s)) / estimate.annual_vol(s))
                       for s in sorted(set(targets) | set(current)) if s in estimate.vol},
         "missing_history": sorted(estimate.missing & (set(targets) | set(current))),
         "observations": estimate.observations, "history_through": estimate.through,

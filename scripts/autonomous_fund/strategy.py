@@ -18,7 +18,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news")
+                   "market_data", "news", "validation")
 NOTICE_WINDOWS = {"manual_stop": 21600}
 
 
@@ -146,7 +146,8 @@ def risk_settings(config, universe, limits):
     """All operator risk policies, validated together; the AI cannot write any of them."""
     from .execution import ApprovalPolicy, ExecutionPolicy
     from .quant import QuantPolicy
-    return (QuantPolicy.from_config(config.get("quant_risk"), universe, limits),
+    classified = config["universe"] if isinstance(config.get("universe"), dict) else universe
+    return (QuantPolicy.from_config(config.get("quant_risk"), classified, limits),
             ApprovalPolicy.from_config(config.get("approval")),
             ExecutionPolicy.from_config(config.get("execution")),
             ModelBudget.from_config(config.get("model_budget")))
@@ -166,6 +167,8 @@ def configuration(path):
     MarketDataSettings.from_config(result.get("market_data"))
     from .news import NewsSettings
     NewsSettings.from_config(result.get("news"))
+    from .validation import ValidationSettings
+    ValidationSettings.from_config(result.get("validation"))
     return result
 
 
@@ -262,6 +265,8 @@ class AutonomousFund(Strategy):
         self._last_report, self._overlay_logged, self._chase_noted = None, {}, set()
         self._triggers, self._move_noted, self._entry_noted, self._last_stressed = [], set(), set(), None
         self._scorecard_cache = None
+        from .validation import ValidationSettings
+        self.validation = ValidationSettings.from_config(config.get("validation"))
         self.news = None
         from .news import NewsSettings, NewsWatch
         news = NewsSettings.from_config(config.get("news"))
@@ -424,6 +429,19 @@ class AutonomousFund(Strategy):
             review_after_close(self)
         except Exception as exc:
             self.notify("postmarket_review_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        try:
+            # Once per completed review: test whether the learned memo beats the baseline,
+            # after that session's shadow decision exists (never before the close).
+            if getattr(self, "validation", None) is not None:
+                with self.journal.connection() as db:
+                    row = db.execute("SELECT json_extract(body,'$.session_date') FROM events WHERE kind='postmarket_review' "
+                                     "ORDER BY sequence DESC LIMIT 1").fetchone()
+                session = row[0] if row else None
+                if session and self.journal.get_meta("learning_evaluated_session") != session:
+                    self._evaluate_learning(self.get_datetime())
+                    self.journal.set_meta("learning_evaluated_session", session)
+        except Exception as exc:
+            self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
     def _research_before_open(self):
         if self.mode not in {"local", "paper"} or self.observe_only or self.halt_path.exists():
@@ -775,6 +793,7 @@ class AutonomousFund(Strategy):
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
+                   "learning_validation": self.journal.get_meta("learning_evaluation"),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
                        "stop_loss": "exit the position when the bid falls to this price (automatic, no approval)",
@@ -783,6 +802,7 @@ class AutonomousFund(Strategy):
                        "news_watch": "search phrases; a new matching headline wakes you for an early review"},
                    "model_budget": {"min_review_minutes": budget.min_review_minutes,
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day}}
+        champion = self._champion()
         try:
             research = self._record_agent("researcher", self._agent_call("researcher",
                 task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
@@ -790,7 +810,7 @@ class AutonomousFund(Strategy):
             context["as_of"] = self.get_datetime().isoformat()
             decision = self._record_agent("manager", self._agent_call("manager",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
-                context={**context, "research": research}))
+                context=self._arm_context({**context, "research": research}, champion)))
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -807,7 +827,80 @@ class AutonomousFund(Strategy):
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
-        self._continue_allocation(self.execution.active(now, self.universe, self.limits))
+        try:
+            self._continue_allocation(self.execution.active(now, self.universe, self.limits))
+        finally:
+            # After the tradable decision is safe: the other arm decides in the shadow only.
+            self._shadow({**context, "research": research}, champion, decision, now, budget)
+
+    def _champion(self):
+        """Which learning arm trades: 'memo' (memo + scorecards) or 'baseline' (neither)."""
+        if getattr(self, "memory_mode", "rolling") != "rolling" or getattr(self, "validation", None) is None:
+            return "memo"
+        return self.journal.get_meta("learning_champion", "memo")
+
+    @staticmethod
+    def _arm_context(context, arm):
+        if arm == "memo":
+            return context
+        # The baseline arm sees the same market, research, risk and mandate, but no
+        # learned memo, follow-up or scorecards: it is the control for the learning loop.
+        return {**context, "strategy_memory": None, "strategy_followup": None, "scorecards": None,
+                "learning_validation": None}
+
+    def _shadow(self, context, champion, decision, now, budget):
+        settings = getattr(self, "validation", None)
+        if (settings is None or not settings.shadow_enabled or getattr(self, "memory_mode", "rolling") != "rolling"
+                or self.journal.counter("shadow_decisions", now) >= settings.shadows_per_session):
+            return
+        if self.journal.counter("agent_runs", now) + 1 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
+            return
+        arm = "baseline" if champion == "memo" else "memo"
+        self.journal.counter("shadow_decisions", now, 1)
+        record = {"arm": arm, "trading_arm": champion, "decided_at": decision["as_of"], "trading_decision": decision,
+                  "memo_version": (context.get("strategy_memory") or {}).get("version")}
+        try:
+            shadow = self._record_agent("manager", self._agent_call("manager",
+                task_prompt="Choose the complete target portfolio and when to reassess it.",
+                context=self._arm_context(context, arm)), phase="shadow")
+            # Structural validation at its own as_of: this answer is scored, never executed.
+            validate_decision(shadow, instant(shadow["as_of"]), self.universe, self.limits)
+            self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": shadow, "valid": True})
+        except Exception as exc:
+            self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": None, "valid": False,
+                               "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+
+    def _evaluate_learning(self, now):
+        """Daily paired test of memo vs baseline decisions; switch the trading arm only on evidence."""
+        settings = getattr(self, "validation", None)
+        if settings is None or not settings.shadow_enabled or getattr(self, "quant", None) is None:
+            return None
+        from .review import _events
+        from .validation import paired_test, shadow_pairs
+        rows = [r["body"] for r in _events(self.journal, instant(now), kinds=("shadow_decision",)) if r["body"].get("valid")]
+        symbols = {"SPY"} | {t["symbol"] for row in rows for body in (row["decision"], row["trading_decision"])
+                             for t in body["targets"]}
+        closes = {s: self._daily_closes(s, now) for s in sorted(symbols & (set(self.universe) | {"SPY"}))}
+        stats = paired_test(shadow_pairs(rows, closes), settings.min_pairs)
+        champion = self._champion()
+        switch = None
+        if stats["sufficient"] and stats["t_stat"] is not None:
+            if champion == "memo" and stats["t_stat"] <= -settings.switch_t_stat:
+                switch = "baseline"
+            elif champion == "baseline" and stats["t_stat"] >= settings.switch_t_stat:
+                switch = "memo"
+        evaluation = {"as_of": str(now), "champion": switch or champion, "previous_champion": champion,
+                      "memo_minus_baseline_1d_excess": stats, "switch_t_stat": settings.switch_t_stat,
+                      "interpretation": "Paired next-session excess returns of the memo-informed and baseline "
+                                        "decisions made from the same research. A switch needs at least min_pairs "
+                                        "sessions and |t| >= switch_t_stat; otherwise the current arm keeps trading."}
+        if switch:
+            self.journal.set_meta("learning_champion", switch)
+            self.notify("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
+                                                       "pairs": stats["pairs"]})
+        self.journal.set_meta("learning_evaluation", evaluation)
+        self.journal.event(now, "learning_evaluation", evaluation)
+        return evaluation
 
     def _decision_failed(self, budget):
         # Exponential backoff: an invalid, stale or failed model cycle must not
@@ -1068,8 +1161,9 @@ class AutonomousFund(Strategy):
                 "max_portfolio_es_975_1d": str(self.quant.max_portfolio_es),
                 "max_name_risk": str(self.quant.max_name_risk),
                 "annual_vol_estimates": {s: round(v, 4) for s, v in estimate.vol.items()},
+                "max_etf_name_risk": str(self.quant.max_etf_name_risk),
                 "name_caps": {s: round(min(float(self.limits.max_position),
-                                           float(self.quant.max_name_risk) / estimate.annual_vol(s)), 4)
+                                           float(self.quant.name_risk(s)) / estimate.annual_vol(s)), 4)
                               for s in estimate.vol},
                 "missing_history": sorted(estimate.missing),
                 "groups": {name: {"limit": cap, "members": list(members)} for name, cap, members in self.quant.groups},

@@ -270,7 +270,7 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -293,6 +293,7 @@ def main(argv=None):
     parser.add_argument("--agent-seconds", type=int, default=900)
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
     parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
+    parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
@@ -351,6 +352,18 @@ def main(argv=None):
     if args.mode == "check":
         check_market(args, config)
         return
+    if args.mode == "validate-risk":
+        print(json.dumps(validate_risk(args, config), indent=2, ensure_ascii=False))
+        return
+    if args.mode == "acceptance":
+        from .validation import ValidationSettings, acceptance, acceptance_markdown
+        result = acceptance(args.run_dir, ValidationSettings.from_config(config.get("validation")).acceptance)
+        (args.run_dir / "acceptance.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
+                                                      encoding="utf-8")
+        (args.run_dir / "acceptance.md").write_text(acceptance_markdown(result), encoding="utf-8")
+        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"]}, indent=2,
+                         ensure_ascii=False, default=str))
+        return
     with FileLock(str(args.run_dir / "runner.lock"), timeout=0):
         if args.mode == "reset-drawdown":
             with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
@@ -391,6 +404,32 @@ def main(argv=None):
         else:
             run_backtest(args, config)
         print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
+
+
+def validate_risk(args, config):
+    """Replay fixed targets through the configured risk layer on recorded closes (offline)."""
+    from .quant import QuantPolicy
+    from .risk import Limits, number, validate_decision
+    from .validation import load_closes, risk_replay
+    if not args.data_dir or not args.targets:
+        raise RiskError("validate-risk needs --data-dir and --targets SYMBOL=weight,...")
+    targets = {}
+    for pair in args.targets.split(","):
+        symbol, _, weight = pair.partition("=")
+        targets[symbol.strip().upper()] = float(number(weight))
+    limits = Limits(**config["limits"])
+    universe = {s: config["universe"].get(s, "unlevered_etf") for s in targets}
+    if any(w > float(limits.max_position) for w in targets.values()) or sum(targets.values()) > float(limits.max_exposure):
+        raise RiskError("Targets exceed the configured position or exposure limits")
+    section = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
+    groups = {name: {"limit": spec["limit"], "members": [m for m in spec["members"] if m in targets]}
+              for name, spec in ((config.get("quant_risk") or {}).get("groups") or {}).items()}
+    policy = QuantPolicy.from_config({**section, "groups": groups}, universe, limits)
+    result = risk_replay(load_closes(args.data_dir, sorted(targets)), targets, policy, limits)
+    summary = {k: v for k, v in result.items() if k != "daily"}
+    (args.run_dir / "validation_risk.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
+                                                       encoding="utf-8")
+    return summary
 
 
 def adjust_reserve(args):

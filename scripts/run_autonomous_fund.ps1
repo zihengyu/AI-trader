@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
+    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'acceptance', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
     [string]$Mode = 'mock',
     [string]$RunDir = 'artifacts/autonomous-fund',
     [string]$Model = '',
@@ -18,6 +18,7 @@ param(
     [switch]$ConsoleOnly,
     [string]$MemoryFile = '',
     [string]$Amount = '',
+    [string]$Targets = '',
     [switch]$RebaselineExternal
 )
 $ErrorActionPreference = 'Stop'
@@ -40,6 +41,7 @@ try {
     if ($ConsoleOnly) { $runArgs += '--console-only' }
     if ($MemoryFile) { $runArgs += @('--memory-file', $MemoryFile) }
     if ($Amount) { $runArgs += @('--amount', $Amount) }
+    if ($Targets) { $runArgs += @('--targets', $Targets) }
     if ($RebaselineExternal) { $runArgs += '--rebaseline-external' }
     if ($Mode -in @('mock', 'backtest', 'qualify')) {
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null

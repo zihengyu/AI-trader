@@ -390,7 +390,7 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 | 约束 | 方法 | 默认值（`quant_risk`） |
 |---|---|---|
 | 波动率估计 | 最近 63 个交易日简单收益的 EWMA 协方差（RiskMetrics λ=0.94），年化 | 下限 10%；平盘序列相关系数按 1 处理 |
-| 单名风险上限 | 权重 ≤ min(10%, `max_name_risk` ÷ 年化波动) | 0.025：波动 25% 的股票上限 10%，波动 50% 的上限 5% |
+| 单名风险上限 | 权重 ≤ min(10%, 风险预算 ÷ 年化波动)；个股用 `max_name_risk`，普通 ETF 用 `max_etf_name_risk` | 个股 0.025：波动 25% 的股票上限 10%，波动 50% 的上限 5%；ETF 0.05（依据下文 2019 年真实数据回放校准） |
 | 行业／主题组 | 运营者定义、可重叠的组，组内权重和 ≤ 组上限 | 科技 30%、通信 20%、可选消费 20%、金融 30%、医疗 25%、能源 15%、必需消费 25%、大型成长股 35%、宽基指数 40% |
 | 回撤分档预算 | 回撤 ≤ 4% 满额；4%–8% 线性降到 25%；≥8% 锁定增仓 | 总敞口预算 = 70% × 系数，超出部分自动卖出 |
 | 组合波动率目标 | 事前年化波动 √(wᵀΣw) 超过目标时整体等比例缩小 | 12% |
@@ -449,6 +449,70 @@ STOP 激活时不能批准开启交易，但可以拒绝未使用的批准。历
 每条指令记入账本（`telegram_command`，授权人 `telegram:<用户 ID>`）。发送「状态」可查看监控、待审批数和分仓净值。
 控制了你的 Telegram 账号就等于控制了审批，请开启 Telegram 两步验证；设 `FUND_TELEGRAM_APPROVALS=off` 可退回只通知。
 希望所有买入都人工确认的运营者可把 `auto_daily_exposure_increase` 设为 `"0"`。
+
+## 离线验证：用真实历史数据回放风控
+
+`validate-risk` 把固定的 AI 目标权重逐日送入同一套量化风控，在真实收盘价上回放，比较“未风控持有”与“风控后”：
+
+```bash
+python -m scripts.autonomous_fund.run validate-risk --run-dir artifacts/validation --data-dir data --targets SPY=0.1,TLT=0.1,GLD=0.1
+```
+
+回放无前视：第 t 天收盘时只用到 t 天及以前的收盘价决定权重，赚取 t→t+1 的收益；缺数据的日子跳过，不补数；
+按换手收取 10 基点成本；结果写入 `validation_risk.json`（含逐日敞口、约束和事前波动）。`--data-dir` 下每个证券一个 CSV，
+支持 Yahoo 导出（Date/Close）或分钟线（time/close，自动取每日最后收盘）。
+
+用仓库自带的真实数据（`data/`：2019 年 SPY/TLT/GLD/IEF/DJP 日线；`data/XYZ_1Min.csv`：美国指数期货 2020-01 至 2020-04 分钟线，含新冠暴跌）得到：
+
+| 场景 | 未风控 | 风控后 |
+|---|---|---|
+| 2020 暴跌，70% 单一指数，只开波动率目标／ES／回撤分档 | 收益 −8.5%，最大回撤 25.0%，年化波动 45.4% | 收益 −6.2%，回撤 12.2%，年化波动 13.4%（目标 12%，暴跌初期 EWMA 有滞后） |
+| 2020 暴跌，同上，全部默认（含单名风险预算） | 同上 | 收益 −3.1%，回撤 6.3%，年化波动 7.4% |
+| 2019 平稳，5 只 ETF 各 10%（出厂配置） | 收益 5.34%，回撤 1.25% | 收益 5.23%，回撤 1.26%，没有任何约束触发，成本仅为再平衡费用 |
+| 2019 平稳，SPY 25%/TLT 15%/GLD 15%/IEF 10%/DJP 5%，按个股预算 | 收益 9.56% | 收益 7.57%，回撤反而略高：单名预算把 SPY 压低了 181 天 |
+| 同上，按 ETF 预算（现在的默认） | 收益 9.56% | 收益 9.39%，回撤与波动相同 |
+
+结论：波动率目标和回撤分档在真实暴跌中把回撤减半以上；平稳市场几乎没有成本。回放还发现单名风险预算对宽基 ETF 过严，
+因此新增 `max_etf_name_risk`（默认 5%），个股仍为 2.5%。这些都是机制验证，不含 AI 的选股、盘中止损或日内跳空，
+2019 一年和 2020 一个季度的样本也不能代表所有市场环境。这些数字由 `tests/test_autonomous_fund_validation.py` 固定为回归测试。
+
+## 影子 A/B：验证 AI 的自我优化是否有效
+
+每天的复盘备忘和记分卡会改变 AI 之后的决策，但“改了”不等于“改好了”。`validation` 段开启影子 A/B：
+
+- 每个交易日的第一次决策后，基金经理基于**同一份研究**再做一次对照决策（`shadows_per_session`，默认 1 次）：
+  一组带复盘备忘与记分卡（memo 组），一组不带（baseline 组）。只有当前“冠军”组的决策会交易，另一组只记录（`shadow_decision`）。
+  两组看到的市场、研究、风控和约束完全相同，也都看不到自己属于哪一组；对照组失败不会影响交易或触发退避。
+- 每次盘后复盘之后，用已完成收盘价给两组决策打分：从决策当日收盘起持有一个交易日、相对同敞口 SPY 的超额收益，
+  逐日配对求差（memo − baseline），计算均值、t 统计量和胜率（`learning_evaluation`）。
+- 至少 `min_pairs`（默认 20）个交易日、且 |t| ≥ `switch_t_stat`（默认 2）时才切换冠军：memo 组显著更差就改由 baseline 组交易并通知你；
+  之后若 memo 组显著更好再切回。样本不足或不显著时维持现状。
+- 成本：每个交易日多一次基金经理调用，计入每日模型预算；预算不足时跳过对照组，不影响交易。
+
+局限：日度配对差可能有自相关，20 个样本的 t 检验只是谨慎的门槛，不是严格的因果证明；
+对照组仍然是同一个模型，只是去掉了学到的经验，所以它检验的是“复盘学习这一环”是否有价值，而不是模型本身的选股能力。
+
+## 运行验收报告
+
+本地或 Paper 运行一段时间后，用 `acceptance` 从账本生成验收报告（`acceptance.json` 和 `acceptance.md`），作为进入下一阶段的客观依据：
+
+```bash
+python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
+```
+
+| 标准（`validation.acceptance`） | 默认阈值 | 含义 |
+|---|---|---|
+| `min_sessions` | 20 | 有账户观测的已结束交易日数 |
+| `min_iteration_ratio` | 0.9 | 各交易日实际完成的迭代数 ÷ 应完成数的中位数（反映掉线、卡住） |
+| `max_watchdog_stops` | 3 | 独立监控或服务监督写 STOP 的次数 |
+| `max_unresolved_intents` | 0 | 仍未结束的委托预留（含无法确认的提交） |
+| `max_fill_details_unavailable` | 0 | 券商只给累计成交、缺明细的次数 |
+| `max_model_failure_rate` | 0.2 | 模型调用失败比例 |
+| `min_review_ratio` | 0.9 | 完成盘后复盘的交易日比例 |
+| `max_mean_slippage_bps` | 25 | 成交价相对首次提交限价的平均不利滑点（基点） |
+
+报告还列出人工干预次数（审批、复位、补单、出入金、Telegram 指令）、保护性卖单、改价撤单、追价封锁、回撤与单日亏损闸门、
+最新的影子 A/B 结论等。它只证明运行层面的可靠性，不证明盈利；本地虚拟账户也不能代替券商 Paper 的证据。
 
 ## 研究网络与数据边界
 
@@ -702,6 +766,16 @@ Alpaca 网络登录、Paper 下单／撤单／停机恢复和通知投递尚未�
 没有向任何真实资金账户发送订单。
 当前虚拟环境的 DuckDB 2.0 会在退出时打印 nanobind 引用泄漏诊断；测试退出码正常，但长期运行的内存稳定性仍待观察。
 
+### 2026-11-01 真实数据回放、影子 A/B 与运行验收
+
+新增 20 项验证回归（`tests/test_autonomous_fund_validation.py`），其中 6 项直接用仓库内真实行情：2020 暴跌中波动率目标与回撤分档把回撤减半、
+全部默认时回撤低于 8% 硬锁、2019 平稳市场成本 < 0.3%、ETF 预算修复平稳市场的收益拖累、回放无前视（篡改未来数据不改变此前权重）、
+CSV／分钟线加载。其余覆盖配对检验、两组打分方向一致、冠军只在显著变差时切换并可切回、对照组“盲测”且每日一次并受预算约束、
+对照组失败不影响交易、验收报告的通过与失败、`acceptance` 命令输出。另新增 1 项端到端浸泡测试（`tests/test_autonomous_fund_soak.py`）：
+原生本地模拟一个完整交易日——决策与影子决策、额度内自动买入并成交、跌破 AI 止损后自动卖出、提前唤醒 AI 复核、
+收盘复盘后学习评估、生成验收报告。对 8 处新逻辑做变异检查，全部被测试抓到。`tests/test_autonomous_fund*.py` 合计 330 项通过。
+本环境的网络策略拦截了 Yahoo、Telegram、资讯源与模型接口，真实联网验证仍待在放开这些域名后进行。
+
 ### 2026-11-01 Telegram 回复审批、实时推送报价与资讯监控
 
 新增 30 项回归（`tests/test_autonomous_fund_realtime.py`）：回复提醒「同意」批准对应请求并回执、代码拒绝、
@@ -757,6 +831,7 @@ DoH 解析与 Fake-IP 诊断、DoH 模式下 SSRF 保护仍有效、DuckDB 可�
 | `tests/test_autonomous_fund_model.py` | 实际 LiteLLM 工具请求、模拟工具往返和原生 ADK＋HTTP 替身依赖回归 |
 | `tests/test_autonomous_fund_model_roles.py` | 分角色模型覆盖、全部凭证检查、旧账本及风险锁保留、按模型记录 usage 和费率 |
 | `scripts/autonomous_fund/risk.py` | 区分历史研究日期规则、不可花费的应收款；买入预算、再平衡带、参与率和追价封锁 |
+| `scripts/autonomous_fund/validation.py`、`tests/test_autonomous_fund_validation.py`、`tests/test_autonomous_fund_soak.py` | 真实数据风控回放、影子 A/B 统计、运行验收报告与端到端浸泡测试 |
 | `scripts/autonomous_fund/news.py`、`tests/test_autonomous_fund_realtime.py` | 实时资讯监控；Telegram 回复审批、推送报价与资讯回归 |
 | `scripts/autonomous_fund/scorecard.py`、`tests/test_autonomous_fund_autonomy.py` | 预测与决策记分卡；授权资金、盯盘、研究网络回归 |
 | `scripts/autonomous_fund/quant.py`、`tests/test_autonomous_fund_quant.py` | 量化组合构建（波动率目标、ES、单名与分组上限、回撤分档、压力识别）及执行／预算回归 |
