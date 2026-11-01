@@ -35,9 +35,13 @@ class PostmarketReview(BaseModel):
     strategy_memo: str = Field(min_length=1, max_length=6000)
 
 
-def _events(journal, now):
+def _events(journal, now, kinds=None):
     with journal.connection() as db:
-        rows = db.execute("SELECT sequence,at,kind,body FROM events ORDER BY sequence").fetchall()
+        if kinds:
+            rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence"
+                              % ",".join("?" * len(kinds)), tuple(kinds)).fetchall()
+        else:
+            rows = db.execute("SELECT sequence,at,kind,body FROM events ORDER BY sequence").fetchall()
     # SQL string ordering is unsafe when timestamps have different UTC offsets.
     return [{"sequence": row[0], "at": row[1], "kind": row[2], "body": json.loads(row[3])}
             for row in rows if instant(row[1]) <= now]
@@ -274,8 +278,11 @@ def export_reviews(root, packets):
                       f"置信度：{review['confidence']}。复盘调整是待验证的假设，不保证收益改善。", ""])
         body = json.dumps(packet, indent=2, ensure_ascii=False)
         text = "\n".join(lines)
-        (folder / f"{day}.json").write_text(body, encoding="utf-8")
-        (folder / f"{day}.md").write_text(text, encoding="utf-8")
+        # Completed reviews are immutable (one per session); write each archive
+        # once, and rebuild only a missing file, instead of every report cycle.
+        for path, content in ((folder / f"{day}.json", body), (folder / f"{day}.md", text)):
+            if not path.is_file():
+                path.write_text(content, encoding="utf-8")
     (root / "postmarket_review.json").write_text(body, encoding="utf-8")
     (root / "postmarket_review.md").write_text(text, encoding="utf-8")
     last = packets[-1]

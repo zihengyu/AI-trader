@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.autonomous_fund.journal import Journal, encode
+from scripts.autonomous_fund.execution import EXECUTION_REVISION
 from scripts.autonomous_fund.monitor import Monitor, Telegram
 from scripts.autonomous_fund.risk import RiskError
 
@@ -14,7 +15,7 @@ NOW = datetime(2026, 11, 1, 17, tzinfo=timezone.utc)  # Closed market avoids sch
 
 def setup(tmp_path):
     journal = Journal(tmp_path, "synthetic-notification-account")
-    journal.event(NOW, "startup", {"mode": "local", "execution_revision": 2})
+    journal.event(NOW, "startup", {"mode": "local", "execution_revision": EXECUTION_REVISION})
     heartbeat(tmp_path, NOW)
     return journal
 

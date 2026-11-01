@@ -1376,8 +1376,12 @@ does not change other strategies' model defaults. The supplied role configuratio
 uses ``deepseek/deepseek-flash`` for research and ``deepseek/deepseek-v4-pro`` for
 portfolio decisions; both use the same ``DEEPSEEK_API_KEY``. The PowerShell
 launcher exposes these overrides as ``-ResearchModel`` and ``-DecisionModel``.
-Role model changes preserve the account journal and its risk state. Restart the
-runner to load new settings; no real-money execution is enabled by changing models.
+Role model changes preserve the account journal and its risk state. Quantitative
+risk limits, the approval envelope, execution controls and the model budget are
+configured in the application's ``config.json``, not through environment
+variables; changing them also keeps the same account journal and is recorded as
+an audited policy change. Restart the runner to load new settings; no real-money
+execution is enabled by changing models or policies.
 
 OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
 DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.

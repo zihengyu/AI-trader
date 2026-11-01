@@ -8,14 +8,47 @@ from .risk import RiskError, instant
 
 
 TRIGGERS = {
-    "single_order_at_least_8_percent": "单笔交易达到净值的 8%",
-    "single_order_threshold": "单笔交易达到人工审批阈值",
-    "daily_turnover_threshold": "当日累计预留／提交买卖额达到净值的 20%（含撤单）",
-    "liquidate_entire_portfolio": "拟清空现有全部证券持仓",
+    "single_order_at_least_8_percent": "单笔交易达到净值的 8%（旧版逐笔规则）",
+    "single_order_threshold": "单笔交易达到人工审批阈值（旧版逐笔规则）",
+    "daily_turnover_threshold": "当日累计买卖额达到阈值（旧版逐笔规则）",
+    "liquidate_entire_portfolio": "拟清空现有全部证券持仓（旧版规则）",
+    "exposure_ramp": "当日总敞口增幅将超过自动额度",
+    "buy_turnover": "当日买入现金流将超过自动额度",
+    "market_stress": "基准市场处于压力状态（大跌或高波动），任何新增买入都需确认",
+    "automatic_envelope": "超出自动风险增量额度",
 }
 
 
+def _pct(value):
+    try:
+        return f"{float(value) * 100:.2f}%"
+    except (TypeError, ValueError):
+        return str(value)
+
+
 def approval_message(details):
+    reasons = "；".join(TRIGGERS.get(r, r) for r in details["reasons"])
+    if "buys" in details:
+        lines = ["量化风控：调仓计划超出自动额度，待一次性审批（只覆盖新增买入；卖出/减仓已自动执行）",
+                 f"审批触发：{reasons}",
+                 f"参考净值：${details.get('observed_equity')}；开盘敞口 {_pct(details.get('start_exposure'))}，"
+                 f"当前 {_pct(details.get('current_exposure'))}，批准后最高 {_pct(details.get('max_exposure_after'))}",
+                 f"当日买入现金流上限：${details.get('max_buy_turnover_usd')}",
+                 f"自动额度：{encode(details.get('auto_envelope'))}"]
+        risk = details.get("risk") or {}
+        if risk:
+            lines.append(f"构建后组合：年化波动 {_pct(risk.get('annual_vol'))}，1日97.5% ES {_pct(risk.get('es_975_1d'))}")
+        stress = details.get("stress") or {}
+        if stress.get("stressed"):
+            lines.append(f"市场压力：{encode(stress.get('reasons'))}")
+        lines.append("拟买入（权重上限 / 限价上界）：")
+        for symbol, scope in sorted(details["buys"].items()):
+            lines.append(f"- {symbol}: {_pct(scope['max_weight'])} / ${scope['max_limit']}")
+        lines += [f"有效期至（UTC）：{details['expires_at']}", f"请求 ID：{details['id']}", f"摘要：{details['digest']}",
+                  "批准不放宽任何硬性风控；每笔仍实时复核波动率、ES、行业、回撤与报价。"
+                  "Telegram 回复不会批准；超时只停止超额部分，已在自动额度内的买入不受影响。", "",
+                  "AI 理由（可能包含不确定判断）：", str(details.get("rationale") or "")]
+        return "\n".join(lines)
     side = {"buy": "买入", "sell": "卖出"}.get(details["side"], details["side"])
     return (f"重大模拟交易待审批：{side} {details['symbol']}\n"
             f"当前持股：{details.get('current_quantity', '见审批原文')}；目标权重：{details.get('target_weight', '见原文')}\n"
@@ -23,7 +56,7 @@ def approval_message(details):
             f"卖出限价下界 ${details.get('min_limit', '旧请求须重新审阅')}\n"
             f"预留名义金额上界 ${details['max_notional']}（卖出实际收入仍按成交价）\n"
             f"参考账户净值：${details.get('observed_equity', '见原文')}\n"
-            "审批触发：" + "；".join(TRIGGERS.get(r, r) for r in details["reasons"]) + "\n"
+            "审批触发：" + reasons + "\n"
             f"有效期至（UTC）：{details['expires_at']}\n"
             f"请求 ID：{details['id']}\n摘要：{details['digest']}\n"
             "请在服务器 approvals 查看完整组合与理由，再用 approve/reject + ID + 摘要处理。"

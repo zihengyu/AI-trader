@@ -127,7 +127,11 @@ def run_backtest(args, config):
     runtime = ScriptedRuntime() if args.scripted or args.mode == "mock" else None
     source = YahooDataBacktesting
     if args.mode == "mock":
-        config = {**config, "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
+        # Synthetic symbols replace the operator universe, so its symbol groups
+        # cannot apply; the default groups filter themselves to this universe.
+        quant = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
+        config = {**config, "quant_risk": quant,
+                  "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
         data, source = {"pandas_data": mock_data()}, PandasDataBacktesting
     elif args.data_dir:
         data, source = {"pandas_data": csv_data(args.data_dir)}, PandasDataBacktesting
@@ -207,17 +211,15 @@ def check_market(args, config):
 
 def run_local(args, config):
     from lumibot.traders import Trader
-    from .journal import Journal
     from .local_broker import LocalPaperBroker
     from .market_data import YahooRealtimeData
     from .risk import Limits
-    from .strategy import AutonomousFund, account_digest
+    from .strategy import AutonomousFund, open_journal
     if not args.observe_only:
         models_ready(args, config)
     if args.scripted:
         raise RiskError("Scripted models are forbidden against the running market")
-    binding = account_digest("local", "local-virtual-account", config)
-    journal = Journal(args.run_dir, binding)
+    journal = open_journal(args.run_dir, "local", "local-virtual-account", config)
     broker = LocalPaperBroker(YahooRealtimeData(), journal, Limits(**config["limits"]),
                               matching_enabled=not args.observe_only, require_monitor=args.require_monitor)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
@@ -369,11 +371,12 @@ def attach_order(args):
     assert_paper(broker)
     order = broker._pull_order(args.broker_order_id, "AutonomousPaperFund")
     with sqlite3.connect(args.run_dir / "state.sqlite3") as db:
-        from .strategy import configuration, account_digest
+        from .strategy import configuration, account_digest, legacy_account_digest
         account_key = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
-        expected = account_digest("paper", account_key, configuration(args.config))
+        expected = {account_digest("paper", account_key),
+                    legacy_account_digest("paper", account_key, configuration(args.config))}
         binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
-        if not binding or binding[0] != expected:
+        if not binding or binding[0] not in expected:
             raise RiskError("Recovery credentials/configuration do not match this account journal")
         row = db.execute("SELECT body,updated_at FROM intents WHERE id=? AND status!='terminal'", (args.intent_id,)).fetchone()
         if not row:

@@ -45,8 +45,9 @@ class Limits:
             object.__setattr__(self, key, number(getattr(self, key)))
         if not (0 < self.max_position <= self.max_exposure <= 1 and 0 < self.drawdown < 1):
             raise RiskError("Invalid position, exposure or drawdown limits")
-        if type(self.daily_orders) is not int or not 1 <= self.daily_orders <= 5:
-            raise RiskError("Daily order limit must be an integer in [1, 5]")
+        # Counts every submission, including cancel/replace repricing and sales.
+        if type(self.daily_orders) is not int or not 1 <= self.daily_orders <= 50:
+            raise RiskError("Daily order limit must be an integer in [1, 50]")
         if not 1 <= self.quote_max_seconds <= 300 or self.min_dollar_volume <= 0:
             raise RiskError("Invalid freshness or liquidity limit")
         if not 0 <= self.fee_buffer <= Decimal("0.05") or not 0 <= self.limit_buffer <= Decimal("0.01"):
@@ -127,11 +128,19 @@ def desired_shares(equity, weight, ask, limits):
     return int((number(equity) * number(weight) / buy_limit).to_integral_value(rounding=ROUND_FLOOR))
 
 
-def plan(targets, account, prices, universe, limits, now, paused=False, historical=False):
+def plan(targets, account, prices, universe, limits, now, paused=False, historical=False, *,
+         buy_budget=None, min_trade=None, participation=None, blocked_buys=frozenset()):
     """Sell first; return candidates. The caller rechecks before EACH submission.
 
     No sale proceeds fund a purchase until a fresh broker snapshot confirms them.
     Limits bound submitted risk, not subsequent price appreciation or overnight gaps.
+
+    Optional quantitative execution controls (all only shrink orders):
+    - buy_budget: maximum notional of the next purchase (risk-increase envelope).
+    - min_trade: no-trade band; smaller adjustments are skipped, but a sale to a
+      zero target always proceeds so a position can always be fully exited.
+    - participation: fraction of observed 20-day average dollar volume per order.
+    - blocked_buys: symbols that must not be bought now (e.g. chase limit).
     """
     now = instant(now)
     if account.open_orders:
@@ -164,21 +173,36 @@ def plan(targets, account, prices, universe, limits, now, paused=False, historic
         if delta < 0:
             quantity = int(min(-delta, held))  # Whole shares only; never turn a sell into a short.
             limit = (number(quote.bid) * (1 - limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_FLOOR)
+            full_exit = desired[symbol] == 0
+            if participation is not None:
+                quantity = min(quantity, max(1 if full_exit else 0, _participation_cap(quote, limit, participation)))
+            if min_trade is not None and not full_exit and quantity * limit < number(min_trade):
+                continue
             if quantity and limit > 0:
                 sells.append(Intent(symbol, "sell", quantity, limit))
-        elif delta >= 1 and not paused:
+        elif delta >= 1 and not paused and symbol not in blocked_buys:
             limit = (number(quote.ask) * (1 + limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
             capacity = min(
                 equity * limits.max_position - values[symbol],
                 equity * limits.max_exposure - sum(values.values()),
                 cash / (1 + limits.fee_buffer),
             )
+            if buy_budget is not None:
+                capacity = min(capacity, number(buy_budget))
             quantity = min(int(delta), int((max(0, capacity) / limit).to_integral_value(rounding=ROUND_FLOOR)))
+            if participation is not None:
+                quantity = min(quantity, _participation_cap(quote, limit, participation))
+            if min_trade is not None and quantity * limit < number(min_trade):
+                continue
             if quantity:
                 buys.append(Intent(symbol, "buy", quantity, limit))
     # Only one order is sent before refreshing account/order state. Risk cannot
     # be reused across several buys, and unfilled sales cannot fund buys.
     return sells or buys
+
+
+def _participation_cap(quote, limit, participation):
+    return int((number(quote.dollar_volume) * number(participation) / limit).to_integral_value(rounding=ROUND_FLOOR))
 
 
 def trading_day(now):

@@ -3,6 +3,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -14,11 +15,20 @@ def encode(value):
 
 
 class Journal:
-    def __init__(self, root, binding):
+    def __init__(self, root, binding, legacy_bindings=(), migrate_any_legacy=None):
+        """Open the account journal bound to `binding`.
+
+        `legacy_bindings` are exact earlier digests that provably name the same
+        account; `migrate_any_legacy(db)` may approve a migration when the
+        journal itself is the account (local virtual book). Any other mismatch
+        still refuses to borrow another account's latches, orders or peak.
+        """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "state.sqlite3"
         with self.connection() as db:
+            # WAL lets the monitor read while the runner writes; it persists in the file.
+            db.execute("PRAGMA journal_mode=WAL")
             db.executescript("""
                 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS intents (
@@ -27,10 +37,18 @@ class Journal:
                 CREATE TABLE IF NOT EXISTS events (
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
                     kind TEXT NOT NULL, body TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS events_kind_sequence ON events(kind, sequence);
+                CREATE INDEX IF NOT EXISTS intents_day ON intents(day);
             """)
+            db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
             if old and old[0] != binding:
-                raise RiskError("State belongs to another mode, account or configuration")
+                if old[0] in legacy_bindings or (migrate_any_legacy and migrate_any_legacy(db)):
+                    db.execute("UPDATE meta SET value=? WHERE key='binding'", (binding,))
+                    db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (
+                        datetime.now(timezone.utc).isoformat(), "binding_migrated", encode({"from": old[0], "to": binding})))
+                else:
+                    raise RiskError("State belongs to another mode, account or configuration")
             db.execute("INSERT OR IGNORE INTO meta VALUES ('binding', ?)", (binding,))
 
     @contextmanager
@@ -48,14 +66,15 @@ class Journal:
         with self.connection() as db:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(at), kind, encode(body)))
 
-    def reserve(self, intent, now, limits, guard=None):
+    def reserve(self, intent, now, limits, guard=None, max_submissions=None):
         """Commit BEFORE contacting the broker. Ambiguous calls remain reserved."""
         key = uuid4().hex
+        cap = max_submissions or limits.daily_orders
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             unresolved = db.execute("SELECT 1 FROM intents WHERE status != 'terminal'").fetchone()
             count = db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
-            if unresolved or count >= limits.daily_orders:
+            if unresolved or count >= cap:
                 raise RiskError("Unresolved intent or daily submission limit reached")
             if guard:
                 guard(db)
@@ -63,6 +82,10 @@ class Journal:
                 key, trading_day(now), encode(asdict(intent)), None, "reserved", str(now)))
         self.event(now, "intent_reserved", {"id": key, **asdict(intent)})
         return key
+
+    def submissions(self, now):
+        with self.connection() as db:
+            return db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
 
     def update(self, key, broker_id, terminal, now):
         with self.connection() as db:
@@ -94,12 +117,104 @@ class Journal:
             self.event(now, "drawdown_pause", {"equity": equity, "peak": peak})
         return paused
 
-    def export(self):
+    def observe_session(self, now, account, daily_loss_limit=None):
+        """Per New York trading day: start equity/exposure and observed cash spent.
+
+        The start equity is the last account observation before this trading
+        day (normally the prior close); the start exposure is the first
+        observation of the day. Cash spent is the sum of observed cash
+        decreases, i.e. purchases and their costs, from real account snapshots.
+        Nothing is estimated when a snapshot is missing.
+        """
+        day = trading_day(now)
+        equity, cash = number(account.equity), number(account.cash)
+        exposure = (equity - cash - number(account.receivables)) / equity if equity > 0 else number(0)
         with self.connection() as db:
-            rows = [dict(r) for r in db.execute("SELECT * FROM events ORDER BY sequence")]
+            db.execute("BEGIN IMMEDIATE")
+            rows = dict(db.execute("SELECT key,value FROM meta WHERE key LIKE 'session_%'"))
+            if rows.get("session_day") != day:
+                start = number(rows.get("session_last_equity", equity))
+                rows = {"session_day": day, "session_start_equity": str(start),
+                        "session_start_exposure": str(exposure), "session_cash_spent": "0",
+                        "session_loss_paused": "false"}
+            else:
+                spent = number(rows["session_cash_spent"]) + max(number(0), number(rows["session_last_cash"]) - cash)
+                rows["session_cash_spent"] = str(spent)
+            rows["session_last_cash"], rows["session_last_equity"] = str(cash), str(equity)
+            start = number(rows["session_start_equity"])
+            loss = 1 - equity / start if start > 0 else number(0)
+            newly_paused = False
+            if daily_loss_limit is not None and loss >= number(daily_loss_limit) and rows["session_loss_paused"] != "true":
+                rows["session_loss_paused"], newly_paused = "true", True
+            for key, value in rows.items():
+                db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, value))
+            peak = db.execute("SELECT value FROM meta WHERE key='peak'").fetchone()
+        if newly_paused:
+            self.event(now, "daily_loss_pause", {"day": day, "loss": str(loss), "start_equity": str(start)})
+        return self.session(now, peak=number(peak[0]) if peak else equity, equity=equity)
+
+    def session(self, now, peak=None, equity=None):
+        with self.connection() as db:
+            rows = dict(db.execute("SELECT key,value FROM meta WHERE key LIKE 'session_%' OR key IN ('peak','drawdown_paused')"))
+        if rows.get("session_day") != trading_day(now):
+            return None
+        equity = number(equity if equity is not None else rows["session_last_equity"])
+        peak = number(peak if peak is not None else rows.get("peak", equity))
+        start = number(rows["session_start_equity"])
+        return {"day": rows["session_day"], "start_equity": start,
+                "start_exposure": number(rows["session_start_exposure"]),
+                "cash_spent": number(rows["session_cash_spent"]),
+                "day_loss": 1 - equity / start if start > 0 else number(0),
+                "loss_paused": rows["session_loss_paused"] == "true",
+                "drawdown": max(number(0), 1 - equity / peak) if peak > 0 else number(0),
+                "drawdown_latched": rows.get("drawdown_paused") == "true"}
+
+    def counter(self, key, now, increment=0):
+        """Per-trading-day durable counter, e.g. model runs; survives restarts."""
+        day = trading_day(now)
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT value FROM meta WHERE key=?", (f"counter:{key}",)).fetchone()
+            saved = json.loads(row[0]) if row else {}
+            count = saved.get("count", 0) if saved.get("day") == day else 0
+            if increment:
+                count += increment
+                db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (f"counter:{key}", encode({"day": day, "count": count})))
+        return count
+
+    def get_meta(self, key, default=None):
+        with self.connection() as db:
+            row = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return json.loads(row[0]) if row else default
+
+    def set_meta(self, key, value):
+        with self.connection() as db:
+            db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, encode(value)))
+
+    def export(self):
+        """Append new events to the rebuildable JSONL export; rebuild if it was altered."""
+        target = self.root / "events.jsonl"
+        with self.connection() as db:
+            state = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('jsonl_sequence','jsonl_bytes')"))
+        last, size = int(state.get("jsonl_sequence", 0)), int(state.get("jsonl_bytes", -1))
+        append = last > 0 and target.is_file() and target.stat().st_size == size
+        with self.connection() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM events WHERE sequence>? ORDER BY sequence",
+                                                (last if append else 0,))]
         # SQLite is authoritative; these are rebuildable human-readable exports.
-        with (self.root / "events.jsonl").open("w", encoding="utf-8") as out:
+        with target.open("a" if append else "w", encoding="utf-8") as out:
             for row in rows:
                 row["body"] = json.loads(row["body"])
                 out.write(encode(row) + "\n")
+        if rows or not append:
+            with self.connection() as db:
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_sequence',?)", (str(rows[-1]["sequence"] if rows else last),))
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_bytes',?)", (str(target.stat().st_size),))
+        return rows
+
+    def all_events(self):
+        with self.connection() as db:
+            rows = [dict(r) for r in db.execute("SELECT * FROM events ORDER BY sequence")]
+        for row in rows:
+            row["body"] = json.loads(row["body"])
         return rows

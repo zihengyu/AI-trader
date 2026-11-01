@@ -10,7 +10,7 @@ from pathlib import Path
 
 import requests
 
-from .execution import operator_connection
+from .execution import EXECUTION_REVISION, operator_connection
 from .journal import encode
 from .risk import RiskError, instant
 
@@ -94,7 +94,7 @@ class Monitor:
             raise RiskError("Monitor requires an existing local or Alpaca paper run")
         startup = json.loads(saved[1])
         state = "healthy"
-        if startup.get("execution_revision") != 2:
+        if startup.get("execution_revision") != EXECUTION_REVISION:
             state = "runner_upgrade_required"
         else:
             try:
@@ -149,23 +149,30 @@ class Monitor:
             state = self._health(db, now)
             # Recover even if the trader exited between persisting the review
             # and exporting it. One durable notification per completed review.
-            reviews = db.execute("SELECT sequence,at,body FROM events WHERE kind='postmarket_review'").fetchall()
+            # One indexed pass per poll; never a full-table scan per review.
+            notified = {row[0] for row in db.execute(
+                "SELECT json_extract(body,'$.details.review_sequence') FROM events WHERE kind='notification' "
+                "AND json_extract(body,'$.kind')='postmarket_report'")}
+            reviews = db.execute("SELECT sequence,at FROM events WHERE kind='postmarket_review'").fetchall()
             for review in reviews:
-                packet = json.loads(review["body"])
+                if review["sequence"] in notified:
+                    continue
+                packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
                 if instant(packet["completed_at"]) > now:
                     continue
-                existing = db.execute("SELECT 1 FROM events WHERE kind='notification' AND "
-                    "json_extract(body,'$.kind')='postmarket_report' AND json_extract(body,'$.details.review_sequence')=?",
-                    (review["sequence"],)).fetchone()
-                if not existing:
-                    db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
-                        "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
-                        "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
+                    "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
+                    "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
             # Drop stale first-start alerts; retain recent requests and failures.
-            rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' ORDER BY sequence").fetchall()
+            # A durable cursor bounds each poll to new notifications. It never
+            # advances past one stamped in the future, which is revisited later.
+            cursor = db.execute("SELECT value FROM fund_monitor_meta WHERE key='notification_cursor'").fetchone()
+            rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' AND sequence>? ORDER BY sequence",
+                              (int(cursor[0]) if cursor else 0,)).fetchall()
             for row in rows:
                 if instant(row["at"]) > now:
-                    continue
+                    break
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('notification_cursor',?)", (str(row["sequence"]),))
                 exists = db.execute("SELECT 1 FROM fund_deliveries WHERE sequence=?", (row["sequence"],)).fetchone()
                 if exists:
                     continue
@@ -223,7 +230,8 @@ class Monitor:
                     result = self.transport.send_document(
                         f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
                         filename, document)
-                elif body.get("kind") == "approval_required" and "side" in body.get("details", {}):
+                elif body.get("kind") == "approval_required" and (
+                        "side" in body.get("details", {}) or "buys" in body.get("details", {})):
                     message = approval_message(body["details"])
                     result = (self.transport.send(message) if len(message) <= 4000 else
                               self.transport.send_document(message[:900] + "\n完整理由见附件。",

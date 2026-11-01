@@ -5,16 +5,50 @@
     "manager": "deepseek/deepseek-v4-pro"
   },
   "reasoning_effort": null,
-  "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 5, "drawdown": "0.08"},
+  "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 20, "drawdown": "0.08"},
   "universe": {
     "AAPL": "stock", "MSFT": "stock", "AMZN": "stock", "GOOGL": "stock",
     "META": "stock", "NVDA": "stock", "BRK.B": "stock", "JPM": "stock",
     "V": "stock", "MA": "stock", "UNH": "stock", "JNJ": "stock",
     "XOM": "stock", "COST": "stock", "PG": "stock", "HD": "stock",
-    "SPY": "unlevered_etf", "QQQ": "unlevered_etf", "IWM": "unlevered_etf",
-    "DIA": "unlevered_etf", "VTI": "unlevered_etf", "XLK": "unlevered_etf",
-    "XLF": "unlevered_etf", "XLV": "unlevered_etf", "XLE": "unlevered_etf",
-    "XLP": "unlevered_etf", "XLI": "unlevered_etf"
+    "SPY": "unlevered_etf", "QQQ": "unlevered_etf", "IWM": "unlevered_etf", "DIA": "unlevered_etf",
+    "VTI": "unlevered_etf", "XLK": "unlevered_etf", "XLF": "unlevered_etf", "XLV": "unlevered_etf",
+    "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf"
   },
+  "quant_risk": {
+    "vol_lookback_days": 63,
+    "es_lookback_days": 252,
+    "min_history_days": 20,
+    "es_min_observations": 120,
+    "ewma_lambda": "0.94",
+    "min_annual_vol": "0.10",
+    "unknown_annual_vol": "0.60",
+    "target_portfolio_vol": "0.12",
+    "max_portfolio_es": "0.02",
+    "max_name_risk": "0.025",
+    "max_adv_participation": "0.01",
+    "drawdown_soft": "0.04",
+    "drawdown_floor_scale": "0.25",
+    "daily_loss_limit": "0.02",
+    "stress_benchmark": "SPY",
+    "stress_day_drop": "0.03",
+    "stress_annual_vol": "0.35",
+    "rebalance_band": "0.005",
+    "min_trade_notional": "100",
+    "groups": {
+      "technology": {"limit": "0.30", "members": ["AAPL", "MSFT", "NVDA", "XLK"]},
+      "communication": {"limit": "0.20", "members": ["GOOGL", "META"]},
+      "consumer_discretionary": {"limit": "0.20", "members": ["AMZN", "HD"]},
+      "financials": {"limit": "0.30", "members": ["BRK.B", "JPM", "V", "MA", "XLF"]},
+      "health_care": {"limit": "0.25", "members": ["UNH", "JNJ", "XLV"]},
+      "energy": {"limit": "0.15", "members": ["XOM", "XLE"]},
+      "consumer_staples": {"limit": "0.25", "members": ["COST", "PG", "XLP"]},
+      "us_growth_megacap": {"limit": "0.35", "members": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]},
+      "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]}
+    }
+  },
+  "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
+  "execution": {"reprice_after_seconds": 180, "max_buy_chase": "0.0075", "report_interval_seconds": 300},
+  "model_budget": {"max_agent_runs_per_day": 60, "reserved_review_runs": 4, "min_review_minutes": 15, "failure_backoff_minutes": [5, 15, 60]},
   "model_prices_per_million": null
 }
