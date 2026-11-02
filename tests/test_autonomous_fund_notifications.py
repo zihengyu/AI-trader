@@ -127,3 +127,31 @@ def test_telegram_upload_is_in_memory_and_redacts_token_on_http_failure():
         raise RuntimeError('synthetic-token must not be retained')
     result = Telegram('synthetic-token', 'synthetic-chat', failed).send_document('x', 'x.md', 'x')
     assert result['error'] == 'transport_or_response_error' and 'synthetic-token' not in str(result)
+
+
+def test_daily_report_shows_this_sessions_scorecard_factor_tests_and_run_health(tmp_path):
+    from scripts.autonomous_fund.scorecard import score_timing
+    strategy, _ = completed(tmp_path)
+    day = '2026-11-02'
+    with strategy.journal.connection() as db:
+        sequence = db.execute("SELECT sequence FROM events WHERE kind='postmarket_review'").fetchone()[0]
+    after = CLOSE + timedelta(seconds=2)  # Live clocks move: both are written just after the review.
+    timing = score_timing([(TRADE.isoformat(), 'protective_trigger',
+                            {'symbol': 'ALFA', 'trigger': 'stop_loss', 'bid': '100'})], {})
+    card = {'session_date': day, 'as_of': str(CLOSE), 'timing': timing,
+            'predictions': {'total': 4, 'scored': 2, 'correct': 1, 'hit_rate': 0.5, 'pending': 2},
+            'decisions': {'by_horizon': {'5': {'observed': 3, 'mean_excess_return': 0.004}}}}
+    strategy.journal.event(after, 'scorecard', card)
+    strategy.journal.event(after, 'factor_tests', {'session_date': day, 'results': [
+        {'name': '中期动量', 'expression': 'rank(ret(60))', 'horizon_sessions': 5, 'status': 'rejected',
+         'in_sample': {'t': 1.2}, 'holdout': {'t': 0.4}, 'reason': 'in-sample |t| below the trials-adjusted bar 1.96'},
+        {'name': '坏表达式', 'expression': 'open(1)', 'status': 'invalid', 'reason': 'Unknown factor function'}]})
+    strategy.journal.event(CLOSE + timedelta(days=1), 'scorecard',
+                           {**card, 'session_date': '2026-11-03', 'predictions': {**card['predictions'], 'total': 999}})
+    strategy.journal.event(TRADE + timedelta(minutes=5), 'notification',
+                           {'kind': 'bookkeeping_error', 'details': 'export: OSError'})
+    document = daily_document(tmp_path, sequence)[1]
+    assert '共 4 条' in document and '999' not in document  # This session's card, never a later one.
+    assert '止损 1 次' in document
+    assert 'rank(ret(60))' in document and '未通过' in document and '表达式无效' in document
+    assert 'bookkeeping_error' in document

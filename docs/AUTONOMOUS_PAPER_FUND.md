@@ -620,6 +620,7 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
 | `max_model_failure_rate` | 0.2 | 模型调用失败比例 |
 | `min_review_ratio` | 0.9 | 完成盘后复盘的交易日比例 |
 | `max_mean_slippage_bps` | 25 | 成交价相对首次提交限价的平均不利滑点（基点） |
+| `max_bot_crashes` | 0 | 绕过所有保护导致进程退出的崩溃（`bot_crash`）；记账错误和自动恢复次数只作为参考数据列出 |
 
 报告还列出人工干预次数（审批、复位、补单、出入金、Telegram 指令）、保护性卖单、改价撤单、追价封锁、回撤与单日亏损闸门、
 最新的影子 A/B 结论等。它只证明运行层面的可靠性，不证明盈利；本地虚拟账户也不能代替券商 Paper 的证据。
@@ -698,15 +699,17 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 
 | 级别 | 来源 | 自动解除 |
 |---|---|---|
-| 人工 | `stop` 命令、首次安装、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
+| 人工 | `stop` 命令；**手动关闭**服务（`systemctl stop`／`restart`、在 `serve` 窗口按 Ctrl+C）；首次安装、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
 | 监控 | 看门狗或服务监督发现故障 | 仅进程级故障（心跳超时、进程退出或卡死、监控暂时不可用）；磁盘不足、版本不符、撮合错误、未配置通知不解除 |
-| 服务 | 服务自身启动或退出 | 是 |
+| 服务 | **异常关闭**：进程自己退出（崩溃）、被系统杀死、断电或死机后重新启动、操作系统关机或重启 | 是 |
 
 自动恢复由独立监控进程执行（`config.json` 的 `service` 段，`.env` 中 `FUND_AUTO_RESUME=false` 可关闭），必须同时满足：
 交易进程连续健康至少 `auto_resume_after_seconds`（默认 180 秒，故障后从恢复时重新计时）；没有状态不明或未结束的订单预留
 （交易进程在 STOP 期间会撤销本应用的未完成订单）；24 小时内自动恢复不超过 `max_auto_resumes_per_day` 次（默认 3）。
 恢复、被挡住（`auto_resume_blocked`）或次数用完（`auto_resume_exhausted`）都会通过 Telegram 通知。
-只想停掉服务时，下次启动会自动恢复交易；要让交易保持停止，请用 `stop` 命令。
+手动关闭和异常关闭的区分：服务收到停止信号时，若操作系统正在关机或重启（systemd 报告 `stopping`）视为异常，开机后自动恢复；
+其他停止信号（你执行 `systemctl stop`／`restart` 或按 Ctrl+C）视为手动关闭，下次启动保持 STOP，核对后 `resume`，
+修改 `.env` 后重启服务同样需要 `resume`。无法判断时按手动处理。直接关闭窗口或在任务管理器中结束进程，程序来不及记录，按异常处理。
 
 `notify(kind, details)` 是通知扩展接口，默认输出控制台及持久化本地通知 outbox。
 同一状况（同类型、同内容）在 30 分钟内只记录一次，STOP 提示为 6 小时，避免每分钟写入相同告警；

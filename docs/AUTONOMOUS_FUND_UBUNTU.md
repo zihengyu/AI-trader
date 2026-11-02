@@ -116,7 +116,8 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh resume --run-dir ar
 之后普通模拟交易无需审批；系统按 AI 的下次复核时间（不早于 15 分钟）重新研究和决策，
 模型失败时按 5／15／60 分钟退避，并受每日 Agent 运行次数预算约束。
 所有服务启动／重启都保留或设置 STOP。`prepare` 写入的首次安装 STOP 和 `stop` 命令写入的 STOP 必须核对后显式 resume；
-之后服务器重启、服务退出或进程卡死造成的 STOP，由独立监控在交易进程连续健康 3 分钟、没有状态不明的订单预留后自动解除
+手动关闭服务（`systemctl stop`／`restart`）同样记为人工 STOP，不会自动恢复。
+异常关闭——进程崩溃、被系统杀死、断电后重启、操作系统关机或重启——造成的 STOP，由独立监控在交易进程连续健康 3 分钟、没有状态不明的订单预留后自动解除
 （24 小时内最多 3 次，`FUND_AUTO_RESUME=false` 可关闭），并通过 Telegram 通知；磁盘不足、版本不符等故障仍需人工处理。
 详见 `docs/AUTONOMOUS_PAPER_FUND.md` 的“停止、恢复与异常通知”。
 休市时不撮合；恢复后按原生市场调度运行，盘前研究和盘后复盘在对应钩子触发。

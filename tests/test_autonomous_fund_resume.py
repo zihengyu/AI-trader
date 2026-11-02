@@ -169,7 +169,10 @@ def test_supervisor_keeps_runner_and_monitor_alive_with_a_restart_delay(tmp_path
         return step >= 12
     stop = SimpleNamespace(is_set=lambda: False, wait=wait, set=lambda: None)
     monkeypatch.setattr(service, "stop_child", lambda child: stopped.append(child.role))
-    service.serve(env, tmp_path / "config.json", popen=popen, clock=lambda: clock[0], stop=stop, install_signals=False)
+    monkeypatch.setattr(service, "system_stopping", lambda: False)
+    service.serve(env, tmp_path / "config.json", tmp_path, popen=popen, clock=lambda: clock[0], stop=stop,
+                  install_signals=False)
+    assert stops.read(tmp_path)["class"] == "operator"  # Ctrl+C on serve is a manual stop.
     roles = [child.role for child in started]
     assert roles[:2] == ["runner", "monitor"] and roles.count("runner") == 2  # Restarted once, not in a loop.
     assert sorted(stopped) == ["monitor", "runner"]  # Every live child is stopped on exit.
@@ -187,3 +190,54 @@ def test_supervisor_refuses_to_run_unattended_without_notifications(tmp_path, mo
     with pytest.raises(RiskError, match="FUND_TELEGRAM"):
         service.serve(env, tmp_path / "config.json", popen=lambda *a, **k: pytest.fail("started a child"),
                       install_signals=False)
+
+
+# ----- Manual versus abnormal shutdown ------------------------------------------------------
+
+def run_service(tmp_path, monkeypatch, *, signalled, shutting_down=False):
+    import threading
+    import scripts.autonomous_fund.service as service
+    from .test_autonomous_fund_server import service_harness
+    env, _ = service_harness(tmp_path, monkeypatch)
+    child = SimpleNamespace(poll=lambda: None if signalled else 0, returncode=0 if signalled else 3)
+    monkeypatch.setattr(service.subprocess, "Popen", lambda command, **kwargs: child)
+    event = threading.Event()
+    if signalled:
+        event.set()  # systemctl stop / Ctrl+C reached the supervisor.
+    monkeypatch.setattr(service.threading, "Event", lambda: event)
+    monkeypatch.setattr(service, "system_stopping", lambda: shutting_down)
+    service.main(["runner", "--run-dir", str(tmp_path), "--env-file", str(env)])
+    return stops.read(tmp_path)
+
+
+def test_a_deliberate_service_stop_is_manual_and_never_resumed_automatically(tmp_path, monkeypatch):
+    record = run_service(tmp_path, monkeypatch, signalled=True)
+    assert record["class"] == "operator" and not stops.resumable(record)
+
+
+def test_a_crash_or_an_operating_system_shutdown_resumes_automatically(tmp_path, monkeypatch):
+    crashed = run_service(tmp_path, monkeypatch, signalled=False)  # The child exited by itself.
+    assert crashed["class"] == "service" and stops.resumable(crashed)
+    stops.clear(tmp_path)
+    shutdown = run_service(tmp_path, monkeypatch, signalled=True, shutting_down=True)
+    assert shutdown["reason"] == "system_shutdown" and stops.resumable(shutdown)
+
+
+@pytest.mark.parametrize("output, expected", [("stopping\n", True), ("running\n", False), ("degraded\n", False),
+                                              (None, False)])
+def test_operating_system_shutdown_detection_falls_back_to_manual(monkeypatch, output, expected):
+    import scripts.autonomous_fund.service as service
+    def run(*args, **kwargs):
+        if output is None:
+            raise FileNotFoundError("systemctl")
+        return SimpleNamespace(stdout=output)
+    monkeypatch.setattr(service.subprocess, "run", run)
+    monkeypatch.setattr(service.os, "name", "posix")
+    assert service.system_stopping() is expected
+
+
+def test_on_windows_a_stop_signal_is_always_manual(monkeypatch):
+    import scripts.autonomous_fund.service as service
+    monkeypatch.setattr(service.subprocess, "run", lambda *a, **k: SimpleNamespace(stdout="stopping\n"))
+    monkeypatch.setattr(service.os, "name", "nt")
+    assert service.system_stopping() is False  # Windows shutdown kills the process; Ctrl+C is a person.

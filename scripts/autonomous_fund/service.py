@@ -42,6 +42,29 @@ def supervision_reason(root, started, now, *, grace_seconds=180):
     return None
 
 
+def system_stopping():
+    """True only while the operating system is shutting down (systemd).
+
+    A stop signal during shutdown or reboot is not the operator closing the fund,
+    so trading may resume after boot; any other signal is a manual stop. When the
+    state cannot be read, the stop counts as manual: a human resumes it.
+    """
+    if os.name != "posix":
+        return False
+    try:
+        state = subprocess.run(["systemctl", "is-system-running"], capture_output=True, text=True, timeout=5).stdout
+    except Exception:
+        return False
+    return str(state).strip() == "stopping"
+
+
+def stopped_by_signal(root):
+    """Record a signalled exit: manual unless the operating system is shutting down."""
+    if system_stopping():
+        return stops.write(root, "service", "system_shutdown")
+    return stops.write(root, "operator", "stopped_by_operator")
+
+
 def stop_child(child, timeout=30):
     if child.poll() is not None:
         return
@@ -134,8 +157,13 @@ def main(argv=None):
                 break
     finally:
         if args.role == "runner":
-            # Applies even to a deliberate systemctl stop or clean child exit.
-            stops.write(args.run_dir, "service", "service_exit")
+            # systemctl stop / Ctrl+C is a manual close that stays stopped; a
+            # child that exited by itself or an OS shutdown is abnormal and may
+            # resume once the monitor confirms health.
+            if not reason and exiting.is_set():
+                stopped_by_signal(args.run_dir)
+            else:
+                stops.write(args.run_dir, "service", "service_exit")
         stop_child(child)
     return 1 if reason else (child.returncode or 0)
 
@@ -152,11 +180,13 @@ def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.
     load_environment(env_file)
     if not os.environ.get("FUND_TELEGRAM_BOT_TOKEN") or not os.environ.get("FUND_TELEGRAM_CHAT_ID"):
         raise RiskError("Unattended running requires FUND_TELEGRAM_BOT_TOKEN and FUND_TELEGRAM_CHAT_ID in .env")
+    from .settings import startup
+    _, account_dir, _, _ = startup("start", run_dir, os.environ)
     stop = stop or threading.Event()
     if install_signals:
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda *_: stop.set())
-    children, started = {}, {}
+    children, started, requested = {}, {}, False
     try:
         while True:
             for role in ("runner", "monitor"):
@@ -172,8 +202,13 @@ def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.
                 children[role] = popen(command)
                 started[role] = clock()
             if stop.wait(5):
+                requested = True
                 break
     finally:
+        if requested:
+            # Before the children: on Windows they may be terminated without
+            # running their own cleanup, and Ctrl+C here is a manual close.
+            stopped_by_signal(account_dir)
         for child in children.values():
             stop_child(child)
 
