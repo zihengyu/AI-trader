@@ -80,6 +80,7 @@ SETTINGS = {
     "FUND_MODE": (None, None, False, "启动", "启动模式：local（真实行情本地模拟盘）或 paper（Alpaca 模拟账户）；没有实盘选项"),
     "FUND_RUN_DIR": (None, None, False, "启动", "账户运行目录（账本、报告、STOP）；留空为 artifacts/fund-<模式>"),
     "FUND_OBSERVE_ONLY": (None, None, False, "启动", "仅 local：只读观察，不调用模型、不下单"),
+    "FUND_AUTO_RESUME": (("service", "auto_resume"), _bool, False, "启动", "服务重启或进程卡死造成的 STOP 在确认健康后自动解除；人工 stop 永不自动解除"),
     # ----- Model keys and model choice
     "DEEPSEEK_API_KEY": (None, None, True, "模型", "DeepSeek API Key（默认研究员和基金经理都用 DeepSeek）"),
     "OPENAI_API_KEY": (None, None, True, "模型", "OpenAI API Key（仅当选用 openai/ 模型时需要）"),

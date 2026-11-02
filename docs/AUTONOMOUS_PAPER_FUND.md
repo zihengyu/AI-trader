@@ -85,7 +85,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 
 | 类别 | 变量 | 作用 |
 |---|---|---|
-| 启动 | `FUND_MODE`、`FUND_RUN_DIR`、`FUND_OBSERVE_ONLY` | 启动模式 local／paper（没有实盘）、账户目录、只读观察（见[启动模式](#启动模式由-env-的-fund_mode-决定)） |
+| 启动 | `FUND_MODE`、`FUND_RUN_DIR`、`FUND_OBSERVE_ONLY`、`FUND_AUTO_RESUME` | 启动模式 local／paper（没有实盘）、账户目录、只读观察（见[启动模式](#启动模式由-env-的-fund_mode-决定)）、重启后安全条件下自动恢复交易 |
 | 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
 | 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
@@ -420,7 +420,10 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 
 ## 因子实验室：AI 挖掘因子，代码客观检验
 
-AI 在盘后复盘中可提出最多 5 个因子表达式（`factor_proposals`），确定性代码（`factors.py`）用无前视的历史数据检验，
+因子挖掘只在盘后做：复盘的研究阶段结合以往检验结果研究可能的新规律，基金经理阶段把它写成最多 5 个因子表达式（`factor_proposals`），
+代码随即检验。盘中只使用已验证因子的排名：排名来自最近一个已完成收盘，开盘前预热一次，全天复用，不占用盘中盯盘和下单的时间。
+
+这些因子表达式由确定性代码（`factors.py`）用无前视的历史数据检验，
 结果在之后的每次决策和复盘中交给 AI。闭环是：**AI 发现规律 → 写成因子 → 代码检验 → 通过的因子及其实盘表现回到 AI → AI 修正或提出新因子**。
 
 **因子语言**（安全白名单，不执行任何 Python 代码）：数据 `close`、`volume`（已完成日线）；时序函数
@@ -677,8 +680,33 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 - 若仍有异常让进程崩溃，`on_bot_crash` 先写入 `bot_crash` 通知，独立监控进程据此（以及心跳超时）通过 Telegram 告警；
 - 历史回测中这些错误仍直接抛出，以免测试掩盖真正的 bug。
 
-进程本身退出后，Ubuntu 上的 systemd 服务 30 秒后自动重启，重启后保持 STOP，核对后 `resume`；
-Windows 下用启动器直接运行时没有自动重启，长期运行请使用 Ubuntu 服务方式（见 `docs/AUTONOMOUS_FUND_UBUNTU.md`）。
+**进程退出后的自动重启与自动恢复**：
+
+- Ubuntu：两个 systemd 服务（交易、监控）退出后 30 秒自动重启；
+- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易和监控两个进程，任一退出 30 秒后重启：
+
+  ```powershell
+  .\scripts\run_autonomous_fund.ps1 -Mode serve
+  ```
+
+  与服务器一样要求在 `.env` 配好 Telegram。开机自动启动可在“任务计划程序”中创建登录时运行的任务，
+  例如 `schtasks /Create /TN "LumiBot Fund" /SC ONLOGON /TR "powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\scripts\run_autonomous_fund.ps1 -Mode serve"`；
+  长期运行请关闭电脑睡眠（`powercfg /change standby-timeout-ac 0`），睡眠期间进程冻结，心跳超时会触发 STOP。
+  Windows 下的 `serve` 只在模拟测试中验证过，尚未在真实 Windows 机器上运行。
+
+每次（重新）启动都会先写入 STOP，避免无人监控的成交。**STOP 文件记录原因**，分三级，后写入的不能降级：
+
+| 级别 | 来源 | 自动解除 |
+|---|---|---|
+| 人工 | `stop` 命令、首次安装、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
+| 监控 | 看门狗或服务监督发现故障 | 仅进程级故障（心跳超时、进程退出或卡死、监控暂时不可用）；磁盘不足、版本不符、撮合错误、未配置通知不解除 |
+| 服务 | 服务自身启动或退出 | 是 |
+
+自动恢复由独立监控进程执行（`config.json` 的 `service` 段，`.env` 中 `FUND_AUTO_RESUME=false` 可关闭），必须同时满足：
+交易进程连续健康至少 `auto_resume_after_seconds`（默认 180 秒，故障后从恢复时重新计时）；没有状态不明或未结束的订单预留
+（交易进程在 STOP 期间会撤销本应用的未完成订单）；24 小时内自动恢复不超过 `max_auto_resumes_per_day` 次（默认 3）。
+恢复、被挡住（`auto_resume_blocked`）或次数用完（`auto_resume_exhausted`）都会通过 Telegram 通知。
+只想停掉服务时，下次启动会自动恢复交易；要让交易保持停止，请用 `stop` 命令。
 
 `notify(kind, details)` 是通知扩展接口，默认输出控制台及持久化本地通知 outbox。
 同一状况（同类型、同内容）在 30 分钟内只记录一次，STOP 提示为 6 小时，避免每分钟写入相同告警；

@@ -271,3 +271,17 @@ def test_the_strategy_panel_never_includes_todays_forming_bar(tmp_path):
     close, volume = AutonomousFund._factor_panel(fake, days[-1].to_pydatetime())
     assert list(close.columns) == ["ALFA", "BETA"] and len(close) == 5 and close.iloc[-1, 0] == 104.0
     assert volume.iloc[-1, 0] == 1e6
+
+
+def test_factor_context_is_computed_once_per_trading_day_and_before_the_open(tmp_path):
+    from datetime import timedelta
+    from types import SimpleNamespace
+    from scripts.autonomous_fund.strategy import AutonomousFund
+    calls = []
+    lab = SimpleNamespace(context=lambda now, close, volume: calls.append(now) or {"day": str(now.date())})
+    fake = SimpleNamespace(factor_lab=lab, _factor_context_cache=None, _factor_panel=lambda now: (None, None))
+    morning = NOW.replace(hour=13)
+    assert AutonomousFund._factor_context(fake, morning) == AutonomousFund._factor_context(fake, NOW)
+    assert len(calls) == 1  # Intraday decisions reuse the morning's ranks.
+    AutonomousFund._factor_context(fake, NOW + timedelta(days=1))
+    assert len(calls) == 2

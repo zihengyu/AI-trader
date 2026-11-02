@@ -96,8 +96,9 @@ class Telegram:
 
 
 class Monitor:
-    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900):
+    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900, resume_policy=None):
         self.root, self.transport = Path(root), transport
+        self.resume_policy = resume_policy  # None: never resume automatically.
         if heartbeat_seconds < 30 or agent_seconds < 60:
             raise RiskError("Watchdog thresholds are too short")
         self.heartbeat_seconds, self.agent_seconds = heartbeat_seconds, agent_seconds
@@ -158,11 +159,12 @@ class Monitor:
                 state = "iteration_stalled"
         if shutil.disk_usage(self.root).free < 200_000_000:
             state = "low_disk_space"
+        underlying = state
         if state not in {"healthy", "stopped"}:
             # Reassert every poll even after someone resumes an unhealthy run;
             # deduplication applies to alerts, never to the protective STOP.
-            (self.root / "STOP").touch()
-        # A deliberate manual stop is already a safe state. Never auto-resume.
+            from . import stops
+            stops.write(self.root, "watchdog", state, now)
         if (self.root / "STOP").exists() and state == "healthy":
             state = "stopped"
         old = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health'").fetchone()
@@ -171,10 +173,65 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_stop", "details": {"reason": state, "action": "STOP written; inspect broker orders and resume explicitly"}})))
             elif old and old[0] not in {"healthy", "stopped"}:
+                policy = self.resume_policy
+                text = (f"Health recovered; trading resumes by itself after {policy.auto_resume_after_seconds} s of "
+                        "continuous health if no order is unresolved" if policy and policy.auto_resume else
+                        "Health recovered; STOP still requires explicit operator resume")
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
-                    "kind": "watchdog_recovered", "details": "Health recovered; STOP still requires explicit operator resume"})))
+                    "kind": "watchdog_recovered", "details": text})))
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
+        if self._auto_resume(db, now, underlying):
+            state = "healthy"
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
         return state
+
+    def _auto_resume(self, db, now, underlying):
+        """Lift a STOP that a service restart or a liveness fault wrote, never an operator's.
+
+        Requires continuous health for auto_resume_after_seconds after the stop,
+        no unresolved order reservation, and at most max_auto_resumes_per_day.
+        """
+        from . import stops
+        if underlying != "healthy":
+            db.execute("DELETE FROM fund_monitor_meta WHERE key='healthy_since'")
+            return False
+        db.execute("INSERT OR IGNORE INTO fund_monitor_meta VALUES('healthy_since',?)", (now.isoformat(),))
+        policy = self.resume_policy
+        if policy is None or not policy.auto_resume:
+            return False
+        record = stops.read(self.root)
+        if not stops.resumable(record):
+            return False
+        since = instant(db.execute("SELECT value FROM fund_monitor_meta WHERE key='healthy_since'").fetchone()[0])
+        begun = max(since, instant(record["at"])) if record.get("at") else since
+        if (now - begun).total_seconds() < policy.auto_resume_after_seconds:
+            return False
+        marker = f"{record['at']}|{record['reason']}"
+
+        def note_once(kind, details):
+            seen = db.execute("SELECT value FROM fund_monitor_meta WHERE key='auto_resume_note'").fetchone()
+            if not seen or seen[0] != f"{kind}|{marker}":
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+                    "kind": kind, "details": details})))
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('auto_resume_note',?)", (f"{kind}|{marker}",))
+        if db.execute("SELECT 1 FROM intents WHERE status!='terminal' LIMIT 1").fetchone():
+            note_once("auto_resume_blocked", {"stop_reason": record["reason"], "action": (
+                "An order reservation is unresolved: verify it at the broker, resolve it, then resume explicitly")})
+            return False
+        day_ago = now - timedelta(hours=24)
+        recent = sum(instant(row[0]) >= day_ago for row in db.execute("SELECT at FROM events WHERE kind='auto_resume'"))
+        if recent >= policy.max_auto_resumes_per_day:
+            note_once("auto_resume_exhausted", {"stop_reason": record["reason"], "resumes_last_24h": recent, "action": (
+                "Repeated restarts: inspect runtime.log and journalctl, then resume explicitly")})
+            return False
+        if not stops.clear(self.root, record):
+            return False  # Someone changed STOP meanwhile; their record wins.
+        detail = {"stop": record, "healthy_since": since.isoformat()}
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "auto_resume", encode(detail)))
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+            "kind": "auto_resumed", "details": {"stop_reason": record["reason"], "stopped_at": record["at"],
+                                                "healthy_since": since.isoformat()}})))
+        return True
 
     def poll(self, now=None):
         now = instant(now or datetime.now(timezone.utc))
@@ -439,9 +496,13 @@ def send_test(root):
 
 def run_monitor(args):
     from filelock import FileLock
+    from .stops import ResumePolicy
+    from .strategy import configuration
+    policy = ResumePolicy.from_config(configuration(args.config).get("service"))
     transport = None if args.console_only else Telegram()
     with FileLock(str(args.run_dir / "monitor.lock"), timeout=0):
-        monitor = Monitor(args.run_dir, transport, heartbeat_seconds=args.heartbeat_seconds, agent_seconds=args.agent_seconds)
+        monitor = Monitor(args.run_dir, transport, heartbeat_seconds=args.heartbeat_seconds, agent_seconds=args.agent_seconds,
+                          resume_policy=policy)
         while True:
             status = monitor.poll()
             if args.once:

@@ -18,7 +18,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation", "factor_lab")
+                   "market_data", "news", "validation", "factor_lab", "service")
 NOTICE_WINDOWS = {"manual_stop": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -180,6 +180,8 @@ def configuration(path, environ=None):
     ValidationSettings.from_config(result.get("validation"))
     from .factors import FactorSettings
     FactorSettings.from_config(result.get("factor_lab"))
+    from .stops import ResumePolicy
+    ResumePolicy.from_config(result.get("service"))
     return result
 
 
@@ -525,6 +527,7 @@ class AutonomousFund(Strategy):
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
+                       "factor_lab": self._factor_context(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -1211,14 +1214,25 @@ class AutonomousFund(Strategy):
         return panel
 
     def _factor_context(self, now):
+        """Once per trading day (warmed before the open): intraday decisions only reuse it.
+
+        Ranks come from the last completed close, so they cannot change during the
+        session; mining and testing happen in the post-market review.
+        """
         lab = getattr(self, "factor_lab", None)
         if lab is None:
             return None
+        day = trading_day(now)
+        cached = getattr(self, "_factor_context_cache", None)
+        if cached and cached[0] == day:
+            return cached[1]
         try:
             close, volume = self._factor_panel(now)
-            return lab.context(now, close, volume)
+            context = lab.context(now, close, volume)
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+        self._factor_context_cache = (day, context)
+        return context
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_closes(self, symbol, now):

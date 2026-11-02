@@ -240,6 +240,8 @@ def review_after_close(strategy):
                         "区分选股、择时、执行与市场整体表现。可使用只读研究工具，核对消息与价格的真实时间。"
                         "引用日志证据请使用 event:<sequence>，外部资料请给出来源和时间。"
                         "披露数据缺失、陈旧估值和费用不确定性；不要编造收盘净值或把没成交当成成交。"
+                        "结合 factor_lab 中已验证、被拒绝和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
+                        "波动等可由日线计算的规律），供基金经理决定是否写成 factor_proposals。"
                         "本阶段不输出订单。历史模式只能使用 as_of 当时可得的信息。", context=context)
         research = strategy._record_agent("researcher", result, phase="postmarket_review")
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
@@ -297,6 +299,7 @@ def review_after_close(strategy):
             if close is None:
                 raise RiskError("Factor history unavailable")
             lab.test(review["factor_proposals"], strategy.get_datetime(), day, close, volume)
+            strategy._factor_context_cache = None  # The next context includes these results.
         except Exception as exc:  # Evidence tooling must never cost the saved review.
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {
                 "session_date": day, "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})

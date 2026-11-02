@@ -1427,7 +1427,9 @@ cover the startup mode (``FUND_MODE``: ``local`` for real-time public data with 
 local virtual account, or ``paper`` for an Alpaca paper account; any other value,
 including ``live``, is refused because no live mode exists; ``FUND_RUN_DIR`` for
 the account directory, default ``artifacts/fund-<mode>``; ``FUND_OBSERVE_ONLY``
-for local runs without model calls or orders), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
+for local runs without model calls or orders; ``FUND_AUTO_RESUME`` to let the
+independent monitor lift a STOP written by a service restart or a liveness fault
+after continuous health, never an operator's stop), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
 ``FUND_REASONING_EFFORT``, ``FUND_MAX_AGENT_RUNS_PER_DAY``,
 ``FUND_MIN_REVIEW_MINUTES``, ``FUND_MODEL_PRICES_JSON``), user limits
 (``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,

@@ -59,7 +59,8 @@ def backup(root, destination):
             source.backup(target)
     os.chmod(destination / "state.sqlite3", 0o600)
     # Always restore into STOP, even if the source account was trading.
-    (destination / "STOP").touch(mode=0o600)
+    from . import stops
+    stops.write(destination, "operator", "restored_backup")
 
 
 def main(argv=None):
@@ -100,7 +101,8 @@ def main(argv=None):
     if not args.run_dir and repo / "artifacts" not in run_dir.resolve().parents:
         raise RiskError(f"FUND_RUN_DIR for server services must be under {repo / 'artifacts'}: the service may only write there")
     run_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    (run_dir / "STOP").touch(mode=0o600)
+    from . import stops
+    stops.write(run_dir, "operator", "first_install")  # The first start is verified and resumed by hand.
     print(f"Services start in mode {mode} with account directory {run_dir}"
           + ("" if args.mode else "; change FUND_MODE in .env and restart both services to switch."))
     for filename, body in units.items():

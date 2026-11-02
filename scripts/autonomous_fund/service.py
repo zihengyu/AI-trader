@@ -1,4 +1,8 @@
-"""systemd child supervision. Recovery never clears STOP or replays an order."""
+"""Child supervision for systemd units and for `serve` (Windows/no systemd).
+
+Recovery never replays an order. Every start writes a `service` STOP; only the
+independent monitor may lift that (or a liveness fault), after its own checks.
+"""
 import argparse
 import json
 import os
@@ -7,9 +11,13 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 
+from . import stops
 from .risk import RiskError, instant
+
+RESTART_SECONDS = 30  # Same delay as the systemd units' RestartSec.
 
 
 FATAL_HEALTH = {"heartbeat_stale", "heartbeat_unavailable", "runner_exited", "agent_call_stalled",
@@ -83,9 +91,9 @@ def main(argv=None):
             raise RiskError(f"FUND_RUN_DIR for server services must be under {sandbox}: the service may only write there")
     args.run_dir.mkdir(parents=True, exist_ok=True)
     if args.role == "runner":
-        # No bootstrap interval with unmonitored fills. The operator first
-        # verifies both services and explicitly resumes the persisted account.
-        (args.run_dir / "STOP").touch()
+        # No bootstrap interval with unmonitored fills. A stronger existing
+        # STOP (operator or fault) is kept; the monitor alone may lift this one.
+        stops.write(args.run_dir, "service", "service_start")
     exiting = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: exiting.set())
@@ -113,7 +121,7 @@ def main(argv=None):
                 except Exception:
                     reason = "monitor_child_stalled"
             if reason:
-                (args.run_dir / "STOP").touch()
+                stops.write(args.run_dir, "watchdog", reason)
                 from .execution import operator_connection
                 from .journal import encode
                 try:
@@ -127,9 +135,47 @@ def main(argv=None):
     finally:
         if args.role == "runner":
             # Applies even to a deliberate systemctl stop or clean child exit.
-            (args.run_dir / "STOP").touch()
+            stops.write(args.run_dir, "service", "service_exit")
         stop_child(child)
     return 1 if reason else (child.returncode or 0)
+
+
+def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.monotonic, stop=None,
+          install_signals=True):
+    """Keep the runner and monitor services alive where systemd is unavailable (e.g. Windows).
+
+    Equivalent to the two generated units: each role runs under this module's
+    supervision and is restarted RESTART_SECONDS after it last started when it
+    exits. Unattended running requires Telegram, like the server services.
+    """
+    from .environment import load_environment
+    load_environment(env_file)
+    if not os.environ.get("FUND_TELEGRAM_BOT_TOKEN") or not os.environ.get("FUND_TELEGRAM_CHAT_ID"):
+        raise RiskError("Unattended running requires FUND_TELEGRAM_BOT_TOKEN and FUND_TELEGRAM_CHAT_ID in .env")
+    stop = stop or threading.Event()
+    if install_signals:
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(signum, lambda *_: stop.set())
+    children, started = {}, {}
+    try:
+        while True:
+            for role in ("runner", "monitor"):
+                child = children.get(role)
+                if child is not None and child.poll() is None:
+                    continue
+                if child is not None:
+                    if clock() - started[role] < RESTART_SECONDS:
+                        continue
+                    print(f"{role} exited with code {child.poll()}; restarting", flush=True)
+                command = [sys.executable, "-m", "scripts.autonomous_fund.service", role, "--env-file", str(env_file),
+                           "--config", str(config)] + (["--run-dir", str(run_dir)] if run_dir else [])
+                children[role] = popen(command)
+                started[role] = clock()
+            if stop.wait(5):
+                break
+    finally:
+        for child in children.values():
+            stop_child(child)
 
 
 if __name__ == "__main__":

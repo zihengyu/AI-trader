@@ -271,7 +271,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -316,6 +316,7 @@ def main(argv=None):
                 print(f"Warning: {exc}; STOP still proceeds.", flush=True)
         args.model = args.model or os.environ.get("AI_MODEL")
     from .settings import MODES, startup
+    explicit_run_dir = args.run_dir is not None
     args.mode, args.run_dir, observe, origin = startup(args.mode, args.run_dir, os.environ)
     args.observe_only = args.observe_only or observe
     if args.mode in MODES:
@@ -330,14 +331,22 @@ def main(argv=None):
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
     os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check"} else "true"
+    if args.mode == "serve":
+        from .service import serve
+        if not args.env_file:
+            raise RiskError("serve needs the .env file (the launchers select the checkout .env)")
+        serve(args.env_file, args.config, args.run_dir if explicit_run_dir else None)
+        return
     args.run_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
     if args.mode == "stop":
-        (args.run_dir / "STOP").touch()
+        from . import stops
+        stops.write(args.run_dir, "operator", "operator_stop")  # Never lifted automatically.
         print("STOP active. Running process cancels known pending orders on its next iteration; verify broker cancellations.")
         return
     if args.mode == "resume":
-        (args.run_dir / "STOP").unlink(missing_ok=True)
+        from . import stops
+        stops.clear(args.run_dir)
         print("Manual stop removed; drawdown and ambiguous-order locks remain.")
         return
     if args.mode in {"approvals", "approve", "reject"}:
