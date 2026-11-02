@@ -410,3 +410,255 @@ def test_a_sale_is_never_filled_at_a_price_from_before_an_applied_split(tmp_path
     pre_split_bar = SimpleNamespace(high=100.0, low=100.0, volume=1e6)
     with pytest.raises(RiskError, match="predates"):
         broker._fill_bar(order.identifier, order, pd.Timestamp(clock.value), pre_split_bar)
+
+
+# ----- Fourth review: strategy loop, monitor and market data ----------------------------------
+
+def test_a_reply_to_a_plain_text_alert_never_crashes_the_monitor(tmp_path):
+    from scripts.autonomous_fund.monitor import Monitor
+    from .test_autonomous_fund_execution import NOW as EXEC_NOW, envelope, setup as exec_setup
+    from .test_autonomous_fund_realtime import Bot, message
+    journal, state, account, active = exec_setup(tmp_path)
+    state.request(active, envelope(), EXEC_NOW)  # A plan is waiting for approval.
+    heartbeat(tmp_path, EXEC_NOW)
+    journal.event(EXEC_NOW, "iteration_finished", {})
+    journal.event(EXEC_NOW, "notification", {"kind": "watchdog_recovered", "details": "Health recovered (text only)"})
+    bot = Bot()
+    monitor = Monitor(tmp_path, bot)
+    monitor.poll(EXEC_NOW)
+    alert = 100 + next(i for i, (text, _) in enumerate(bot.sent, 1) if "watchdog_recovered" in text)
+    broken = message("同意", EXEC_NOW + timedelta(seconds=6), update_id=8)
+    broken["message"]["date"] = "not-a-timestamp"  # Raises inside the handler itself.
+    bot.batches.append([message("同意", EXEC_NOW + timedelta(seconds=5), update_id=7, reply_to=alert), broken,
+                        message("状态", EXEC_NOW + timedelta(seconds=7), update_id=9)])
+    monitor.poll(EXEC_NOW + timedelta(seconds=10))  # Must not raise: the watchdog must keep running.
+    monitor.poll(EXEC_NOW + timedelta(seconds=20))
+    assert bot.offsets[-1] == 10  # Every update is consumed, never re-read in a crash loop.
+    answered = [r["body"] for r in journal.all_events() if r["kind"] == "telegram_command"]
+    assert any(b.get("result") == "unresolved" for b in answered)  # The text alert got a real answer.
+    assert any(b.get("result") == "error" and b.get("update_id") == 8 for b in answered)
+    assert any(b.get("result") == "status" for b in answered)  # The update after the broken one ran.
+
+
+def test_a_long_but_progressing_iteration_is_not_reported_as_stalled(tmp_path):
+    from scripts.autonomous_fund.monitor import Monitor
+    journal = setup(tmp_path)
+    start = datetime(2026, 11, 2, 16, tzinfo=timezone.utc)  # Monday 11:00 in New York: the session is open.
+    journal.event(start, "iteration_started", {})
+    journal.event(start + timedelta(seconds=5), "agent_call_started", {"id": "research"})
+    journal.event(start + timedelta(seconds=150), "agent_call_finished", {"id": "research"})
+    journal.event(start + timedelta(seconds=151), "agent_call_started", {"id": "manager"})
+    journal.event(start + timedelta(seconds=235), "agent_call_finished", {"id": "manager"})
+    now = start + timedelta(seconds=240)
+    heartbeat(tmp_path, now)
+    assert Monitor(tmp_path, FakeTelegram()).poll(now)["health"] == "healthy"
+    assert not (tmp_path / "STOP").exists()
+    later = now + timedelta(minutes=10)  # A genuinely stuck iteration is still caught.
+    heartbeat(tmp_path, later)
+    assert Monitor(tmp_path, FakeTelegram()).poll(later)["health"] == "iteration_stalled"
+
+
+def stopped_with_order(tmp_path, status):
+    from lumibot.entities import Order
+    from scripts.autonomous_fund.risk import Intent, number
+    from .test_autonomous_fund import LIMITS, NOW as BASE_NOW, harness
+    strategy = harness(tmp_path)
+    strategy.halt_path.touch()
+    key = strategy.journal.reserve(Intent("ALFA", "buy", 1, number(100)), BASE_NOW, LIMITS)
+    order = Order("test", "ALFA", 1, "buy", limit_price=100, status=status)
+    strategy.session_orders[key] = order
+    strategy.journal.update(key, order.identifier, False, BASE_NOW)
+    canceled = []
+    strategy.cancel_order = canceled.append
+    return strategy, canceled
+
+
+def test_orders_confirmed_canceled_during_a_stop_are_reconciled_so_auto_resume_can_proceed(tmp_path):
+    strategy, _ = stopped_with_order(tmp_path, "canceled")
+    strategy.on_trading_iteration()
+    assert not strategy.journal.pending()
+
+
+def test_cancel_requests_during_a_stop_are_throttled_too(tmp_path):
+    strategy, canceled = stopped_with_order(tmp_path, "cancelling")
+    for _ in range(3):
+        strategy.on_trading_iteration()
+    assert len(canceled) == 1 and strategy.journal.pending()
+
+
+def test_a_stop_on_another_holding_is_detected_and_takes_priority_while_an_order_is_open(tmp_path):
+    from dataclasses import replace
+    from .test_autonomous_fund_autonomy import accept, account, pending_order, quote, watching
+    strategy = watching(tmp_path, {"ALFA": quote(100), "BETA": quote(94)})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05}, {"symbol": "BETA", "weight": .05, "stop_loss": 95}])
+    pending_order(strategy, symbol="ALFA", decision_id=active["id"])
+    canceled = []
+    strategy.cancel_order = canceled.append
+    held = replace(account(9530, {"BETA": 5}, price=94), open_orders=True)
+    strategy._protect_while_orders_open(held, NOW)
+    assert any(r["kind"] == "protective_trigger" for r in strategy.journal.all_events())
+    assert [order.asset.symbol for order in canceled] == ["ALFA"]  # The purchase yields to the stop exit.
+    assert strategy.execution.levels()["BETA"]["state"] == "triggered"
+
+
+def take_profit_setup(tmp_path, quotes):
+    from .test_autonomous_fund_autonomy import accept, at, watching
+    strategy = watching(tmp_path, quotes)
+    accept(strategy, [{"symbol": "ALFA", "weight": .10, "stop_loss": 90, "take_profit": 120,
+                       "take_profit_weight": .05}], when=at(-30))
+    return strategy
+
+
+def test_a_partial_take_profit_has_a_fixed_size_and_keeps_the_stop_on_the_remaining_shares(tmp_path, sent_orders):
+    from .test_autonomous_fund_autonomy import account, at, quote
+    quotes = {"ALFA": quote(120)}
+    strategy = take_profit_setup(tmp_path, quotes)
+    assert strategy._watch(account(9040, {"ALFA": 8}, price=120), NOW)
+    first = sent_orders[-1]
+    keep = 8 - first.quantity
+    strategy.journal.update(strategy.journal.pending()[0]["id"], "o1", True, NOW)  # Canceled unfilled.
+    quotes["ALFA"] = quote(126)  # The price keeps rising before the trim fills.
+    assert strategy._watch(account(9040, {"ALFA": 8}, price=126), at(1))
+    assert sent_orders[-1].quantity == first.quantity  # Sized once, when it triggered: no chasing.
+    strategy.journal.update(strategy.journal.pending()[0]["id"], "o2", True, at(1))
+    assert strategy._watch(account(9544, {"ALFA": keep}, price=126), at(2)) is False  # The trim filled.
+    level = strategy.execution.levels()["ALFA"]
+    assert level["state"] == "active" and level["stop_loss"] == "90" and "take_profit" not in level
+    assert "ALFA" not in strategy.execution.exiting()
+    quotes["ALFA"] = quote(85)
+    assert strategy._watch(account(9544, {"ALFA": keep}, price=85), at(3))
+    assert sent_orders[-1].quantity == keep  # The stop still protects the remaining shares.
+
+
+def test_a_stop_breach_during_a_take_profit_trim_escalates_to_a_full_exit(tmp_path, sent_orders):
+    from .test_autonomous_fund_autonomy import account, at, quote
+    quotes = {"ALFA": quote(120)}
+    strategy = take_profit_setup(tmp_path, quotes)
+    assert strategy._watch(account(9040, {"ALFA": 8}, price=120), NOW)
+    strategy.journal.update(strategy.journal.pending()[0]["id"], "o1", True, NOW)
+    quotes["ALFA"] = quote(85)  # The market falls through the stop before the trim fills.
+    assert strategy._watch(account(9040, {"ALFA": 8}, price=85), at(1))
+    assert sent_orders[-1].quantity == 8
+
+
+def test_a_level_left_triggered_without_a_target_is_rearmed_not_stuck(tmp_path, sent_orders):
+    from .test_autonomous_fund_autonomy import accept, account, at, quote, watching
+    strategy = watching(tmp_path, {"ALFA": quote(94)})
+    accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 95}], when=at(-30))
+    with strategy.journal.connection() as db:  # As left by a crash between two separate writes.
+        db.execute("UPDATE fund_levels SET state='triggered' WHERE symbol='ALFA'")
+    assert strategy._watch(account(9530, {"ALFA": 5}, price=94), NOW)
+    assert str(sent_orders[-1].side) == "sell" and sent_orders[-1].quantity == 5
+
+
+def test_the_runner_heartbeat_survives_a_failed_write(tmp_path):
+    import time
+    from scripts.autonomous_fund.monitor import RunnerHeartbeat
+    beat = RunnerHeartbeat(tmp_path, interval=0.01)
+    writes, real = [], beat._write
+
+    def flaky(state):
+        writes.append(state)
+        if len(writes) == 2:
+            raise PermissionError("synthetic: file in use by a reader")
+        real(state)
+    beat._write = flaky
+    with beat:
+        deadline = time.monotonic() + 3
+        while len(writes) < 6 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    assert len(writes) >= 6
+
+
+def test_a_symbol_the_operator_no_longer_holds_returns_to_the_ai_universe(tmp_path):
+    from scripts.autonomous_fund.risk import number
+    from .test_autonomous_fund_schwab import UNIVERSE, position, snapshot
+    strategy, state = snapshot(tmp_path, [position("AAPL", 100, value=23000)], 27000, 50000)
+    strategy._snapshot()
+    assert "AAPL" not in strategy.universe
+    # The operator sold AAPL, recorded the proceeds as reserve and re-baselined.
+    strategy.journal.adjust_reserve(NOW, number(23000))
+    strategy.journal.set_meta("mandate_external", {})
+    state.update(positions=[], cash=50000, equity=50000)
+    strategy._snapshot()
+    assert strategy.universe == frozenset(UNIVERSE)
+
+
+def test_concurrent_quote_requests_start_one_live_stream(monkeypatch):
+    import threading
+    import time
+    import scripts.autonomous_fund.market_data as market_data
+    created = []
+
+    class SlowThread:
+        def __init__(self, target, name, daemon):
+            created.append(self)
+            self.alive = False
+
+        def start(self):
+            time.sleep(0.05)
+            self.alive = True
+
+        def is_alive(self):
+            return self.alive
+    tape = market_data.LiveTape(connect=lambda: None)
+    real_thread = threading.Thread
+    monkeypatch.setattr(market_data.threading, "Thread", SlowThread)
+    callers = [real_thread(target=tape.watch, args=([s],)) for s in ("SPY", "QQQ", "IWM")]
+    for caller in callers:
+        caller.start()
+    for caller in callers:
+        caller.join()
+    assert len(created) == 1
+
+
+def test_the_monitor_builds_the_market_calendar_once(tmp_path, monkeypatch):
+    import scripts.autonomous_fund.market_data as market_data
+    from scripts.autonomous_fund.monitor import Monitor
+    journal = setup(tmp_path)
+    calls, real = [], market_data.mcal.get_calendar
+    monkeypatch.setattr(market_data.mcal, "get_calendar", lambda name: calls.append(name) or real(name))
+    start = datetime(2026, 11, 2, 16, tzinfo=timezone.utc)
+    monitor = Monitor(tmp_path, FakeTelegram())
+    for seconds in (0, 10, 20):
+        heartbeat(tmp_path, start + timedelta(seconds=seconds))
+        journal.event(start + timedelta(seconds=seconds), "iteration_started", {})
+        monitor.poll(start + timedelta(seconds=seconds))
+    assert len(calls) == 1
+
+
+def test_continuing_an_allocation_reuses_the_iterations_account_snapshot(tmp_path, sent_orders):
+    from .test_autonomous_fund_autonomy import accept, account, quote, watching
+    strategy = watching(tmp_path, {"ALFA": quote(100)})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05}])
+    strategy._snapshot = lambda: pytest.fail("a second account snapshot in the same iteration")
+    strategy._continue_allocation(active, account())
+    assert sent_orders and str(sent_orders[-1].side) == "buy"
+
+
+def test_the_trading_iteration_watches_stops_while_an_order_is_open(tmp_path):
+    from dataclasses import replace
+    from .test_autonomous_fund_autonomy import accept, account, pending_order, quote, watching
+    strategy = watching(tmp_path, {"ALFA": quote(100), "BETA": quote(94)})
+    active = accept(strategy, [{"symbol": "ALFA", "weight": .05}, {"symbol": "BETA", "weight": .05, "stop_loss": 95}])
+    pending_order(strategy, symbol="ALFA", decision_id=active["id"])
+    strategy.cancel_order = lambda order: None
+    strategy._reconcile = lambda: None
+    strategy._snapshot = lambda: replace(account(9530, {"BETA": 5}, price=94), open_orders=True)
+    strategy.on_trading_iteration()
+    assert any(r["kind"] == "protective_trigger" for r in strategy.journal.all_events())
+
+
+def test_a_working_stop_exit_is_never_canceled_to_make_room_for_another(tmp_path):
+    from dataclasses import replace
+    from .test_autonomous_fund_autonomy import accept, account, pending_order, quote, watching
+    strategy = watching(tmp_path, {"GAMMA": quote(50), "BETA": quote(94)})
+    active = accept(strategy, [{"symbol": "BETA", "weight": .05, "stop_loss": 95}])
+    protective = pending_order(strategy, symbol="GAMMA", side="sell", limit="49.75", decision_id=active["id"])
+    strategy.execution.mark_protective(protective, NOW)
+    canceled = []
+    strategy.cancel_order = canceled.append
+    strategy._protect_while_orders_open(replace(account(9530, {"BETA": 5, "GAMMA": 2}, price=94), open_orders=True),
+                                        NOW)
+    assert canceled == []  # Both exits matter: BETA's follows once GAMMA's completes.
+    assert "BETA" in strategy._protective_needed

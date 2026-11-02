@@ -90,9 +90,10 @@ class LiveTape:
                 if len(self._wanted) < self.max_symbols:
                     self._wanted.add(symbol)
             running = self._thread is not None and self._thread.is_alive()
-        if not running and not self._stop.is_set():
-            self._thread = threading.Thread(target=self._run, name="yahoo-live-tape", daemon=True)
-            self._thread.start()
+            if not running and not self._stop.is_set():
+                # Under the lock: concurrent quote requests never start two streams.
+                self._thread = threading.Thread(target=self._run, name="yahoo-live-tape", daemon=True)
+                self._thread.start()
 
     def tick(self, symbol):
         with self._lock:

@@ -655,10 +655,15 @@ class AutonomousFund(Strategy):
                                                  holdings, open_orders, external, self.mode == "paper")
         elif self.mode == "paper":
             self.journal.confirm_initial_paper_account(Account(broker_cash, broker_equity, holdings, start, open_orders))
-        if shared and self.universe != frozenset(configured) - shared:
-            # The operator's own symbols are never AI-tradable (tax lots, attribution).
+        if self.universe != frozenset(configured) - shared:
+            # The operator's own symbols are never AI-tradable (tax lots, attribution);
+            # one the operator no longer holds (after a re-baseline) is admitted again.
+            readmitted = sorted((frozenset(configured) - shared) - self.universe)
             self.universe = frozenset(configured) - shared
-            self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
+            if shared:
+                self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
+            if readmitted:
+                self.journal.event(start, "shared_symbols_readmitted", {"symbols": readmitted})
         # The account the AI and every risk rule see is the operator's capital sleeve.
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
                           open_orders, receivables)
@@ -771,12 +776,19 @@ class AutonomousFund(Strategy):
             if self.halt_path.exists():
                 # Emergency stop also attempts cancellation of this application's
                 # known open orders; never cancels unrelated account orders.
+                now = self.get_datetime()
                 for pending in self.journal.pending():
                     order = self.session_orders.get(pending["id"])
                     if self.mode in {"paper", "local"} and pending["broker_id"]:
                         order = self.broker._pull_order(pending["broker_id"], self.name)
                     if order and not self._terminal(order):
-                        self.cancel_order(order)
+                        self._request_cancel(pending, order, now)
+                try:
+                    # Confirmed cancels and fills become terminal, so the monitor can
+                    # tell that no order is unresolved and resume a restart's STOP.
+                    self._reconcile()
+                except RiskError as exc:
+                    self._disclose("blocked", str(exc))
                 from . import stops
                 record = stops.read(self.halt_path.parent) or {}
                 # One notice per (who, why) and window, not per rewrite: a restart loop or a
@@ -802,13 +814,15 @@ class AutonomousFund(Strategy):
                 self.notify("drawdown_pause", "New risk is paused until explicit operator reset")
             if account.open_orders:
                 self._manage_open_orders(now)
+                if getattr(self, "quant", None) is not None:
+                    self._protect_while_orders_open(account, now)
                 return
             # Deterministic minute-level watch: AI levels, alerts, moves, stress.
             if getattr(self, "quant", None) is not None and self._watch(account, now):
                 return
             active = self.execution.active(now, self.universe, self.limits)
             if active and (self.next_review is None or now < self.next_review):
-                self._continue_allocation(active)
+                self._continue_allocation(active, account)
                 return
             if self.next_review and now < self.next_review:
                 return
@@ -998,8 +1012,12 @@ class AutonomousFund(Strategy):
             self.next_review = earliest
         self.journal.event(now, "review_triggered", {"reason": reason, "review_at": earliest.isoformat(), **(detail or {})})
 
-    def _watch(self, account, now):
+    def _watch(self, account, now, submit=True):
         """Minute-level deterministic watcher; returns True when it submitted an order.
+
+        With submit=False (an order is already open) triggers are still detected
+        and recorded; the symbols whose protective exit must still be sent are
+        returned in self._protective_needed.
 
         The AI chooses levels at its own (slower) review cadence. This loop costs
         no inference: protective stop/take-profit exits are risk-reducing sales
@@ -1023,10 +1041,15 @@ class AutonomousFund(Strategy):
             # The exit completed; a newer decision's deferred levels for it take effect now.
             self.execution.finish_level(symbol)
             levels = self.execution.levels()
+        needed = set()
         for symbol in sorted(set(levels) & set(account.positions)):
             level, price = levels[symbol], prices.get(symbol)
             if price is None:
                 continue
+            if level["state"] == "triggered" and level.get("protective_target") is None:
+                # Left between two writes by an older version: watch again instead of staying stuck.
+                self.execution.rearm(symbol)
+                level = {k: v for k, v in level.items() if k not in self.execution.PROTECTIVE_KEYS}
             if level.get("protective_target") is None:
                 if level.get("stop_loss") and price.bid <= number(level["stop_loss"]):
                     target, kind = number(0), "stop_loss"
@@ -1034,20 +1057,36 @@ class AutonomousFund(Strategy):
                     target, kind = number(level.get("take_profit_weight") or 0), "take_profit"
                 else:
                     continue
+                # Sized once, at the trigger: a rising price must not keep shaving off shares.
+                keep = desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0
                 if not self.execution.trigger_level(symbol, kind, now, {"bid": str(price.bid), "level": level,
-                                                                          "target_weight": str(target)}):
+                                                                          "target_weight": str(target)},
+                                                    target=target, keep=keep):
                     continue
-                self.execution.set_protective_target(symbol, target)
                 if latest and latest["state"] == "active":
                     self.execution.override(latest["id"], symbol, target, kind, now)
                 self._request_review(now, kind, {"symbol": symbol, "bid": str(price.bid)})
             else:
                 target = number(level["protective_target"])
+                keep = (int(level["protective_keep"]) if level.get("protective_keep") is not None else
+                        desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0)
+                if target > 0 and level.get("stop_loss") and price.bid <= number(level["stop_loss"]):
+                    # The stop is breached while a take-profit trim is still selling: exit fully.
+                    target, keep = number(0), 0
+                    self.execution.set_protective_target(symbol, target, keep, "stop_loss")
+                    if latest and latest["state"] == "active":
+                        self.execution.override(latest["id"], symbol, target, "stop_loss", now)
+                    self.journal.event(now, "protective_escalated", {"symbol": symbol, "bid": str(price.bid),
+                                                                     "stop_loss": level["stop_loss"]})
+                    self._request_review(now, "stop_loss", {"symbol": symbol, "bid": str(price.bid)})
             held = number(account.positions[symbol])
-            keep = desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0
             quantity = int(held) - keep
             if quantity <= 0:
-                self.execution.finish_level(symbol)
+                # A partial take-profit keeps the stop on the remaining shares.
+                self.execution.finish_level(symbol, keep_levels=target > 0)
+                continue
+            if not submit:
+                needed.add(symbol)
                 continue
             # A protective exit prioritizes getting out: a marketable limit below the bid.
             buffer = number(getattr(self.execution_policy, "protective_limit_buffer", self.limits.limit_buffer))
@@ -1055,6 +1094,7 @@ class AutonomousFund(Strategy):
             self._submit(Intent(symbol, "sell", quantity, limit), now, level["decision_id"], kind="protective",
                          max_submissions=self.limits.daily_orders + 5)
             return True
+        self._protective_needed = needed
         for alert in alerts:
             price = prices.get(alert["symbol"])
             if price is None:
@@ -1148,6 +1188,34 @@ class AutonomousFund(Strategy):
                 "decisions": cards["decisions"]["by_horizon"],
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"}}
 
+    def _request_cancel(self, pending, order, now, kind=None, detail=None):
+        """Ask once, then only again after CANCEL_RETRY_SECONDS: broker cancellation is asynchronous."""
+        requested = self.__dict__.setdefault("_cancel_requested", {})
+        last = requested.get(pending["id"])
+        if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
+            return
+        requested[pending["id"]] = instant(now)
+        self.cancel_order(order)
+        if kind:
+            self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **(detail or {})})
+
+    def _protect_while_orders_open(self, account, now):
+        """Stops and take-profits are still watched while an order is open; an exit that
+        must be sent takes priority, so our own non-protective orders are canceled."""
+        self._protective_needed = set()
+        self._watch(account, now, submit=False)
+        if not self._protective_needed:
+            return
+        for pending in self.journal.pending():
+            if self.execution.is_protective(pending["id"]):
+                continue
+            order = self.session_orders.get(pending["id"])
+            if self.mode in {"paper", "local"} and pending["broker_id"]:
+                order = self.broker._pull_order(pending["broker_id"], self.name)
+            if order and not self._terminal(order):
+                self._request_cancel(pending, order, now, "protective_priority_cancel",
+                                     {"protect": sorted(self._protective_needed)})
+
     def _manage_open_orders(self, now):
         """Cancel expired-target orders, and cancel stale limits so they can be repriced.
 
@@ -1164,13 +1232,7 @@ class AutonomousFund(Strategy):
         levels = self.execution.levels() if getattr(self, "quant", None) is not None else {}
 
         def cancel(pending, order, kind, detail):
-            last = requested.get(pending["id"])
-            if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
-                return
-            requested[pending["id"]] = instant(now)
-            self.cancel_order(order)
-            if kind:
-                self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **detail})
+            self._request_cancel(pending, order, now, kind, detail)
 
         for pending in self.journal.pending():
             order = self.session_orders.get(pending["id"])
@@ -1469,10 +1531,11 @@ class AutonomousFund(Strategy):
         }
         return result
 
-    def _continue_allocation(self, active):
+    def _continue_allocation(self, active, account=None):
         if not active:
             return
-        account = self._snapshot()
+        # The iteration's own snapshot when it has one; a fresh one after slow model calls.
+        account = account if account is not None else self._snapshot()
         prices = {symbol: self._price(symbol) for symbol in set(active["weights"]) | set(account.positions)}
         now = self.get_datetime()
         result = self._candidates(active, account, prices, now)
