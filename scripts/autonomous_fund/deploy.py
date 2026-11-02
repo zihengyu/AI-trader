@@ -105,6 +105,12 @@ def main(argv=None):
     stops.write(run_dir, "operator", "first_install")  # The first start is verified and resumed by hand.
     print(f"Services start in mode {mode} with account directory {run_dir}"
           + ("" if args.mode else "; change FUND_MODE in .env and restart both services to switch."))
+    # Files created here belong to the user running prepare; the services run as --user.
+    print("Give the service user its files (the account directory, its STOP and lock files, and .env), then "
+          "run fund commands as that user:")
+    print(f'  sudo chown -R "{args.user}" {repo / "artifacts"} {args.env_file}')
+    print(f"  sudo chmod 600 {args.env_file}")
+    print(f'  sudo -u "{args.user}" bash scripts/run_autonomous_fund.sh show-config')
     for filename, body in units.items():
         (args.output_dir / filename).write_text(body, encoding="utf-8")
     print("Prepared STOP, secret template if absent, and two service files. Review and install explicitly; nothing was started.")

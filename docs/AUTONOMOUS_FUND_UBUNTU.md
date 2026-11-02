@@ -41,7 +41,8 @@ python3.12 -m venv .venv
 `scripts/autonomous_fund/.env.example`，真实 `.env` 已被 Git 忽略。模板按“模型 Key 与模型选择、用户约束、审批额度、
 Telegram、外部数据与运行参数、券商”分节，所有可调项都有中文说明和默认值；优先级为进程环境 > `.env` > `config.json`，
 留空表示沿用 `config.json`，`.env` 中拼错的 `FUND_*` 名称会拒绝启动。完整变量表见 `docs/AUTONOMOUS_PAPER_FUND.md` 的 “`.env`：运营者配置入口”。
-修改后用 `bash scripts/run_autonomous_fund.sh show-config` 核对最终生效值和来源，再重启服务。
+修改后用 `sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh show-config` 核对最终生效值和来源，再重启服务
+（`.env` 归服务用户所有且权限为 600，所以基金命令都以服务用户身份运行）。
 
 | 变量 | 用途 |
 |---|---|
@@ -65,13 +66,15 @@ API 美元成本依赖配置中明确填写的模型费率；未知 usage 或缺
 服务用户必须能读代码和 `.env`、写所选运行目录；服务运行时通过 systemd 将代码和秘密文件设为只读。
 
 ```bash
-chmod 600 .env
-sudo chown "<service-user>" .env artifacts/fund-local artifacts/fund-local/STOP
 mkdir -p artifacts/autonomous-fund-account-locks
-sudo chown "<service-user>" artifacts/autonomous-fund-account-locks
+sudo chown -R "<service-user>" artifacts .env
+sudo chmod 600 .env
 sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.run check \
   --run-dir artifacts/fund-local --env-file .env
 ```
+
+`prepare` 以当前用户创建的账户目录、STOP 和锁文件必须整体交给服务用户（上面的 `chown -R`），否则服务首次写入 STOP
+时会因权限不足退出，日志会给出同样的修复命令。之后修改 `.env` 用 `sudo -u "<service-user>" nano .env`。
 
 `check` 只验证公开行情、源时间及 Key 是否存在，不调用付费模型，也不证明提供方鉴权成功。
 它还会报告 `research_network`：若研究站点解析为 Fake-IP（198.18.0.0/15）或私有地址，网页研究会被安全检查拒绝，
