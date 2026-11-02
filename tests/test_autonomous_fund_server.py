@@ -285,3 +285,21 @@ def test_generated_units_can_leave_the_mode_to_the_env_file():
     for body in units.values():
         assert '"--mode"' not in body and '"--run-dir"' not in body
         assert 'ReadWritePaths="/srv/fund/artifacts"\n' in body
+
+
+def test_generated_units_pass_systemds_own_verification(tmp_path):
+    import shutil
+    if shutil.which('systemd-analyze') is None:
+        pytest.skip('systemd-analyze is not installed')
+    repo = tmp_path / 'AI-trader'
+    (repo / '.venv' / 'bin').mkdir(parents=True)
+    (repo / '.venv' / 'bin' / 'python').symlink_to(sys.executable)
+    (repo / 'artifacts').mkdir()
+    units = generate(str(repo), None, str(repo / '.env'), 'nobody', None)
+    for name, body in units.items():
+        assert f'WorkingDirectory={repo}\n' in body  # systemd does not unquote this setting.
+        (tmp_path / name).write_text(body)
+    result = subprocess.run(['systemd-analyze', 'verify', *(str(tmp_path / n) for n in units)],
+                            capture_output=True, text=True)
+    assert 'bad unit file setting' not in result.stderr and 'not absolute' not in result.stderr, result.stderr
+    assert result.returncode == 0, result.stderr
