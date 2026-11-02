@@ -375,7 +375,8 @@ class AutonomousFund(Strategy):
                 "take_profit_weight, and with price alerts: a deterministic watcher checks them every minute without "
                 "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
                 "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
-                "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak. "
+                "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak; "
+                "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
                 "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
                 "(cross-sectional rank IC, trials-adjusted significance, holdout and live record after validation) "
                 "with today's favored and disfavored names; use them as evidence alongside research, never as orders. "
@@ -423,8 +424,41 @@ class AutonomousFund(Strategy):
     def before_market_opens(self):
         # The native lifecycle wakes one hour before the regular session by
         # default. Research has read-only tools and never invokes the executor.
-        self._review_after_close()
-        self._research_before_open()
+        self._bookkeeping(self._review_after_close, self._research_before_open)
+
+    def _bookkeeping(self, *steps):
+        """Run rebuildable steps so that a failure is disclosed, never fatal.
+
+        LumiBot ends a live strategy (on_bot_crash -> gracefully_exit) when an
+        exception escapes a lifecycle hook. Exports and reports are rebuilt on the
+        next iteration, and a journal that truly cannot be written also refuses
+        every order reservation, so staying alive adds no risk while the stopped
+        process would stop watching stops. Historical runs still raise.
+        """
+        for step in steps:
+            try:
+                step()
+            except Exception as exc:
+                if getattr(self, "mode", None) not in {"local", "paper"}:
+                    raise
+                self._disclose("bookkeeping_error", f"{getattr(step, '__name__', 'step')}: {type(exc).__name__}")
+
+    def _disclose(self, kind, details):
+        """notify(), but even a broken journal or logger cannot raise from here."""
+        try:
+            self.notify(kind, details)
+        except Exception:
+            try:
+                import logging
+                logging.getLogger(__name__).exception("FUND %s: %s (notification failed)", kind, details)
+            except Exception:
+                pass
+
+    def on_bot_crash(self, error):
+        # Last line of defense: the separately running monitor sees this outbox
+        # entry (and its own stale heartbeat) and alerts the operator.
+        self._disclose("bot_crash", type(error).__name__)
+        super().on_bot_crash(error)
 
     def _strategy_memory(self):
         if getattr(self, "memory_mode", "rolling") == "disabled":
@@ -508,11 +542,11 @@ class AutonomousFund(Strategy):
             self.premarket_research = packet
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except Exception as exc:
-            self.notify("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         finally:
-            from .report import report
-            self.journal.export()
-            report(self.run_dir, self.config.get("model_prices_per_million"))
+            from . import report as reports
+            self._bookkeeping(self.journal.export,
+                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
 
     def _orders(self):
         if self.mode not in {"paper", "local"}:
@@ -716,8 +750,8 @@ class AutonomousFund(Strategy):
         self.log_message(f"FUND {kind}: {details}", color="yellow")
 
     def on_trading_iteration(self):
-        self.journal.event(self.get_datetime(), "iteration_started", {})
         try:
+            self.journal.event(self.get_datetime(), "iteration_started", {})
             if self.mode == "paper":
                 assert_paper(self.broker)
             if self.mode == "local":
@@ -770,12 +804,12 @@ class AutonomousFund(Strategy):
                 return
             # Never retry an uncertain submit. Reservation remains durable.
             # Third-party exceptions may contain authenticated URLs or headers.
-            self.notify("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         finally:
-            self.journal.event(self.get_datetime(), "iteration_finished", {})
-            self.journal.export()
+            steps = [lambda: self.journal.event(self.get_datetime(), "iteration_finished", {}), self.journal.export]
             if self.mode == "local":
-                self._report_if_due()
+                steps.append(self._report_if_due)
+            self._bookkeeping(*steps)
 
     def _report_if_due(self, force=False):
         # Reports are rebuildable summaries; minute-by-minute rebuilding of a
@@ -1055,8 +1089,11 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == trading_day(now):
             return cached[1]
         from .review import _events
-        from .scorecard import score_decisions, score_predictions
-        rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated"))
+        from .scorecard import score_decisions, score_predictions, score_timing
+        rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated",
+                                                          "protective_trigger", "entry_waiting", "order_submitted"))
+        timing = [(r["at"], r["kind"], r["body"]) for r in rows
+                  if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
         reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"][-40:]
         # One allocation per session (its last), so frequent reviews are not over-counted.
         by_day = {}
@@ -1069,9 +1106,10 @@ class AutonomousFund(Strategy):
         for packet in reviews:
             for prediction in packet["review"].get("predictions", []):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
+        symbols |= {body["symbol"] for _, kind, body in timing if kind in {"protective_trigger", "entry_waiting"}}
         closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols & allowed)}
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
-                  "decisions": score_decisions(decisions, closes)}
+                  "decisions": score_decisions(decisions, closes), "timing": score_timing(timing, closes)}
         self._scorecard_cache = (trading_day(now), result)
         return result
 
@@ -1085,7 +1123,8 @@ class AutonomousFund(Strategy):
         predictions = cards["predictions"]
         return {"predictions": {k: predictions[k] for k in ("total", "scored", "correct", "hit_rate", "pending")} |
                 {"by_hypothesis": dict(list(predictions["by_hypothesis"].items())[:8])},
-                "decisions": cards["decisions"]["by_horizon"]}
+                "decisions": cards["decisions"]["by_horizon"],
+                "timing": {k: v for k, v in cards["timing"].items() if k != "recent"}}
 
     def _manage_open_orders(self, now):
         """Cancel expired-target orders, and cancel stale limits so they can be repriced.
@@ -1500,14 +1539,13 @@ class AutonomousFund(Strategy):
             self._reconcile()
             self._snapshot()
         except Exception as exc:
-            self.notify("report_error", type(exc).__name__)
+            self._disclose("report_error", type(exc).__name__)
         finally:
-            from .report import report
+            from . import report as reports
             # A failed closing mark must be disclosed, not block ordinary
             # read-only review of the evidence we actually retained.
-            self._review_after_close()
-            self.journal.export()
-            report(self.run_dir, self.config.get("model_prices_per_million"))
+            self._bookkeeping(self._review_after_close, self.journal.export,
+                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
 
     def on_abrupt_closing(self):
         if getattr(self, "news", None) is not None:

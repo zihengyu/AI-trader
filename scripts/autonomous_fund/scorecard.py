@@ -107,3 +107,74 @@ def score_decisions(decisions, closes, benchmark="SPY"):
     return {"decisions": len(rows), "by_horizon": summary, "recent": rows[-10:],
             "interpretation": "Excess over the benchmark at the same gross exposure, before costs and risk "
                               "scaling. Overlapping horizons are correlated; this is evidence, not proof."}
+
+
+def score_timing(events, closes):
+    """Did the AI's own entry and exit levels add value? Completed closes only.
+
+    events: [(at_iso, kind, body)] with kinds protective_trigger, entry_waiting and
+    order_submitted. A protective exit sold near `bid` on its session; its value
+    added after h sessions is -(close[h] / bid - 1): positive means the exit avoided
+    a further fall, negative that it gave up a rebound. An entry wait compares the
+    ask when waiting began with the buy limit eventually submitted for the same
+    decision (an upper bound on the fill price), or, when no buy followed, with the
+    later close: a rise is the gain the wait missed, a fall is the loss it avoided.
+    """
+    def day_of(at):
+        return instant(at).astimezone(ZONE).date().isoformat()
+
+    exits, waits = [], []
+    buys = [(instant(at), body) for at, kind, body in events
+            if kind == "order_submitted" and body.get("side") == "buy" and body.get("kind", "allocation") == "allocation"]
+    for at, kind, body in events:
+        if kind == "protective_trigger" and body.get("bid") is not None:
+            price, row = float(body["bid"]), {"at": at, "symbol": body["symbol"], "trigger": body["trigger"],
+                                              "bid": float(body["bid"]), "horizons": {}}
+            for horizon in HORIZONS:
+                path = _forward(closes.get(body["symbol"]), day_of(at), horizon)
+                if path is None or path == "pending":
+                    row["horizons"][str(horizon)] = {"status": "unavailable" if path is None else "pending"}
+                else:
+                    row["horizons"][str(horizon)] = {"status": "observed", "value_added": -(path[1] / price - 1)}
+            exits.append(row)
+        elif kind == "entry_waiting":
+            ask, symbol = float(body["ask"]), body["symbol"]
+            entered = next((b for t, b in buys if t >= instant(at) and b.get("symbol") == symbol
+                            and b.get("decision_id") == body.get("decision_id")), None)
+            row = {"at": at, "symbol": symbol, "entry_limit": body.get("entry_limit"), "ask": ask,
+                   "entered": entered is not None, "horizons": {}}
+            if entered is not None:
+                row["entry_improvement"] = (ask - float(entered["limit"])) / ask
+            else:
+                for horizon in HORIZONS:
+                    path = _forward(closes.get(symbol), day_of(at), horizon)
+                    if path is None or path == "pending":
+                        row["horizons"][str(horizon)] = {"status": "unavailable" if path is None else "pending"}
+                    else:
+                        row["horizons"][str(horizon)] = {"status": "observed", "value_added": -(path[1] / ask - 1)}
+            waits.append(row)
+
+    def summary(rows):
+        result = {"count": len(rows)}
+        for horizon in HORIZONS:
+            values = [r["horizons"][str(horizon)]["value_added"] for r in rows
+                      if r["horizons"].get(str(horizon), {}).get("status") == "observed"]
+            result[str(horizon)] = {"observed": len(values),
+                                    "mean_value_added": sum(values) / len(values) if values else None,
+                                    "helpful_rate": sum(v > 0 for v in values) / len(values) if values else None}
+        return result
+
+    entered = [r for r in waits if r["entered"]]
+    improvements = [r["entry_improvement"] for r in entered]
+    return {
+        "protective_exits": {trigger: summary([r for r in exits if r["trigger"] == trigger])
+                             for trigger in ("stop_loss", "take_profit")},
+        "entry_waits": {"count": len(waits), "entered": len(entered),
+                        "mean_entry_improvement": sum(improvements) / len(improvements) if improvements else None,
+                        "not_entered": summary([r for r in waits if not r["entered"]])},
+        "recent": (exits + waits)[-12:],
+        "interpretation": "value_added > 0: the exit avoided a further fall, or skipping the entry avoided a loss; "
+                          "< 0: the exit gave up a rebound, or the wait missed a gain. entry_improvement compares the "
+                          "submitted buy limit with the ask when waiting began. Small samples are noise; use this to "
+                          "calibrate how tight stops and entry limits should be, not to stop using protection.",
+    }
