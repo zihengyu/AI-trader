@@ -453,6 +453,9 @@ def test_configured_policy_sections_validate_and_ship_with_documented_defaults()
     config = configuration(path)
     quant, approval, execution, budget = risk_settings(config, set(config["universe"]), Limits(**config["limits"]))
     assert quant.target_portfolio_vol == number("0.12") and quant.max_portfolio_es == number("0.02")
+    assert (quant.correlation_lookback_days, quant.correlation_lambda, quant.correlation_shrinkage) == (
+        252, number("0.97"), number("0.25"))
+    assert quant.max_scenario_loss == number("0.35") and quant.stress_scenarios == QuantPolicy().stress_scenarios
     assert approval.auto_daily_exposure_increase == "0.25" and execution.reprice_after_seconds == 180
     assert budget.min_review_minutes == 15 and Limits(**config["limits"]).daily_orders == 20
     groups = {name: set(members) for name, _, members in quant.groups}

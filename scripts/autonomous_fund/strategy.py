@@ -1445,8 +1445,60 @@ class AutonomousFund(Strategy):
         key = (trading_day(now), frozenset(symbols))
         if key not in self._estimates:
             self._estimates = {k: v for k, v in self._estimates.items() if k[0] == key[0]}
-            self._estimates[key] = RiskEstimate({s: self._daily_closes(s, now) for s in symbols}, self.quant)
+            # The benchmark's own history gives every name an ex-ante beta for stress proxies.
+            names = set(symbols) | {self.quant.stress_benchmark}
+            self._estimates[key] = RiskEstimate({s: self._daily_closes(s, now) for s in names}, self.quant,
+                                                scenarios=self._scenario_returns(names, now))
         return self._estimates[key]
+
+    def _scenario_returns(self, symbols, now):
+        """Historical stress-window returns, persisted so each long history is fetched once per symbol.
+
+        Only windows that ended before today count, so a historical run never sees
+        a later crisis. A symbol whose history does not cover a window is stored
+        as None and proxied pessimistically by the estimate; a failed fetch is
+        retried on a later day and never blocks trading.
+        """
+        from datetime import date
+        from .quant import window_return
+        today = trading_day(now)
+        windows = [(name, start, end) for name, start, end in self.quant.stress_scenarios if end < today]
+        if not windows:
+            return {}
+        wanted = set(symbols) | {self.quant.stress_benchmark}
+        with self.journal.connection() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS fund_scenario_returns (symbol TEXT NOT NULL, scenario TEXT NOT NULL,
+                start TEXT NOT NULL, end TEXT NOT NULL, value REAL, recorded_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, scenario, start, end))""")
+            stored = {(r["symbol"], r["scenario"], r["start"], r["end"]): r["value"]
+                      for r in db.execute("SELECT * FROM fund_scenario_returns")}
+        failed = self.__dict__.setdefault("_scenario_failed", set())
+        for symbol in sorted(wanted):
+            needed = [w for w in windows if (symbol, *w) not in stored]
+            if not needed or (today, symbol) in failed:
+                continue
+            first = min(start for _, start, _ in needed)
+            length = int((date.fromisoformat(today) - date.fromisoformat(first)).days * 252 / 365) + 30
+            try:
+                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
+                frame = bars.df if bars is not None else None
+                rows = [] if frame is None or "close" not in frame else [
+                    (str(index.date()), _finite(close)) for index, close in zip(frame.index, frame["close"])]
+                rows = [(d, c) for d, c in rows if d < today and c == c and c > 0]
+            except Exception as exc:
+                failed.add((today, symbol))
+                self.journal.event(now, "scenario_history_unavailable", {"symbol": symbol, "error": type(exc).__name__})
+                continue
+            with self.journal.connection() as db:
+                for name, start, end in needed:
+                    value = window_return(rows, start, end)
+                    db.execute("INSERT OR REPLACE INTO fund_scenario_returns VALUES (?,?,?,?,?,?)",
+                               (symbol, name, start, end, value, str(now)))
+                    stored[(symbol, name, start, end)] = value
+        benchmark = self.quant.stress_benchmark
+        return {name: {"window": [start, end], "benchmark": stored.get((benchmark, name, start, end)),
+                       "returns": {s: stored.get((s, name, start, end)) for s in sorted(wanted)}}
+                for name, start, end in windows}
 
     def _stress(self, now):
         from .quant import stress_state
@@ -1479,8 +1531,17 @@ class AutonomousFund(Strategy):
             scale = drawdown_scale(session["drawdown"], self.quant, self.limits.drawdown)
             policy = self.execution.policy
             return {
-                "method": "EWMA covariance of completed daily returns, volatility-adjusted name caps, group caps, "
-                          "uniform scaling to the volatility target and 97.5% expected shortfall",
+                "method": "EWMA volatilities and slower, shrunk EWMA correlations of completed daily returns, "
+                          "volatility-adjusted name caps, group caps, uniform scaling to the volatility target, "
+                          "97.5% expected shortfall and the historical stress-window loss limit",
+                "stress_scenarios": {
+                    "max_loss": str(self.quant.max_scenario_loss),
+                    "meaning": "buy-and-hold loss of the target weights over each ended crisis window; a name "
+                               "without history there is proxied by the benchmark loss x max(1, beta)",
+                    "windows": {name: {"window": item["window"], "benchmark_return": item["benchmark"],
+                                       "returns": {sym: (round(v, 4) if v is not None else None)
+                                                   for sym, v in item["returns"].items()}}
+                                for name, item in estimate.scenarios.items()}},
                 "target_portfolio_vol": str(self.quant.target_portfolio_vol),
                 "max_portfolio_es_975_1d": str(self.quant.max_portfolio_es),
                 "max_name_risk": str(self.quant.max_name_risk),
