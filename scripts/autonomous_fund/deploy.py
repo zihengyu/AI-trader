@@ -15,6 +15,12 @@ def unit_quote(value):
     return '"' + text + '"'
 
 
+def unit_path(value):
+    """A path for a setting systemd does NOT unquote (WorkingDirectory=): validated, written as is."""
+    unit_quote(value)  # Same refusal of control characters, quotes, $, % and backslashes.
+    return str(value)
+
+
 def generate(repo, run_dir, env_file, user, mode):
     """mode/run_dir None: every (re)start reads FUND_MODE / FUND_RUN_DIR from env_file."""
     if mode not in {None, "local", "paper"} or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", user):
@@ -35,7 +41,7 @@ def generate(repo, run_dir, env_file, user, mode):
         units[f"lumibot-fund-{role}.service"] = "\n".join([
             "[Unit]", f"Description=LumiBot paper fund {role}",
             "Wants=network-online.target", "After=network-online.target", "StartLimitIntervalSec=0", "",
-            "[Service]", "Type=exec", f"User={user}", f"WorkingDirectory={unit_quote(repo)}",
+            "[Service]", "Type=exec", f"User={user}", f"WorkingDirectory={unit_path(repo)}",
             "ExecStart=" + " ".join(unit_quote(arg) for arg in args),
             "Restart=always", "RestartSec=30", "KillSignal=SIGINT", "KillMode=mixed", "TimeoutStopSec=45",
             "Environment=PYTHONUNBUFFERED=1 LUMIBOT_DISABLE_DOTENV=true",
