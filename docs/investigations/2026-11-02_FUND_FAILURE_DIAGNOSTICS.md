@@ -2,9 +2,9 @@
 
 Retain actionable failure locations when a healthy runner reports a skipped iteration.
 
-**Last Updated:** 2026-11-02
+**Last Updated:** 2026-11-03
 
-**Status:** Diagnostic improvement; the reported remote OSError still needs source evidence
+**Status:** Remote native-memory EROFS identified; see the memory-storage follow-up
 
 **Audience:** Autonomous fund maintainers and local/paper operators
 
@@ -36,6 +36,13 @@ runtime logging is attempted independently of the journal write.
 The maintenance status displays the most recent diagnostic with its timestamp,
 location and errno, plus any persisted AI failure count and retry time. The
 diagnostic is a historical record, not a second process-health verdict.
+
+The follow-up trace identified `MemoryStore.__init__` during lazy native-memory
+loading. Its final errno was EROFS; recursively handled ENOENT contexts had
+misled the first status formatter. Status now prefers the final error's own
+errno and a non-stdlib caller, using a chained OS cause only when the final
+error has no errno. See
+`2026-11-03_FUND_SERVICE_MEMORY_STORAGE.md` for the path configuration fix.
 
 ## Investigation and deployment
 

@@ -5,6 +5,7 @@ heartbeat and the journal) and never changes trading state.
 """
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,9 +119,15 @@ def summary(root, mode, now=None):
                      f"记录的重试时间 {retries['decision_retry_at']}")
     if failure:
         detail = json.loads(failure[1])
-        origin = (detail.get("causes") or [detail])[-1]
+        # mkdir(parents=True) handles missing parents before its final EROFS.
+        # Those ENOENT contexts must not replace the errno that escaped.
+        causes = detail.get("causes") or []
+        origin = detail if "errno" in detail else next(
+            (cause for cause in causes if "errno" in cause), detail)
         frames = origin.get("frames") or detail.get("frames") or []
-        location = frames[-1] if frames else {}
+        location = next((frame for frame in reversed(frames)
+                         if frame.get("module", "").split(".")[0] not in sys.stdlib_module_names),
+                        frames[-1] if frames else {})
         code = f" errno={origin['errno']} ({origin.get('errno_name', '')})" if "errno" in origin else ""
         lines.append(f"最近业务异常：{failure[0]} {detail.get('phase')} {detail.get('error')}{code}；"
                      f"位置 {location.get('module', '?')}.{location.get('function', '?')}:{location.get('line', '?')}")

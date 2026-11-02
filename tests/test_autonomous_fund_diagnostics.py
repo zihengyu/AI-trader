@@ -110,3 +110,30 @@ def test_cyclic_exception_chains_are_bounded():
     first.__cause__, second.__cause__ = second, first
     detail = exception_diagnostic(first, phase="trading_iteration")
     assert len(detail["causes"]) == 1
+
+
+def test_status_keeps_final_mkdir_errno_instead_of_handled_parent_errors(tmp_path):
+    strategy = live(tmp_path)
+    detail = {"phase": "trading_iteration", "error": "OSError", "errno": errno.EROFS,
+              "errno_name": "EROFS", "frames": [
+                  {"module": "lumibot.components.memory.store", "function": "__init__", "line": 140},
+                  {"module": "pathlib", "function": "mkdir", "line": 1313}],
+              "causes": [{"error": "FileNotFoundError", "errno": errno.ENOENT, "errno_name": "ENOENT",
+                          "frames": [{"module": "pathlib", "function": "mkdir", "line": 1313}]}]}
+    strategy.journal.event(strategy.get_datetime(), "operation_error", detail)
+    text = summary(tmp_path, "local", now=strategy.get_datetime())
+    assert "errno=30 (EROFS)" in text
+    assert "errno=2 (ENOENT)" not in text
+    assert "lumibot.components.memory.store.__init__:140" in text
+
+
+def test_status_uses_os_cause_when_outer_wrapper_has_no_errno(tmp_path):
+    strategy = live(tmp_path)
+    detail = {"phase": "trading_iteration", "error": "RuntimeError", "frames": [],
+              "causes": [{"error": "OSError", "errno": errno.ENOSPC, "errno_name": "ENOSPC",
+                          "frames": [{"module": "synthetic.store", "function": "write", "line": 12}]},
+                         {"error": "FileNotFoundError", "errno": errno.ENOENT, "errno_name": "ENOENT",
+                          "frames": [{"module": "pathlib", "function": "mkdir", "line": 1313}]}]}
+    strategy.journal.event(strategy.get_datetime(), "operation_error", detail)
+    text = summary(tmp_path, "local", now=strategy.get_datetime())
+    assert "ENOSPC" in text and "synthetic.store.write:12" in text

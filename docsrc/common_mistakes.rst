@@ -38,6 +38,23 @@ variables, source text, filenames or authenticated request contents. Use the
 retained location to diagnose the underlying fault; additional diagnostics alone
 do not remediate that fault.
 
+Read-Only Native Memory in the Autonomous Fund Service
+--------------------------------------------------------------------------------
+
+The generic native memory default is ``.lumibot/memory`` under the working
+directory. The fund's systemd service permits writes under ``artifacts`` and
+the selected account directory. Previously its CLI configured the cache but
+omitted the separate memory root, so the first lazy ``MemoryStore`` load could
+raise ``EROFS`` before either agent reached its model call.
+
+The fund CLI now defaults an unset or empty ``LUMIBOT_MEMORY_DIR`` to
+``<run-dir>/memory``. Explicit nonempty overrides remain in effect; select a
+path the service may write. Restart the updated runner to load this setting,
+keeping the same account journal and normal STOP/resume checks. Status displays
+the final exception's OS errno before looking for an OS cause and identifies
+the nearest non-standard-library caller. Intermediate handled ``ENOENT``
+contexts from recursive directory creation no longer hide the final ``EROFS``.
+
 Research Failures Delaying the Autonomous Fund Manager
 --------------------------------------------------------------------------------
 
