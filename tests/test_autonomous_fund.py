@@ -373,4 +373,8 @@ def test_real_native_backtest_runs_agents_fills_and_reports(tmp_path, monkeypatc
     events = [json.loads(line) for line in (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert {row["body"]["name"] for row in events if row["kind"] == "agent"} == {"researcher", "manager"}
     assert any(row["kind"] == "decision" for row in events)
+    # Every validated decision names the prompt version that produced it.
+    version = next(row["body"]["prompt_version"] for row in events if row["kind"] == "startup")
+    validated = [row["body"] for row in events if row["kind"] == "decision_validated"]
+    assert validated and all(body["prompt_version"] == version for body in validated) and len(version) == 12
     assert (tmp_path / "run" / "native_trade_events.csv").exists()

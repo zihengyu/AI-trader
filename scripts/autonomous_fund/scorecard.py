@@ -68,20 +68,65 @@ def score_predictions(reviews, closes):
                               "should be retired when its scored record is persistently weak."}
 
 
-def score_decisions(decisions, closes, benchmark="SPY"):
-    """Forward return of each AI target portfolio vs the benchmark at equal gross exposure.
+BETA_LOOKBACK = 126
+MIN_BETA_OBSERVATIONS = 20
+DEFAULT_COST_BPS = 10
 
-    decisions: [(accepted_at_iso, decision_body)]. The start is the CLOSE of the
-    decision's own session, so the measurement never uses prices from before the
-    decision was made. Cash earns zero; costs and the risk overlay are excluded:
-    this isolates the AI's selection skill from execution.
+
+def beta(rows, benchmark_rows, through_day, lookback=BETA_LOOKBACK):
+    """OLS beta of daily close-to-close returns to the benchmark, using closes through `through_day` only.
+
+    None when fewer than MIN_BETA_OBSERVATIONS common returns exist or the benchmark did not move.
     """
-    rows = []
+    own, base = dict(_series_pairs(rows)), dict(_series_pairs(benchmark_rows))
+    days = sorted(day for day in set(own) & set(base) if day <= through_day)[-(lookback + 1):]
+    x = [base[b] / base[a] - 1 for a, b in zip(days, days[1:]) if base[a] > 0 and own[a] > 0]
+    y = [own[b] / own[a] - 1 for a, b in zip(days, days[1:]) if base[a] > 0 and own[a] > 0]
+    if len(x) < MIN_BETA_OBSERVATIONS:
+        return None
+    mx, my = sum(x) / len(x), sum(y) / len(y)
+    variance = sum((v - mx) ** 2 for v in x)
+    if variance <= 0:
+        return None
+    return sum((a - mx) * (b - my) for a, b in zip(x, y)) / variance
+
+
+def _series_pairs(rows):
+    return [(str(day), float(close)) for day, close in rows or []]
+
+
+def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS):
+    """Forward return of each AI target portfolio vs a BETA-MATCHED benchmark, gross and net of costs.
+
+    decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
+    CLOSE of the decision's own session, so the measurement never uses prices
+    from before the decision was made. Each name's beta comes from closes through
+    that session only. A portfolio of high-beta names in a rising market is not
+    skill: excess_return = portfolio - portfolio_beta x benchmark. A name whose
+    beta cannot be estimated is assumed to have beta 1 and is listed in
+    beta_assumed. Costs: |change in target weights| versus the previous decision
+    (the first one starts from cash) times cost_bps per side. Cash earns zero and
+    the risk overlay is excluded: this isolates the AI's selection skill.
+    """
+    rows, previous = [], {}
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
         weights = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
         exposure = sum(weights.values())
-        row = {"decided_at": at, "session_date": day, "gross_exposure": exposure, "horizons": {}}
+        betas, assumed = {}, []
+        for symbol in weights:
+            estimate = 1.0 if symbol == benchmark else beta(closes.get(symbol), closes.get(benchmark), day)
+            if estimate is None:
+                estimate = 1.0
+                assumed.append(symbol)
+            betas[symbol] = estimate
+        portfolio_beta = sum(w * betas[s] for s, w in weights.items())
+        turnover = sum(abs(weights.get(s, 0.0) - previous.get(s, 0.0)) for s in set(weights) | set(previous))
+        cost = turnover * cost_bps / 10_000
+        previous = weights
+        row = {"decided_at": at, "session_date": day, "gross_exposure": exposure, "beta": portfolio_beta,
+               "beta_assumed": sorted(assumed), "turnover": turnover,
+               "prompt_version": body.get("prompt_version") or "unversioned", "horizons": {}}
         for horizon in HORIZONS:
             market = _forward(closes.get(benchmark), day, horizon)
             paths = {s: _forward(closes.get(s), day, horizon) for s in weights}
@@ -92,21 +137,41 @@ def score_decisions(decisions, closes, benchmark="SPY"):
             else:
                 portfolio = sum(w * (paths[s][1] / paths[s][0] - 1) for s, w in weights.items())
                 benchmark_return = market[1] / market[0] - 1
+                excess = portfolio - portfolio_beta * benchmark_return
                 row["horizons"][str(horizon)] = {
                     "status": "observed", "portfolio_return": portfolio,
+                    "beta_matched_benchmark_return": portfolio_beta * benchmark_return,
+                    "excess_return": excess, "cost": cost, "net_excess_return": excess - cost,
                     "exposure_matched_benchmark_return": exposure * benchmark_return,
-                    "excess_return": portfolio - exposure * benchmark_return}
+                    "exposure_excess_return": portfolio - exposure * benchmark_return}
         rows.append(row)
-    summary = {}
-    for horizon in HORIZONS:
-        observed = [r["horizons"][str(horizon)] for r in rows if r["horizons"][str(horizon)]["status"] == "observed"]
-        excess = [o["excess_return"] for o in observed]
-        summary[str(horizon)] = {"observed": len(observed),
-                                 "mean_excess_return": sum(excess) / len(excess) if excess else None,
-                                 "positive_excess_rate": sum(e > 0 for e in excess) / len(excess) if excess else None}
-    return {"decisions": len(rows), "by_horizon": summary, "recent": rows[-10:],
-            "interpretation": "Excess over the benchmark at the same gross exposure, before costs and risk "
-                              "scaling. Overlapping horizons are correlated; this is evidence, not proof."}
+
+    def summary(selected):
+        result = {}
+        for horizon in HORIZONS:
+            observed = [r["horizons"][str(horizon)] for r in selected
+                        if r["horizons"][str(horizon)]["status"] == "observed"]
+            gross = [o["excess_return"] for o in observed]
+            net = [o["net_excess_return"] for o in observed]
+            result[str(horizon)] = {
+                "observed": len(observed),
+                "mean_excess_return": sum(gross) / len(gross) if gross else None,
+                "mean_net_excess_return": sum(net) / len(net) if net else None,
+                "positive_excess_rate": sum(e > 0 for e in gross) / len(gross) if gross else None,
+                "mean_exposure_excess_return": (sum(o["exposure_excess_return"] for o in observed) / len(observed)
+                                                if observed else None)}
+        return result
+
+    versions = {}
+    for row in rows:
+        versions.setdefault(row["prompt_version"], []).append(row)
+    return {"decisions": len(rows), "by_horizon": summary(rows),
+            "by_prompt_version": {version: summary(selected) for version, selected in versions.items()},
+            "cost_bps_per_side": cost_bps, "recent": rows[-10:],
+            "interpretation": "excess_return is over a beta-matched benchmark (portfolio beta from closes through "
+                              "the decision day), so market exposure is not counted as skill; net_excess_return "
+                              "also charges turnover costs. Overlapping horizons are correlated; this is evidence, "
+                              "not proof."}
 
 
 def score_timing(events, closes):

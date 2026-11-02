@@ -133,7 +133,8 @@ def daily_document(root, sequence):
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
-                  "决策相对同敞口基准的超额收益（1/5/20 个交易日）：" + json.dumps(decisions, ensure_ascii=False)]
+                  "决策超额收益（1/5/20 个交易日；已扣除组合 beta 对应的市场涨跌，net 再扣交易成本）："
+                  + json.dumps(decisions, ensure_ascii=False)]
         timing = card.get("timing")
         if timing:
             stop, profit = timing["protective_exits"]["stop_loss"], timing["protective_exits"]["take_profit"]
