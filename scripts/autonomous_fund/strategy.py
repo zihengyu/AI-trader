@@ -508,6 +508,32 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
+    def _announce_session_open(self, now, account=None):
+        """Once per trading day, at the first iteration of the regular session: trading
+        begins (or, while STOP is active, will not), with the account and today's research."""
+        if self.mode not in {"local", "paper"}:
+            return
+        try:
+            if not self.broker.is_market_open():
+                return
+            day = trading_day(now)
+            if self.journal.get_meta("session_open_notified") == day:
+                return
+            from . import stops
+            from .market_data import SessionClock
+            record = stops.read(self.halt_path.parent)
+            research = (getattr(self, "premarket_research", None) or {}).get("research") or {}
+            close = SessionClock(now=lambda: instant(now)).status().get("close")
+            self.journal.set_meta("session_open_notified", day)
+            self._disclose("session_open", {
+                "session_date": day, "mode": self.mode, "close": close,
+                "stop": {"class": record["class"], "reason": record["reason"]} if record else None,
+                "account": {"equity": str(account.equity), "cash": str(account.cash),
+                            "positions": {s: str(q) for s, q in account.positions.items()}} if account else None,
+                "research_summary": (research.get("summary") or "")[:600] or None})
+        except Exception as exc:  # An announcement must never cost the iteration.
+            self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
+
     def _research_before_open(self):
         if self.mode not in {"local", "paper"} or self.observe_only or self.halt_path.exists():
             return
@@ -552,6 +578,12 @@ class AutonomousFund(Strategy):
                       "model": result.model, "cache_hit": result.cache_hit}
             self.journal.event(self.get_datetime(), "premarket_research", packet)
             self.premarket_research = packet
+            # The operator reads the research on Telegram before the session.
+            self._disclose("premarket_research", {
+                "session_open": opens_at.isoformat(), "phase": slot, "summary": research["summary"],
+                "evidence_count": len(research["evidence"]),
+                "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
+                             for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except Exception as exc:
             self._disclose("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
@@ -783,6 +815,7 @@ class AutonomousFund(Strategy):
                         order = self.broker._pull_order(pending["broker_id"], self.name)
                     if order and not self._terminal(order):
                         self._request_cancel(pending, order, now)
+                self._announce_session_open(now)
                 try:
                     # Confirmed cancels and fills become terminal, so the monitor can
                     # tell that no order is unresolved and resume a restart's STOP.
@@ -804,6 +837,7 @@ class AutonomousFund(Strategy):
             self._reconcile()
             account = self._snapshot()
             now = self.get_datetime()
+            self._announce_session_open(now, account)
             if self.mode == "local":
                 self.journal.event(now, "market_status", self.broker.data_source.session.status())
                 if self.observe_only:
