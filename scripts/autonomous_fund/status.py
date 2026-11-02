@@ -107,10 +107,11 @@ def summary(root, mode, now=None):
     with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         failure = db.execute("SELECT at,body FROM events WHERE kind='operation_error' ORDER BY sequence DESC LIMIT 1").fetchone()
         retries = {key: json.loads(value) for key, value in db.execute(
-            "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at')")}
+            "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
     if retries.get("decision_failures") and retries.get("decision_retry_at"):
-        lines.append(f"AI 失败退避：连续失败 {retries['decision_failures']} 次；"
+        label = "基金经理失败退避" if retries.get("decision_failure_role") == "manager" else "AI 失败退避"
+        lines.append(f"{label}：连续失败 {retries['decision_failures']} 次；"
                      f"记录的重试时间 {retries['decision_retry_at']}")
     if failure:
         detail = json.loads(failure[1])

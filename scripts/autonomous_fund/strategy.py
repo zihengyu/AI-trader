@@ -319,9 +319,9 @@ class AutonomousFund(Strategy):
             self.last_decision = json.loads(saved_target["body"])
             self.next_review = max(instant(self.last_decision["next_review_at"]), instant(saved_target["accepted_at"]) +
                                    timedelta(minutes=self.model_budget.min_review_minutes))
-        retry = self.journal.get_meta("decision_retry_at")
-        if retry and (self.next_review is None or instant(retry) > self.next_review):
-            self.next_review = instant(retry)
+        retry = self._restore_decision_retry()
+        if retry and (self.next_review is None or retry > self.next_review):
+            self.next_review = retry
         with self.journal.connection() as db:
             saved = db.execute("SELECT body FROM events WHERE kind='premarket_research' ORDER BY sequence DESC LIMIT 1").fetchone()
         self.premarket_research = json.loads(saved[0]) if saved else None
@@ -362,6 +362,10 @@ class AutonomousFund(Strategy):
                 "You are the sole investment decision maker for this long-only paper portfolio. "
                 "Pursue long-term risk-adjusted returns, without a fixed signal or obligation to trade. "
                 "Review the research, account and risks; independently use read-only research tools. "
+                "During regular sessions research_status describes saved premarket research and its original times. "
+                "It may be unavailable, invalid or from a previous session. Continue your own assessment with "
+                "current read-only tools; verify material claims and disclose gaps in your rationale. "
+                "Missing research is not a reason to wait for the researcher, nor permission to invent evidence. "
                 "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
                 "Omitted positions are to be liquidated, an empty list means all cash. "
                 "Respect supplied limits: no debt, shorts, derivatives, inverse or leveraged funds. "
@@ -941,10 +945,70 @@ class AutonomousFund(Strategy):
             report(self.run_dir, self.config.get("model_prices_per_million"))
             self._last_report = monotonic()
 
+    def _session_research(self, now):
+        """Saved research is context, never a prerequisite for the live manager."""
+        packet = getattr(self, "premarket_research", None)
+        absent = {"research": None, "premarket_research": None,
+                  "research_status": {"state": "unavailable"}}
+        if not packet:
+            return absent
+        try:
+            research = Research.model_validate(packet["research"]).model_dump()
+            validate_evidence(research["evidence"], now, False)
+            made, completed, opens = (instant(packet[k]) for k in ("as_of", "completed_at", "session_open"))
+            if made > completed or completed > now:
+                raise ValueError("Invalid research packet clock")
+        except (KeyError, TypeError, ValueError, RiskError):
+            return {**absent, "research_status": {"state": "invalid"}}
+        return {"research": research, "premarket_research": packet,
+                "research_status": {
+                    "state": "available" if trading_day(opens) == trading_day(now) else "previous_session",
+                    "as_of": packet["as_of"], "completed_at": packet["completed_at"],
+                    "session_open": packet["session_open"], "age_seconds": (now - completed).total_seconds()}}
+
+    def _restore_decision_retry(self):
+        """Detach only an attributable old research failure from live scheduling.
+
+        Older versions stored a shared retry without its role. The matching
+        backoff event and the last call before it identify a researcher-only
+        failure. Unknown and manager failures retain their original retry.
+        This migration never changes STOP, orders, targets or call counters.
+        """
+        with self.journal.connection() as db:
+            state = {r["key"]: json.loads(r["value"]) for r in db.execute(
+                "SELECT key,value FROM meta WHERE key IN ('decision_retry_at','decision_failure_role')")}
+            retry = state.get("decision_retry_at")
+            if not retry:
+                return None
+            if self.mode not in {"local", "paper"}:
+                return instant(retry)
+            role = state.get("decision_failure_role")
+            if role is None:
+                failure = db.execute("SELECT sequence,body FROM events WHERE kind='decision_backoff' "
+                                     "ORDER BY sequence DESC LIMIT 1").fetchone()
+                if failure and json.loads(failure["body"]).get("retry_at") == retry:
+                    prior = db.execute("SELECT kind,body FROM events WHERE sequence<? AND kind IN "
+                                       "('agent_call_started','agent_call_finished','agent',"
+                                       "'decision_backoff','decision_validated','iteration_started') "
+                                       "ORDER BY sequence DESC LIMIT 1", (failure["sequence"],)).fetchone()
+                    if prior and prior["kind"] in {"agent_call_started", "agent_call_finished", "agent"}:
+                        role = json.loads(prior["body"]).get("name")
+            if role != "researcher":
+                return instant(retry)
+            db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+                ("decision_failures", encode(0)), ("decision_retry_at", encode(None)),
+                ("decision_failure_role", encode(None))])
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (
+                str(self.get_datetime()), "research_backoff_detached",
+                encode({"previous_retry_at": retry, "role": "researcher"})))
+        return None
+
     def _decide(self, account, now, paused):
         budget = getattr(self, "model_budget", None) or ModelBudget()
         runs = self.journal.counter("agent_runs", now)
-        if runs + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
+        live = self.mode in {"local", "paper"}
+        required_runs = 1 if live else 2
+        if runs + required_runs > budget.max_agent_runs_per_day - budget.reserved_review_runs:
             # Existing accepted targets keep executing without new inference; the
             # budget resets at the next New York trading day.
             self.notify("model_budget_exhausted", {"day": trading_day(now), "runs": runs,
@@ -974,14 +1038,23 @@ class AutonomousFund(Strategy):
                    "model_budget": {"min_review_minutes": budget.min_review_minutes,
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day}}
         champion = self._champion()
+        failure_role = "manager" if live else "researcher"
         try:
-            research = self._record_agent("researcher", self._agent_call("researcher",
-                task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
-            validate_evidence(research["evidence"], now, self.mode not in {"paper", "local"})
+            if live:
+                # Phase handoff: no synchronous researcher call can delay the
+                # regular-session manager, even after a failed pre-open run.
+                context.update(self._session_research(now))
+            else:
+                # Preserve dated research and the evidence gate in replays.
+                research = self._record_agent("researcher", self._agent_call("researcher",
+                    task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
+                validate_evidence(research["evidence"], now, True)
+                context["research"] = research
             context["as_of"] = self.get_datetime().isoformat()
+            failure_role = "manager"
             decision = self._record_agent("manager", self._agent_call("manager",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
-                context=self._arm_context({**context, "research": research}, champion)))
+                context=self._arm_context(context, champion)))
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -989,11 +1062,12 @@ class AutonomousFund(Strategy):
             minimum = timedelta(minutes=budget.min_review_minutes)
             self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
         except Exception:
-            self._decision_failed(budget)
+            self._decision_failed(budget, role=failure_role)
             raise
         if self.journal.get_meta("decision_failures", 0):
             self.journal.set_meta("decision_failures", 0)
             self.journal.set_meta("decision_retry_at", None)
+            self.journal.set_meta("decision_failure_role", None)
         self.journal.event(now, "decision_validated", decision)
         self._triggers = []
         self.last_decision = decision
@@ -1003,7 +1077,7 @@ class AutonomousFund(Strategy):
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
-            self._shadow({**context, "research": research}, champion, decision, now, budget)
+            self._shadow(context, champion, decision, now, budget)
 
     def _champion(self):
         """Which learning arm trades: 'memo' (memo + scorecards) or 'baseline' (neither)."""
@@ -1074,7 +1148,7 @@ class AutonomousFund(Strategy):
         self.journal.event(now, "learning_evaluation", evaluation)
         return evaluation
 
-    def _decision_failed(self, budget):
+    def _decision_failed(self, budget, *, role="manager"):
         # Exponential backoff: an invalid, stale or failed model cycle must not
         # be retried (and paid for) on every one-minute iteration.
         now = self.get_datetime()
@@ -1083,8 +1157,9 @@ class AutonomousFund(Strategy):
         retry = now + timedelta(minutes=delay)
         self.journal.set_meta("decision_failures", failures)
         self.journal.set_meta("decision_retry_at", retry.isoformat())
+        self.journal.set_meta("decision_failure_role", role)
         self.next_review = retry
-        self.journal.event(now, "decision_backoff", {"failures": failures, "retry_at": retry.isoformat()})
+        self.journal.event(now, "decision_backoff", {"role": role, "failures": failures, "retry_at": retry.isoformat()})
 
     def _request_review(self, now, reason, detail=None):
         """Bring the next AI review forward, never past the review floor or a failure backoff."""

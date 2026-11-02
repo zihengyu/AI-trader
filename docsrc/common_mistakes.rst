@@ -38,6 +38,28 @@ variables, source text, filenames or authenticated request contents. Use the
 retained location to diagnose the underlying fault; additional diagnostics alone
 do not remediate that fault.
 
+Research Failures Delaying the Autonomous Fund Manager
+--------------------------------------------------------------------------------
+
+In the optional local and broker-paper fund application, regular-session
+portfolio assessments now invoke the manager directly. Saved premarket research
+is supplied with its original times and a status identifying missing, invalid or
+previous-session work. The manager retains its own read-only research tools and
+must verify material claims and disclose gaps. A fresh researcher call is no
+longer a prerequisite for an opening or later portfolio assessment.
+
+Manager failures still use the persisted review backoff and daily inference
+budget. On startup, a matching legacy journal failure attributable only to the
+researcher is detached from the manager's retry schedule and audited as
+``research_backoff_detached``. Manager and unattributed failures retain their
+retry times. STOP, order reconciliation, approvals and execution checks remain
+in force. Restart the updated runner to load this behavior; a manager call can
+still fail if the underlying runtime fault affects both roles.
+
+Historical replays retain their dated research and evidence validation before a
+manager decision. Pre-open and post-close research remain read-only lifecycle
+work; this change does not introduce background research workers.
+
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------
 
