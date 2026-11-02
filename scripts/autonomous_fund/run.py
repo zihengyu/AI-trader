@@ -271,7 +271,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -301,6 +301,10 @@ def main(argv=None):
     parser.add_argument("--min-names", type=int, help="factor-lab: minimum names per date (default from config)")
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
+    parser.add_argument("--check-monitor", action="store_true",
+                        help="status: exit 0 only when the independent monitor is fresh and healthy (or stopped)")
+    parser.add_argument("--stop-class", action="store_true",
+                        help="status: print only the STOP class (operator, watchdog, service or none)")
     args = parser.parse_args(argv)
     if args.env_file:
         from .environment import load_environment
@@ -382,8 +386,21 @@ def main(argv=None):
             raise RiskError("serve needs the .env file (the launchers select the checkout .env)")
         serve(args.env_file, args.config, args.run_dir if explicit_run_dir else None)
         return
-    args.run_dir.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
+    if args.mode == "status":
+        # Read-only: never creates an account directory or journal.
+        from .status import monitor_ready, stop_class, summary
+        if args.stop_class:
+            print(stop_class(args.run_dir))
+        elif args.check_monitor:
+            if not monitor_ready(args.run_dir):
+                raise SystemExit(3)
+        else:
+            print(summary(args.run_dir, (os.environ.get("FUND_MODE") or "local").strip().lower()))
+        return
+    if args.mode not in {"show-config", "validate-risk", "factor-lab"}:
+        # Read-only commands leave no stray directory (LumiBot creates its cache folder on import).
+        args.run_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
     if args.mode == "resume":
         from . import stops
         stops.clear(args.run_dir)
