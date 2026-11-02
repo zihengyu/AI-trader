@@ -268,9 +268,10 @@ def test_the_strategy_panel_never_includes_todays_forming_bar(tmp_path):
     strategy.universe = frozenset({"ALFA", "BETA"})
     strategy.factor_lab, strategy._factor_cache = FactorLab(strategy.journal, SETTINGS), None
     strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=frame)
-    close, volume = strategy._factor_panel(days[-1].to_pydatetime())
+    panels = strategy._factor_panel(days[-1].to_pydatetime())
+    close, volume = panels["stocks"]["close"], panels["stocks"]["volume"]  # No ETFs admitted here.
     assert list(close.columns) == ["ALFA", "BETA"] and len(close) == 5 and close.iloc[-1, 0] == 104.0
-    assert volume.iloc[-1, 0] == 1e6
+    assert volume.iloc[-1, 0] == 1e6 and "etfs" not in panels
 
 
 def test_factor_context_is_computed_once_per_trading_day_and_before_the_open(tmp_path):
@@ -278,8 +279,9 @@ def test_factor_context_is_computed_once_per_trading_day_and_before_the_open(tmp
     from types import SimpleNamespace
     from scripts.autonomous_fund.strategy import AutonomousFund
     calls = []
-    lab = SimpleNamespace(context=lambda now, close, volume: calls.append(now) or {"day": str(now.date())})
-    fake = SimpleNamespace(factor_lab=lab, _factor_context_cache=None, _factor_panel=lambda now: (None, None))
+    lab = SimpleNamespace(context=lambda now, panels, tradable=None: calls.append(now) or {"day": str(now.date())})
+    fake = SimpleNamespace(factor_lab=lab, _factor_context_cache=None, _factor_panel=lambda now: None,
+                           universe=frozenset())
     morning = NOW.replace(hour=13)
     assert AutonomousFund._factor_context(fake, morning) == AutonomousFund._factor_context(fake, NOW)
     assert len(calls) == 1  # Intraday decisions reuse the morning's ranks.

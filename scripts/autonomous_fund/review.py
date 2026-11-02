@@ -38,6 +38,8 @@ class FactorProposal(BaseModel):
     expression: str = Field(min_length=1, max_length=300)
     horizon_sessions: int = Field(ge=1, le=20)
     hypothesis: str = Field(min_length=1, max_length=600)
+    # Which cross-section ranks it: stocks (tradable plus research universe) or ETFs, never both.
+    universe: Literal["stocks", "etfs"] = "stocks"
 
 
 class PostmarketReview(BaseModel):
@@ -240,8 +242,9 @@ def review_after_close(strategy):
                         "区分选股、择时、执行与市场整体表现。可使用只读研究工具，核对消息与价格的真实时间。"
                         "引用日志证据请使用 event:<sequence>，外部资料请给出来源和时间。"
                         "披露数据缺失、陈旧估值和费用不确定性；不要编造收盘净值或把没成交当成成交。"
-                        "结合 factor_lab 中已验证、被拒绝和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
-                        "波动等可由日线计算的规律），供基金经理决定是否写成 factor_proposals。"
+                        "结合 factor_lab 中已验证、被拒绝、冗余和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
+                        "高低价区间、波动，以及 SEC 财报中的盈利、营收、毛利、经营现金流、净资产、总资产和股本等"
+                        "按披露日可得的基本面），供基金经理决定是否写成 factor_proposals。"
                         "本阶段不输出订单。历史模式只能使用 as_of 当时可得的信息。", context=context)
         research = strategy._record_agent("researcher", result, phase="postmarket_review")
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
@@ -272,8 +275,10 @@ def review_after_close(strategy):
                     "在 mandate_compliance 中逐条核对当日决策是否遵守 operator_mandate 的约束，如有偏离必须说明。"
                     "阅读 factor_lab：已验证因子的样本内、样本外和验证后的实盘记录，以及被拒绝或退役的因子。"
                     "可在 factor_proposals 中按 factor_lab.grammar 提出最多 5 个新的因子表达式（name、expression、"
-                    "horizon_sessions 1-20、hypothesis），优先基于复盘中发现的选股或择时规律；代码会用无前视的历史数据"
-                    "做横截面 rank IC 检验，每多试一个表达式门槛都会提高，结果在下一次决策和复盘中提供。"
+                    "horizon_sessions 1-20、hypothesis、universe=stocks 或 etfs），优先基于复盘中发现的选股或择时规律；"
+                    "代码会在所选横截面（个股含研究股票池，或 ETF）里用无前视的历史数据做 rank IC 检验，"
+                    "要求扣除换手成本后多空收益仍为正、且与已验证因子不高度相关，每多试一个表达式门槛都会提高，"
+                    "结果在下一次决策和复盘中提供。"
                     "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。", context=context,
         output_schema=PostmarketReview)
@@ -295,10 +300,19 @@ def review_after_close(strategy):
     lab = getattr(strategy, "factor_lab", None)
     if lab is not None and review["factor_proposals"]:
         try:
-            close, volume = strategy._factor_panel(now)
-            if close is None:
+            panels = strategy._factor_panel(now)
+            if isinstance(panels, tuple):  # (close, volume) from older callers and test doubles.
+                panels = panels[0] if panels[0] is None else {"stocks": {"close": panels[0], "volume": panels[1]},
+                                                              "etfs": {"close": panels[0], "volume": panels[1]}}
+            if not panels:
                 raise RiskError("Factor history unavailable")
-            lab.test(review["factor_proposals"], strategy.get_datetime(), day, close, volume)
+            testable = [p for p in review["factor_proposals"] if (p.get("universe") or "stocks") in panels]
+            if len(testable) < len(review["factor_proposals"]):
+                strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {
+                    "session_date": day, "error": "no history for the cross-section of some proposals",
+                    "skipped": [p["name"] for p in review["factor_proposals"] if p not in testable]})
+            if testable:
+                lab.test(testable, strategy.get_datetime(), day, panels)
             strategy._factor_context_cache = None  # The next context includes these results.
         except Exception as exc:  # Evidence tooling must never cost the saved review.
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {

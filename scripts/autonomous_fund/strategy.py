@@ -1,6 +1,7 @@
 """Native Strategy integration. Agents propose; deterministic code executes."""
 import hashlib
 import json
+import os
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
@@ -78,8 +79,10 @@ MANAGER_PROMPT = (
     "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak; "
     "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
-    "(cross-sectional rank IC, trials-adjusted significance, holdout and live record after validation) "
-    "with today's favored and disfavored names; use them as evidence alongside research, never as orders. "
+    "(cross-sectional rank IC in their own cross-section, stocks incl. a non-tradable research universe or ETFs; "
+    "trials-adjusted significance, holdout, a quintile spread that survives costs, not redundant, and the live "
+    "record after validation; fields include point-in-time SEC fundamentals) with today's favored and disfavored "
+    "tradable names; use them as evidence alongside research, never as orders. "
     "risk.event_risk caps a stock reporting earnings today or on the next business day (no stop catches an "
     "overnight gap); macro gives FRED yields, the curve, credit spreads and the VIX as regime context. "
     "The news context lists recent headlines, filings and macro releases with publication times; it is "
@@ -399,6 +402,14 @@ class AutonomousFund(Strategy):
         from .factors import FactorLab, FactorSettings
         factor_settings = FactorSettings.from_config(config.get("factor_lab"))
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
+        self.sec = None
+        agent = os.environ.get("FUND_SEC_USER_AGENT", "").strip()
+        if self.factor_lab is not None and agent and mode != "mock" and runtime is None:
+            from .fundamentals import SecFundamentals
+            try:
+                self.sec = SecFundamentals(self.run_dir / "cache" / "sec", agent)
+            except RiskError as exc:
+                self.journal.event(self.get_datetime(), "fundamentals_unavailable", {"error": str(exc)})
         self._factor_cache = None
         self.news = None
         from .news import NewsSettings, NewsWatch
@@ -409,11 +420,13 @@ class AutonomousFund(Strategy):
         from .events import EarningsCalendar, EventSettings
         events = EventSettings.from_config(config.get("events"))
         # Live only: a historical run would need the earnings calendar as it was known then.
-        self.earnings = EarningsCalendar(self.journal, events) if events.enabled and mode in {"paper", "local"} else None
+        # Scripted-model runs (tests, mock) stay off the network, like the news watch.
+        self.earnings = (EarningsCalendar(self.journal, events)
+                         if events.enabled and mode in {"paper", "local"} and runtime is None else None)
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
         self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"})
-                      if macro.enabled and mode != "mock" else None)
+                      if macro.enabled and mode != "mock" and runtime is None else None)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
             # Faster deterministic watching; AI reviews keep their own floor and budget.
@@ -1399,23 +1412,68 @@ class AutonomousFund(Strategy):
 
     # ----- Factor lab: AI-proposed factors, objectively tested -----------------------
     def _factor_panel(self, now):
-        """Completed daily closes and volumes of the universe; never today's forming bar. Cached per day."""
+        """Per cross-section, completed daily bars (and SEC fundamentals for stocks); never today's bar.
+
+        Returns {"stocks": {...}, "etfs": {...}} (a cross-section without history is
+        absent) or None. Stocks are the tradable stocks plus the non-tradable
+        research universe; ETFs are the tradable unlevered ETFs. Cached per day.
+        """
         day = trading_day(now)
         if self._factor_cache and self._factor_cache[0] == day:
             return self._factor_cache[1]
         from .factors import panel_from_rows
-        history, missing = {}, []
-        for symbol in sorted(self.universe):
-            rows, error = self._daily_bars(symbol, now)
-            if error or not rows:
-                missing.append(symbol)
+        kinds = (getattr(self, "config", None) or {}).get("universe") or {}
+        lab = getattr(self, "factor_lab", None)
+        research = set(lab.settings.research_universe) if lab is not None else set()
+        groups = {"stocks": sorted({s for s in self.universe if kinds.get(s, "stock") == "stock"} | research),
+                  "etfs": sorted(s for s in self.universe if kinds.get(s) == "unlevered_etf")}
+        panels, missing = {}, []
+        for name, symbols in groups.items():
+            history = {}
+            for symbol in symbols:
+                rows, error = self._daily_bars(symbol, now)
+                if error or not rows:
+                    missing.append(symbol)
+                    continue
+                history[symbol] = [(d, close, shares) for d, close, shares in self._completed(rows, now)]
+            if not history:
                 continue
-            history[symbol] = [(day, close, shares) for day, close, shares in self._completed(rows, now)]
+            close, volume = panel_from_rows(history)
+            data = {"close": close, "volume": volume, **self._ohlc_panels(close, now)}
+            if name == "stocks":
+                data.update(self._fundamental_panels(close))
+            panels[name] = data
         if missing:
             self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
-        panel = panel_from_rows(history) if history else (None, None)
-        self._factor_cache = (day, panel)
-        return panel
+        result = panels or None
+        self._factor_cache = (day, result)
+        return result
+
+    def _ohlc_panels(self, close, now):
+        """Completed daily open/high/low aligned to `close`; NaN where the provider gave none."""
+        import pandas as pd
+        captured = getattr(self, "_ohlc", None) or {}
+        day = trading_day(now)
+        frames = {}
+        for position, field in enumerate(("open", "high", "low")):
+            columns = {}
+            for symbol in close.columns:
+                rows = captured.get((day, symbol)) or {}
+                columns[symbol] = pd.Series({pd.Timestamp(d): values[position] for d, values in rows.items()},
+                                            dtype=float)
+            frames[field] = pd.DataFrame(columns).reindex(index=close.index, columns=close.columns).astype(float)
+        return frames
+
+    def _fundamental_panels(self, close):
+        """SEC point-in-time fields for the stock cross-section, or nothing when unavailable."""
+        sec = getattr(self, "sec", None)
+        if sec is None:
+            return {}
+        try:
+            return sec.panels(set(close.columns), close.index)
+        except Exception as exc:
+            self.journal.event(self.get_datetime(), "fundamentals_unavailable", {"error": type(exc).__name__})
+            return {}
 
     def _factor_context(self, now):
         """Once per trading day (warmed before the open): intraday decisions only reuse it.
@@ -1431,8 +1489,15 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == day:
             return cached[1]
         try:
-            close, volume = self._factor_panel(now)
-            context = lab.context(now, close, volume)
+            panels = self._factor_panel(now)
+            if isinstance(panels, tuple):  # Older test doubles return (close, volume).
+                panels = panels[0] if panels[0] is None else {"stocks": {"close": panels[0], "volume": panels[1]},
+                                                              "etfs": {"close": panels[0], "volume": panels[1]}}
+            context = lab.context(now, panels, tradable=set(self.universe))
+            sec = getattr(self, "sec", None)
+            context["fundamentals"] = ({"source": "SEC EDGAR company facts (point in time)",
+                                        "errors": dict(list(sec.errors.items())[:10])} if sec is not None else
+                                       {"unavailable": "set FUND_SEC_USER_AGENT (name and e-mail) to enable"})
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
         self._factor_context_cache = (day, context)
@@ -1463,11 +1528,18 @@ class AutonomousFund(Strategy):
                     # Row by row: one bad value (a missing volume, say) never costs the whole symbol.
                     rows = [(index.date(), _finite(close), _finite(shares))
                             for index, close, shares in zip(frame.index, frame["close"], volume)]
+                    if all(column in frame for column in ("open", "high", "low")):
+                        # Kept beside the rows for the factor lab's open/high/low fields.
+                        self.__dict__.setdefault("_ohlc", {})[key] = {
+                            str(index.date()): (_finite(o), _finite(h), _finite(l))
+                            for index, o, h, l in zip(frame.index, frame["open"], frame["high"], frame["low"])
+                            if index.date() < instant(now).date()}
             except Exception as exc:
                 error = type(exc).__name__
             if error:
                 self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
             self._bars = {k: v for k, v in cache.items() if k[0] == day}
+            self._ohlc = {k: v for k, v in (getattr(self, "_ohlc", None) or {}).items() if k[0] == day}
             self._bars[key] = (rows, error)
         return self._bars[key]
 

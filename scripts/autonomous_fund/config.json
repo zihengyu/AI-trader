@@ -110,7 +110,15 @@
     "holdout_min_t": 1.0,
     "live_min_observations": 10,
     "max_proposals_per_review": 5,
-    "max_active": 8
+    "max_active": 8,
+    "cost_bps": 10.0,
+    "max_redundancy": 0.7,
+    "research_universe": [
+      "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "NFLX", "DIS", "T", "VZ",
+      "TSLA", "MCD", "LOW", "BKNG", "WMT", "KO", "PEP", "PM", "LLY", "MRK", "ABBV", "PFE",
+      "TMO", "BAC", "WFC", "GS", "MS", "AXP", "CVX", "COP", "CAT", "HON", "GE", "UNP",
+      "RTX", "LIN", "NEE", "PLD"
+    ]
   },
   "model_prices_per_million": null
 }

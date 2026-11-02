@@ -126,7 +126,7 @@ SETTINGS = {
     "FUND_NEWS_POLL_SECONDS": (("news", "poll_seconds"), _int, False, "外部", "资讯轮询间隔（秒）"),
     "FUND_NEWS_QUERIES": (("news", "queries"), _list, False, "外部", "长期关注的新闻搜索词，多条用 | 分隔"),
     "FUND_NEWS_RSS_FEEDS": (("news", "rss_feeds"), _feeds, False, "外部", "自定义 RSS：名称=https://...，多条用 | 分隔"),
-    "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告"),
+    "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告和按披露日的财报基本面"),
     "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选；不填用公开 CSV 下载）"),
     "FUND_MACRO": (("macro", "enabled"), _bool, False, "外部", "是否给 AI 提供 FRED 宏观环境（美债收益率、利差、高收益债利差、VIX）"),
     "FINNHUB_API_KEY": (None, None, True, "外部", "Finnhub Key（可选）：更可靠的财报日历；不填用 Yahoo"),
