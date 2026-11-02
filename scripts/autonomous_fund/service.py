@@ -142,10 +142,16 @@ def main(argv=None):
         # STOP (operator or fault) is kept; the monitor alone may lift this one.
         # A brand-new account book (first start, or a switched FUND_MODE/FUND_RUN_DIR)
         # is verified by a person once, never resumed automatically.
-        if (args.run_dir / "state.sqlite3").exists():
-            stops.write(args.run_dir, "service", "service_start")
-        else:
-            stops.write(args.run_dir, "operator", "first_start")
+        try:
+            if (args.run_dir / "state.sqlite3").exists():
+                stops.write(args.run_dir, "service", "service_start")
+            else:
+                stops.write(args.run_dir, "operator", "first_start")
+        except PermissionError as exc:
+            # Typically files `deploy prepare` created as another user (stop.lock, STOP).
+            raise RiskError(f"The service user cannot write {args.run_dir} ({exc.filename or exc}): run "
+                            f'sudo chown -R "<service-user>" {Path(__file__).resolve().parents[2] / "artifacts"} '
+                            f"{args.env_file} and restart the services") from None
     exiting = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: exiting.set())

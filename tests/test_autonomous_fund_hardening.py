@@ -662,3 +662,36 @@ def test_a_working_stop_exit_is_never_canceled_to_make_room_for_another(tmp_path
                                         NOW)
     assert canceled == []  # Both exits matter: BETA's follows once GAMMA's completes.
     assert "BETA" in strategy._protective_needed
+
+
+# ----- Deployment: file ownership ---------------------------------------------------------------
+
+def test_a_run_directory_the_service_user_cannot_write_fails_with_the_fix_to_apply(tmp_path, monkeypatch):
+    import scripts.autonomous_fund.service as service
+    from .test_autonomous_fund_server import service_harness
+    env, calls = service_harness(tmp_path, monkeypatch)
+
+    def denied(*args, **kwargs):  # stop.lock left behind by `deploy prepare` run as another user.
+        raise PermissionError(13, "Permission denied", str(tmp_path / "stop.lock"))
+    monkeypatch.setattr(service.stops, "write", denied)
+    with pytest.raises(RiskError, match="chown -R"):
+        service.main(["runner", "--run-dir", str(tmp_path), "--env-file", str(env)])
+    assert calls == []  # Nothing starts without a STOP in place.
+
+
+def test_prepare_prints_the_ownership_command_for_the_service_user(tmp_path, monkeypatch, capsys):
+    from scripts.autonomous_fund import deploy
+    env = tmp_path / ".env"
+    env.write_text("FUND_MODE=local\n")
+    env.chmod(0o600)
+    for name in ("FUND_MODE", "FUND_RUN_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(deploy.Path, "mkdir", lambda self, *a, **k: None)
+    monkeypatch.setattr(deploy.os, "chmod", lambda *a, **k: None)
+    written = []
+    monkeypatch.setattr(deploy.Path, "write_text", lambda self, body, **k: written.append(self))
+    from scripts.autonomous_fund import stops
+    monkeypatch.setattr(stops, "write", lambda *a, **k: None)
+    deploy.main(["prepare", "--user", "fundbot", "--env-file", str(env), "--output-dir", str(tmp_path / "units")])
+    out = capsys.readouterr().out
+    assert 'sudo chown -R "fundbot"' in out and str(env) in out and "artifacts" in out
