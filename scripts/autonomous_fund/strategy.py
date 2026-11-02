@@ -508,6 +508,35 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
+    def _announce_decision(self, decision, now):
+        """Tell the operator when the AI changes the target portfolio, and its first plan
+        each day; an unchanged review (within one weight point) sends nothing."""
+        if self.mode not in {"local", "paper"}:
+            return
+        try:
+            new = {t["symbol"]: number(t["weight"]) for t in decision["targets"] if number(t["weight"]) > 0}
+            old = {s: number(w) for s, w in (self.journal.get_meta("notified_targets") or {}).items()}
+            day = trading_day(now)
+            first_today = self.journal.get_meta("notified_targets_day") != day
+            changed = set(new) != set(old) or any(abs(new[s] - old[s]) >= number("0.01") for s in new)
+            if not (changed or first_today):
+                return
+            levels = decision_levels(decision)
+            changes = []
+            for symbol in sorted(set(new) | set(old)):
+                row = {"symbol": symbol, "from": str(old.get(symbol, number(0))), "to": str(new.get(symbol, number(0)))}
+                row.update({k: v for k, v in (levels.get(symbol) or {}).items()
+                            if k in {"entry_limit", "stop_loss", "take_profit"}})
+                changes.append(row)
+            self.journal.set_meta("notified_targets", {s: str(w) for s, w in new.items()})
+            self.journal.set_meta("notified_targets_day", day)
+            self._disclose("decision_changed", {
+                "at": str(now), "first_today": first_today and not changed, "changes": changes,
+                "cash_weight": str(max(number(0), 1 - sum(new.values(), number(0)))),
+                "rationale": str(decision.get("rationale") or "")[:1500], "next_review_at": decision.get("next_review_at")})
+        except Exception as exc:  # An announcement must never cost the decision.
+            self.log_message(f"Decision announcement skipped: {type(exc).__name__}", color="yellow")
+
     def _announce_session_open(self, now, account=None):
         """Once per trading day, at the first iteration of the regular session: trading
         begins (or, while STOP is active, will not), with the account and today's research."""
@@ -944,6 +973,7 @@ class AutonomousFund(Strategy):
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
+        self._announce_decision(decision, now)
         try:
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:

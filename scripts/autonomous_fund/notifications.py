@@ -244,6 +244,32 @@ def readable(kind, details, sequence=None):
         if not stop:
             lines.append("AI 会在开盘后复核并决定今天的组合；买入在自动额度内直接执行，超出额度会发审批请求。")
         text = "\n".join(lines)
+    elif kind == "decision_changed" and isinstance(details, dict):
+        def percent(value):
+            return f"{float(value) * 100:g}%"
+
+        def levels(row):
+            parts = [f"{label} {row[key]}" for key, label in (("entry_limit", "入场 ≤"), ("stop_loss", "止损"),
+                                                                ("take_profit", "止盈")) if row.get(key)]
+            return f"（{'，'.join(parts)}）" if parts else ""
+        changes = details.get("changes") or []
+        header = ("🧭 今日首次复核：维持目标组合" if details.get("first_today") else "🧭 AI 调整目标组合")
+        lines = [f"{header}（{_when(details.get('at'))}）"]
+        for label, rows in (("买入／加仓", [r for r in changes if float(r["to"]) > float(r["from"])]),
+                            ("卖出／减仓", [r for r in changes if float(r["to"]) < float(r["from"])]),
+                            ("不变", [r for r in changes if float(r["to"]) == float(r["from"])])):
+            for row in rows:
+                if label == "不变":
+                    lines.append(f"不变：{row['symbol']} {percent(row['to'])}{levels(row)}")
+                else:
+                    lines.append(f"{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
+        lines.append(f"现金约 {percent(details.get('cash_weight') or 0)}")
+        if details.get("rationale"):
+            lines += ["", f"理由：{details['rationale']}"]
+        if details.get("next_review_at"):
+            lines.append(f"下次复核：{_when(details['next_review_at'])}")
+        lines.append("权重是上限：风控可能按波动、尾部风险等再缩小；买入在自动额度内直接执行，超出额度会发审批。")
+        text = "\n".join(lines)
     elif kind == "stop_active" and isinstance(details, dict):
         label, hint = _stop_text(details)
         text = f"⏸ 交易已停止（{label}）——{hint}；期间不会下新单。"

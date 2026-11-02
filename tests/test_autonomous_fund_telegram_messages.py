@@ -120,3 +120,59 @@ def test_common_notices_are_readable(tmp_path):
         assert bot.messages[0].startswith(expected), bot.messages[0]
     unknown = delivered(tmp_path / "unknown", "something_new", {"x": 1})
     assert "something_new" in unknown.messages[0]  # Anything else still arrives, as before.
+
+
+# ----- Intraday portfolio changes ----------------------------------------------------------------
+
+def deciding(tmp_path):
+    from .test_autonomous_fund_quant import harness
+    strategy = harness(tmp_path, mode="local")
+    strategy.log_message = lambda *args, **kwargs: None
+    strategy.notify = lambda kind, details: strategy.journal.event(NOW, "notification", {"kind": kind, "details": details})
+    return strategy
+
+
+def decision(targets, rationale="合成理由"):
+    return {"targets": targets, "rationale": rationale, "next_review_at": "2026-11-02T16:00:00+00:00"}
+
+
+def test_the_operator_hears_when_the_ai_changes_the_portfolio_not_on_every_review(tmp_path):
+    strategy = deciding(tmp_path)
+    day = datetime(2026, 11, 2, 15, tzinfo=timezone.utc)
+    strategy._announce_decision(decision([{"symbol": "SPY", "weight": 0.10}]), day)  # First of the day.
+    strategy._announce_decision(decision([{"symbol": "SPY", "weight": 0.105}]), day + timedelta(minutes=20))
+    assert len(notices(strategy.journal, "decision_changed")) == 1  # Half a point: not a change worth a message.
+    strategy._announce_decision(decision([{"symbol": "SPY", "weight": 0.10},
+                                          {"symbol": "ALFA", "weight": 0.05, "stop_loss": 95}], "加入 ALFA"),
+                                day + timedelta(minutes=40))
+    changed = notices(strategy.journal, "decision_changed")[-1]
+    assert {"symbol": "ALFA", "from": "0", "to": "0.05", "stop_loss": "95"} in changed["changes"]
+    assert changed["rationale"] == "加入 ALFA" and changed["first_today"] is False
+    strategy._announce_decision(decision([{"symbol": "ALFA", "weight": 0.05}]), day + timedelta(minutes=60))
+    sold = notices(strategy.journal, "decision_changed")[-1]["changes"]
+    assert {"symbol": "SPY", "from": "0.1", "to": "0"} in sold  # A sale is a change too.
+    strategy._announce_decision(decision([{"symbol": "ALFA", "weight": 0.05}]), day + timedelta(days=1))
+    assert notices(strategy.journal, "decision_changed")[-1]["first_today"] is True  # Each day's first plan.
+
+
+def test_historical_runs_do_not_announce_decisions(tmp_path):
+    strategy = deciding(tmp_path)
+    strategy.mode = "mock"
+    strategy._announce_decision(decision([{"symbol": "SPY", "weight": 0.10}]), NOW)
+    assert notices(strategy.journal, "decision_changed") == []
+
+
+def test_a_portfolio_change_reads_as_buys_sales_and_reasons(tmp_path):
+    bot = delivered(tmp_path, "decision_changed", {
+        "at": "2026-11-02T15:15:00+00:00", "first_today": False, "cash_weight": "0.85",
+        "changes": [{"symbol": "NVDA", "from": "0", "to": "0.05", "entry_limit": "120", "stop_loss": "110"},
+                    {"symbol": "XLE", "from": "0.06", "to": "0"}, {"symbol": "SPY", "from": "0.1", "to": "0.1"}],
+        "rationale": "NVDA 财报超预期；能源股动能转弱。", "next_review_at": "2026-11-02T16:00:00+00:00"})
+    [text] = bot.messages
+    assert text.startswith("🧭 AI 调整目标组合")
+    assert "买入／加仓：NVDA 0%→5%（入场 ≤ 120，止损 110）" in text and "卖出／减仓：XLE 6%→0%" in text
+    assert "不变：SPY 10%" in text and "现金约 85%" in text and "NVDA 财报超预期" in text
+    first = delivered(tmp_path / "first", "decision_changed", {
+        "at": "2026-11-02T15:00:00+00:00", "first_today": True, "cash_weight": "0.9",
+        "changes": [{"symbol": "SPY", "from": "0.1", "to": "0.1"}], "rationale": "维持。", "next_review_at": None})
+    assert first.messages[0].startswith("🧭 今日首次复核：维持目标组合")
