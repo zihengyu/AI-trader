@@ -141,3 +141,98 @@ def test_role_models_from_the_environment_rank_above_ai_model(tmp_path, monkeypa
     shown, _ = run_show(tmp_path, monkeypatch, capsys, "FUND_RESEARCH_MODEL=openai/fixture-research\n",
                         {"AI_MODEL": "anthropic/fixture-common"})
     assert shown["models"] == {"researcher": "openai/fixture-research", "manager": "anthropic/fixture-common"}
+
+
+# ----- Startup mode from .env: FUND_MODE / FUND_RUN_DIR / FUND_OBSERVE_ONLY --------------
+
+def test_fund_mode_selects_the_simulation_and_its_own_account_directory(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.settings import startup
+    monkeypatch.chdir(tmp_path)
+    assert startup("start", None, {"FUND_MODE": "paper"})[:2] == ("paper", Path("artifacts/fund-paper"))
+    assert startup("start", None, {"FUND_MODE": " Local "})[:2] == ("local", Path("artifacts/fund-local"))
+    assert startup("start", None, {})[:2] == ("local", Path("artifacts/fund-local"))  # Virtual money by default.
+    # Account commands without --run-dir act on the account FUND_MODE runs.
+    assert startup("stop", None, {"FUND_MODE": "paper"})[1] == Path("artifacts/fund-paper")
+    book = {"FUND_MODE": "paper", "FUND_RUN_DIR": "artifacts/book"}
+    assert startup("approvals", None, book)[1] == startup("start", None, book)[1] == Path("artifacts/book")
+    # An explicit command or directory wins; FUND_RUN_DIR belongs to the FUND_MODE account only.
+    assert startup("local", None, book)[:2] == ("local", Path("artifacts/fund-local"))
+    assert startup("start", tmp_path / "chosen", book)[1] == tmp_path / "chosen"
+    # Historical and offline commands never write into an account directory.
+    for command in ("mock", "backtest", "qualify", "validate-risk", "show-config", "schwab-check", "check"):
+        assert startup(command, None, {"FUND_MODE": "local", "FUND_RUN_DIR": "artifacts/book"})[1] == \
+            Path("artifacts/autonomous-fund")
+
+
+@pytest.mark.parametrize("value", ["live", "schwab", "real", "实盘", "paper-live"])
+def test_no_mode_value_reaches_real_money(tmp_path, value):
+    from scripts.autonomous_fund.settings import startup
+    with pytest.raises(RiskError, match="no live"):
+        startup("start", None, {"FUND_MODE": value})
+    with pytest.raises(RiskError, match="no live"):
+        startup("approvals", None, {"FUND_MODE": value})
+    # The emergency stop is never blocked by a configuration error.
+    assert startup("stop", None, {"FUND_MODE": value, "FUND_RUN_DIR": str(tmp_path)})[1] == tmp_path
+    assert startup("stop", tmp_path, {"FUND_MODE": value})[1] == tmp_path
+    with pytest.raises(RiskError, match="--run-dir"):
+        startup("stop", None, {"FUND_MODE": value})
+
+
+def test_observe_only_from_the_env_file_is_a_local_option():
+    from scripts.autonomous_fund.settings import startup
+    assert startup("start", None, {"FUND_MODE": "local", "FUND_OBSERVE_ONLY": "true"})[2] is True
+    assert startup("start", None, {"FUND_MODE": "local", "FUND_OBSERVE_ONLY": ""})[2] is False
+    with pytest.raises(RiskError, match="local"):
+        startup("start", None, {"FUND_MODE": "paper", "FUND_OBSERVE_ONLY": "true"})
+    assert startup("stop", None, {"FUND_MODE": "paper", "FUND_OBSERVE_ONLY": "true"})[2] is False
+
+
+def test_an_account_in_the_earlier_default_directory_keeps_being_used(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.journal import Journal
+    from scripts.autonomous_fund.settings import startup
+    monkeypatch.chdir(tmp_path)
+    Journal(tmp_path / "artifacts/autonomous-fund", "synthetic-earlier").event("2026-10-30", "startup", {"mode": "local"})
+    assert startup("start", None, {"FUND_MODE": "local"})[1] == Path("artifacts/autonomous-fund")
+    assert startup("stop", None, {"FUND_MODE": "local"})[1] == Path("artifacts/autonomous-fund")
+    assert startup("start", None, {"FUND_MODE": "paper"})[1] == Path("artifacts/fund-paper")  # Another account.
+    Journal(tmp_path / "artifacts/fund-local", "synthetic-new")
+    assert startup("start", None, {"FUND_MODE": "local"})[1] == Path("artifacts/fund-local")  # The new book wins.
+
+
+def cli(tmp_path, monkeypatch, argv, env_text):
+    import logging
+    import os
+    from scripts.autonomous_fund import run
+    for name in list(SETTINGS):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.chdir(tmp_path)
+    env = tmp_path / ".env"
+    env.write_text(env_text, encoding="utf-8")
+    env.chmod(0o600)
+    before, handlers = set(os.environ), list(logging.getLogger().handlers)
+    try:
+        run.main([*argv, "--env-file", str(env)])
+    finally:
+        for name in set(os.environ) - before:  # The .env loader writes the process environment.
+            os.environ.pop(name, None)
+        for handler in set(logging.getLogger().handlers) - set(handlers):
+            logging.getLogger().removeHandler(handler)
+            handler.close()
+
+
+def test_starting_without_a_command_runs_the_mode_from_the_env_file(tmp_path, monkeypatch, capsys):
+    from scripts.autonomous_fund import run
+    import scripts.autonomous_fund.report as report_module
+    seen = []
+    monkeypatch.setattr(run, "run_local", lambda args, config: seen.append((args.mode, args.run_dir, args.observe_only)))
+    monkeypatch.setattr(report_module, "report", lambda *args, **kwargs: {})
+    cli(tmp_path, monkeypatch, [], "FUND_MODE=local\nFUND_OBSERVE_ONLY=true\n")
+    assert seen == [("local", Path("artifacts/fund-local"), True)]
+    out = capsys.readouterr().out
+    assert "FUND_MODE" in out and "artifacts/fund-local" in out
+
+
+def test_stop_works_even_when_the_env_file_has_a_mistake(tmp_path, monkeypatch, capsys):
+    cli(tmp_path, monkeypatch, ["stop"], "FUND_MODE=paper\nFUND_MAX_POSITON=0.05\n")
+    assert (tmp_path / "artifacts/fund-paper/STOP").exists()
+    assert "FUND_MAX_POSITON" in capsys.readouterr().out  # The mistake is still reported.

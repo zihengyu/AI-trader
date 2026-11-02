@@ -34,7 +34,9 @@ python3.12 -m venv .venv
 ```
 
 `prepare` 只生成 `artifacts/fund-systemd/` 中的两个 unit 文件，创建模拟账户目录和 STOP 标记，
-并在 `.env` 不存在时独占创建空值模板。它不覆盖已有 `.env`，也不安装或启动任何服务。
+并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`
+（`local` 本地模拟盘或 `paper` Alpaca 模拟账户，没有实盘选项）和 `FUND_RUN_DIR`（留空为 `artifacts/fund-<模式>`，
+服务要求放在仓库 `artifacts/` 下），`prepare` 会打印服务将使用的模式和账户目录。它不覆盖已有 `.env`，也不安装或启动任何服务。
 请在服务器本地编辑 `.env`，不要把密钥粘到聊天中。模板源是
 `scripts/autonomous_fund/.env.example`，真实 `.env` 已被 Git 忽略。模板按“模型 Key 与模型选择、用户约束、审批额度、
 Telegram、外部数据与运行参数、券商”分节，所有可调项都有中文说明和默认值；优先级为进程环境 > `.env` > `config.json`，
@@ -74,9 +76,16 @@ sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.run check \
 `check` 只验证公开行情、源时间及 Key 是否存在，不调用付费模型，也不证明提供方鉴权成功。
 它还会报告 `research_network`：若研究站点解析为 Fake-IP（198.18.0.0/15）或私有地址，网页研究会被安全检查拒绝，
 按提示让服务器不走 Fake-IP，或在 `config.json` 设置 `"research_network": {"resolver": "doh"}`。
-如将来选择 Alpaca Paper，先在本地 `.env` 填写专用 Paper Key，再用
-`deploy prepare --user "<service-user>" --mode paper --run-dir artifacts/fund-paper`
-生成另一套配置；不要用 `fund-local` 的账本连接券商账户。首次 Paper 启动时账户不能持有投资范围内的证券或未完成订单，
+如将来选择 Alpaca Paper，先在本地 `.env` 填写专用 Paper Key，把 `FUND_MODE` 改为 `paper`，为服务用户准备新账户目录，
+再一起重启两个服务；账本自动换到 `artifacts/fund-paper`，不会用 `fund-local` 的账本连接券商账户：
+
+```bash
+sudo install -d -o "<service-user>" -m 700 artifacts/fund-paper
+sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service
+```
+
+重启后同样保持 STOP，核对后再 `resume`。也可用 `deploy prepare --mode paper --run-dir artifacts/fund-paper`
+生成写死模式的服务；此时若 `.env` 的 `FUND_MODE` 与之不同，服务会拒绝启动并提示。首次 Paper 启动时账户不能持有投资范围内的证券或未完成订单，
 现金不少于 `mandate.capital_usd`；超出部分自动记为 AI 不能动用的保留现金。之后账户出入金须先停止交易服务，再执行
 `bash scripts/run_autonomous_fund.sh adjust-reserve --run-dir artifacts/fund-paper --amount <金额>` 记入保留现金。
 如果父目录不允许服务用户遍历，需由管理员调整目录权限；不要用放开所有文件读写的方式解决。

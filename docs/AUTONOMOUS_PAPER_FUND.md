@@ -38,6 +38,31 @@ python -m venv .venv
 应用依赖固定 `litellm==1.105.1`，与框架要求的 MCP 1.x 配合使用；不修改共享依赖或升级 MCP 主版本。
 修改依赖前先停止正在运行的模拟盘。以后重新安装共享依赖后，也需重新应用本应用的依赖约束。
 
+### 启动模式：由 `.env` 的 `FUND_MODE` 决定
+
+在 `.env` 中设置 `FUND_MODE` 后，**不带命令**启动（或服务器服务重启）就按该模式运行；修改后重新启动即生效：
+
+| `FUND_MODE` | 含义 | 需要 |
+|---|---|---|
+| `local`（默认） | 真实行情本地模拟盘：Yahoo 实时行情＋本地虚拟资金，本地保守撮合，不连接任何券商 | 模型 Key |
+| `paper` | Alpaca 模拟账户：券商模拟撮合，不是真钱 | 模型 Key＋Alpaca Paper Key |
+
+```powershell
+.\scripts\run_autonomous_fund.ps1
+```
+
+Linux：`bash scripts/run_autonomous_fund.sh`。启动时第一行会打印模式、来源（`FUND_MODE`／命令行／默认）和账户目录。
+
+- **没有实盘选项**：`FUND_MODE` 只接受 `local`、`paper`，写 `live`、`schwab` 或其他任何值都拒绝启动。
+- **账户目录**：`FUND_RUN_DIR` 留空时为 `artifacts/fund-<模式>`，local 和 paper 的账本自动分开，切换模式不会混用账本；
+  若以前不带 `-RunDir` 启动过，账本在旧默认目录 `artifacts/autonomous-fund`，系统会识别并继续使用它。
+  `stop`、`resume`、`approvals`、`report`、`acceptance` 等命令不带 `--run-dir` 时，也作用于 `FUND_MODE` 对应的账户。
+- **只读观察**：`FUND_OBSERVE_ONLY=true`（仅 local）不调用模型、不下单。
+- **显式命令优先**：`-Mode local`／`-Mode paper`（Linux 为 `local`／`paper`）或 `-RunDir` 仍然有效，并覆盖 `.env`；
+  mock、backtest 等历史实验从不写入账户目录。
+- `stop` 即使 `.env` 有拼写错误也会执行（并提示错误），紧急停止不会被配置问题挡住。
+- `show-config` 会显示最终的启动模式、来源和账户目录。
+
 无需密钥的完整机械检查：
 
 ```powershell
@@ -53,12 +78,14 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 
 模型 Key、你给 AI 的约束和外部参数都可以写在仓库根目录的 `.env`（已被 Git 忽略；从
 `scripts/autonomous_fund/.env.example` 复制）。优先级为 **进程环境变量 > `.env` > `config.json`**：
-`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的值与默认值一致，留空表示不覆盖。
+`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的风控与参数值与默认值一致，留空表示不覆盖；
+模板中的 `FUND_MODE=local` 决定不带命令启动时进入本地模拟盘。
 每个覆盖都按与 `config.json` 相同的规则校验，记入启动审计（`startup.environment_overrides`），并且会使旧目标失效、由 AI 按新规则重新决策。
 `.env` 中写错的 `FUND_*` 名称会直接拒绝启动并提示正确名称，避免约束被静默忽略。
 
 | 类别 | 变量 | 作用 |
 |---|---|---|
+| 启动 | `FUND_MODE`、`FUND_RUN_DIR`、`FUND_OBSERVE_ONLY` | 启动模式 local／paper（没有实盘）、账户目录、只读观察（见[启动模式](#启动模式由-env-的-fund_mode-决定)） |
 | 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
 | 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |

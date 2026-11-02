@@ -57,8 +57,8 @@ def stop_child(child, timeout=30):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("role", choices=["runner", "monitor"])
-    parser.add_argument("--mode", choices=["local", "paper"], default="local")
-    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--mode", choices=["local", "paper"], help="Default: FUND_MODE from --env-file (local if unset)")
+    parser.add_argument("--run-dir", type=Path, help="Default: FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--env-file", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     args = parser.parse_args(argv)
@@ -67,6 +67,20 @@ def main(argv=None):
     load_environment(args.env_file)
     if not os.environ.get("FUND_TELEGRAM_BOT_TOKEN") or not os.environ.get("FUND_TELEGRAM_CHAT_ID"):
         raise RiskError("Server services require FUND_TELEGRAM_BOT_TOKEN and FUND_TELEGRAM_CHAT_ID")
+    # Every (re)start reads the mode from .env; a unit that names another mode is
+    # an operator mistake, never silently resolved in either direction.
+    from .settings import configured_mode, startup
+    configured = configured_mode(os.environ)
+    if args.mode and configured and args.mode != configured:
+        raise RiskError(f"This service was generated with --mode {args.mode}, but FUND_MODE={configured} in "
+                        f"{args.env_file}: regenerate the services without --mode so .env decides, or change FUND_MODE")
+    derived = args.run_dir is None
+    args.mode, args.run_dir, _, _ = startup(args.mode or "start", args.run_dir, os.environ)
+    if derived:
+        sandbox = Path(__file__).resolve().parents[2] / "artifacts"
+        resolved = args.run_dir.resolve()
+        if resolved != sandbox and sandbox not in resolved.parents:
+            raise RiskError(f"FUND_RUN_DIR for server services must be under {sandbox}: the service may only write there")
     args.run_dir.mkdir(parents=True, exist_ok=True)
     if args.role == "runner":
         # No bootstrap interval with unmonitored fills. The operator first

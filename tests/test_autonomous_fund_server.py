@@ -244,3 +244,44 @@ def test_monitor_service_recycles_a_hung_upload_child_and_sets_stop(tmp_path, mo
     monkeypatch.setattr(service.threading, 'Event', lambda: SimpleNamespace(wait=lambda _: False))
     assert service.main(['monitor', '--run-dir', str(tmp_path), '--env-file', str(env)]) == 1
     assert (tmp_path / 'STOP').exists() and stopped == [child]
+
+
+def service_harness(tmp_path, monkeypatch, **environ):
+    import scripts.autonomous_fund.service as service
+    env = tmp_path / '.env'
+    env.write_text('FUND_TELEGRAM_BOT_TOKEN=synthetic\nFUND_TELEGRAM_CHAT_ID=synthetic\n')
+    env.chmod(0o600)
+    for key in ('FUND_TELEGRAM_BOT_TOKEN', 'FUND_TELEGRAM_CHAT_ID'):
+        monkeypatch.setenv(key, 'synthetic')
+    for key in ('FUND_MODE', 'FUND_RUN_DIR', 'FUND_OBSERVE_ONLY'):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in environ.items():
+        monkeypatch.setenv(key, value)
+    calls = []
+    monkeypatch.setattr(service.subprocess, 'Popen', lambda command, **kwargs: calls.append(command) or
+                        SimpleNamespace(poll=lambda: 0, returncode=0))
+    monkeypatch.setattr(service, 'stop_child', lambda item: None)
+    monkeypatch.setattr(service.signal, 'signal', lambda *args: None)
+    return env, calls
+
+
+def test_service_restarts_in_the_mode_the_env_file_selects(tmp_path, monkeypatch):
+    env, calls = service_harness(tmp_path, monkeypatch, FUND_MODE='paper')
+    assert main(['runner', '--run-dir', str(tmp_path), '--env-file', str(env)]) == 0
+    assert calls[0][3] == 'paper' and (tmp_path / 'STOP').exists()  # Restarts still come up in STOP.
+    with pytest.raises(RiskError, match='FUND_MODE'):
+        main(['runner', '--mode', 'local', '--run-dir', str(tmp_path), '--env-file', str(env)])
+
+
+def test_service_account_directory_from_the_env_file_must_be_writable_by_the_sandbox(tmp_path, monkeypatch):
+    env, calls = service_harness(tmp_path, monkeypatch, FUND_MODE='local', FUND_RUN_DIR=str(tmp_path / 'outside'))
+    with pytest.raises(RiskError, match='artifacts'):
+        main(['monitor', '--env-file', str(env)])
+    assert calls == []
+
+
+def test_generated_units_can_leave_the_mode_to_the_env_file():
+    units = generate('/srv/fund', None, '/srv/fund/.env', 'fundbot', None)
+    for body in units.values():
+        assert '"--mode"' not in body and '"--run-dir"' not in body
+        assert 'ReadWritePaths="/srv/fund/artifacts"\n' in body

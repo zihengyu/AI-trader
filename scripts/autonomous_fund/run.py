@@ -270,9 +270,10 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
-    parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
+    parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
     parser.add_argument("--research-model", help="Researcher override; takes precedence over --model/AI_MODEL")
     parser.add_argument("--decision-model", help="Portfolio manager override; takes precedence over --model/AI_MODEL")
@@ -297,14 +298,27 @@ def main(argv=None):
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
-    if args.require_monitor and args.mode not in {"local", "paper"}:
-        raise RiskError("--require-monitor is available only for local/paper execution")
     if args.env_file:
         from .environment import load_environment
         from .settings import validate_env_file
-        validate_env_file(args.env_file)  # Before loading: a typo never half-applies.
-        load_environment(args.env_file)
+        # Before loading: a typo never half-applies. The emergency stop is never
+        # blocked by a configuration mistake; it reports it and still finds the account.
+        for step in (validate_env_file, load_environment):
+            try:
+                step(args.env_file)
+            except RiskError as exc:
+                if args.mode != "stop":
+                    raise
+                print(f"Warning: {exc}; STOP still proceeds.", flush=True)
         args.model = args.model or os.environ.get("AI_MODEL")
+    from .settings import MODES, startup
+    args.mode, args.run_dir, observe, origin = startup(args.mode, args.run_dir, os.environ)
+    args.observe_only = args.observe_only or observe
+    if args.mode in MODES:
+        print(f"Mode {args.mode} ({MODES[args.mode]}); source: {origin}; account directory: {args.run_dir}; "
+              f"observe-only: {args.observe_only}. No live mode exists.", flush=True)
+    if args.require_monitor and args.mode not in {"local", "paper"}:
+        raise RiskError("--require-monitor is available only for local/paper execution")
     # Role models from the environment rank with the role CLI arguments, above AI_MODEL.
     args.research_model = args.research_model or os.environ.get("FUND_RESEARCH_MODEL") or None
     args.decision_model = args.decision_model or os.environ.get("FUND_DECISION_MODEL") or None
@@ -368,8 +382,11 @@ def main(argv=None):
         from .settings import apply_environment, describe
         _, audit = apply_environment(json.loads(args.config.read_text(encoding="utf-8")), os.environ)
         rows = describe(config, os.environ, audit)
+        mode, run_dir, observe, origin = startup("start", None, os.environ)
         print(json.dumps({"config_file": str(args.config), "env_file": str(args.env_file) if args.env_file else None,
                           "precedence": "process environment > .env > config.json",
+                          "startup": {"mode": mode, "meaning": MODES[mode], "source": origin, "run_dir": str(run_dir),
+                                      "observe_only": observe, "live_trading": "not available"},
                           "models": selected_models(args, config), "settings": rows},
                          indent=2, ensure_ascii=False, default=str))
         return
