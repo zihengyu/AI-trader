@@ -105,6 +105,8 @@ SETTINGS = {
     "FUND_DAILY_LOSS_LIMIT": (("quant_risk", "daily_loss_limit"), _decimal, False, "约束", "当日亏损达到该比例停止买入"),
     "FUND_TARGET_VOL": (("quant_risk", "target_portfolio_vol"), _decimal, False, "约束", "组合年化波动率目标"),
     "FUND_MAX_ES": (("quant_risk", "max_portfolio_es"), _decimal, False, "约束", "1 日 97.5% 预期尾部损失上限"),
+    "FUND_MAX_SCENARIO_LOSS": (("quant_risk", "max_scenario_loss"), _decimal, False, "约束", "历史危机情景（2008/2020/2022）下组合最大允许亏损"),
+    "FUND_CASH_SWEEP": (("cash_sweep", "enabled"), _bool, False, "约束", "闲置现金自动买入短期国债 ETF（SGOV），买入证券前先卖出筹款"),
     # ----- Approval envelope
     "FUND_AUTO_DAILY_EXPOSURE_INCREASE": (("approval", "auto_daily_exposure_increase"), _decimal, False, "审批", "无需审批的单日敞口增幅；0 表示所有买入都要审批"),
     "FUND_AUTO_DAILY_BUY_TURNOVER": (("approval", "auto_daily_buy_turnover"), _decimal, False, "审批", "无需审批的单日买入现金流（占净值）"),
@@ -270,6 +272,10 @@ def apply_environment(config, environ):
         if groups:
             result["quant_risk"]["groups"] = {name: {**spec, "members": [m for m in spec["members"] if m not in excluded]}
                                               for name, spec in groups.items()}
+        sweep = result.get("cash_sweep")
+        if isinstance(sweep, dict) and sweep.get("symbol") in excluded:
+            # Excluding the sweep symbol turns the sweep off rather than leaving it misconfigured.
+            result["cash_sweep"] = {**sweep, "enabled": False}
         audit.append({"variable": "FUND_EXCLUDE_SYMBOLS", "path": "universe", "value": excluded})
     return result, audit
 

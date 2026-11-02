@@ -18,7 +18,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation", "factor_lab", "service")
+                   "market_data", "news", "validation", "factor_lab", "service", "cash_sweep")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -51,7 +51,9 @@ MANAGER_PROMPT = (
     "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
     "Omitted positions are to be liquidated, an empty list means all cash. "
     "Respect supplied limits: no debt, shorts, derivatives, inverse or leveraged funds. "
-    "Choose cash freely. Write rationale in Chinese: explain each proposed buy, reduction, "
+    "Choose cash freely: idle cash is swept automatically into the operator's cash-equivalent ETF (account "
+    "cash_equivalents) and already counts as cash in account.cash; never target that symbol. "
+    "Write rationale in Chinese: explain each proposed buy, reduction, "
     "sale (including omitted holdings) and hold by symbol, evidence, selection/timing thesis, "
     "main downside and invalidation condition. Distinguish an investment reason from an "
     "approval trigger; never invent certainty. Supply exact context as_of, expires_at "
@@ -223,6 +225,18 @@ def prompt_version(models, extra=None):
     return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
 
+def ai_universe(universe, sweep=None):
+    """Symbols the AI may target: every admitted symbol except the active cash sweep.
+
+    With no explicit sweep, the one that `cash_sweep` would configure is excluded.
+    """
+    from .cash import CashSweep
+    universe = dict(universe)
+    if sweep is None:
+        sweep = CashSweep.from_config(None, universe) if any(k == "cash_equivalent" for k in universe.values()) else None
+    return frozenset(s for s in universe if sweep is None or s != sweep.symbol)
+
+
 def risk_settings(config, universe, limits):
     """All operator risk policies, validated together; the AI cannot write any of them."""
     from .execution import ApprovalPolicy, ExecutionPolicy
@@ -244,8 +258,11 @@ def configuration(path, environ=None):
         result["_environment_overrides"] = overrides
     limits = Limits(**result["limits"])
     model_selection(result)
-    if not result["universe"] or any(v not in {"stock", "unlevered_etf"} for v in result["universe"].values()):
-        raise RiskError("Only operator-reviewed stocks and unlevered ETFs may be admitted")
+    if not result["universe"] or any(v not in {"stock", "unlevered_etf", "cash_equivalent"}
+                                     for v in result["universe"].values()):
+        raise RiskError("Only operator-reviewed stocks, unlevered ETFs and one cash-equivalent ETF may be admitted")
+    from .cash import CashSweep
+    CashSweep.from_config(result.get("cash_sweep"), result["universe"])
     risk_settings(result, set(result["universe"]), limits)
     Mandate.from_config(result.get("mandate"))
     from .boundary import ResearchNetwork
@@ -338,8 +355,12 @@ class AutonomousFund(Strategy):
         self.require_monitor = require_monitor
         self.config = config
         self.limits = Limits(**config["limits"])
-        self.universe = frozenset(config["universe"])
-        self._configured_universe = self.universe
+        from .cash import CashSweep
+        self.cash_sweep = CashSweep.from_config(config.get("cash_sweep"), config["universe"])
+        # The sweep is admitted (so its holding is ours) but is never an AI target.
+        self.universe = ai_universe(config["universe"], self.cash_sweep) if self.cash_sweep else frozenset(
+            config["universe"])
+        self._configured_universe = frozenset(config["universe"])
         if mode not in {"mock", "backtest", "paper", "local"}:
             raise RiskError("Live trading is unavailable")
         if mode == "paper":
@@ -740,11 +761,13 @@ class AutonomousFund(Strategy):
                                                  holdings, open_orders, external, self.mode == "paper")
         elif self.mode == "paper":
             self.journal.confirm_initial_paper_account(Account(broker_cash, broker_equity, holdings, start, open_orders))
-        if self.universe != frozenset(configured) - shared:
+        sweep = getattr(self, "cash_sweep", None)
+        tradable = frozenset(configured) - shared - ({sweep.symbol} if sweep else set())
+        if self.universe != tradable:
             # The operator's own symbols are never AI-tradable (tax lots, attribution);
             # one the operator no longer holds (after a re-baseline) is admitted again.
-            readmitted = sorted((frozenset(configured) - shared) - self.universe)
-            self.universe = frozenset(configured) - shared
+            readmitted = sorted(tradable - self.universe)
+            self.universe = tradable
             if shared:
                 self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
             if readmitted:
@@ -758,6 +781,10 @@ class AutonomousFund(Strategy):
             self._set_cash_position(float(account.cash))
             self.portfolio_value = float(account.equity)
             self.broker.sync_positions(self)
+        if sweep is not None and account.positions.get(sweep.symbol):
+            # Every rule below sees the sweep as cash; only the sweep step trades it.
+            from .cash import merge
+            account = merge(account, sweep, self.get_last_price(Asset(sweep.symbol, asset_type="stock")) or 0)
         if reserve or external:
             self.journal.event(start, "broker_account", {"cash": str(broker_cash), "equity": str(broker_equity),
                                "reserved_cash": str(reserve), "external_holdings": {k: str(v) for k, v in external.items()},
@@ -1696,13 +1723,34 @@ class AutonomousFund(Strategy):
                 self.journal.event(now, "risk_overlay", {"decision_id": active["id"], **result["overlay"]})
         if result["request"]:
             self.execution.request(active, result["request"], now)
+        sweep = getattr(self, "cash_sweep", None)
         if result["orders"]:
-            self._execute(result["orders"][0], now, account, prices)
+            order = result["orders"][0]
+            if sweep is not None and order.side == "buy":
+                from .cash import funding_sell
+                funding = funding_sell(account, order, self._sweep_quote(now), self.limits, sweep)
+                if funding is not None:
+                    # Fund the purchase first; it follows on a later iteration through the same checks.
+                    self._submit(funding, now, active["id"], kind="cash_sweep")
+                    return
+            self._execute(order, now, account, prices)
         elif result["request"]:
             from .execution import ApprovalPending
             raise ApprovalPending("Purchase beyond the automatic risk envelope waits for plan approval")
         elif result["complete"]:
             self.execution.complete(active["id"], now)
+            if sweep is not None:
+                # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
+                from .cash import park_buy
+                park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
+                                min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
+                if park is not None:
+                    self._submit(park, now, active["id"], kind="cash_sweep")
+
+    def _sweep_quote(self, now):
+        quote = self._price(self.cash_sweep.symbol)
+        quote.validate(now, self.limits, self.mode not in {"paper", "local"})
+        return quote
 
     def _execute(self, intent, now, account=None, prices=None):
         if getattr(self, "observe_only", False):

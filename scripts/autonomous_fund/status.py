@@ -99,7 +99,10 @@ def summary(root, mode, now=None):
     if account:
         positions = account.get("positions") or {}
         held = "、".join(f"{s}×{q}" for s, q in positions.items()) or "无"
-        lines.append(f"账户：净值 {account.get('equity')}，现金 {account.get('cash')}，持仓 {held}"
+        swept = account.get("cash_equivalents") or {}
+        parked = (f"（其中 {account.get('cash_equivalent_value')} 停在短债 ETF：" +
+                  "、".join(f"{s}×{q}" for s, q in swept.items()) + "）") if swept else ""
+        lines.append(f"账户：净值 {account.get('equity')}，现金 {account.get('cash')}{parked}，持仓 {held}"
                      f"（{account.get('as_of') or account.get('at') or ''}）")
     if data.get("return") is not None:
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")

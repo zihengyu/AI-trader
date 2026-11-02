@@ -13,8 +13,11 @@
     "XOM": "stock", "COST": "stock", "PG": "stock", "HD": "stock",
     "SPY": "unlevered_etf", "QQQ": "unlevered_etf", "IWM": "unlevered_etf", "DIA": "unlevered_etf",
     "VTI": "unlevered_etf", "XLK": "unlevered_etf", "XLF": "unlevered_etf", "XLV": "unlevered_etf",
-    "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf"
+    "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf",
+    "IEF": "unlevered_etf", "TLT": "unlevered_etf", "GLD": "unlevered_etf",
+    "SGOV": "cash_equivalent"
   },
+  "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02"},
   "quant_risk": {
     "vol_lookback_days": 63,
     "es_lookback_days": 252,
@@ -51,7 +54,8 @@
       "energy": {"limit": "0.15", "members": ["XOM", "XLE"]},
       "consumer_staples": {"limit": "0.25", "members": ["COST", "PG", "XLP"]},
       "us_growth_megacap": {"limit": "0.35", "members": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]},
-      "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]}
+      "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]},
+      "treasury_duration": {"limit": "0.30", "members": ["IEF", "TLT"]}
     }
   },
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},

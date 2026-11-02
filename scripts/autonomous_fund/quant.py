@@ -46,6 +46,7 @@ DEFAULT_GROUPS = {
     "consumer_staples": ("0.25", ["COST", "PG", "XLP"]),
     "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]),
     "us_broad_index": ("0.40", ["SPY", "VTI", "DIA", "IWM", "QQQ"]),
+    "treasury_duration": ("0.30", ["IEF", "TLT"]),
 }
 
 # Historical stress windows (peak to trough of the benchmark, approximately).

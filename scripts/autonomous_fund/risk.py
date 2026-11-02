@@ -1,5 +1,5 @@
 """Independent, deterministic risk boundary; no model or broker dependencies."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from zoneinfo import ZoneInfo
@@ -79,6 +79,9 @@ class Account:
     as_of: datetime
     open_orders: bool = False
     receivables: Decimal = Decimal("0")
+    # The cash sweep holding (see cash.py): already counted in `cash`, never in `positions`.
+    cash_equivalents: dict = field(default_factory=dict)
+    cash_equivalent_value: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)

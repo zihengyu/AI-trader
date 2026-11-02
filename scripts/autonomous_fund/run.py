@@ -130,7 +130,7 @@ def run_backtest(args, config):
         # Synthetic symbols replace the operator universe, so its symbol groups
         # cannot apply; the default groups filter themselves to this universe.
         quant = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
-        config = {**config, "quant_risk": quant,
+        config = {**config, "quant_risk": quant, "cash_sweep": {"enabled": False},
                   "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
         data, source = {"pandas_data": mock_data()}, PandasDataBacktesting
     elif args.data_dir:
