@@ -465,6 +465,31 @@ class AutonomousFund(Strategy):
             except Exception:
                 pass
 
+    def _disclose_failure(self, kind, error, *, phase):
+        """Retain a safe failure location without breaking the notification contract."""
+        if not isinstance(error, RiskError):
+            try:
+                from .diagnostics import exception_diagnostic
+                detail = {"notification": kind, **exception_diagnostic(error, phase=phase)}
+                now, key = self.get_datetime(), encode(detail)
+                seen = getattr(self, "_failure_diagnostics", None)
+                if seen is None:
+                    self._failure_diagnostics = seen = {}
+                last = seen.get(key)
+                if last is None or not 0 <= (now - last).total_seconds() < 1800:
+                    seen[key] = now
+                    try:
+                        self.journal.event(now, "operation_error", detail)
+                    except Exception:
+                        pass
+                    try:
+                        self.log_message(f"FUND operation_error: {key}", color="red")
+                    except Exception:
+                        pass
+            except Exception:
+                pass  # Diagnostic failures must never stop the strategy.
+        self._disclose(kind, str(error) if isinstance(error, RiskError) else type(error).__name__)
+
     def on_bot_crash(self, error):
         # Last line of defense: the separately running monitor sees this outbox
         # entry (and its own stale heartbeat) and alerts the operator.
@@ -615,7 +640,7 @@ class AutonomousFund(Strategy):
                              for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except Exception as exc:
-            self._disclose("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose_failure("premarket_research_error", exc, phase="premarket_research")
         finally:
             from . import report as reports
             self._bookkeeping(self.journal.export,
@@ -898,7 +923,7 @@ class AutonomousFund(Strategy):
                 return
             # Never retry an uncertain submit. Reservation remains durable.
             # Third-party exceptions may contain authenticated URLs or headers.
-            self._disclose("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose_failure("blocked", exc, phase="trading_iteration")
         finally:
             steps = [lambda: self.journal.event(self.get_datetime(), "iteration_finished", {}), self.journal.export]
             if self.mode == "local":

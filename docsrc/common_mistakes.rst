@@ -22,6 +22,22 @@ status before resuming. Changing a strategy's timezone or pre-open buffer is not
 needed to compensate for this bug. Alpaca's provider-clock overrides and
 backtesting's simulated clock retain their existing behavior.
 
+Healthy Process, Failed Autonomous Fund Iterations
+--------------------------------------------------------------------------------
+
+In the optional autonomous paper-fund application, fresh heartbeats, ``healthy``
+monitoring and a cleared STOP indicate process liveness. An individual research
+or trading iteration may still fail. Identical short alerts are deduplicated for
+30 minutes, so the absence of a new alert does not establish business recovery.
+
+The maintenance status now displays the most recent ``operation_error`` with its
+timestamp, phase, module, function, line number and OS errno when available. It
+also shows the persisted AI failure count and retry time. Detailed safe records
+are written to the journal and runtime log without exception messages, local
+variables, source text, filenames or authenticated request contents. Use the
+retained location to diagnose the underlying fault; additional diagnostics alone
+do not remediate that fault.
+
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------
 
