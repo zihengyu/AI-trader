@@ -476,6 +476,10 @@ class AutonomousFund(Strategy):
                          if events.enabled and mode in {"paper", "local"} and runtime is None else None)
         from .construction import ConstructionSettings
         self.construction = ConstructionSettings.from_config(config.get("construction"))
+        self.history_fallback = None
+        if mode == "local" and runtime is None and os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET"):
+            from .history import AlpacaDailyHistory
+            self.history_fallback = AlpacaDailyHistory(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"])
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
         self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"})
@@ -1653,6 +1657,18 @@ class AutonomousFund(Strategy):
                             if index.date() < instant(now).date()}
             except Exception as exc:
                 error = type(exc).__name__
+            fallback = getattr(self, "history_fallback", None)
+            if (error or not rows) and fallback is not None:
+                # A second, official source for the same completed daily bars (risk and factor history only).
+                try:
+                    bars = fallback.bars(symbol, length, instant(now).astimezone(ZoneInfo("America/New_York")).date())
+                    rows = [(d, close, shares) for d, close, shares, _, _, _ in bars]
+                    self.__dict__.setdefault("_ohlc", {})[key] = {str(d): (o, h, l) for d, _, _, o, h, l in bars}
+                    self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
+                                                                      "feed": fallback.feed, "yahoo_error": error})
+                    error = None
+                except Exception as exc:
+                    error = error or type(exc).__name__
             if error:
                 self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
             self._bars = {k: v for k, v in cache.items() if k[0] == day}

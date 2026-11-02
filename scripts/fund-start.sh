@@ -12,6 +12,8 @@ unit_dir="${AI_FUND_UNIT_DIR:-/etc/systemd/system}"
 build_dir="${AI_FUND_UNIT_BUILD:-$repo/artifacts/fund-systemd}"
 user="${AI_FUND_USER:-$(id -un)}"
 units=(lumibot-fund-runner.service lumibot-fund-monitor.service)
+# Installed with the services; the timer takes a daily journal snapshot after the close.
+backup_units=(lumibot-fund-backup.service lumibot-fund-backup.timer)
 yes=0
 [[ "${1:-}" == "-y" ]] && yes=1
 run() { if [[ -n "${AI_FUND_DRY_RUN:-}" ]]; then echo "+ $*"; else "$@"; fi; }
@@ -38,7 +40,7 @@ fund show-config >/dev/null  # A mistyped FUND_* name or an invalid value stops 
 echo "2/4 检查服务文件……"
 "$py" -m scripts.autonomous_fund.deploy units --user "$user" --env-file "$env_file" --output-dir "$build_dir" >/dev/null
 changed=0
-for unit in "${units[@]}"; do
+for unit in "${units[@]}" "${backup_units[@]}"; do
   if ! cmp -s "$build_dir/$unit" "$unit_dir/$unit"; then
     run sudo install -m 644 "$build_dir/$unit" "$unit_dir/$unit"
     changed=1
@@ -50,7 +52,7 @@ if (( changed )); then
 fi
 
 echo "3/4 启动服务……"
-run sudo systemctl enable --now "${units[@]}"
+run sudo systemctl enable --now "${units[@]}" lumibot-fund-backup.timer
 
 echo "4/4 等待独立监控就绪（最多 3 分钟，第一次启动时监控可能先重启一次）……"
 ready=0

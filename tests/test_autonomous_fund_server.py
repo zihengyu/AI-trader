@@ -46,7 +46,13 @@ def test_linux_secret_permissions_fail_closed(tmp_path):
 
 def test_generated_units_quote_paths_and_have_independent_recovery():
     units = generate('/srv/fund checkout', '/srv/fund checkout/artifacts/book', '/srv/fund checkout/.env', 'fundbot', 'local')
-    assert set(units) == {'lumibot-fund-runner.service', 'lumibot-fund-monitor.service'}
+    assert set(units) == {'lumibot-fund-runner.service', 'lumibot-fund-monitor.service', 'lumibot-fund-backup.service',
+                          'lumibot-fund-backup.timer'}
+    backup = units['lumibot-fund-backup.service']
+    assert 'Type=oneshot' in backup and '"rotate-backup"' in backup and 'Restart=' not in backup
+    assert '"--run-dir" "/srv/fund checkout/artifacts/book"' in backup and 'ProtectSystem=strict' in backup
+    assert 'OnCalendar=*-*-* 17:45:00 America/New_York' in units['lumibot-fund-backup.timer']
+    assert 'Persistent=true' in units['lumibot-fund-backup.timer']
     for role in ('runner', 'monitor'):
         body = units[f'lumibot-fund-{role}.service']
         assert f'"scripts.autonomous_fund.service" "{role}"' in body
@@ -282,7 +288,9 @@ def test_service_account_directory_from_the_env_file_must_be_writable_by_the_san
 
 def test_generated_units_can_leave_the_mode_to_the_env_file():
     units = generate('/srv/fund', None, '/srv/fund/.env', 'fundbot', None)
-    for body in units.values():
+    for name, body in units.items():
+        if not name.endswith('.service'):
+            continue
         assert '"--mode"' not in body and '"--run-dir"' not in body
         assert 'ReadWritePaths="/srv/fund/artifacts"\n' in body
 
@@ -297,7 +305,8 @@ def test_generated_units_pass_systemds_own_verification(tmp_path):
     (repo / 'artifacts').mkdir()
     units = generate(str(repo), None, str(repo / '.env'), 'nobody', None)
     for name, body in units.items():
-        assert f'WorkingDirectory={repo}\n' in body  # systemd does not unquote this setting.
+        if name.endswith('.service'):
+            assert f'WorkingDirectory={repo}\n' in body  # systemd does not unquote this setting.
         (tmp_path / name).write_text(body)
     result = subprocess.run(['systemd-analyze', 'verify', *(str(tmp_path / n) for n in units)],
                             capture_output=True, text=True)

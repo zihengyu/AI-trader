@@ -2,7 +2,7 @@
 
 本应用的显式秘密配置、无人值守进程管理、审批和日报运维说明。
 
-**Last Updated:** 2026-11-01
+**Last Updated:** 2026-11-02
 
 **Status:** 部署生成器与进程／通知回归已验证；目标 Ubuntu 安装和 Telegram 实际投递待验证
 
@@ -42,12 +42,28 @@ sudo apt-get update
 sudo apt-get install python3.12-venv python3-dev build-essential ca-certificates tzdata
 cd "<repo>"
 python3.12 -m venv .venv
-.venv/bin/python -m pip install -e . -r scripts/autonomous_fund/requirements.txt
+.venv/bin/python -m pip install -c scripts/autonomous_fund/constraints-py312-linux.txt \
+    -e . -r scripts/autonomous_fund/requirements.txt
 .venv/bin/python -m pip check
 .venv/bin/python -m scripts.autonomous_fund.deploy prepare --user "<service-user>"
 ```
 
-`prepare` 只生成 `artifacts/fund-systemd/` 中的两个 unit 文件，创建模拟账户目录和 STOP 标记，
+`constraints-py312-linux.txt` 锁定了经过测试的全部依赖版本（Python 3.12、Linux x86_64），任何镜像源都会装出同一组版本，
+避免 `ResolutionImpossible`。国内镜像缺少新版本时，换官方源 `-i https://pypi.org/simple` 或清华源
+`-i https://pypi.tuna.tsinghua.edu.cn/simple`；不要去掉 `-c`。
+
+装好后先确认服务器能连上所需的每个服务（只读探测，不调用模型推理、不下单、不发消息，输出不含任何 Key）：
+
+```bash
+sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh check
+```
+
+`connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 的 HTTP 状态和耗时，
+`connectivity_summary.blocking` 列出会影响运行的失败项并附中文原因。**服务器在中国大陆地域时 Telegram 和 Yahoo 通常无法直连**，
+请改用香港／新加坡等境外地域，或在 `.env` 设置 `HTTPS_PROXY`。设置了 Alpaca Key 时，local 模式在 Yahoo 拿不到日线时
+会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`）。
+
+`prepare` 只生成 `artifacts/fund-systemd/` 中的两个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`
 （`local` 本地模拟盘或 `paper` Alpaca 模拟账户，没有实盘选项）和 `FUND_RUN_DIR`（留空为 `artifacts/fund-<模式>`，
 服务要求放在仓库 `artifacts/` 下），`prepare` 会打印服务将使用的模式和账户目录。它不覆盖已有 `.env`，也不安装或启动任何服务。
@@ -225,6 +241,22 @@ systemd、监督和持久化降低中断风险，无法保证永不故障。整�
 ```
 
 快照保留账户绑定、风控／审批／订单状态，始终带 STOP，不含 Key。
+
+**每日自动备份**：`fund-start.sh` 同时安装并启用 `lumibot-fund-backup.timer`，每天美东 17:45（收盘和复盘之后，随机延后
+最多 5 分钟；服务器关机错过时开机补做）对当前账户做一次一致快照，存到 `artifacts/fund-backups/<UTC 时间>/`，保留最近 14 份，
+只删除它自己创建的快照目录。手动执行：
+
+```bash
+sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.deploy rotate-backup --keep 14
+```
+
+快照仍在同一台机器上。异地保存请自行把 `artifacts/fund-backups/` 同步到对象存储或另一台主机（例如每天
+`rsync -a artifacts/fund-backups/ <backup-host>:<path>/`，或用云厂商的对象存储同步工具）。
+
+**监控指标**：独立监控每轮写 `<账户目录>/metrics.prom`（Prometheus 文本格式）：`fund_healthy`、`fund_health_state`、
+`fund_stop_active`、`fund_equity_usd`、`fund_cash_usd`、`fund_cash_equivalent_usd`、`fund_gross_exposure`、`fund_drawdown`、
+`fund_pending_approvals`、`fund_notifications`、`fund_disk_free_bytes` 和最后检查时间。已有 Prometheus／Grafana 的话，
+让 node_exporter 的 textfile 收集器读取这个文件（复制或软链到它的目录），就能画曲线、设告警；没有也不影响运行。
 秘密和准确版本的配置应另行安全保存；恢复必须使用同一配置和正确账户，先核对再 resume。
 SQLite 不是异地备份，不能抵御整机磁盘丢失。
 

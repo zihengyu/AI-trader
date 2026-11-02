@@ -55,10 +55,13 @@ def test_start_installs_starts_waits_for_the_monitor_and_resumes_a_manual_stop(t
     result = script("fund-start.sh", tmp_path, env, "-y")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "+ sudo install -m 644" in result.stdout and "+ sudo systemctl daemon-reload" in result.stdout
-    assert "+ sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service" in result.stdout
+    assert ("+ sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service "
+            "lumibot-fund-backup.timer") in result.stdout
     assert "已恢复交易" in result.stdout and not (book / "STOP").exists()
     assert sorted(p.name for p in (tmp_path / "build").iterdir()) == [
-        "lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
+        "lumibot-fund-backup.service", "lumibot-fund-backup.timer", "lumibot-fund-monitor.service",
+        "lumibot-fund-runner.service"]
+    assert "+ sudo install -m 644" in result.stdout and "lumibot-fund-backup.timer" in result.stdout
     assert not (ROOT / "artifacts" / "autonomous-fund").exists()  # Checking the config leaves no stray directory.
 
 
@@ -89,7 +92,7 @@ def test_stop_writes_an_operator_stop_then_stops_the_services(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert stops.read(book)["class"] == "operator"  # Never lifted automatically.
     assert "+ sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service" in result.stdout
-    assert "+ sudo systemctl disable" in result.stdout
+    assert "+ sudo systemctl disable --now" in result.stdout and "lumibot-fund-backup.timer" in result.stdout
 
 
 def test_logs_status_explains_the_state_in_one_screen(tmp_path):
@@ -126,4 +129,19 @@ def test_status_command_flags_for_scripts(tmp_path, monkeypatch, capsys):
 def test_units_only_writes_the_unit_files(tmp_path):
     from scripts.autonomous_fund import deploy
     deploy.main(["units", "--user", "nobody", "--env-file", str(tmp_path / ".env"), "--output-dir", str(tmp_path)])
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["lumibot-fund-backup.service", "lumibot-fund-backup.timer",
+                                                          "lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
+
+
+def test_rotating_backups_keep_the_newest_snapshots_only(tmp_path):
+    from datetime import timedelta
+    from scripts.autonomous_fund import deploy
+    book, _ = account_book(tmp_path)
+    start = datetime(2026, 11, 2, 22, 45, tzinfo=timezone.utc)
+    made = [deploy.rotate(book, tmp_path / "backups", keep=3, now=start + timedelta(days=i)) for i in range(5)]
+    (tmp_path / "backups" / "notes").mkdir()  # Never ours: never pruned.
+    kept = sorted(p.name for p in (tmp_path / "backups").iterdir())
+    assert kept == sorted([m.name for m in made[-3:]] + ["notes"])
+    assert stops.read(made[-1])["reason"] == "restored_backup"  # A restore always starts stopped.
+    with pytest.raises(Exception):
+        deploy.rotate(book, tmp_path / "backups", keep=0)

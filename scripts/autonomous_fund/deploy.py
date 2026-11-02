@@ -49,6 +49,21 @@ def generate(repo, run_dir, env_file, user, mode):
             "ReadWritePaths=" + " ".join(unit_quote(p) for p in sorted({repo / "artifacts", run_dir or repo / "artifacts"})),
             "StandardOutput=journal", "StandardError=journal", "",
             "[Install]", "WantedBy=multi-user.target", ""])
+    # A daily journal snapshot after the close and the review; Persistent catches up after downtime.
+    backup_args = [python, "-m", "scripts.autonomous_fund.deploy", "rotate-backup", "--env-file", env_file]
+    backup_args += ["--run-dir", run_dir] if run_dir else []
+    units["lumibot-fund-backup.service"] = "\n".join([
+        "[Unit]", "Description=LumiBot paper fund daily journal backup", "",
+        "[Service]", "Type=oneshot", f"User={user}", f"WorkingDirectory={unit_path(repo)}",
+        "ExecStart=" + " ".join(unit_quote(arg) for arg in backup_args),
+        "Environment=PYTHONUNBUFFERED=1 LUMIBOT_DISABLE_DOTENV=true",
+        "UMask=0077", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict", "ProtectHome=read-only",
+        "ReadWritePaths=" + " ".join(unit_quote(p) for p in sorted({repo / "artifacts", run_dir or repo / "artifacts"})),
+        "StandardOutput=journal", "StandardError=journal", ""])
+    units["lumibot-fund-backup.timer"] = "\n".join([
+        "[Unit]", "Description=Daily LumiBot paper fund journal backup", "",
+        "[Timer]", "OnCalendar=*-*-* 17:45:00 America/New_York", "Persistent=true", "RandomizedDelaySec=300", "",
+        "[Install]", "WantedBy=timers.target", ""])
     return units
 
 
@@ -69,6 +84,32 @@ def backup(root, destination):
     stops.write(destination, "operator", "restored_backup")
 
 
+BACKUP_NAME = re.compile(r"\d{8}-\d{6}")
+
+
+def rotate(root, backup_dir, keep=14, now=None):
+    """A timestamped snapshot under backup_dir, keeping the newest `keep`; returns the new directory.
+
+    Only directories this function created (timestamp names with a journal) are
+    ever pruned. Off-server copies are the operator's choice (see the guide).
+    """
+    from datetime import datetime, timezone
+    if type(keep) is not int or not 1 <= keep <= 365:
+        raise RiskError("keep must be 1..365 snapshots")
+    backup_dir = Path(backup_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
+    target = backup_dir / stamp
+    backup(root, target)
+    snapshots = sorted(p for p in backup_dir.iterdir()
+                       if p.is_dir() and BACKUP_NAME.fullmatch(p.name) and (p / "state.sqlite3").is_file())
+    for old in snapshots[:-keep]:
+        for child in old.iterdir():
+            child.unlink()
+        old.rmdir()
+    return target
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -78,17 +119,30 @@ def main(argv=None):
     setup.add_argument("--run-dir", type=Path, help="Fix the account directory; default: .env FUND_RUN_DIR or artifacts/fund-<mode>")
     setup.add_argument("--env-file", type=Path, default=Path(".env"))
     setup.add_argument("--output-dir", type=Path, default=Path("artifacts/fund-systemd"))
-    only = sub.add_parser("units", help="Write the two unit files only: no STOP, no .env (used by fund-start.sh)")
+    only = sub.add_parser("units", help="Write the unit files only: no STOP, no .env (used by fund-start.sh)")
     only.add_argument("--user", required=True)
     only.add_argument("--env-file", type=Path, default=Path(".env"))
     only.add_argument("--output-dir", type=Path, default=Path("artifacts/fund-systemd"))
     copy = sub.add_parser("backup")
     copy.add_argument("--run-dir", type=Path, required=True)
     copy.add_argument("--output-dir", type=Path, required=True)
+    daily = sub.add_parser("rotate-backup", help="Timestamped snapshot of the configured account, keeping the newest N")
+    daily.add_argument("--env-file", type=Path, default=Path(".env"))
+    daily.add_argument("--run-dir", type=Path)
+    daily.add_argument("--backup-dir", type=Path, default=Path("artifacts/fund-backups"))
+    daily.add_argument("--keep", type=int, default=14)
     args = parser.parse_args(argv)
     if args.action == "backup":
         backup(args.run_dir, args.output_dir)
         print("Account snapshot saved in STOP. Secrets excluded; verify configuration before restoring.")
+        return
+    if args.action == "rotate-backup":
+        from dotenv import dotenv_values
+        from .settings import startup
+        values = dotenv_values(args.env_file) if args.env_file.is_file() else {}
+        _, run_dir, _, _ = startup("start", args.run_dir, {**values, **os.environ})
+        target = rotate(run_dir, args.backup_dir, args.keep)
+        print(f"Journal snapshot {target} (restores into STOP; secrets excluded).")
         return
     if os.name != "posix":
         raise RiskError("Generate service paths on the target Linux host, not Windows")
@@ -130,7 +184,8 @@ def main(argv=None):
     print(f'  sudo -u "{args.user}" bash scripts/run_autonomous_fund.sh show-config')
     for filename, body in units.items():
         (args.output_dir / filename).write_text(body, encoding="utf-8")
-    print("Prepared STOP, secret template if absent, and two service files. Review and install explicitly; nothing was started.")
+    print("Prepared STOP, secret template if absent, two service files and the daily backup timer. "
+          "Review and install explicitly; nothing was started.")
 
 
 if __name__ == "__main__":

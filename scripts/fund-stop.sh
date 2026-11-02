@@ -35,8 +35,8 @@ fi
 echo "3/3 停止服务……"
 run sudo systemctl stop "${units[@]}"
 if (( disable )); then
-  run sudo systemctl disable "${units[@]}"
-  echo "    已取消开机自启。"
+  run sudo systemctl disable --now "${units[@]}" lumibot-fund-backup.timer
+  echo "    已取消开机自启（含每日备份定时器）。"
 fi
 echo
 echo "已关停：交易保持停止，不会自动恢复。重新启动：bash scripts/fund-start.sh"
