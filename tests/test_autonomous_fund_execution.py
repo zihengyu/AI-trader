@@ -295,13 +295,13 @@ def test_native_restart_continues_multisymbol_target_without_recalling_models(tm
     restored.on_trading_iteration()
     second_order = restored.broker._pull_order(journal.pending()[0]["broker_id"], restored.name)
     assert second_order.asset.symbol == "BETA"
-    assert calls == ["researcher", "manager"]
+    assert calls == ["researcher", "critic", "manager"]
     clock.value += timedelta(minutes=2)
     source._cache.clear()
     restored.broker.do_polling()
     restored.on_trading_iteration()
     assert not journal.pending()
-    assert calls == ["researcher", "manager"]
+    assert calls == ["researcher", "critic", "manager"]
     assert restored.execution.latest(clock())["state"] == "complete"
     assert {p.asset.symbol for p in restored.broker._pull_positions(restored.name)} == {"ALFA", "BETA"}
     with journal.connection() as db:
@@ -352,7 +352,7 @@ def test_native_purchase_beyond_envelope_waits_for_plan_approval_then_rechecks_a
     source._cache.clear()
     strategy.on_trading_iteration()
     assert len(journal.pending()) == 1
-    assert calls == ["researcher", "manager"]
+    assert calls == ["researcher", "critic", "manager"]
     identifier = journal.pending()[0]["broker_id"]
     clock.value += timedelta(minutes=2)
     source._cache.clear()

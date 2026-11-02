@@ -20,7 +20,8 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro")
+                   "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
+                   "construction", "critic")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -46,10 +47,20 @@ RESEARCHER_PROMPT = (
     "operator_mandate instructions come from the human operator and bound what may be proposed. "
     "Use scorecards (scored predictions and allocation excess returns) to weigh past ideas."
 )
+CRITIC_PROMPT = (
+    "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
+    "AGAINST the research's main ideas and the current portfolio: contrary evidence, crowded or already-priced "
+    "theses, valuation, event and liquidity risks, correlation between ideas, and evidence that is stale, "
+    "undated or unverified. Use read-only research tools to check claims. Return concerns by symbol (\"\" for "
+    "portfolio-level) with evidence, and list missing evidence. Never fabricate; say when the research holds up. "
+    "You do not decide or trade; the manager weighs your critique. In historical mode use only information "
+    "public by as_of."
+)
 MANAGER_PROMPT = (
     "You are the sole investment decision maker for this long-only paper portfolio. "
     "Pursue long-term risk-adjusted returns, without a fixed signal or obligation to trade. "
-    "Review the research, account and risks; independently use read-only research tools. "
+    "Review the research, the devil's-advocate critique (when present), account and risks; independently use "
+    "read-only research tools. Address the critique's material concerns in the rationale. "
     "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
     "Omitted positions are to be liquidated, an empty list means all cash. "
     "Respect supplied limits: no debt, shorts, derivatives, inverse or leveraged funds. "
@@ -140,6 +151,21 @@ class NewsQuery(BaseModel):
     reason: str = Field(min_length=1, max_length=200)
 
 
+class Concern(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    symbol: str = Field(max_length=12)  # "" for a portfolio-level concern.
+    concern: str = Field(min_length=1, max_length=600)
+    evidence: str = Field(max_length=600)
+
+
+class Critique(BaseModel):
+    """The devil's advocate: the strongest case against the research, never orders."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    summary: str = Field(min_length=1, max_length=1500)
+    concerns: list[Concern] = Field(default_factory=list, max_length=10)
+    missing_evidence: list[str] = Field(default_factory=list, max_length=10)
+
+
 class Decision(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     as_of: str
@@ -225,8 +251,9 @@ def prompt_version(models, extra=None):
     Recorded on every validated decision so scorecards compare prompt versions
     instead of mixing them; a change is journaled as prompt_version_changed.
     """
-    body = {"researcher": RESEARCHER_PROMPT, "manager": MANAGER_PROMPT,
-            "schemas": {"research": Research.model_json_schema(), "decision": Decision.model_json_schema()},
+    body = {"researcher": RESEARCHER_PROMPT, "manager": MANAGER_PROMPT, "critic": CRITIC_PROMPT,
+            "schemas": {"research": Research.model_json_schema(), "decision": Decision.model_json_schema(),
+                        "critique": Critique.model_json_schema()},
             "models": dict(models), **(extra or {})}
     return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
@@ -241,6 +268,27 @@ def ai_universe(universe, sweep=None):
     if sweep is None:
         sweep = CashSweep.from_config(None, universe) if any(k == "cash_equivalent" for k in universe.values()) else None
     return frozenset(s for s in universe if sweep is None or s != sweep.symbol)
+
+
+@dataclass(frozen=True)
+class CriticSettings:
+    """`critic` section: a devil's-advocate agent between the researcher and the manager."""
+    enabled: bool = True
+    model: str | None = None  # Default: the researcher's model.
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise RiskError("critic.enabled must be true/false")
+        if self.model is not None:
+            model_selection({"model": self.model})
+
+    @classmethod
+    def from_config(cls, section):
+        section = dict(section or {})
+        unknown = set(section) - set(cls.__dataclass_fields__)
+        if unknown:
+            raise RiskError("Unknown critic settings: " + ", ".join(sorted(unknown)))
+        return cls(**section)
 
 
 def risk_settings(config, universe, limits):
@@ -287,6 +335,9 @@ def configuration(path, environ=None):
     EventSettings.from_config(result.get("events"))
     from .macro import MacroSettings
     MacroSettings.from_config(result.get("macro"))
+    from .construction import ConstructionSettings
+    ConstructionSettings.from_config(result.get("construction"))
+    CriticSettings.from_config(result.get("critic"))
     return result
 
 
@@ -423,6 +474,8 @@ class AutonomousFund(Strategy):
         # Scripted-model runs (tests, mock) stay off the network, like the news watch.
         self.earnings = (EarningsCalendar(self.journal, events)
                          if events.enabled and mode in {"paper", "local"} and runtime is None else None)
+        from .construction import ConstructionSettings
+        self.construction = ConstructionSettings.from_config(config.get("construction"))
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
         self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"})
@@ -471,7 +524,14 @@ class AutonomousFund(Strategy):
             name="manager", model=self.agent_models["manager"], output_schema=Decision, **common,
             system_prompt=MANAGER_PROMPT,
         )
-        self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}")
+        self.critic = CriticSettings.from_config(config.get("critic"))
+        if self.critic.enabled:
+            self.agent_models["critic"] = self.critic.model or self.agent_models["researcher"]
+            self.agents.create(name="critic", model=self.agent_models["critic"], output_schema=Critique, **common,
+                               system_prompt=CRITIC_PROMPT)
+            self._critic_ready = True
+        self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
+                         + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))
         self.prompt_version = prompt_version(self.agent_models)
         before = self.journal.get_meta("prompt_version")
         if before and before != self.prompt_version:
@@ -1033,6 +1093,7 @@ class AutonomousFund(Strategy):
             research = self._record_agent("researcher", self._agent_call("researcher",
                 task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
             validate_evidence(research["evidence"], now, self.mode not in {"paper", "local"})
+            context["critique"] = self._critique(context, research, budget, now)
             context["as_of"] = self.get_datetime().isoformat()
             decision = self._record_agent("manager", self._agent_call("manager",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
@@ -1050,6 +1111,7 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_failures", 0)
             self.journal.set_meta("decision_retry_at", None)
         self.journal.event(now, "decision_validated", {**decision, "prompt_version": getattr(self, "prompt_version", None)})
+        self._record_construction_variant(decision, now)
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
@@ -1059,6 +1121,47 @@ class AutonomousFund(Strategy):
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow({**context, "research": research}, champion, decision, now, budget)
+
+    def _critique(self, context, research, budget, now):
+        """The devil's advocate's critique, or None (disabled, no budget, or failed: never blocks a decision)."""
+        settings = getattr(self, "critic", None)
+        if settings is None or not settings.enabled or not getattr(self, "_critic_ready", False):
+            return None
+        if self.journal.counter("agent_runs", now) + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
+            self.journal.event(now, "critic_skipped", {"reason": "model_budget"})
+            return None
+        try:
+            return self._record_agent("critic", self._agent_call("critic",
+                task_prompt="Argue the strongest honest case against this research and the current portfolio.",
+                context={**context, "research": research}), phase="critique")
+        except Exception as exc:
+            self.journal.event(self.get_datetime(), "critic_unavailable",
+                               {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+            return None
+
+    def _construction_arm(self):
+        """Which construction trades: the AI's weights or risk budgets proportional to them."""
+        settings = getattr(self, "construction", None)
+        if settings is None or getattr(self, "quant", None) is None:
+            return "ai"
+        if settings.mode != "auto":
+            return settings.mode
+        return self.journal.get_meta("construction_champion", "ai")
+
+    def _record_construction_variant(self, decision, now):
+        """Both constructions of this decision, so they can be scored side by side later."""
+        if getattr(self, "construction", None) is None or getattr(self, "quant", None) is None:
+            return
+        from .quant import risk_budget
+        weights = {t["symbol"]: number(t["weight"]) for t in decision["targets"] if number(t["weight"]) > 0}
+        try:
+            budgeted = risk_budget(weights, self._risk_estimate(set(weights), now)) if weights else {}
+        except Exception as exc:  # Evidence tooling never costs the decision.
+            self.journal.event(now, "construction_variant_unavailable", {"error": type(exc).__name__})
+            return
+        self.journal.event(now, "construction_variant", {"ai": {s: str(w) for s, w in weights.items()},
+                                                         "risk_budget": {s: str(w) for s, w in budgeted.items()},
+                                                         "trading": self._construction_arm()})
 
     def _champion(self):
         """Which learning arm trades: 'memo' (memo + scorecards) or 'baseline' (neither)."""
@@ -1297,7 +1400,9 @@ class AutonomousFund(Strategy):
         from .review import _events
         from .scorecard import score_decisions, score_predictions, score_timing
         rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated",
-                                                          "protective_trigger", "entry_waiting", "order_submitted"))
+                                                          "protective_trigger", "entry_waiting", "order_submitted",
+                                                          "construction_variant"))
+        variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
         timing = [(r["at"], r["kind"], r["body"]) for r in rows
                   if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
         reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"][-40:]
@@ -1313,9 +1418,20 @@ class AutonomousFund(Strategy):
             for prediction in packet["review"].get("predictions", []):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
         symbols |= {body["symbol"] for _, kind, body in timing if kind in {"protective_trigger", "entry_waiting"}}
+        symbols |= {s for _, body in variants for arm in ("ai", "risk_budget") for s in body.get(arm, {})}
         closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols & allowed)}
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
                   "decisions": score_decisions(decisions, closes), "timing": score_timing(timing, closes)}
+        settings = getattr(self, "construction", None)
+        if settings is not None:
+            from .construction import evaluate
+            current = self.journal.get_meta("construction_champion", "ai")
+            construction = evaluate(variants, closes, settings, current)
+            result["construction"] = construction
+            if settings.mode == "auto" and construction["champion"] != current:
+                self.journal.set_meta("construction_champion", construction["champion"])
+                self.notify("construction_switched", {"from": current, "to": construction["champion"],
+                                                      "test": construction["test"]})
         self._scorecard_cache = (trading_day(now), result)
         return result
 
@@ -1331,6 +1447,7 @@ class AutonomousFund(Strategy):
                 {"by_hypothesis": dict(list(predictions["by_hypothesis"].items())[:8])},
                 "decisions": cards["decisions"]["by_horizon"],
                 "decisions_by_prompt_version": dict(list(cards["decisions"].get("by_prompt_version", {}).items())[-3:]),
+                "construction": cards.get("construction"),
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"}}
 
     def _request_cancel(self, pending, order, now, kind=None, detail=None):
@@ -1743,7 +1860,11 @@ class AutonomousFund(Strategy):
         estimate = self._risk_estimate(set(active["weights"]) | set(account.positions), now)
         # Protective exits cap a symbol for the rest of this decision (no immediate re-buy).
         overrides = self.execution.overrides(active["id"])
-        requested = {s: min(w, overrides.get(s, w)) for s, w in active["weights"].items()}
+        base, arm = active["weights"], self._construction_arm()
+        if arm == "risk_budget":
+            from .quant import risk_budget
+            base = risk_budget(base, estimate)
+        requested = {s: min(w, overrides.get(s, w)) for s, w in base.items()}
         # Scheduled earnings: a gap no stop can catch, so the name is capped before the announcement.
         caps = self._earnings_caps(now)["caps"]
         capped = sorted(s for s, w in requested.items() if s in caps and w > caps[s])
@@ -1753,6 +1874,7 @@ class AutonomousFund(Strategy):
         if capped:
             overlay["binding"] = [f"earnings:{s}" for s in capped] + overlay["binding"]
             overlay["event_caps"] = {s: str(caps[s]) for s in capped}
+        overlay["construction"] = arm
         stress = self._stress(now)
         stressed = stress["stressed"] is not False  # Unknown benchmark state is treated as stress.
         buys_paused = paused or session["loss_paused"]

@@ -498,3 +498,48 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
         "missing_history": sorted(estimate.missing & (set(targets) | set(current))),
         "observations": estimate.observations, "history_through": estimate.through,
     }
+
+
+def risk_budget(targets, estimate, iterations=500, tolerance=1e-10):
+    """Re-weight the AI's names so each one's risk contribution is proportional to its AI weight.
+
+    The AI's weights are treated as risk budgets b (selection and conviction), the
+    gross exposure is kept, and the risk engine's limits still apply afterwards.
+    Solved by cyclical coordinate descent on min 1/2 x'Cx - sum(b ln x), whose
+    unique positive solution has risk contributions x_i (Cx)_i proportional to b_i
+    even with negative correlations. Names without a covariance estimate keep the
+    AI's weight. Returns Decimal weights rounded down to the weight step.
+    """
+    positive = {s: float(w) for s, w in targets.items() if float(w) > 0}
+    names = [s for s in sorted(positive) if s in estimate.vol]
+    if len(names) < 2:
+        return {s: number(w) for s, w in targets.items()}
+    index = [estimate.symbols.index(s) for s in names]
+    cov = estimate.cov[np.ix_(index, index)]
+    budgets = np.array([positive[s] for s in names])
+    budgets = budgets / budgets.sum()
+    x = budgets / np.sqrt(np.diag(cov))
+    for _ in range(iterations):
+        previous = x.copy()
+        for i in range(len(names)):
+            other = float(cov[i] @ x - cov[i, i] * x[i])
+            x[i] = (-other + math.sqrt(other * other + 4 * cov[i, i] * budgets[i])) / (2 * cov[i, i])
+        if np.max(np.abs(x - previous) / np.maximum(previous, 1e-12)) < tolerance:
+            break
+    gross = sum(positive[s] for s in names)
+    x = x / x.sum() * gross
+    result = {s: number(w) for s, w in targets.items() if s not in names}
+    result.update({s: _floor(value) for s, value in zip(names, x)})
+    return result
+
+
+def risk_contributions(weights, estimate):
+    """Fraction of ex-ante portfolio variance from each name (known names only)."""
+    names = [s for s in sorted(weights) if float(weights[s]) > 0 and s in estimate.vol]
+    if not names:
+        return {}
+    index = [estimate.symbols.index(s) for s in names]
+    w = np.array([float(weights[s]) for s in names])
+    marginal = estimate.cov[np.ix_(index, index)] @ w
+    total = float(w @ marginal)
+    return {s: float(w[i] * marginal[i] / total) for i, s in enumerate(names)} if total > 0 else {}

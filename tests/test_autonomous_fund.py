@@ -371,7 +371,8 @@ def test_real_native_backtest_runs_agents_fills_and_reports(tmp_path, monkeypatc
     assert (tmp_path / "run" / "postmarket_review.md").exists()
     assert (tmp_path / "run" / "strategy_memory.json").exists()
     events = [json.loads(line) for line in (tmp_path / "run" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
-    assert {row["body"]["name"] for row in events if row["kind"] == "agent"} == {"researcher", "manager"}
+    # The devil's-advocate critic runs between the researcher and the manager.
+    assert {row["body"]["name"] for row in events if row["kind"] == "agent"} == {"researcher", "critic", "manager"}
     assert any(row["kind"] == "decision" for row in events)
     # Every validated decision names the prompt version that produced it.
     version = next(row["body"]["prompt_version"] for row in events if row["kind"] == "startup")

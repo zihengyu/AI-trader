@@ -89,6 +89,8 @@ SETTINGS = {
     "FUND_RESEARCH_MODEL": (("agent_models", "researcher"), str, False, "模型", "研究员模型，例如 deepseek/deepseek-flash"),
     "FUND_DECISION_MODEL": (("agent_models", "manager"), str, False, "模型", "基金经理模型，例如 deepseek/deepseek-v4-pro"),
     "FUND_REASONING_EFFORT": (("reasoning_effort",), _optional, False, "模型", "推理强度 low/medium/high，留空为模型默认"),
+    "FUND_CRITIC": (("critic", "enabled"), _bool, False, "模型", "是否在研究员和基金经理之间加入反方审查（每次决策多一次模型调用）"),
+    "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
     "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
@@ -109,6 +111,7 @@ SETTINGS = {
     "FUND_CASH_SWEEP": (("cash_sweep", "enabled"), _bool, False, "约束", "闲置现金自动买入短期国债 ETF（SGOV），买入证券前先卖出筹款"),
     "FUND_EARNINGS_GUARD": (("events", "enabled"), _bool, False, "约束", "个股财报日（当天或下一个交易日）前自动把权重降到上限以内"),
     "FUND_EARNINGS_MAX_POSITION": (("events", "earnings_max_position"), _decimal, False, "约束", "财报前单只个股最大权重，例如 0.05"),
+    "FUND_CONSTRUCTION_MODE": (("construction", "mode"), str, False, "约束", "组合构建：ai（AI 原始权重）、risk_budget（按 AI 权重分配风险贡献）或 auto（配对检验显著后自动切换）"),
     # ----- Approval envelope
     "FUND_AUTO_DAILY_EXPOSURE_INCREASE": (("approval", "auto_daily_exposure_increase"), _decimal, False, "审批", "无需审批的单日敞口增幅；0 表示所有买入都要审批"),
     "FUND_AUTO_DAILY_BUY_TURNOVER": (("approval", "auto_daily_buy_turnover"), _decimal, False, "审批", "无需审批的单日买入现金流（占净值）"),

@@ -26,6 +26,9 @@ class ScriptedRuntime:
             body = {"summary": "SCRIPTED mechanical test; no investment research performed.", "evidence": [{
                 "source": "Scripted fixture, not news or fundamentals", "available_at": (now - timedelta(days=1)).isoformat(),
                 "observed_at": now.isoformat(), "estimated": False, "estimate_reason": ""}]}
+        elif request.agent_name == "critic":
+            body = {"summary": "SCRIPTED critique; no research was challenged.", "concerns": [],
+                    "missing_evidence": ["Scripted fixture: no real evidence was reviewed."]}
         elif context.get("phase") == "postmarket_review":
             body = {"session_date": context["session"]["session_date"], "as_of": now.isoformat(),
                     "summary": "SCRIPTED 复盘流程测试；未进行真实模型研究或策略优化。",
