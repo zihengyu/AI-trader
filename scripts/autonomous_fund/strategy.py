@@ -19,7 +19,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service")
-NOTICE_WINDOWS = {"manual_stop": 21600}
+NOTICE_WINDOWS = {"manual_stop": 21600, "stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
@@ -768,7 +768,11 @@ class AutonomousFund(Strategy):
                         order = self.broker._pull_order(pending["broker_id"], self.name)
                     if order and not self._terminal(order):
                         self.cancel_order(order)
-                self.notify("manual_stop", "STOP file active; no new orders")
+                from . import stops
+                record = stops.read(self.halt_path.parent) or {}
+                # One notice per STOP record: who stopped trading, why and since when.
+                self.notify("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
+                                            "since": record.get("at"), "orders": "no new orders"})
                 return
             if self.mode not in {"local", "paper"}:
                 # Native Pandas daily replay advances date rows without close
@@ -1193,20 +1197,11 @@ class AutonomousFund(Strategy):
         from .factors import panel_from_rows
         history, missing = {}, []
         for symbol in sorted(self.universe):
-            try:
-                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"),
-                                                  self.factor_lab.settings.history_days, timestep="day")
-                frame = bars.df if bars is not None else None
-            except Exception:
-                frame = None
-            if frame is None or not len(frame) or "close" not in frame:
+            rows, error = self._daily_bars(symbol, now)
+            if error or not rows:
                 missing.append(symbol)
                 continue
-            frame = frame[frame.index.date < instant(now).date()]
-            volume = frame["volume"] if "volume" in frame else [float("nan")] * len(frame)
-            history[symbol] = [(str(index.date()), float(close), float(shares))
-                               for index, close, shares in zip(frame.index, frame["close"], volume)
-                               if close == close and close > 0]
+            history[symbol] = [(day, close, shares) for day, close, shares in self._completed(rows, now)]
         if missing:
             self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
         panel = panel_from_rows(history) if history else (None, None)
@@ -1235,23 +1230,49 @@ class AutonomousFund(Strategy):
         return context
 
     # ----- Quantitative risk view -------------------------------------------------
+    def _daily_bars(self, symbol, now):
+        """One daily-history request per symbol and trading day, shared by risk and the factor lab.
+
+        Returns (rows, error); rows are (date, close, volume) as the provider
+        returned them, including a possible forming bar for today.
+        """
+        day, key = trading_day(now), (trading_day(now), symbol)
+        cache = self.__dict__.setdefault("_bars", {})
+        if key not in cache:
+            length = self.quant.es_lookback_days + 5
+            lab = getattr(self, "factor_lab", None)
+            if lab is not None:
+                length = max(length, lab.settings.history_days)
+            rows, error = [], None
+            try:
+                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
+                frame = bars.df if bars is not None else None
+                if frame is not None and len(frame) and "close" in frame:
+                    volume = frame["volume"] if "volume" in frame else [float("nan")] * len(frame)
+                    rows = [(index.date(), float(close), float(shares))
+                            for index, close, shares in zip(frame.index, frame["close"], volume)]
+            except Exception as exc:
+                error = type(exc).__name__
+            self._bars = {k: v for k, v in cache.items() if k[0] == day}
+            self._bars[key] = (rows, error)
+        return self._bars[key]
+
+    @staticmethod
+    def _completed(rows, now):
+        """Never today's forming (or a future) bar; only real, positive closes."""
+        today = instant(now).date()
+        return [(str(d), close, shares) for d, close, shares in rows if d < today and close == close and close > 0]
+
     def _daily_closes(self, symbol, now):
-        """Completed daily closes for risk estimation; cached per trading day."""
+        """Completed daily closes for risk estimation: the same window as before (es_lookback_days + 5 bars)."""
         day, key = trading_day(now), (trading_day(now), symbol)
         if key not in self._history:
-            rows = []
-            try:
-                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), self.quant.es_lookback_days + 5,
-                                                  timestep="day")
-                frame = bars.df if bars is not None else None
-                if frame is not None and len(frame):
-                    frame = frame[frame.index.date < now.date()]  # Never today's forming/future bar.
-                    rows = [(str(index.date()), float(close)) for index, close in zip(frame.index, frame["close"])
-                            if close == close and close > 0]
-            except Exception as exc:
-                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": type(exc).__name__})
+            rows, error = self._daily_bars(symbol, now)
+            if error:
+                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
+            window = rows[-(self.quant.es_lookback_days + 5):]
             self._history = {k: v for k, v in self._history.items() if k[0] == day}
-            self._history[key] = rows
+            self._history[key] = [(d, close) for d, close, _ in self._completed(window, now)]
         return self._history[key]
 
     def _risk_estimate(self, symbols, now):

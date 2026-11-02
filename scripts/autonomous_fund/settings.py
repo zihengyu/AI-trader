@@ -169,8 +169,10 @@ def _earlier_book(mode):
     try:
         with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
             rows = db.execute("SELECT body FROM events WHERE kind='startup'").fetchall()
-    except sqlite3.Error:
-        return False
+    except sqlite3.Error as exc:
+        # Never fall through to a fresh book while an existing one cannot be read.
+        raise RiskError(f"Cannot read the account book in {EARLIER_DEFAULT} ({type(exc).__name__}); "
+                        "fix it or pass --run-dir") from None
     return any(json.loads(body).get("mode") == mode for (body,) in rows)
 
 

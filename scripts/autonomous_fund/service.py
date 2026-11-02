@@ -68,11 +68,17 @@ def stopped_by_signal(root):
 def stop_child(child, timeout=30):
     if child.poll() is not None:
         return
+    if os.name != "posix":
+        # Windows does not stop grandchildren with their parent. Ctrl+C already
+        # reached the whole console, so allow a graceful exit, then end the tree.
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"], capture_output=True)
+            child.wait(timeout=5)
+        return
     try:
-        if os.name == "posix":
-            os.killpg(child.pid, signal.SIGINT)
-        else:
-            child.terminate()
+        os.killpg(child.pid, signal.SIGINT)
     except ProcessLookupError:
         return
     try:
@@ -116,7 +122,12 @@ def main(argv=None):
     if args.role == "runner":
         # No bootstrap interval with unmonitored fills. A stronger existing
         # STOP (operator or fault) is kept; the monitor alone may lift this one.
-        stops.write(args.run_dir, "service", "service_start")
+        # A brand-new account book (first start, or a switched FUND_MODE/FUND_RUN_DIR)
+        # is verified by a person once, never resumed automatically.
+        if (args.run_dir / "state.sqlite3").exists():
+            stops.write(args.run_dir, "service", "service_start")
+        else:
+            stops.write(args.run_dir, "operator", "first_start")
     exiting = threading.Event()
     for signum in (signal.SIGINT, signal.SIGTERM):
         signal.signal(signum, lambda *_: exiting.set())

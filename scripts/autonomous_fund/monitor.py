@@ -173,9 +173,11 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_stop", "details": {"reason": state, "action": "STOP written; inspect broker orders and resume explicitly"}})))
             elif old and old[0] not in {"healthy", "stopped"}:
+                from . import stops
                 policy = self.resume_policy
+                automatic = policy and policy.auto_resume and stops.resumable(stops.read(self.root))
                 text = (f"Health recovered; trading resumes by itself after {policy.auto_resume_after_seconds} s of "
-                        "continuous health if no order is unresolved" if policy and policy.auto_resume else
+                        "continuous health if no order is unresolved" if automatic else
                         "Health recovered; STOP still requires explicit operator resume")
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_recovered", "details": text})))

@@ -199,6 +199,9 @@ def run_service(tmp_path, monkeypatch, *, signalled, shutting_down=False):
     import scripts.autonomous_fund.service as service
     from .test_autonomous_fund_server import service_harness
     env, _ = service_harness(tmp_path, monkeypatch)
+    if not (tmp_path / "state.sqlite3").exists():
+        from scripts.autonomous_fund.journal import Journal
+        Journal(tmp_path, "synthetic-existing-account")  # An account that has run before.
     child = SimpleNamespace(poll=lambda: None if signalled else 0, returncode=0 if signalled else 3)
     monkeypatch.setattr(service.subprocess, "Popen", lambda command, **kwargs: child)
     event = threading.Event()

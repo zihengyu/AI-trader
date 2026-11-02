@@ -127,8 +127,8 @@ def daily_document(root, sequence):
              "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
              "```json", json.dumps(watch_events, ensure_ascii=False, indent=2), "```", "",
              "## AI 记分卡（只用已完成收盘价客观打分）", ""]
-    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None) or next(
-        (body for at, kind, body in reversed(events) if kind == "scorecard"), None)
+    # Only this session's card: an earlier one under today's heading would be stale.
+    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
     if card:
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
@@ -145,7 +145,7 @@ def daily_document(root, sequence):
                       f"未买入的 5 日后平均贡献 {_percent(waits['not_entered']['5']['mean_value_added'])}（负＝错过了上涨）"]
         lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
-        lines += ["尚无可打分的样本。", ""]
+        lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
     lines += ["## 因子挖掘（AI 提出，代码客观检验）", ""]
     results = [result for kind, body in related if kind == "factor_tests" for result in body.get("results", [])]
     for result in results:

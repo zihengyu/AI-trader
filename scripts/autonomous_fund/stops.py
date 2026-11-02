@@ -63,7 +63,7 @@ def write(root, kind, reason, now=None, detail=None):
               **({"detail": detail} if detail else {})}
     with _lock(root):
         current = _parse(root / "STOP")
-        if current is not None and RANK[current["class"]] > RANK[kind]:
+        if current is not None and _strength(current) > _strength(record):
             return current
         if current is not None and current["class"] == kind and current["reason"] == record["reason"]:
             return current  # Keep the original time: how long it has been stopped matters.
@@ -84,6 +84,39 @@ def clear(root, expected=None):
             return False
         path.unlink()
         return True
+
+
+def _strength(record):
+    """Operator > watchdog > service; within a class, a fault needing a person outranks a liveness fault."""
+    return RANK[record["class"]], 0 if resumable(record) else 1
+
+
+ACCOUNT_DIRECTORIES = ("artifacts/fund-local", "artifacts/fund-paper", "artifacts/autonomous-fund")
+
+
+def running(root, now=None, max_age_seconds=300):
+    """A runner heartbeat (local status.json or paper runner_health.json) younger than max_age_seconds."""
+    now = now or datetime.now(timezone.utc)
+    for name in ("status.json", "runner_health.json"):
+        try:
+            body = json.loads((Path(root) / name).read_text(encoding="utf-8"))
+            at = datetime.fromisoformat(str(body["heartbeat_at"]))
+            if body.get("runner_state", "running") == "running" and 0 <= (now - at).total_seconds() <= max_age_seconds:
+                return True
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return False
+
+
+def stop_targets(resolved, environ, now=None):
+    """Where an emergency stop without --run-dir writes: the configured account and every running one."""
+    targets = [Path(resolved)] if resolved is not None else []
+    candidates = [environ.get("FUND_RUN_DIR") or None, *ACCOUNT_DIRECTORIES]
+    for candidate in filter(None, candidates):
+        path = Path(candidate)
+        if all(path.resolve() != t.resolve() for t in targets) and running(path, now):
+            targets.append(path)
+    return targets
 
 
 def resumable(record):

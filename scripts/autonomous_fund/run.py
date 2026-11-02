@@ -314,9 +314,37 @@ def main(argv=None):
                 if args.mode != "stop":
                     raise
                 print(f"Warning: {exc}; STOP still proceeds.", flush=True)
+                if step is load_environment:
+                    # Still learn which account is configured (no secret is loaded).
+                    try:
+                        from dotenv import dotenv_values
+                        values = dotenv_values(args.env_file)
+                    except Exception:
+                        values = {}
+                    for name in ("FUND_MODE", "FUND_RUN_DIR"):
+                        if values.get(name) and not os.environ.get(name):
+                            os.environ[name] = values[name]
         args.model = args.model or os.environ.get("AI_MODEL")
     from .settings import MODES, startup
     explicit_run_dir = args.run_dir is not None
+    if args.mode == "stop":
+        # The emergency stop: the configured account plus every account whose
+        # runner is alive, so a fund started with an explicit mode is not missed.
+        from . import stops
+        try:
+            resolved = startup("stop", args.run_dir, os.environ)[1]
+            failure = None
+        except RiskError as exc:
+            resolved, failure = None, exc
+        targets = [resolved] if explicit_run_dir else stops.stop_targets(resolved, os.environ)
+        if not targets:
+            raise failure or RiskError("No account directory found: run stop with --run-dir")
+        for target in targets:
+            Path(target).mkdir(parents=True, exist_ok=True)
+            stops.write(target, "operator", "operator_stop")  # Never lifted automatically.
+        print("STOP active in " + ", ".join(str(t) for t in targets) + ". Running process cancels known pending "
+              "orders on its next iteration; verify broker cancellations.")
+        return
     args.mode, args.run_dir, observe, origin = startup(args.mode, args.run_dir, os.environ)
     args.observe_only = args.observe_only or observe
     if args.mode in MODES:
@@ -339,11 +367,6 @@ def main(argv=None):
         return
     args.run_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
-    if args.mode == "stop":
-        from . import stops
-        stops.write(args.run_dir, "operator", "operator_stop")  # Never lifted automatically.
-        print("STOP active. Running process cancels known pending orders on its next iteration; verify broker cancellations.")
-        return
     if args.mode == "resume":
         from . import stops
         stops.clear(args.run_dir)

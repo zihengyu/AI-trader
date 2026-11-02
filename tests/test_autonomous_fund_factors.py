@@ -261,14 +261,14 @@ def test_favored_names_follow_the_validated_direction(tmp_path):
 
 def test_the_strategy_panel_never_includes_todays_forming_bar(tmp_path):
     from types import SimpleNamespace
-    from scripts.autonomous_fund.strategy import AutonomousFund
+    from .test_autonomous_fund_quant import harness
     days = pd.date_range("2026-10-26 16:00", periods=6, freq="D", tz="America/New_York")  # Last one is "today".
     frame = pd.DataFrame({"close": np.arange(100.0, 106.0), "volume": np.full(6, 1e6)}, index=days)
-    journal = Journal(tmp_path, "synthetic-panel")
-    fake = SimpleNamespace(universe={"ALFA", "BETA"}, _factor_cache=None, journal=journal,
-                           factor_lab=FactorLab(journal, SETTINGS),
-                           get_historical_prices=lambda asset, length, timestep: SimpleNamespace(df=frame))
-    close, volume = AutonomousFund._factor_panel(fake, days[-1].to_pydatetime())
+    strategy = harness(tmp_path)
+    strategy.universe = frozenset({"ALFA", "BETA"})
+    strategy.factor_lab, strategy._factor_cache = FactorLab(strategy.journal, SETTINGS), None
+    strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=frame)
+    close, volume = strategy._factor_panel(days[-1].to_pydatetime())
     assert list(close.columns) == ["ALFA", "BETA"] and len(close) == 5 and close.iloc[-1, 0] == 104.0
     assert volume.iloc[-1, 0] == 1e6
 

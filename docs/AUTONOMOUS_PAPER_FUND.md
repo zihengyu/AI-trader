@@ -60,7 +60,9 @@ Linux：`bash scripts/run_autonomous_fund.sh`。启动时第一行会打印模�
 - **只读观察**：`FUND_OBSERVE_ONLY=true`（仅 local）不调用模型、不下单。
 - **显式命令优先**：`-Mode local`／`-Mode paper`（Linux 为 `local`／`paper`）或 `-RunDir` 仍然有效，并覆盖 `.env`；
   mock、backtest 等历史实验从不写入账户目录。
-- `stop` 即使 `.env` 有拼写错误也会执行（并提示错误），紧急停止不会被配置问题挡住。
+- `stop` 即使 `.env` 有拼写错误或文件权限不对也会执行（并提示错误），仍会读出其中的 `FUND_MODE`／`FUND_RUN_DIR`；
+  不带 `--run-dir` 时，除了 `FUND_MODE` 对应的账户，还会停止所有正在运行（5 分钟内有心跳）的账户，
+  因此用 `-Mode paper` 等显式命令启动的账户也不会漏停。紧急停止不会被配置问题挡住。
 - `show-config` 会显示最终的启动模式、来源和账户目录。
 
 无需密钥的完整机械检查：
@@ -656,7 +658,8 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
 .\scripts\run_autonomous_fund.ps1 -Mode resume -RunDir artifacts/fund-paper
 ```
 
-`stop` 创建 STOP 文件；运行进程下一次迭代停止新单并尝试取消本应用已知未完成订单。
+`stop` 创建 STOP 文件（不带目录时包括所有正在运行的账户，并打印停止了哪些目录）；运行进程下一次迭代停止新单并尝试取消本应用已知未完成订单。
+每个新的 STOP 都会单独通知一次（`stop_active`），注明是谁、因为什么、从何时开始停止。
 不要把创建文件当成券商已确认撤单。模型或网络调用进行中可能延迟处理；紧急时同时去券商界面核验并撤单。
 Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单。
 本地模拟盘的休市等待可被原生关闭钩子唤醒，Ctrl+C 后会退出等待并释放进程锁；
@@ -699,8 +702,8 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 
 | 级别 | 来源 | 自动解除 |
 |---|---|---|
-| 人工 | `stop` 命令；**手动关闭**服务（`systemctl stop`／`restart`、在 `serve` 窗口按 Ctrl+C）；首次安装、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
-| 监控 | 看门狗或服务监督发现故障 | 仅进程级故障（心跳超时、进程退出或卡死、监控暂时不可用）；磁盘不足、版本不符、撮合错误、未配置通知不解除 |
+| 人工 | `stop` 命令；**手动关闭**服务（`systemctl stop`／`restart`、在 `serve` 窗口按 Ctrl+C）；首次安装、**全新账户的第一次启动**（包括切换 `FUND_MODE`／`FUND_RUN_DIR` 后）、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
+| 监控 | 看门狗或服务监督发现故障 | 仅进程级故障（心跳超时、进程退出或卡死、监控暂时不可用）；磁盘不足、版本不符、撮合错误、未配置通知不解除，且之后出现的进程级故障不能覆盖这些需要人工处理的原因 |
 | 服务 | **异常关闭**：进程自己退出（崩溃）、被系统杀死、断电或死机后重新启动、操作系统关机或重启 | 是 |
 
 自动恢复由独立监控进程执行（`config.json` 的 `service` 段，`.env` 中 `FUND_AUTO_RESUME=false` 可关闭），必须同时满足：
