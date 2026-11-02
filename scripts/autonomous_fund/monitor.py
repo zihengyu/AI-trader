@@ -307,6 +307,10 @@ class Monitor:
         temporary = self.root / "monitor.tmp"
         temporary.write_text(encode(status), encoding="utf-8")
         temporary.replace(self.root / "monitor.json")
+        try:
+            write_metrics(self.root, status)
+        except Exception:  # Metrics are a convenience; they never affect supervision.
+            pass
         return status
 
     def _deliver(self, now, only=None):
@@ -482,6 +486,56 @@ class Monitor:
         with operator_connection(self.root) as db:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "telegram_command", encode(audit)))
         self.transport.send(text, reply_to=reply_to)
+
+
+def metrics_text(root, status):
+    """Prometheus text exposition of the fund's state, for a node_exporter textfile collector."""
+    import sqlite3
+    from contextlib import closing
+    root = Path(root)
+    lines = ["# HELP fund_monitor_timestamp_seconds When the independent monitor last checked.",
+             "# TYPE fund_monitor_timestamp_seconds gauge",
+             f"fund_monitor_timestamp_seconds {instant(status['at']).timestamp():.0f}",
+             "# HELP fund_healthy 1 when the monitor sees a healthy runner, else 0 (see fund_health_state).",
+             "# TYPE fund_healthy gauge", f"fund_healthy {int(status.get('health') == 'healthy')}",
+             "# TYPE fund_health_state gauge", f'fund_health_state{{state="{status.get("health")}"}} 1',
+             "# TYPE fund_stop_active gauge", f"fund_stop_active {int(bool(status.get('stop_active')))}",
+             "# TYPE fund_disk_free_bytes gauge", f"fund_disk_free_bytes {status.get('disk_free_bytes', 0)}",
+             "# TYPE fund_notifications gauge"]
+    lines += [f'fund_notifications{{state="{state}"}} {count}'
+              for state, count in sorted((status.get("delivery_counts") or {}).items())]
+    book = root / "state.sqlite3"
+    if book.is_file():
+        with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            row = db.execute("SELECT body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
+            peak = db.execute("SELECT value FROM meta WHERE key='peak'").fetchone()
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            pending = (db.execute("SELECT count(*) FROM fund_approvals WHERE state='pending'").fetchone()[0]
+                       if "fund_approvals" in tables else 0)
+        if row:
+            account = json.loads(row[0])
+            equity, cash = float(account["equity"]), float(account["cash"])
+            lines += ["# TYPE fund_equity_usd gauge", f"fund_equity_usd {equity:.2f}",
+                      "# TYPE fund_cash_usd gauge", f"fund_cash_usd {cash:.2f}",
+                      "# TYPE fund_cash_equivalent_usd gauge",
+                      f"fund_cash_equivalent_usd {float(account.get('cash_equivalent_value') or 0):.2f}",
+                      "# TYPE fund_gross_exposure gauge",
+                      f"fund_gross_exposure {(equity - cash) / equity if equity > 0 else 0:.6f}"]
+            try:  # Written raw by the equity marks; JSON-encoded by generic meta writes.
+                high = float(json.loads(peak[0])) if peak else 0.0
+            except (TypeError, ValueError):
+                high = float(peak[0])
+            if high > 0:
+                lines += ["# TYPE fund_drawdown gauge", f"fund_drawdown {max(0.0, 1 - equity / high):.6f}"]
+        lines += ["# TYPE fund_pending_approvals gauge", f"fund_pending_approvals {pending}"]
+    return "\n".join(lines) + "\n"
+
+
+def write_metrics(root, status):
+    root = Path(root)
+    temporary = root / "metrics.prom.tmp"
+    temporary.write_text(metrics_text(root, status), encoding="utf-8")
+    temporary.replace(root / "metrics.prom")
 
 
 class RunnerHeartbeat:

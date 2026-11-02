@@ -53,6 +53,10 @@ def test_native_trader_stop_exits_while_waiting_for_market_open(tmp_path, monkey
         original_sleep(seconds)
 
     monkeypatch.setattr(broker, "sleep", observed_sleep)
+    # The native wait reads the real clock; pin it to this test's Sunday clock (next open Monday
+    # 14:30 UTC) so the test does not fail when it happens to run within an hour of a real open.
+    next_open = datetime(2026, 11, 2, 14, 30, tzinfo=timezone.utc)
+    monkeypatch.setattr(broker, "get_time_to_open", lambda: (next_open - clock.value).total_seconds())
     strategy = AutonomousFund(broker=broker, name="ShutdownSession", parameters={
         "config": config, "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account",
         "observe_only": True})

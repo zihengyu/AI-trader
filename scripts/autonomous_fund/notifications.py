@@ -133,7 +133,8 @@ def daily_document(root, sequence):
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
-                  "决策相对同敞口基准的超额收益（1/5/20 个交易日）：" + json.dumps(decisions, ensure_ascii=False)]
+                  "决策超额收益（1/5/20 个交易日；已扣除组合 beta 对应的市场涨跌，net 再扣交易成本）："
+                  + json.dumps(decisions, ensure_ascii=False)]
         timing = card.get("timing")
         if timing:
             stop, profit = timing["protective_exits"]["stop_loss"], timing["protective_exits"]["take_profit"]
@@ -300,6 +301,14 @@ def readable(kind, details, sequence=None):
                 "已有目标继续执行，止损照常，明天恢复研究。")
     elif kind == "drawdown_pause":
         text = "🚨 回撤触及上限，暂停增加仓位；卖出和止损照常。确认后由人工复位（reset-drawdown）。"
+    elif kind == "construction_switched" and isinstance(details, dict):
+        names = {"ai": "AI 原始权重", "risk_budget": "风险预算（按 AI 权重分配风险贡献）"}
+        test = details.get("test") or {}
+        mean = test.get("mean")
+        text = (f"🔁 组合构建方式切换：{names.get(details.get('from'), details.get('from'))} → "
+                f"{names.get(details.get('to'), details.get('to'))}。依据 {test.get('pairs')} 个交易日的配对比较，"
+                f"日均超额差 {mean * 100:.3f}%，t = {test.get('t_stat'):.2f}。风控上限不变。" if mean is not None and
+                test.get("t_stat") is not None else "🔁 组合构建方式切换：" + str(details))
     if text is None:
         return None
     return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")

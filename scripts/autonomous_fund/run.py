@@ -26,6 +26,9 @@ class ScriptedRuntime:
             body = {"summary": "SCRIPTED mechanical test; no investment research performed.", "evidence": [{
                 "source": "Scripted fixture, not news or fundamentals", "available_at": (now - timedelta(days=1)).isoformat(),
                 "observed_at": now.isoformat(), "estimated": False, "estimate_reason": ""}]}
+        elif request.agent_name == "critic":
+            body = {"summary": "SCRIPTED critique; no research was challenged.", "concerns": [],
+                    "missing_evidence": ["Scripted fixture: no real evidence was reviewed."]}
         elif context.get("phase") == "postmarket_review":
             body = {"session_date": context["session"]["session_date"], "as_of": now.isoformat(),
                     "summary": "SCRIPTED 复盘流程测试；未进行真实模型研究或策略优化。",
@@ -130,7 +133,7 @@ def run_backtest(args, config):
         # Synthetic symbols replace the operator universe, so its symbol groups
         # cannot apply; the default groups filter themselves to this universe.
         quant = {k: v for k, v in (config.get("quant_risk") or {}).items() if k != "groups"}
-        config = {**config, "quant_risk": quant,
+        config = {**config, "quant_risk": quant, "cash_sweep": {"enabled": False},
                   "universe": {"ALFA": "stock", "BETA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
         data, source = {"pandas_data": mock_data()}, PandasDataBacktesting
     elif args.data_dir:
@@ -185,6 +188,9 @@ def check_market(args, config):
     from .market_data import LiveTape, MarketDataSettings, YahooRealtimeData
     from .risk import Limits
     import time
+    from .connectivity import connectivity, summary
+    # Every external service first, each independently: one blocked host must not hide the others.
+    reachability = connectivity(models=selected_models(args, config).values())
     market = MarketDataSettings.from_config(config.get("market_data"))
     tape = LiveTape() if market.live_stream else None
     source = YahooRealtimeData(tape=tape, live_seconds=market.live_seconds)
@@ -197,8 +203,12 @@ def check_market(args, config):
             time.sleep(0.5)
     for symbol in ("SPY", "QQQ"):
         asset = Asset(symbol, asset_type="stock")
-        quote = source.get_quote(asset)
-        daily = source.get_historical_prices(asset, 30, timestep="day").df
+        try:
+            quote = source.get_quote(asset)
+            daily = source.get_historical_prices(asset, 30, timestep="day").df
+        except Exception as exc:
+            observations[symbol] = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+            continue
         observations[symbol] = {"price": quote.price, "source_as_of": quote.timestamp.isoformat(),
                                 "age_seconds": (source.get_datetime() - instant(quote.timestamp)).total_seconds(),
                                 "completed_daily_rows": len(daily), "price_kind": quote.raw_data["price_kind"]}
@@ -218,6 +228,7 @@ def check_market(args, config):
     if network.resolver == "doh":
         research["doh_resolver"] = diagnose(DohResolver(network.doh_url, network.timeout_seconds))
     result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
+              "connectivity": reachability, "connectivity_summary": summary(reachability),
               "research_network": research,
               "source": source.SOURCE, "requires_broker_key": False, "model": selected_models(args, config)["manager"],
               "models": selected_models(args, config),

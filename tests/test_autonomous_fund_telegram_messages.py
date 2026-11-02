@@ -176,3 +176,10 @@ def test_a_portfolio_change_reads_as_buys_sales_and_reasons(tmp_path):
         "at": "2026-11-02T15:00:00+00:00", "first_today": True, "cash_weight": "0.9",
         "changes": [{"symbol": "SPY", "from": "0.1", "to": "0.1"}], "rationale": "维持。", "next_review_at": None})
     assert first.messages[0].startswith("🧭 今日首次复核：维持目标组合")
+
+
+def test_a_construction_switch_is_explained_in_plain_chinese():
+    from scripts.autonomous_fund.notifications import readable
+    text = readable("construction_switched", {"from": "ai", "to": "risk_budget",
+                                              "test": {"pairs": 24, "mean": 0.0004, "t_stat": 2.4}}, 7)
+    assert "风险预算" in text and "24 个交易日" in text and "t = 2.40" in text and "事件 #7" in text

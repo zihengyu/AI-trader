@@ -89,6 +89,8 @@ SETTINGS = {
     "FUND_RESEARCH_MODEL": (("agent_models", "researcher"), str, False, "模型", "研究员模型，例如 deepseek/deepseek-flash"),
     "FUND_DECISION_MODEL": (("agent_models", "manager"), str, False, "模型", "基金经理模型，例如 deepseek/deepseek-v4-pro"),
     "FUND_REASONING_EFFORT": (("reasoning_effort",), _optional, False, "模型", "推理强度 low/medium/high，留空为模型默认"),
+    "FUND_CRITIC": (("critic", "enabled"), _bool, False, "模型", "是否在研究员和基金经理之间加入反方审查（每次决策多一次模型调用）"),
+    "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
     "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
@@ -105,6 +107,11 @@ SETTINGS = {
     "FUND_DAILY_LOSS_LIMIT": (("quant_risk", "daily_loss_limit"), _decimal, False, "约束", "当日亏损达到该比例停止买入"),
     "FUND_TARGET_VOL": (("quant_risk", "target_portfolio_vol"), _decimal, False, "约束", "组合年化波动率目标"),
     "FUND_MAX_ES": (("quant_risk", "max_portfolio_es"), _decimal, False, "约束", "1 日 97.5% 预期尾部损失上限"),
+    "FUND_MAX_SCENARIO_LOSS": (("quant_risk", "max_scenario_loss"), _decimal, False, "约束", "历史危机情景（2008/2020/2022）下组合最大允许亏损"),
+    "FUND_CASH_SWEEP": (("cash_sweep", "enabled"), _bool, False, "约束", "闲置现金自动买入短期国债 ETF（SGOV），买入证券前先卖出筹款"),
+    "FUND_EARNINGS_GUARD": (("events", "enabled"), _bool, False, "约束", "个股财报日（当天或下一个交易日）前自动把权重降到上限以内"),
+    "FUND_EARNINGS_MAX_POSITION": (("events", "earnings_max_position"), _decimal, False, "约束", "财报前单只个股最大权重，例如 0.05"),
+    "FUND_CONSTRUCTION_MODE": (("construction", "mode"), str, False, "约束", "组合构建：ai（AI 原始权重）、risk_budget（按 AI 权重分配风险贡献）或 auto（配对检验显著后自动切换）"),
     # ----- Approval envelope
     "FUND_AUTO_DAILY_EXPOSURE_INCREASE": (("approval", "auto_daily_exposure_increase"), _decimal, False, "审批", "无需审批的单日敞口增幅；0 表示所有买入都要审批"),
     "FUND_AUTO_DAILY_BUY_TURNOVER": (("approval", "auto_daily_buy_turnover"), _decimal, False, "审批", "无需审批的单日买入现金流（占净值）"),
@@ -122,8 +129,10 @@ SETTINGS = {
     "FUND_NEWS_POLL_SECONDS": (("news", "poll_seconds"), _int, False, "外部", "资讯轮询间隔（秒）"),
     "FUND_NEWS_QUERIES": (("news", "queries"), _list, False, "外部", "长期关注的新闻搜索词，多条用 | 分隔"),
     "FUND_NEWS_RSS_FEEDS": (("news", "rss_feeds"), _feeds, False, "外部", "自定义 RSS：名称=https://...，多条用 | 分隔"),
-    "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告"),
-    "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选）"),
+    "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告和按披露日的财报基本面"),
+    "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选；不填用公开 CSV 下载）"),
+    "FUND_MACRO": (("macro", "enabled"), _bool, False, "外部", "是否给 AI 提供 FRED 宏观环境（美债收益率、利差、高收益债利差、VIX）"),
+    "FINNHUB_API_KEY": (None, None, True, "外部", "Finnhub Key（可选）：更可靠的财报日历；不填用 Yahoo"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
     "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
     "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
@@ -270,6 +279,10 @@ def apply_environment(config, environ):
         if groups:
             result["quant_risk"]["groups"] = {name: {**spec, "members": [m for m in spec["members"] if m not in excluded]}
                                               for name, spec in groups.items()}
+        sweep = result.get("cash_sweep")
+        if isinstance(sweep, dict) and sweep.get("symbol") in excluded:
+            # Excluding the sweep symbol turns the sweep off rather than leaving it misconfigured.
+            result["cash_sweep"] = {**sweep, "enabled": False}
         audit.append({"variable": "FUND_EXCLUDE_SYMBOLS", "path": "universe", "value": excluded})
     return result, audit
 

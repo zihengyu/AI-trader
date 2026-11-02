@@ -197,6 +197,38 @@ def shadow_pairs(shadows, closes, horizon=1):
     return [by_day[day] for day in sorted(by_day)]
 
 
+def session_returns(events, sessions, zone):
+    """Session-to-session equity returns from the last account mark of each completed session.
+
+    A pair spanning an operator reserve adjustment is dropped: moving cash in or
+    out of the sleeve is not a return. Returns (returns, benchmark returns,
+    aligned) where aligned says every pair also has SPY marks on both days.
+    """
+    from .risk import instant
+    marks, spy, adjusted = {}, {}, []
+    for at, kind, body in events:
+        moment = instant(at)
+        day = moment.astimezone(zone).date()
+        if kind == "account" and day in sessions:
+            marks[day] = (moment, float(body["equity"]))
+        elif kind == "benchmark" and day in sessions and body.get("SPY"):
+            spy[day] = float(body["SPY"])
+        elif kind == "operator_reserve_adjusted":
+            adjusted.append(moment)
+    days = sorted(marks)
+    returns, market, aligned = [], [], True
+    for a, b in zip(days, days[1:]):
+        (start, before), (end, after) = marks[a], marks[b]
+        if any(start < t <= end for t in adjusted) or before <= 0:
+            continue
+        returns.append(after / before - 1)
+        if a in spy and b in spy and spy[a] > 0:
+            market.append(spy[b] / spy[a] - 1)
+        else:
+            aligned = False
+    return returns, market, aligned and len(market) == len(returns)
+
+
 def acceptance(root, criteria=None, now=None):
     """Readiness evidence for a local/paper run, computed only from its journal."""
     import json
@@ -225,7 +257,7 @@ def acceptance(root, criteria=None, now=None):
                        "telegram_command", "order_submitted", "fill", "fill_reconciled", "fill_details_unavailable",
                        "order_reprice_cancel", "buy_chase_limit", "protective_trigger", "agent", "decision_backoff",
                        "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation",
-                       "auto_resume"))
+                       "auto_resume", "benchmark", "decision_validated"))
     zone = ZoneInfo("America/New_York")
     startups = [b for _, k, b in events if k == "startup"]
     interval = ((startups[-1].get("execution") or {}).get("iteration_seconds") or 60) if startups else 60
@@ -311,8 +343,16 @@ def acceptance(root, criteria=None, now=None):
                 if value is not None or name == "max_mean_slippage_bps" else False}
                for name, value, threshold, test in checks]
     mode = startups[-1].get("mode") if startups else None
-    return {"as_of": now.isoformat(), "mode": mode, "verdict": "ready" if all(r["passed"] for r in results) else "not_ready",
-            "criteria": results, "metrics": metrics,
+    verdict = "ready" if all(r["passed"] for r in results) else "not_ready"
+    from .performance import capital_stage, evidence
+    returns, market, aligned = session_returns(events, {day for day, _, _ in sessions}, zone)
+    configurations = (len({b.get("prompt_version") or "unversioned" for _, k, b in events if k == "decision_validated"})
+                      or 1) * (len({b.get("risk_policy_digest") for b in startups}) or 1)
+    stats = evidence(returns, market if aligned else None, configurations)
+    limit = ((startups[-1].get("limits") or {}).get("drawdown")) if startups else None
+    stage = capital_stage(verdict, stats, drawdown, float(limit) if limit is not None else None)
+    return {"as_of": now.isoformat(), "mode": mode, "verdict": verdict,
+            "criteria": results, "metrics": metrics, "performance_evidence": stats, "capital_stage": stage,
             "limitations": "Operational readiness evidence from this journal only. It does not prove profitability; "
                            "a local virtual book is not broker evidence, and live trading needs separate approval."}
 
@@ -325,7 +365,21 @@ def acceptance_markdown(result):
         shown = f"{value:.4g}" if isinstance(value, float) else str(value)
         lines.append(f"| {row['criterion']} | {shown} | {row['threshold']} | {'通过' if row['passed'] else '未通过'} |")
     metrics = result["metrics"]
-    lines += ["", "## 关键指标", "", "```json", json_dump(metrics), "```", "", result["limitations"], ""]
+    stats, stage = result.get("performance_evidence") or {}, result.get("capital_stage") or {}
+    regression = stats.get("benchmark_regression") or {}
+    def pct(value):
+        return f"{value * 100:.1f}%" if isinstance(value, (int, float)) else "—"
+    lines += ["", "## 业绩证据（是能力还是运气）", "",
+              f"- 交易日：{stats.get('sessions')}；年化夏普：{stats.get('sharpe_annualized')}",
+              f"- 真实夏普 > 0 的概率（PSR）：{pct(stats.get('probabilistic_sharpe'))}；"
+              f"扣除 {stats.get('configurations_tried')} 种配置试错后的概率（DSR）：{pct(stats.get('deflated_sharpe'))}",
+              f"- 达到 95% 置信所需的最短记录：{stats.get('min_track_record_sessions')} 个交易日",
+              f"- 相对 SPY：beta {regression.get('beta')}，年化 alpha {regression.get('alpha_annualized')}，"
+              f"alpha t 值 {regression.get('alpha_t')}",
+              "", f"## 分阶段资金就绪度：**{stage.get('stage')}**", ""]
+    lines += [f"- {reason}" for reason in stage.get("reasons", [])] or ["- 全部条件满足"]
+    lines += ["", stage.get("notice", ""),
+              "", "## 关键指标", "", "```json", json_dump(metrics), "```", "", result["limitations"], ""]
     return "\n".join(lines)
 
 

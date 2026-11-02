@@ -98,6 +98,27 @@ def test_manager_failure_still_backs_off_and_success_clears_its_state(tmp_path):
     assert strategy.journal.get_meta("decision_failure_role") is None
 
 
+def test_failed_optional_critic_still_reaches_manager_without_research(tmp_path):
+    from scripts.autonomous_fund.strategy import CriticSettings
+    strategy, calls = live_manager(tmp_path)
+    strategy.critic, strategy._critic_ready = CriticSettings(), True
+    good_run = strategy._agent_call
+
+    def run(name, **kwargs):
+        if name == "critic":
+            calls.append((name, kwargs["context"]))
+            raise OSError("synthetic optional critic outage")
+        return good_run(name, **kwargs)
+
+    strategy._agent_call = run
+    strategy._decide(account(), NOW, False)
+    assert [name for name, _ in calls] == ["critic", "manager"]
+    assert calls[-1][1]["critique"] is None
+    assert calls[-1][1]["research_status"]["state"] == "unavailable"
+    assert strategy.last_decision is not None
+    assert not strategy.journal.get_meta("decision_retry_at")
+
+
 @pytest.mark.parametrize("role", ["researcher", "manager", None])
 def test_restart_migrates_only_a_proven_legacy_researcher_backoff(tmp_path, role):
     strategy, _ = live_manager(tmp_path)
@@ -179,7 +200,7 @@ def test_native_open_and_restart_after_failed_research(tmp_path, monkeypatch):
     clock = Clock()
     clock.value = NOW - timedelta(hours=1)
     source = YahooRealtimeData(now=clock, fetch=clock.fetch)
-    config = {"model": "deepseek/deepseek-flash", "reasoning_effort": None, "limits": {},
+    config = {"model": "deepseek/deepseek-flash", "reasoning_effort": None, "limits": {}, "critic": {"enabled": False},
               "universe": {"ALFA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
     journal = Journal(tmp_path, account_digest("local", "local-virtual-account", config))
     calls = []

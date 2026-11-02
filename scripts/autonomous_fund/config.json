@@ -13,8 +13,15 @@
     "XOM": "stock", "COST": "stock", "PG": "stock", "HD": "stock",
     "SPY": "unlevered_etf", "QQQ": "unlevered_etf", "IWM": "unlevered_etf", "DIA": "unlevered_etf",
     "VTI": "unlevered_etf", "XLK": "unlevered_etf", "XLF": "unlevered_etf", "XLV": "unlevered_etf",
-    "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf"
+    "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf",
+    "IEF": "unlevered_etf", "TLT": "unlevered_etf", "GLD": "unlevered_etf",
+    "SGOV": "cash_equivalent"
   },
+  "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02"},
+  "events": {"enabled": true, "earnings_max_position": "0.05", "earnings_window_days": 1, "source": "auto"},
+  "macro": {"enabled": true, "history_days": 400},
+  "construction": {"mode": "auto", "min_pairs": 20, "switch_t_stat": 2.0},
+  "critic": {"enabled": true, "model": null},
   "quant_risk": {
     "vol_lookback_days": 63,
     "es_lookback_days": 252,
@@ -36,6 +43,12 @@
     "stress_annual_vol": "0.35",
     "rebalance_band": "0.005",
     "min_trade_notional": "100",
+    "correlation_lookback_days": 252,
+    "correlation_lambda": "0.97",
+    "correlation_shrinkage": "0.25",
+    "max_scenario_loss": "0.35",
+    "stress_scenarios": {"gfc_2008": ["2008-09-01", "2009-03-09"], "covid_2020": ["2020-02-19", "2020-03-23"],
+                         "rates_2022": ["2022-01-03", "2022-10-12"]},
     "groups": {
       "technology": {"limit": "0.30", "members": ["AAPL", "MSFT", "NVDA", "XLK"]},
       "communication": {"limit": "0.20", "members": ["GOOGL", "META"]},
@@ -45,7 +58,8 @@
       "energy": {"limit": "0.15", "members": ["XOM", "XLE"]},
       "consumer_staples": {"limit": "0.25", "members": ["COST", "PG", "XLP"]},
       "us_growth_megacap": {"limit": "0.35", "members": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]},
-      "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]}
+      "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]},
+      "treasury_duration": {"limit": "0.30", "members": ["IEF", "TLT"]}
     }
   },
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
@@ -98,7 +112,15 @@
     "holdout_min_t": 1.0,
     "live_min_observations": 10,
     "max_proposals_per_review": 5,
-    "max_active": 8
+    "max_active": 8,
+    "cost_bps": 10.0,
+    "max_redundancy": 0.7,
+    "research_universe": [
+      "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "NFLX", "DIS", "T", "VZ",
+      "TSLA", "MCD", "LOW", "BKNG", "WMT", "KO", "PEP", "PM", "LLY", "MRK", "ABBV", "PFE",
+      "TMO", "BAC", "WFC", "GS", "MS", "AXP", "CVX", "COP", "CAT", "HON", "GE", "UNP",
+      "RTX", "LIN", "NEE", "PLD"
+    ]
   },
   "model_prices_per_million": null
 }

@@ -6,9 +6,13 @@ daily history that already exists. It has no model, broker or network access.
 
 Invariants:
 - Every transformation is a monotone reduction: name caps, group caps, the
-  drawdown exposure budget, then one uniform scale for the volatility target and
-  the 97.5% expected-shortfall limit. A reduction can never create a new limit
-  breach, so the result satisfies every constraint at once.
+  drawdown exposure budget, then one uniform scale for the volatility target,
+  the 97.5% expected-shortfall limit and the historical stress-window loss
+  limit. A reduction can never create a new limit breach, so the result
+  satisfies every constraint at once.
+- Correlations come from a longer, slower window than volatilities and are
+  shrunk toward the average correlation; stress windows are used only after
+  they ended and a name without history in a window is proxied pessimistically.
 - Missing or insufficient history is never filled in. Such a symbol cannot be
   increased and is valued with a deliberately pessimistic volatility and
   correlation, so missing data shrinks, never expands, the permitted risk.
@@ -42,6 +46,16 @@ DEFAULT_GROUPS = {
     "consumer_staples": ("0.25", ["COST", "PG", "XLP"]),
     "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]),
     "us_broad_index": ("0.40", ["SPY", "VTI", "DIA", "IWM", "QQQ"]),
+    "treasury_duration": ("0.30", ["IEF", "TLT"]),
+}
+
+# Historical stress windows (peak to trough of the benchmark, approximately).
+# Each is applied as a buy-and-hold loss of the CURRENT weights; a window is used
+# only after it has ended, so a historical run never sees a later crisis.
+DEFAULT_SCENARIOS = {
+    "gfc_2008": ("2008-09-01", "2009-03-09"),
+    "covid_2020": ("2020-02-19", "2020-03-23"),
+    "rates_2022": ("2022-01-03", "2022-10-12"),
 }
 
 
@@ -50,6 +64,42 @@ def _fraction(value, name, low=Decimal("0"), high=Decimal("1"), inclusive_low=Fa
     if not ((low <= result) if inclusive_low else (low < result)) or result > high:
         raise RiskError(f"Invalid quantitative risk setting: {name}")
     return result
+
+
+def _scenarios(config):
+    """{name: [start, end]} -> sorted ((name, start, end)); ISO dates with start < end, at most 10."""
+    from datetime import date
+    if not isinstance(config, dict) or len(config) > 10:
+        raise RiskError("stress_scenarios must map up to 10 names to [start, end] dates")
+    result = []
+    for name, window in sorted(config.items()):
+        try:
+            start, end = (str(value) for value in window)
+            if not name or date.fromisoformat(start) >= date.fromisoformat(end):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise RiskError(f"stress_scenarios.{name} must be [start, end] ISO dates with start before end") from None
+        result.append((str(name), start, end))
+    return tuple(result)
+
+
+def window_return(rows, start, end, tolerance_days=7):
+    """Close-to-close return over [start, end] from completed daily closes, or None if not covered.
+
+    Coverage means the history begins within `tolerance_days` after `start` and
+    reaches within `tolerance_days` of `end`; a name listed during the window, or
+    whose history stops before it ended, has no return (never extrapolated).
+    """
+    from datetime import date, timedelta
+    ordered = sorted((str(day)[:10], float(close)) for day, close in rows or [] if close and close > 0)
+    inside = [(day, close) for day, close in ordered if start <= day <= end]
+    if not inside:
+        return None
+    slack = timedelta(days=tolerance_days)
+    first, last = date.fromisoformat(inside[0][0]), date.fromisoformat(inside[-1][0])
+    if first > date.fromisoformat(start) + slack or last < date.fromisoformat(end) - slack:
+        return None
+    return inside[-1][1] / inside[0][1] - 1
 
 
 @dataclass(frozen=True)
@@ -77,6 +127,15 @@ class QuantPolicy:
     stress_annual_vol: Decimal = Decimal("0.35")
     rebalance_band: Decimal = Decimal("0.005")
     min_trade_notional: Decimal = Decimal("100")
+    # Correlations need far more data than volatilities: a slower decay over a
+    # longer window, shrunk toward the average correlation (constant-correlation
+    # target), so a few unusual weeks do not swing the portfolio volatility.
+    correlation_lookback_days: int = 252
+    correlation_lambda: Decimal = Decimal("0.97")
+    correlation_shrinkage: Decimal = Decimal("0.25")
+    # Buy-and-hold loss of the current weights in each historical stress window.
+    max_scenario_loss: Decimal = Decimal("0.35")
+    stress_scenarios: tuple = tuple((name, start, end) for name, (start, end) in sorted(DEFAULT_SCENARIOS.items()))
     groups: tuple = ()
     etf_symbols: tuple = ()
 
@@ -84,6 +143,8 @@ class QuantPolicy:
     def from_config(cls, section, universe, limits):
         section = dict(section or {})
         groups_config = section.pop("groups", None)
+        if "stress_scenarios" in section:
+            section["stress_scenarios"] = _scenarios(section["stress_scenarios"])
         unknown = set(section) - {f for f in cls.__dataclass_fields__ if f not in {"groups", "etf_symbols"}}
         if unknown:
             raise RiskError("Unknown quantitative risk settings: " + ", ".join(sorted(unknown)))
@@ -107,17 +168,22 @@ class QuantPolicy:
     def __post_init__(self):
         for key, value in asdict(self).items():
             if key in {"vol_lookback_days", "es_lookback_days", "min_history_days", "es_min_observations",
-                       "stress_benchmark", "groups", "etf_symbols"}:
+                       "stress_benchmark", "groups", "etf_symbols", "correlation_lookback_days", "stress_scenarios"}:
                 continue
             object.__setattr__(self, key, number(value))
 
     def validate(self, limits):
-        for key in ("vol_lookback_days", "es_lookback_days", "min_history_days", "es_min_observations"):
+        for key in ("vol_lookback_days", "es_lookback_days", "min_history_days", "es_min_observations",
+                    "correlation_lookback_days"):
             if type(getattr(self, key)) is not int or not 5 <= getattr(self, key) <= 1000:
                 raise RiskError(f"Invalid quantitative risk setting: {key}")
         if self.min_history_days > min(self.vol_lookback_days, self.es_lookback_days):
             raise RiskError("min_history_days must not exceed the risk lookbacks")
         _fraction(self.ewma_lambda, "ewma_lambda", Decimal("0.5"), Decimal("0.999"))
+        _fraction(self.correlation_lambda, "correlation_lambda", Decimal("0.5"), Decimal("0.999"))
+        _fraction(self.correlation_shrinkage, "correlation_shrinkage", inclusive_low=True)
+        _fraction(self.max_scenario_loss, "max_scenario_loss")
+        _scenarios({name: (start, end) for name, start, end in self.stress_scenarios})
         for key in ("min_annual_vol", "unknown_annual_vol", "target_portfolio_vol", "max_portfolio_es",
                     "max_name_risk", "max_etf_name_risk", "max_adv_participation", "drawdown_soft", "daily_loss_limit",
                     "stress_day_drop", "stress_annual_vol"):
@@ -167,10 +233,20 @@ def daily_returns(rows, sessions=None):
 
 
 class RiskEstimate:
-    """EWMA covariance (annualized) and aligned historical return scenarios."""
+    """EWMA volatilities, shrunk EWMA correlations, historical return scenarios and stress windows.
 
-    def __init__(self, histories, policy):
+    Volatility uses the fast `ewma_lambda` over `vol_lookback_days`. Correlation
+    uses the slower `correlation_lambda` over `correlation_lookback_days`, then is
+    shrunk toward the average pairwise correlation by `correlation_shrinkage`.
+    A pair involving a flat series stays perfectly correlated (conservative) and
+    is excluded from the shrinkage target. `scenarios` maps a stress-window name
+    to {"benchmark": return or None, "returns": {symbol: return or None}}.
+    """
+
+    def __init__(self, histories, policy, scenarios=None):
         self.policy = policy
+        self.benchmark = policy.stress_benchmark
+        self.scenarios = dict(scenarios or {})
         sessions = {str(day) for rows in histories.values() for day, _ in rows}
         returns = {symbol: daily_returns(rows, sessions) for symbol, rows in histories.items()}
         usable = {s for s, r in returns.items() if len(r) >= policy.min_history_days}
@@ -187,33 +263,67 @@ class RiskEstimate:
         self.observations = len(common)
         self.through = common[-1] if common else None
         if not self.symbols:
-            self.raw_vol, self.vol, self.cov, self.scenarios = {}, {}, np.zeros((0, 0)), np.zeros((0, 0))
+            self.raw_vol, self.vol, self.cov = {}, {}, np.zeros((0, 0))
+            self.correlation, self.scenarios_history = np.zeros((0, 0)), np.zeros((0, 0))
             return
         matrix = np.array([[returns[s][day] for s in self.symbols] for day in common], dtype=float)
-        self.scenarios = matrix[-policy.es_lookback_days:]
-        recent = matrix[-policy.vol_lookback_days:]
-        lam = float(policy.ewma_lambda)
-        weights = np.array([(1 - lam) * lam ** k for k in range(len(recent))][::-1])
-        weights /= weights.sum()
-        daily_cov = (recent * weights[:, None]).T @ recent
-        raw = np.sqrt(np.clip(np.diag(daily_cov), 0, None) * TRADING_DAYS)
-        floor = float(policy.min_annual_vol)
-        vol = np.maximum(raw, floor)
-        corr = np.ones_like(daily_cov)
-        for i in range(len(self.symbols)):
-            for j in range(len(self.symbols)):
-                if i != j and raw[i] > 0 and raw[j] > 0:
-                    corr[i, j] = np.clip(daily_cov[i, j] * TRADING_DAYS / (raw[i] * raw[j]), -1, 1)
-                # Undefined correlation (a flat series) is assumed perfect: conservative.
-        self.cov = np.outer(vol, vol) * corr
+        self.scenarios_history = matrix[-policy.es_lookback_days:]
+        raw = np.sqrt(np.clip(np.diag(_ewma_cov(matrix[-policy.vol_lookback_days:], policy.ewma_lambda)), 0, None)
+                      * TRADING_DAYS)
+        vol = np.maximum(raw, float(policy.min_annual_vol))
+        self.correlation = _shrunk_correlation(_ewma_cov(matrix[-policy.correlation_lookback_days:],
+                                                         policy.correlation_lambda),
+                                               float(policy.correlation_shrinkage))
+        self.cov = np.outer(vol, vol) * self.correlation
         self.raw_vol = dict(zip(self.symbols, raw.tolist()))
         self.vol = dict(zip(self.symbols, vol.tolist()))
 
     def annual_vol(self, symbol):
         return self.vol.get(symbol, float(self.policy.unknown_annual_vol))
 
+    def beta(self, symbol):
+        """Ex-ante beta to the stress benchmark, or None when either has no estimate."""
+        if symbol == self.benchmark:
+            return 1.0
+        if symbol not in self.symbols or self.benchmark not in self.symbols:
+            return None
+        i, b = self.symbols.index(symbol), self.symbols.index(self.benchmark)
+        return float(self.cov[i, b] / self.cov[b, b]) if self.cov[b, b] > 0 else None
+
+    def _scenario_return(self, name, symbol):
+        """(return, proxied). A missing window is never milder than the benchmark's own loss."""
+        scenario = self.scenarios[name]
+        value = (scenario.get("returns") or {}).get(symbol)
+        if value is not None:
+            return float(value), False
+        market = float(scenario["benchmark"])
+        if market >= 0:
+            return 0.0, True
+        beta = self.beta(symbol)
+        if beta is None:
+            # No history at all: the same pessimism as its volatility assumption.
+            beta = float(self.policy.unknown_annual_vol) / max(self.annual_vol(self.benchmark), 1e-9)
+        return market * max(1.0, beta), True
+
+    def scenario_losses(self, weights):
+        losses, proxied, unavailable = {}, {}, []
+        for name in sorted(self.scenarios):
+            if self.scenarios[name].get("benchmark") is None:
+                unavailable.append(name)
+                continue
+            total, used = 0.0, []
+            for symbol, weight in weights.items():
+                value, proxy = self._scenario_return(name, symbol)
+                total += weight * value
+                if proxy:
+                    used.append(symbol)
+            losses[name] = -total
+            if used:
+                proxied[name] = sorted(used)
+        return losses, proxied, unavailable
+
     def metrics(self, weights):
-        """Ex-ante annual volatility and 1-day 97.5% ES as fractions of equity."""
+        """Ex-ante annual volatility, 1-day 97.5% ES and stress-window losses as fractions of equity."""
         weights = {s: float(w) for s, w in weights.items() if float(w) > 0}
         known = [s for s in self.symbols if s in weights]
         unknown = [s for s in weights if s not in self.vol]
@@ -228,16 +338,49 @@ class RiskEstimate:
         vol = math.sqrt(max(variance, 0.0))
         parametric = vol / math.sqrt(TRADING_DAYS) * NORMAL_ES_975
         historical = None
-        if known and len(self.scenarios) >= self.policy.es_min_observations:
-            pnl = np.sort(self.scenarios[:, index] @ w)
+        if known and len(self.scenarios_history) >= self.policy.es_min_observations:
+            pnl = np.sort(self.scenarios_history[:, index] @ w)
             tail = max(1, math.ceil(0.025 * len(pnl)))
             historical = float(-pnl[:tail].mean())
             if unknown:
                 historical += sum(weights[s] for s in unknown) * float(self.policy.unknown_annual_vol) / math.sqrt(
                     TRADING_DAYS) * NORMAL_ES_975
         es = max(parametric, historical if historical is not None else 0.0)
+        losses, proxied, unavailable = self.scenario_losses(weights)
+        worst = max(losses, key=losses.get) if losses else None
         return {"annual_vol": vol, "es_975_1d": es, "es_parametric": parametric, "es_historical": historical,
-                "gross_exposure": sum(weights.values())}
+                "gross_exposure": sum(weights.values()), "scenario_losses": losses,
+                "worst_scenario": worst, "worst_scenario_loss": losses[worst] if worst else None,
+                "scenario_proxied": proxied, "scenarios_unavailable": unavailable}
+
+
+def _ewma_cov(returns, lam):
+    """Exponentially weighted (uncentered) daily covariance of the rows of `returns`, newest last."""
+    lam = float(lam)
+    weights = np.array([(1 - lam) * lam ** k for k in range(len(returns))][::-1])
+    weights /= weights.sum()
+    return (returns * weights[:, None]).T @ returns
+
+
+def _shrunk_correlation(cov, shrinkage):
+    """Correlation from `cov`, shrunk toward the average defined pairwise correlation.
+
+    Undefined pairs (a flat series) are set to 1 and kept there. A convex mix of
+    a correlation matrix and a constant-correlation matrix stays positive semidefinite.
+    """
+    n = len(cov)
+    sd = np.sqrt(np.clip(np.diag(cov), 0, None))
+    corr = np.ones((n, n))
+    defined = np.zeros((n, n), dtype=bool)
+    for i in range(n):
+        for j in range(n):
+            if i != j and sd[i] > 0 and sd[j] > 0:
+                corr[i, j] = np.clip(cov[i, j] / (sd[i] * sd[j]), -1, 1)
+                defined[i, j] = True
+    if shrinkage > 0 and defined.any():
+        target = float(corr[defined].mean())
+        corr = np.where(defined, (1 - shrinkage) * corr + shrinkage * target, corr)
+    return corr
 
 
 def drawdown_scale(drawdown, policy, hard):
@@ -324,6 +467,11 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
     if before["es_975_1d"] > float(policy.max_portfolio_es):
         scale = min(scale, float(policy.max_portfolio_es) / before["es_975_1d"])
         binding.append("expected_shortfall")
+    worst = before["worst_scenario_loss"]
+    if worst is not None and worst > float(policy.max_scenario_loss):
+        # Losses are linear in the weights, so one uniform scale meets the limit exactly.
+        scale = min(scale, float(policy.max_scenario_loss) / worst)
+        binding.append("scenario_stress")
     result = {s: _floor(w * scale) for s, w in weights.items()}
     result = {s: w for s, w in result.items() if w > 0}
     after = estimate.metrics(result)
@@ -331,6 +479,9 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
     tolerance = 1e-9
     if (after["annual_vol"] > float(policy.target_portfolio_vol) + tolerance or
             after["es_975_1d"] > float(policy.max_portfolio_es) + tolerance or
+            # Flooring a name that GAINED in a window can add at most one weight step of loss per name.
+            (after["worst_scenario_loss"] or 0) > float(policy.max_scenario_loss) + tolerance + len(result) * float(
+                WEIGHT_STEP) or
             sum(result.values()) > number(budget) + Decimal("0.000001")):
         raise RiskError("Quantitative construction failed its own post-condition")
     for name, cap, members in policy.groups:
@@ -347,3 +498,48 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
         "missing_history": sorted(estimate.missing & (set(targets) | set(current))),
         "observations": estimate.observations, "history_through": estimate.through,
     }
+
+
+def risk_budget(targets, estimate, iterations=500, tolerance=1e-10):
+    """Re-weight the AI's names so each one's risk contribution is proportional to its AI weight.
+
+    The AI's weights are treated as risk budgets b (selection and conviction), the
+    gross exposure is kept, and the risk engine's limits still apply afterwards.
+    Solved by cyclical coordinate descent on min 1/2 x'Cx - sum(b ln x), whose
+    unique positive solution has risk contributions x_i (Cx)_i proportional to b_i
+    even with negative correlations. Names without a covariance estimate keep the
+    AI's weight. Returns Decimal weights rounded down to the weight step.
+    """
+    positive = {s: float(w) for s, w in targets.items() if float(w) > 0}
+    names = [s for s in sorted(positive) if s in estimate.vol]
+    if len(names) < 2:
+        return {s: number(w) for s, w in targets.items()}
+    index = [estimate.symbols.index(s) for s in names]
+    cov = estimate.cov[np.ix_(index, index)]
+    budgets = np.array([positive[s] for s in names])
+    budgets = budgets / budgets.sum()
+    x = budgets / np.sqrt(np.diag(cov))
+    for _ in range(iterations):
+        previous = x.copy()
+        for i in range(len(names)):
+            other = float(cov[i] @ x - cov[i, i] * x[i])
+            x[i] = (-other + math.sqrt(other * other + 4 * cov[i, i] * budgets[i])) / (2 * cov[i, i])
+        if np.max(np.abs(x - previous) / np.maximum(previous, 1e-12)) < tolerance:
+            break
+    gross = sum(positive[s] for s in names)
+    x = x / x.sum() * gross
+    result = {s: number(w) for s, w in targets.items() if s not in names}
+    result.update({s: _floor(value) for s, value in zip(names, x)})
+    return result
+
+
+def risk_contributions(weights, estimate):
+    """Fraction of ex-ante portfolio variance from each name (known names only)."""
+    names = [s for s in sorted(weights) if float(weights[s]) > 0 and s in estimate.vol]
+    if not names:
+        return {}
+    index = [estimate.symbols.index(s) for s in names]
+    w = np.array([float(weights[s]) for s in names])
+    marginal = estimate.cov[np.ix_(index, index)] @ w
+    total = float(w @ marginal)
+    return {s: float(w[i] * marginal[i] / total) for i, s in enumerate(names)} if total > 0 else {}

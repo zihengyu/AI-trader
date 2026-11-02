@@ -55,8 +55,31 @@ restart/allocation and plan-approval regressions use the updated manager-only
 call expectation while retaining their order/fill assertions. No provider
 inference or brokerage request is used for these tests.
 
-The focused 13-file regression selection passes 268 tests. The modified public
-documentation page also builds successfully with the repository's Sphinx setup.
+Before integrating the deployed branch, the focused 13-file regression selection
+passed 268 tests. The modified public documentation page also builds successfully
+with the repository's Sphinx setup. The integrated version retains the deployed
+prompt constants/fingerprints, macro/factor/risk construction, cash sweep and
+optional critique. A critique uses the same saved research context, is skipped
+when the remaining budget is needed by the manager, and its failure still does
+not set manager backoff. No new specialist researcher call precedes a live
+manager assessment.
+
+Final integration validation passes 68 focused handoff/native-execution/critic
+tests, 54 complete-session and historical/replay tests, and 7 model SDK tests
+using mock responses. Across the broader run and these repairs/rechecks, 595
+distinct tests pass. The broader selection is not entirely green: 14 unmodified
+Windows/platform checks fail (Bash/WSL execution, Linux service paths/sandbox
+permissions, process termination and Windows backup file locking). Two tests
+skip and three previously identified Linux/POSIX checks were excluded. These
+results do not qualify an Ubuntu deployment. The SDK tests run outside the
+restricted Windows sandbox because its loopback socket restrictions block
+asyncio event-loop creation; they still use synthetic keys and mocked HTTP.
+
+The integrated tree preserves the deployed `a72046a5` application/configuration
+outside the scheduling, diagnostics, handoff, documentation and regression
+changes. Its branch is a parent of the integration commit, allowing an ordinary
+merge from the deployed branch without manually cherry-picking conflicting
+strategy changes. The `.env.example` and `config.json` match that deployed tree.
 
 This is a phase handoff, not a threaded scheduler: existing pre-open/post-close
 hooks and runtime timeouts remain synchronous. It removes the intraday research

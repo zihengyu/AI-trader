@@ -52,8 +52,12 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
 
     # 1. Decision (+ one blind shadow), automatic purchase inside the envelope, fill.
     strategy.on_trading_iteration()
-    assert [(name, phase) for name, phase, _ in seen] == [("researcher", None), ("manager", None), ("manager", None)]
+    # Opening assessments use saved research and no new researcher call; the
+    # optional critique remains shared by the trading and shadow managers.
+    assert [(name, phase) for name, phase, _ in seen] == [("critic", None), ("manager", None),
+                                                          ("manager", None)]
     assert seen[2][2]["strategy_memory"] is None  # The shadow arm is the no-memo baseline.
+    assert seen[2][2]["critique"] == seen[1][2]["critique"] is not None  # Both arms see the same critique.
     step(2)
     assert [p.quantity for p in broker._pull_positions(strategy.name)] == [4]  # 5% of $10,000 at ~$100 with buffer.
     # 2. The price falls through the AI's stop: a protective sale needs no approval.
