@@ -1018,6 +1018,11 @@ class AutonomousFund(Strategy):
             except RiskError:
                 continue  # No fresh evidence: nothing is triggered from stale data.
         equity = number(account.equity)
+        for symbol in sorted(s for s, level in levels.items() if level["state"] == "triggered"
+                             and s not in account.positions):
+            # The exit completed; a newer decision's deferred levels for it take effect now.
+            self.execution.finish_level(symbol)
+            levels = self.execution.levels()
         for symbol in sorted(set(levels) & set(account.positions)):
             level, price = levels[symbol], prices.get(symbol)
             if price is None:
@@ -1387,7 +1392,9 @@ class AutonomousFund(Strategy):
         auto_budget = max(number(0), min(rooms["auto_exposure"], rooms["auto_turnover"], hard_budget))
         if stressed and policy.stress_requires_approval:
             auto_budget = number(0)
-        blocked = set()
+        # No purchase of a symbol whose protective exit is still in progress, even
+        # when a newer decision targets it: the stop completes first.
+        blocked = set(self.execution.exiting())
         # AI entry levels: buy only while the ask is at or below the chosen price,
         # and never below the AI's own stop for that symbol.
         for symbol, level in decision_levels(active["decision"]).items():
@@ -1521,7 +1528,7 @@ class AutonomousFund(Strategy):
             raise RiskError("Orders require an open regular market session")
         if self.mode == "paper":
             assert_paper(self.broker)
-        cap = max_submissions or self.limits.daily_orders
+        cap = self.limits.daily_orders if max_submissions is None else max_submissions
         with self.journal.connection() as db:
             blocked = self.journal.blocked(db, intent, now, cap)
         if blocked:

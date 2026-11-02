@@ -85,7 +85,7 @@ class Journal:
     def reserve(self, intent, now, limits, guard=None, max_submissions=None):
         """Commit BEFORE contacting the broker. Ambiguous calls remain reserved."""
         key = uuid4().hex
-        cap = max_submissions or limits.daily_orders
+        cap = limits.daily_orders if max_submissions is None else max_submissions
         with self.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if self.blocked(db, intent, now, cap):
@@ -96,10 +96,6 @@ class Journal:
                 key, trading_day(now), encode(asdict(intent)), None, "reserved", str(now)))
         self.event(now, "intent_reserved", {"id": key, **asdict(intent)})
         return key
-
-    def submissions(self, now):
-        with self.connection() as db:
-            return db.execute("SELECT count(*) FROM intents WHERE day=?", (trading_day(now),)).fetchone()[0]
 
     def update(self, key, broker_id, terminal, now):
         with self.connection() as db:

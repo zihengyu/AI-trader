@@ -288,19 +288,28 @@ class LocalPaperBroker(Broker):
         friction = self.slippage + self.data_source.spread / 2
         raw = number(bar.high) * (1 + friction) if buy else number(bar.low) * (1 - friction)
         price = raw.quantize(Decimal("0.01"), rounding=ROUND_CEILING if buy else ROUND_FLOOR)
-        cash, _, equity = self._get_balances_at_broker(None, order.strategy)
         # Fill-time checks use the operator's capital sleeve, never reserved cash.
         reserve = self.journal.reserve_cash()
-        equity = number(equity) - reserve
-        paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
-        # Every holding used to admit a fill needs a fresh source observation.
-        marks = {}
-        for position in self._pull_positions(order.strategy):
-            quote = self.data_source.get_quote(position.asset)
-            age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
-            if not 0 <= age <= self.limits.quote_max_seconds:
-                raise RiskError("Stale holding mark; virtual fills paused")
-            marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
+        paused, marks, equity = False, {}, number(0)
+        if buy:
+            # Admitting a purchase needs the whole book valued from fresh source observations.
+            _, _, equity = self._get_balances_at_broker(None, order.strategy)
+            equity = number(equity) - reserve
+            paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
+            for position in self._pull_positions(order.strategy):
+                quote = self.data_source.get_quote(position.asset)
+                age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
+                if not 0 <= age <= self.limits.quote_max_seconds:
+                    raise RiskError("Stale holding mark; virtual fills paused")
+                marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
+        else:
+            # A risk-reducing sale never waits on OTHER holdings' marks. Its own bar
+            # must still postdate an applied split, or the sale would be mispriced.
+            with self.journal.connection() as db:
+                splits = [row[0].rsplit(":", 2)[1] for row in db.execute(
+                    "SELECT id FROM local_actions WHERE id LIKE ?", (f"{order.asset.symbol}:%:split",))]
+            if splits and trading_day(start) < max(splits):
+                raise RiskError("Price predates applied split; virtual fills paused")
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM local_orders WHERE id=?", (identifier,)).fetchone()
@@ -360,6 +369,8 @@ class LocalPaperBroker(Broker):
         # receivables because Yahoo does not establish the actual payment date.
         with self.journal.connection() as db:
             positions = [dict(row) for row in db.execute("SELECT * FROM local_positions WHERE quantity>0")]
+            # Read once; a write lock is only taken for an action not seen before.
+            known = {row[0]: number(row[1]) for row in db.execute("SELECT id,amount FROM local_actions")}
         for position in positions:
             asset = Asset(position["symbol"], asset_type="stock")
             actions = self.data_source.corporate_actions(asset, since=position["opened_at"])
@@ -371,12 +382,14 @@ class LocalPaperBroker(Broker):
                     if amount == 0:
                         continue
                     key = f"{asset.symbol}:{action['date']}:{kind}"
+                    if key in known:
+                        self._same_action(kind, known[key], amount, action, actions)
+                        continue
                     with self.journal.connection() as db:
                         db.execute("BEGIN IMMEDIATE")
                         prior = db.execute("SELECT amount FROM local_actions WHERE id=?", (key,)).fetchone()
                         if prior:
-                            if number(prior[0]) != amount:
-                                raise RiskError("Corporate action revision requires operator reconciliation")
+                            self._same_action(kind, number(prior[0]), amount, action, actions)
                             continue
                         row = db.execute("SELECT * FROM local_positions WHERE symbol=?", (asset.symbol,)).fetchone()
                         if kind == "split":
@@ -395,6 +408,26 @@ class LocalPaperBroker(Broker):
                             db.execute("UPDATE local_account SET receivables=? WHERE id=1", (str(receivable + entitled * amount),))
                         db.execute("INSERT INTO local_actions VALUES(?,?)", (key, str(amount)))
                         self._event(db, "local_corporate_action", {"symbol": asset.symbol, **action, "kind": kind})
+
+    @staticmethod
+    def _same_action(kind, recorded, amount, action, actions):
+        """An already-applied action reported again; only a genuine revision needs the operator.
+
+        Yahoo restates earlier dividends for later splits (0.40 becomes 0.20 after a
+        2:1 split): the cash entitlement booked with pre-split shares is unchanged.
+        """
+        tolerance = number("0.0001") * max(abs(recorded), abs(amount))
+        if abs(recorded - amount) <= tolerance:
+            return
+        if kind == "dividend":
+            factor = number(1)
+            for later in actions:
+                split = number(later.get("split", 0) or 0)
+                if later["date"] > action["date"] and split > 0:
+                    factor *= split
+            if factor != 1 and abs(recorded / factor - amount) <= tolerance:
+                return
+        raise RiskError("Corporate action revision requires operator reconciliation")
 
     @staticmethod
     def _exdate(date):

@@ -14,6 +14,7 @@ import pytest
 from scripts.autonomous_fund import stops
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.risk import RiskError
+from .test_autonomous_fund_autonomy import sent_orders  # noqa: F401  (pytest fixture)
 from .test_autonomous_fund_monitor import NOW, FakeTelegram, heartbeat, setup
 
 
@@ -286,3 +287,126 @@ def test_a_bad_volume_value_never_costs_a_symbols_risk_history(tmp_path):
     strategy.get_historical_prices = lambda asset, length, timestep="day": type("Bars", (), {"df": frame})()
     assert [c for _, c in strategy._daily_closes("ALFA", QUANT_NOW)] == [100.0, 101.0, 102.0, 103.0, 104.0]
     assert not any(r["kind"] == "risk_history_unavailable" for r in strategy.journal.all_events())
+
+
+# ----- Third review: the order, approval, level and local-book core ------------------------
+
+def test_a_reused_approval_must_cover_the_new_exposure_and_turnover(tmp_path):
+    from .test_autonomous_fund_execution import NOW as EXEC_NOW, authorize, envelope, setup as exec_setup
+    journal, state, account, active = exec_setup(tmp_path)
+    first = state.request(active, envelope(max_exposure_after="0.45"), EXEC_NOW)
+    authorize(tmp_path, first)
+    second = state.request(active, envelope(max_exposure_after="0.47"), EXEC_NOW + timedelta(minutes=1))
+    assert second["id"] != first["id"]  # A new request the operator is told about, not a silent stall.
+    third = state.request(active, envelope(max_exposure_after="0.47", max_buy_turnover_usd="12000"),
+                          EXEC_NOW + timedelta(minutes=2))
+    assert third["id"] != second["id"]
+    asked = [r for r in journal.all_events() if r["kind"] == "notification" and
+             r["body"]["kind"] == "approval_required"]
+    assert len(asked) == 3
+
+
+def test_a_triggered_stop_keeps_selling_after_a_new_decision_and_blocks_rebuying_meanwhile(tmp_path, sent_orders):
+    from .test_autonomous_fund_autonomy import accept, account, at, quote, watching
+    strategy = watching(tmp_path, {"ALFA": quote(94)})
+    accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 95}], when=at(-30))
+    assert strategy._watch(account(9530, {"ALFA": 5}, price=94), at(0))  # Stop triggered, sale sent.
+    first = strategy.journal.pending()[0]["id"]
+    # The stop woke the AI: a new decision arrives before the sale fills, keeping ALFA with a new stop.
+    new = accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 90}], when=at(0))
+    level = strategy.execution.levels()["ALFA"]
+    assert level["state"] == "triggered" and level["protective_target"] == "0"
+    strategy.journal.update(first, "order-1", True, at(2))  # The first sale was canceled unfilled.
+    assert strategy._watch(account(9530, {"ALFA": 5}, price=94), at(3))  # The exit is resumed, not abandoned.
+    assert str(sent_orders[-1].side) == "sell"
+    strategy.journal.update(strategy.journal.pending()[0]["id"], "order-2", True, at(4))
+    rebuy = strategy._candidates(new, account(), {"ALFA": quote(96)}, at(0))
+    assert rebuy["orders"] == []  # No purchase while the stop exit is still in progress.
+    strategy._watch(account(10000, {}, price=96), at(5))  # The exit completed.
+    level = strategy.execution.levels()["ALFA"]
+    assert level["state"] == "active" and level["stop_loss"] == "90"  # The new decision's levels now apply.
+
+
+def test_a_stale_mark_on_another_holding_never_blocks_a_risk_reducing_sale(tmp_path):
+    from lumibot.entities import Asset
+    from .test_autonomous_fund_local import advance, setup_book, submit
+    clock, source, journal, broker = setup_book(tmp_path)
+    key, bought = submit(broker, journal, clock.value)
+    advance(clock, source)
+    broker.do_polling()
+    journal.update(key, bought.identifier, True, clock.value)  # The purchase is reconciled and terminal.
+    with journal.connection() as db:
+        db.execute("INSERT INTO local_positions VALUES('BETA', 5, '100', ?)", (str(clock.value),))
+    stale = source.get_quote(Asset("BETA"))
+    original = source.get_quote
+    source.get_quote = lambda asset, *a, **k: stale if asset.symbol == "BETA" else original(asset, *a, **k)
+    _, order = submit(broker, journal, clock.value, quantity=5, side="sell", limit=99)
+    advance(clock, source, 10)
+    broker.do_polling()
+    assert broker._pull_order(order.identifier, "LocalTest").status == "fill"
+
+
+def test_a_split_adjusted_dividend_restatement_does_not_halt_the_local_book(tmp_path):
+    from .test_autonomous_fund_local import advance, setup_book, submit
+    clock, source, journal, broker = setup_book(tmp_path)
+    submit(broker, journal, clock.value)
+    advance(clock, source)
+    broker.do_polling()
+    paid = (clock.value + timedelta(days=1)).date().isoformat()
+    clock.value += timedelta(days=3)
+    clock.actions = [(paid, 0, 0.40)]
+    source._cache.clear()
+    broker._corporate_actions()
+    assert broker.receivables() == pytest.approx(2.0)
+    split = clock.value.date().isoformat()
+    clock.price, clock.high = 50, 50.01
+    clock.actions = [(paid, 0, 0.20), (split, 2, 0)]  # Yahoo restates the earlier dividend for the split.
+    source._cache.clear()
+    broker._get_balances_at_broker(None, "LocalTest")
+    assert broker.receivables() == pytest.approx(2.0) and broker._pull_positions("LocalTest")[0].quantity == 10
+    clock.actions = [(paid, 0, 0.35), (split, 2, 0)]  # A genuine revision still needs the operator.
+    source._cache.clear()
+    with pytest.raises(RiskError, match="revision"):
+        broker._corporate_actions()
+
+
+def test_a_take_profit_must_be_above_the_entry_limit():
+    from scripts.autonomous_fund.risk import validate_decision
+    from .test_autonomous_fund_autonomy import LIMITS, UNIVERSE, decision_body
+    from .test_autonomous_fund_autonomy import NOW as AUTO_NOW
+    with pytest.raises(RiskError, match="take-profit"):
+        validate_decision(decision_body([{"symbol": "ALFA", "weight": .05, "entry_limit": 100, "stop_loss": 95,
+                                          "take_profit": 99}], when=AUTO_NOW), AUTO_NOW, UNIVERSE, LIMITS)
+
+
+def test_an_explicit_zero_submission_budget_allows_nothing(tmp_path):
+    from scripts.autonomous_fund.risk import Intent, Limits, number
+    journal = Journal(tmp_path, "synthetic-zero-budget")
+    with pytest.raises(RiskError, match="daily submission limit"):
+        journal.reserve(Intent("ALFA", "sell", 1, number(100)), NOW, Limits(), max_submissions=0)
+
+
+def test_a_missing_session_never_becomes_a_two_day_return_in_the_risk_scenarios():
+    from scripts.autonomous_fund.quant import daily_returns
+    rows = [("2026-10-26", 100.0), ("2026-10-28", 110.0), ("2026-10-29", 111.1)]  # 10-27 missing here only.
+    sessions = ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29"]
+    assert daily_returns(rows, sessions) == pytest.approx({"2026-10-29": 0.01})
+    assert set(daily_returns(rows)) == {"2026-10-28", "2026-10-29"}  # Without a calendar, as before.
+
+
+def test_a_sale_is_never_filled_at_a_price_from_before_an_applied_split(tmp_path):
+    import pandas as pd
+    from types import SimpleNamespace
+    from .test_autonomous_fund_local import advance, setup_book, submit
+    clock, source, journal, broker = setup_book(tmp_path)
+    key, bought = submit(broker, journal, clock.value)
+    advance(clock, source)
+    broker.do_polling()
+    journal.update(key, bought.identifier, True, clock.value)
+    split_day = (clock.value + timedelta(days=1)).date().isoformat()
+    with journal.connection() as db:  # A 2:1 split already applied to the book (shares doubled).
+        db.execute("INSERT INTO local_actions VALUES(?,?)", (f"ALFA:{split_day}:split", "2"))
+    _, order = submit(broker, journal, clock.value, quantity=5, side="sell", limit=1)
+    pre_split_bar = SimpleNamespace(high=100.0, low=100.0, volume=1e6)
+    with pytest.raises(RiskError, match="predates"):
+        broker._fill_bar(order.identifier, order, pd.Timestamp(clock.value), pre_split_bar)
