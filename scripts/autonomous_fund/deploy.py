@@ -78,6 +78,10 @@ def main(argv=None):
     setup.add_argument("--run-dir", type=Path, help="Fix the account directory; default: .env FUND_RUN_DIR or artifacts/fund-<mode>")
     setup.add_argument("--env-file", type=Path, default=Path(".env"))
     setup.add_argument("--output-dir", type=Path, default=Path("artifacts/fund-systemd"))
+    only = sub.add_parser("units", help="Write the two unit files only: no STOP, no .env (used by fund-start.sh)")
+    only.add_argument("--user", required=True)
+    only.add_argument("--env-file", type=Path, default=Path(".env"))
+    only.add_argument("--output-dir", type=Path, default=Path("artifacts/fund-systemd"))
     copy = sub.add_parser("backup")
     copy.add_argument("--run-dir", type=Path, required=True)
     copy.add_argument("--output-dir", type=Path, required=True)
@@ -90,6 +94,13 @@ def main(argv=None):
         raise RiskError("Generate service paths on the target Linux host, not Windows")
     args.env_file = args.env_file.resolve()
     repo = Path(__file__).resolve().parents[2]
+    if args.action == "units":
+        # Regenerating the units never changes trading state.
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        for filename, body in generate(repo, None, args.env_file, args.user, None).items():
+            (args.output_dir / filename).write_text(body, encoding="utf-8")
+            print(args.output_dir / filename)
+        return
     units = generate(repo, args.run_dir.resolve() if args.run_dir else None, args.env_file, args.user, args.mode)
     args.output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     (repo / "artifacts").mkdir(exist_ok=True)

@@ -508,6 +508,61 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
+    def _announce_decision(self, decision, now):
+        """Tell the operator when the AI changes the target portfolio, and its first plan
+        each day; an unchanged review (within one weight point) sends nothing."""
+        if self.mode not in {"local", "paper"}:
+            return
+        try:
+            new = {t["symbol"]: number(t["weight"]) for t in decision["targets"] if number(t["weight"]) > 0}
+            old = {s: number(w) for s, w in (self.journal.get_meta("notified_targets") or {}).items()}
+            day = trading_day(now)
+            first_today = self.journal.get_meta("notified_targets_day") != day
+            changed = set(new) != set(old) or any(abs(new[s] - old[s]) >= number("0.01") for s in new)
+            if not (changed or first_today):
+                return
+            levels = decision_levels(decision)
+            changes = []
+            for symbol in sorted(set(new) | set(old)):
+                row = {"symbol": symbol, "from": str(old.get(symbol, number(0))), "to": str(new.get(symbol, number(0)))}
+                row.update({k: v for k, v in (levels.get(symbol) or {}).items()
+                            if k in {"entry_limit", "stop_loss", "take_profit"}})
+                changes.append(row)
+            self.journal.set_meta("notified_targets", {s: str(w) for s, w in new.items()})
+            self.journal.set_meta("notified_targets_day", day)
+            self._disclose("decision_changed", {
+                "at": str(now), "first_today": first_today and not changed, "changes": changes,
+                "cash_weight": str(max(number(0), 1 - sum(new.values(), number(0)))),
+                "rationale": str(decision.get("rationale") or "")[:1500], "next_review_at": decision.get("next_review_at")})
+        except Exception as exc:  # An announcement must never cost the decision.
+            self.log_message(f"Decision announcement skipped: {type(exc).__name__}", color="yellow")
+
+    def _announce_session_open(self, now, account=None):
+        """Once per trading day, at the first iteration of the regular session: trading
+        begins (or, while STOP is active, will not), with the account and today's research."""
+        if self.mode not in {"local", "paper"}:
+            return
+        try:
+            if not self.broker.is_market_open():
+                return
+            day = trading_day(now)
+            if self.journal.get_meta("session_open_notified") == day:
+                return
+            from . import stops
+            from .market_data import SessionClock
+            record = stops.read(self.halt_path.parent)
+            research = (getattr(self, "premarket_research", None) or {}).get("research") or {}
+            close = SessionClock(now=lambda: instant(now)).status().get("close")
+            self.journal.set_meta("session_open_notified", day)
+            self._disclose("session_open", {
+                "session_date": day, "mode": self.mode, "close": close,
+                "stop": {"class": record["class"], "reason": record["reason"]} if record else None,
+                "account": {"equity": str(account.equity), "cash": str(account.cash),
+                            "positions": {s: str(q) for s, q in account.positions.items()}} if account else None,
+                "research_summary": (research.get("summary") or "")[:600] or None})
+        except Exception as exc:  # An announcement must never cost the iteration.
+            self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
+
     def _research_before_open(self):
         if self.mode not in {"local", "paper"} or self.observe_only or self.halt_path.exists():
             return
@@ -552,6 +607,12 @@ class AutonomousFund(Strategy):
                       "model": result.model, "cache_hit": result.cache_hit}
             self.journal.event(self.get_datetime(), "premarket_research", packet)
             self.premarket_research = packet
+            # The operator reads the research on Telegram before the session.
+            self._disclose("premarket_research", {
+                "session_open": opens_at.isoformat(), "phase": slot, "summary": research["summary"],
+                "evidence_count": len(research["evidence"]),
+                "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
+                             for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except Exception as exc:
             self._disclose("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
@@ -783,6 +844,7 @@ class AutonomousFund(Strategy):
                         order = self.broker._pull_order(pending["broker_id"], self.name)
                     if order and not self._terminal(order):
                         self._request_cancel(pending, order, now)
+                self._announce_session_open(now)
                 try:
                     # Confirmed cancels and fills become terminal, so the monitor can
                     # tell that no order is unresolved and resume a restart's STOP.
@@ -804,6 +866,7 @@ class AutonomousFund(Strategy):
             self._reconcile()
             account = self._snapshot()
             now = self.get_datetime()
+            self._announce_session_open(now, account)
             if self.mode == "local":
                 self.journal.event(now, "market_status", self.broker.data_source.session.status())
                 if self.observe_only:
@@ -910,6 +973,7 @@ class AutonomousFund(Strategy):
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
+        self._announce_decision(decision, now)
         try:
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:

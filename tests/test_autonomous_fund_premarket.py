@@ -204,6 +204,8 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
     assert strategy.agents["manager"].allow_trading is False
     assert calls[-1][1]["premarket_research"]["phase"] == "before_market_opens"
     assert len(journal.pending()) == 1
+    assert any(r["kind"] == "notification" and r["body"]["kind"] == "decision_changed"
+               for r in journal.all_events())  # The operator hears about the day's first portfolio.
     identifier = journal.pending()[0]["broker_id"]
     clock.value += timedelta(minutes=2)
     source._cache.clear()

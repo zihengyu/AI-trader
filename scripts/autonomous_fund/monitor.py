@@ -347,7 +347,13 @@ class Monitor:
                               self.transport.send_document(message[:900] + "\n完整理由见附件。",
                                   f"approval-{body['details']['id']}.txt", message))
                 else:
-                    result = self.transport.send(text)
+                    from .notifications import LONG_MESSAGE, readable
+                    message = readable(body.get("kind"), body.get("details"), row["sequence"]) or text
+                    if len(message) <= LONG_MESSAGE:
+                        result = self.transport.send(message)
+                    else:  # A long research text arrives whole, as a document.
+                        result = self.transport.send_document(message.split("\n", 1)[0] + "\n内容较长，见附件。",
+                                                              f"{body.get('kind')}-{row['sequence']}.txt", message)
             except Exception:
                 # Never persist third-party exceptions (may contain credentials).
                 result = {"ok": False, "error": "report_or_delivery_error", "retry_after": 30}

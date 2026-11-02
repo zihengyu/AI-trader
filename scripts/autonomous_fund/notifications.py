@@ -178,3 +178,128 @@ def daily_document(root, sequence):
                   session["limitations"], "", "## 原始研究", "", packet["research"]["summary"], "",
                   encode(packet["research"]["evidence"])])
     return f"daily-{day}.md", "\n".join(lines)
+
+
+# ----- Readable operator notices ---------------------------------------------------------------
+
+LONG_MESSAGE = 3800  # Telegram allows 4096 characters; longer texts go as a document.
+
+
+def _when(value):
+    """New York time and the server's local time; never guesses an unknown time."""
+    try:
+        moment = instant(value)
+    except (TypeError, ValueError):
+        return "未知"
+    return (f"美东 {moment.astimezone(ZoneInfo('America/New_York')):%m-%d %H:%M}"
+            f" · 本地 {moment.astimezone():%m-%d %H:%M}")
+
+
+def _stop_text(stop):
+    from . import stops
+    from .status import CLASSES, REASONS
+    label = f"{CLASSES.get(stop.get('class'), stop.get('class'))}：{REASONS.get(stop.get('reason'), stop.get('reason'))}"
+    if stop.get("class") == "operator":
+        hint = "运行 bash scripts/fund-start.sh 确认恢复"
+    elif stops.resumable({"class": stop.get("class"), "reason": stop.get("reason")}):
+        hint = "满足条件后会自动恢复"
+    else:
+        hint = "需要先处理原因再恢复"
+    return label, hint
+
+
+def readable(kind, details, sequence=None):
+    """Chinese text for the notices an operator reads most; None keeps the generic format."""
+    from .settings import MODES
+    from .status import REASONS
+    details = details if details is not None else {}
+    text = None
+    if kind == "premarket_research":
+        phase = {"before_market_opens": "开盘前", "closed_startup": "休市期间"}.get(details.get("phase"), "盘前")
+        lines = [f"📊 盘前研究 · {phase}（开盘 {_when(details.get('session_open'))}）", "", details.get("summary") or ""]
+        evidence = details.get("evidence") or []
+        if evidence:
+            lines += ["", f"证据 {details.get('evidence_count', len(evidence))} 条："]
+            lines += [f"• {e.get('source')}（{_when(e.get('available_at') or e.get('observed_at'))}）" for e in evidence]
+        lines += ["", "这只是研究：开盘后由 AI 决策，并经过风控后才会下单。"]
+        text = "\n".join(lines)
+    elif kind == "session_open":
+        lines = [f"🔔 美股开盘 · {details.get('session_date')}"]
+        stop = details.get("stop")
+        if stop:
+            label, hint = _stop_text(stop)
+            lines.append(f"交易：暂停（{label}）——{hint}")
+        else:
+            lines.append("交易：运行中")
+        mode = details.get("mode")
+        lines.append(f"模式：{mode}（{MODES.get(mode, mode)}）")
+        account = details.get("account")
+        if account:
+            held = "、".join(f"{s}×{q}" for s, q in (account.get("positions") or {}).items()) or "无"
+            lines.append(f"账户：净值 {account.get('equity')}，现金 {account.get('cash')}，持仓 {held}")
+        if details.get("research_summary"):
+            lines.append(f"今日盘前研究要点：{details['research_summary']}")
+        if details.get("close"):
+            lines.append(f"收盘：{_when(details['close'])}")
+        if not stop:
+            lines.append("AI 会在开盘后复核并决定今天的组合；买入在自动额度内直接执行，超出额度会发审批请求。")
+        text = "\n".join(lines)
+    elif kind == "decision_changed" and isinstance(details, dict):
+        def percent(value):
+            return f"{float(value) * 100:g}%"
+
+        def levels(row):
+            parts = [f"{label} {row[key]}" for key, label in (("entry_limit", "入场 ≤"), ("stop_loss", "止损"),
+                                                                ("take_profit", "止盈")) if row.get(key)]
+            return f"（{'，'.join(parts)}）" if parts else ""
+        changes = details.get("changes") or []
+        header = ("🧭 今日首次复核：维持目标组合" if details.get("first_today") else "🧭 AI 调整目标组合")
+        lines = [f"{header}（{_when(details.get('at'))}）"]
+        for label, rows in (("买入／加仓", [r for r in changes if float(r["to"]) > float(r["from"])]),
+                            ("卖出／减仓", [r for r in changes if float(r["to"]) < float(r["from"])]),
+                            ("不变", [r for r in changes if float(r["to"]) == float(r["from"])])):
+            for row in rows:
+                if label == "不变":
+                    lines.append(f"不变：{row['symbol']} {percent(row['to'])}{levels(row)}")
+                else:
+                    lines.append(f"{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
+        lines.append(f"现金约 {percent(details.get('cash_weight') or 0)}")
+        if details.get("rationale"):
+            lines += ["", f"理由：{details['rationale']}"]
+        if details.get("next_review_at"):
+            lines.append(f"下次复核：{_when(details['next_review_at'])}")
+        lines.append("权重是上限：风控可能按波动、尾部风险等再缩小；买入在自动额度内直接执行，超出额度会发审批。")
+        text = "\n".join(lines)
+    elif kind == "stop_active" and isinstance(details, dict):
+        label, hint = _stop_text(details)
+        text = f"⏸ 交易已停止（{label}）——{hint}；期间不会下新单。"
+    elif kind == "auto_resumed" and isinstance(details, dict):
+        text = f"▶️ 已自动恢复交易（之前因{REASONS.get(details.get('stop_reason'), details.get('stop_reason'))}停止）。"
+    elif kind == "auto_resume_blocked":
+        text = "⚠️ 未能自动恢复：有状态不明的订单，请到券商核对后运行 bash scripts/fund-start.sh。"
+    elif kind == "auto_resume_exhausted" and isinstance(details, dict):
+        text = (f"⚠️ 未能自动恢复：24 小时内已自动恢复 {details.get('resumes_last_24h')} 次，达到上限。"
+                "请运行 bash scripts/fund-logs.sh errors 查看原因，再运行 bash scripts/fund-start.sh。")
+    elif kind == "watchdog_stop" and isinstance(details, dict):
+        reason = details.get("reason")
+        _, hint = _stop_text({"class": "watchdog", "reason": reason})
+        text = f"🚨 监控停止交易：{REASONS.get(reason, reason)}（{reason}）——{hint}。"
+    elif kind == "watchdog_recovered":
+        automatic = "resumes by itself" in str(details)
+        text = "✅ 健康已恢复：" + ("满足条件后会自动恢复交易。" if automatic else "交易仍需确认后恢复（bash scripts/fund-start.sh）。")
+    elif kind == "server_supervision_stop":
+        text = f"🚨 服务监督停止交易：{REASONS.get(str(details), details)}（{details}）。"
+    elif kind == "bot_crash":
+        text = f"🚨 交易进程崩溃（{details}）：服务会自动重启，监控确认安全后才恢复交易。"
+    elif kind == "blocked":
+        text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
+    elif kind == "bookkeeping_error":
+        text = f"⚠️ 记账步骤出错，下一轮自动重试：{details}"
+    elif kind == "model_budget_exhausted" and isinstance(details, dict):
+        text = (f"ℹ️ 今日模型调用预算已用完（{details.get('runs')}/{details.get('limit')}）："
+                "已有目标继续执行，止损照常，明天恢复研究。")
+    elif kind == "drawdown_pause":
+        text = "🚨 回撤触及上限，暂停增加仓位；卖出和止损照常。确认后由人工复位（reset-drawdown）。"
+    if text is None:
+        return None
+    return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")
