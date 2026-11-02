@@ -6,6 +6,22 @@ Common Mistakes and How to Avoid Them
 
 This page documents the most common mistakes made when writing Lumibot strategies, along with the correct patterns to use instead.
 
+Pre-Open Hooks Delayed on a Non-UTC Server
+--------------------------------------------------------------------------------
+
+Continuous local, paper and live strategies should select the same opening
+instant regardless of the server timezone. The shared broker clock now uses an
+explicitly timezone-aware UTC instant when selecting the next session. Earlier
+versions could interpret a local wall clock as UTC, choose tomorrow's session and
+miss today's ``before_market_opens()`` hook and opening bell. Background telemetry
+could continue while the strategy slept.
+
+Deploy the corrected runtime and restart an affected runner so its existing long
+wait is recalculated. Keep its account state and inspect the normal STOP and order
+status before resuming. Changing a strategy's timezone or pre-open buffer is not
+needed to compensate for this bug. Alpaca's provider-clock overrides and
+backtesting's simulated clock retain their existing behavior.
+
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------
 
