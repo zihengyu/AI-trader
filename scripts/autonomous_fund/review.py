@@ -31,6 +31,15 @@ class Prediction(BaseModel):
     hypothesis_ref: str = Field(default="", max_length=200)
 
 
+class FactorProposal(BaseModel):
+    """A candidate factor in the factor lab grammar; deterministic code tests it, it never trades."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    name: str = Field(min_length=1, max_length=80)
+    expression: str = Field(min_length=1, max_length=300)
+    horizon_sessions: int = Field(ge=1, le=20)
+    hypothesis: str = Field(min_length=1, max_length=600)
+
+
 class PostmarketReview(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     session_date: str
@@ -45,6 +54,7 @@ class PostmarketReview(BaseModel):
     strategy_memo: str = Field(min_length=1, max_length=6000)
     predictions: list[Prediction] = Field(default_factory=list, max_length=10)
     mandate_compliance: str = Field(default="", max_length=2000)
+    factor_proposals: list[FactorProposal] = Field(default_factory=list, max_length=5)
 
 
 def _events(journal, now, kinds=None):
@@ -219,6 +229,7 @@ def review_after_close(strategy):
                "limits": asdict(strategy.limits), "strategy_memory": memory,
                "strategy_followup": strategy._strategy_evaluations(),
                "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
+               "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
                "session": _inputs(rows, session, now)}
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
@@ -255,6 +266,11 @@ def review_after_close(strategy):
                     "（symbol、direction=up/down/outperform/underperform、horizon_sessions 1-20、benchmark、"
                     "hypothesis_ref 指向对应调整），之后会被自动打分。"
                     "在 mandate_compliance 中逐条核对当日决策是否遵守 operator_mandate 的约束，如有偏离必须说明。"
+                    "阅读 factor_lab：已验证因子的样本内、样本外和验证后的实盘记录，以及被拒绝或退役的因子。"
+                    "可在 factor_proposals 中按 factor_lab.grammar 提出最多 5 个新的因子表达式（name、expression、"
+                    "horizon_sessions 1-20、hypothesis），优先基于复盘中发现的选股或择时规律；代码会用无前视的历史数据"
+                    "做横截面 rank IC 检验，每多试一个表达式门槛都会提高，结果在下一次决策和复盘中提供。"
+                    "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。", context=context,
         output_schema=PostmarketReview)
     review = PostmarketReview.model_validate(strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()
@@ -272,6 +288,16 @@ def review_after_close(strategy):
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)
+    lab = getattr(strategy, "factor_lab", None)
+    if lab is not None and review["factor_proposals"]:
+        try:
+            close, volume = strategy._factor_panel(now)
+            if close is None:
+                raise RiskError("Factor history unavailable")
+            lab.test(review["factor_proposals"], strategy.get_datetime(), day, close, volume)
+        except Exception as exc:  # Evidence tooling must never cost the saved review.
+            strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {
+                "session_date": day, "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
     if scorecards:
         strategy.journal.event(strategy.get_datetime(), "scorecard", {"session_date": day, **scorecards})
     strategy.log_message(f"Post-market review saved for {day}; strategy memory v{packet['version']} is available.")

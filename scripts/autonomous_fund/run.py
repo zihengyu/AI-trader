@@ -271,7 +271,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -295,6 +295,10 @@ def main(argv=None):
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
     parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
+    parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
+    parser.add_argument("--expression", help="factor-lab: factor expression; use --expression=-vol(60) when it starts with '-'")
+    parser.add_argument("--horizon", type=int, default=5, help="factor-lab: forward horizon in sessions (1-20)")
+    parser.add_argument("--min-names", type=int, help="factor-lab: minimum names per date (default from config)")
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
@@ -393,6 +397,9 @@ def main(argv=None):
     if args.mode == "validate-risk":
         print(json.dumps(validate_risk(args, config), indent=2, ensure_ascii=False))
         return
+    if args.mode == "factor-lab":
+        print(json.dumps(factor_lab(args, config), indent=2, ensure_ascii=False, default=str))
+        return
     if args.mode == "acceptance":
         from .validation import ValidationSettings, acceptance, acceptance_markdown
         result = acceptance(args.run_dir, ValidationSettings.from_config(config.get("validation")).acceptance)
@@ -442,6 +449,39 @@ def main(argv=None):
         else:
             run_backtest(args, config)
         print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
+
+
+def factor_lab(args, config):
+    """Offline: test one factor expression on recorded daily CSVs (Date, Close and optional Volume)."""
+    import pandas as pd
+    from .factors import FactorSettings, canonical, evaluate
+    if not args.data_dir or not args.symbols or not args.expression:
+        raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
+    section = dict(config.get("factor_lab") or {})
+    if args.min_names:
+        section["min_names"] = args.min_names
+    settings = FactorSettings.from_config(section)
+    closes, volumes = {}, {}
+    for symbol in [s.strip().upper() for s in args.symbols.split(",") if s.strip()]:
+        path = Path(args.data_dir) / f"{symbol}.csv"
+        if not path.is_file():
+            raise RiskError(f"Missing history file {path.name}")
+        frame = pd.read_csv(path)
+        columns = {c.lower(): c for c in frame.columns}
+        if "date" not in columns or "close" not in columns:
+            raise RiskError(f"{path.name} needs Date and Close columns (daily bars)")
+        index = pd.to_datetime(frame[columns["date"]].astype(str).str[:10])
+        closes[symbol] = pd.Series(frame[columns["close"]].astype(float).to_numpy(), index=index)
+        shares = frame[columns["volume"]].astype(float).to_numpy() if "volume" in columns else float("nan")
+        volumes[symbol] = pd.Series(shares, index=index)
+    close = pd.DataFrame(closes).sort_index()
+    volume = pd.DataFrame(volumes).reindex(index=close.index, columns=close.columns)
+    expression = canonical(args.expression)
+    result = evaluate(expression, args.horizon, close, volume, settings, trials=1)
+    return {"expression": expression, "horizon_sessions": args.horizon, "names": close.shape[1],
+            "first_close": str(close.index[0].date()), "last_close": str(close.index[-1].date()),
+            "note": "One offline test (trials=1). In the running fund every distinct expression raises the bar.",
+            **result}
 
 
 def validate_risk(args, config):

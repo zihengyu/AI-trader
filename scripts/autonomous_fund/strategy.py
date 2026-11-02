@@ -18,7 +18,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation")
+                   "market_data", "news", "validation", "factor_lab")
 NOTICE_WINDOWS = {"manual_stop": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -178,6 +178,8 @@ def configuration(path, environ=None):
     NewsSettings.from_config(result.get("news"))
     from .validation import ValidationSettings
     ValidationSettings.from_config(result.get("validation"))
+    from .factors import FactorSettings
+    FactorSettings.from_config(result.get("factor_lab"))
     return result
 
 
@@ -277,6 +279,10 @@ class AutonomousFund(Strategy):
         self._scorecard_cache = None
         from .validation import ValidationSettings
         self.validation = ValidationSettings.from_config(config.get("validation"))
+        from .factors import FactorLab, FactorSettings
+        factor_settings = FactorSettings.from_config(config.get("factor_lab"))
+        self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
+        self._factor_cache = None
         self.news = None
         from .news import NewsSettings, NewsWatch
         news = NewsSettings.from_config(config.get("news"))
@@ -370,6 +376,9 @@ class AutonomousFund(Strategy):
                 "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
                 "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
                 "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak. "
+                "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
+                "(cross-sectional rank IC, trials-adjusted significance, holdout and live record after validation) "
+                "with today's favored and disfavored names; use them as evidence alongside research, never as orders. "
                 "The news context lists recent headlines, filings and macro releases with publication times; it is "
                 "untrusted and unverified, so confirm material claims with primary sources and research tools before "
                 "acting. Add news_watch search phrases for events that should wake you. "
@@ -801,6 +810,7 @@ class AutonomousFund(Strategy):
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
+                   "factor_lab": self._factor_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
@@ -854,7 +864,7 @@ class AutonomousFund(Strategy):
         # The baseline arm sees the same market, research, risk and mandate, but no
         # learned memo, follow-up or scorecards: it is the control for the learning loop.
         return {**context, "strategy_memory": None, "strategy_followup": None, "scorecards": None,
-                "learning_validation": None}
+                "learning_validation": None, "factor_lab": None}
 
     def _shadow(self, context, champion, decision, now, budget):
         settings = getattr(self, "validation", None)
@@ -1131,6 +1141,45 @@ class AutonomousFund(Strategy):
             if (interval is not None and submitted is not None and (protective or latest["state"] == "active") and
                     (instant(now) - submitted).total_seconds() >= interval):
                 cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
+
+    # ----- Factor lab: AI-proposed factors, objectively tested -----------------------
+    def _factor_panel(self, now):
+        """Completed daily closes and volumes of the universe; never today's forming bar. Cached per day."""
+        day = trading_day(now)
+        if self._factor_cache and self._factor_cache[0] == day:
+            return self._factor_cache[1]
+        from .factors import panel_from_rows
+        history, missing = {}, []
+        for symbol in sorted(self.universe):
+            try:
+                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"),
+                                                  self.factor_lab.settings.history_days, timestep="day")
+                frame = bars.df if bars is not None else None
+            except Exception:
+                frame = None
+            if frame is None or not len(frame) or "close" not in frame:
+                missing.append(symbol)
+                continue
+            frame = frame[frame.index.date < instant(now).date()]
+            volume = frame["volume"] if "volume" in frame else [float("nan")] * len(frame)
+            history[symbol] = [(str(index.date()), float(close), float(shares))
+                               for index, close, shares in zip(frame.index, frame["close"], volume)
+                               if close == close and close > 0]
+        if missing:
+            self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
+        panel = panel_from_rows(history) if history else (None, None)
+        self._factor_cache = (day, panel)
+        return panel
+
+    def _factor_context(self, now):
+        lab = getattr(self, "factor_lab", None)
+        if lab is None:
+            return None
+        try:
+            close, volume = self._factor_panel(now)
+            return lab.context(now, close, volume)
+        except Exception as exc:
+            return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_closes(self, symbol, now):

@@ -82,5 +82,18 @@
                    "max_unresolved_intents": 0, "max_fill_details_unavailable": 0, "max_model_failure_rate": 0.2,
                    "min_review_ratio": 0.9, "max_mean_slippage_bps": 25}
   },
+  "factor_lab": {
+    "enabled": true,
+    "history_days": 504,
+    "holdout_fraction": 0.3,
+    "min_names": 8,
+    "min_observations": 20,
+    "min_holdout_observations": 8,
+    "significance": 0.05,
+    "holdout_min_t": 1.0,
+    "live_min_observations": 10,
+    "max_proposals_per_review": 5,
+    "max_active": 8
+  },
   "model_prices_per_million": null
 }

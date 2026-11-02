@@ -1438,7 +1438,7 @@ envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER`
 ``FUND_STRESS_REQUIRES_APPROVAL``, ``FUND_APPROVAL_VALID_MINUTES``) and external
 parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
-``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``). Values are
+``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``, ``FUND_FACTOR_LAB``). Values are
 validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.env`` file fails startup
 with a suggestion, and ``show-config`` prints effective values and their sources with
 secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of

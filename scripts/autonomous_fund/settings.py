@@ -124,6 +124,7 @@ SETTINGS = {
     "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告"),
     "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选）"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
+    "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
     "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
     "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),

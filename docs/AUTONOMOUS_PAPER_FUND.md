@@ -97,7 +97,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 通知 | `FUND_TELEGRAM_BOT_TOKEN`、`FUND_TELEGRAM_CHAT_ID`、`FUND_TELEGRAM_APPROVER_IDS`、`FUND_TELEGRAM_APPROVALS` | Telegram 通知与回复审批 |
 | 外部 | `FUND_ITERATION_SECONDS`、`FUND_LIVE_STREAM`、`FUND_RESEARCH_RESOLVER` | 盯盘间隔、实时推送报价、研究网页解析（Fake-IP 用 `doh`） |
 | 外部 | `FUND_NEWS_ENABLED`、`FUND_NEWS_POLL_SECONDS`、`FUND_NEWS_QUERIES`、`FUND_NEWS_RSS_FEEDS`、`FUND_SEC_USER_AGENT`、`FRED_API_KEY` | 实时资讯监控与数据源 |
-| 外部 | `FUND_SHADOW_AB` | 影子 A/B 验证 AI 的复盘学习 |
+| 外部 | `FUND_SHADOW_AB`、`FUND_FACTOR_LAB` | 影子 A/B 验证 AI 的复盘学习；因子实验室（AI 提出因子、代码客观检验） |
 | 券商 | `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`ALPACA_IS_PAPER` | 仅 paper 模式 |
 | Schwab | `SCHWAB_ACCOUNT_NUMBER`、`SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL`、`SCHWAB_TOKEN`、`SCHWAB_TOKEN_PATH` | 仅用于只读体检 `schwab-check`（见“Schwab 实盘准备”） |
 
@@ -413,6 +413,40 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 
 两张记分卡进入盘后复盘、研究和决策的上下文，复盘被要求据此保留、修正或撤回假设，结果写入日报和 `report.json` 的 `latest_scorecard`。
 这是客观反馈而不是自动改参数：风险参数、投资范围和权限仍只能由你修改。样本少时结论不稳定，重叠期限之间相关。
+
+## 因子实验室：AI 挖掘因子，代码客观检验
+
+AI 在盘后复盘中可提出最多 5 个因子表达式（`factor_proposals`），确定性代码（`factors.py`）用无前视的历史数据检验，
+结果在之后的每次决策和复盘中交给 AI。闭环是：**AI 发现规律 → 写成因子 → 代码检验 → 通过的因子及其实盘表现回到 AI → AI 修正或提出新因子**。
+
+**因子语言**（安全白名单，不执行任何 Python 代码）：数据 `close`、`volume`（已完成日线）；时序函数
+`ret(n)`、`vol(n)`、`delay`、`delta`、`ts_mean`、`ts_std`、`ts_max`、`ts_min`、`ts_rank`、`log`、`abs`、`sign`；
+横截面函数 `rank`、`zscore`、`demean`；`+ - * /`。所有运算只看过去，窗口 1–504 个交易日。例如：
+`rank(ret(126) - ret(21))`（中期动量）、`-vol(60)`（低波动）、`rank(close / ts_mean(close, 200) - 1)`、`-rank(ret(5))`（短期反转）。
+
+**检验标准**（防止“挖掘”变成过拟合）：
+- 每个日期在投资范围内计算因子值与之后 `horizon_sessions` 个交易日收益的横截面 rank IC（Spearman），
+  每隔 `horizon_sessions` 取一个日期，避免重叠收益虚增 t 值；
+- 前 70% 为样本内，`|t|` 必须超过随**累计尝试次数**提高的 Bonferroni 门槛（试 1 个约 1.96，50 个约 3.29，200 个约 3.66）；
+  同一表达式重复提出不算新尝试，但也不会重新检验；
+- 后 30% 为样本外，方向必须一致且 `t ≥ holdout_min_t`（默认 1.0）；
+- 通过后跟踪**验证日之后**的 IC，这是真正的样本外记录；至少 `live_min_observations`（默认 10）个观测后若平均 IC 与方向相反，自动退役。
+
+**AI 看到什么**（`factor_lab` 上下文）：语法、检验标准、已尝试次数和下一个门槛、已验证因子（样本内／样本外／实盘 IC、
+当前排名靠前和靠后的证券）、最近被拒绝或退役的因子及原因。因子**只是证据**，不会直接下单；
+AI 仍决定完整目标组合，量化风控和审批规则不变。影子 A/B 的对照组看不到因子实验室，因此 A/B 衡量的是包括因子在内的整个学习闭环。
+
+配置在 `config.json` 的 `factor_lab` 段（`.env` 中 `FUND_FACTOR_LAB=false` 可关闭）：历史长度 504 个交易日、
+每个日期至少 8 个证券、样本内至少 20 个观测、样本外至少 8 个、显著性 5%。离线检验单个表达式：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode factor-lab -DataDir data -Symbols SPY,TLT,GLD,IEF,DJP -Expression "rank(ret(60))" -Horizon 5 -MinNames 5
+```
+
+Linux 用 `--expression=...` 形式（表达式以 `-` 开头时必须如此），例如 `--expression=-vol(20)`。
+**实测**：仓库自带的 2019 年 5 只 ETF 日线上，`rank(ret(20))`、`-rank(ret(5))`、`-vol(20)`、`rank(ret(60))` 全部被拒绝
+（样本内 |t| 0.11–1.21，低于 1.96）。5 只证券、一年数据远不足以证明任何因子，这正是检验应有的结论；
+运行中的基金使用 27 只证券、两年日线。合成数据测试中，真实存在的动量规律在所有种子下都通过，纯噪声在所有种子下都被拒绝。
 
 ## 实时行情：Yahoo 推送报价
 
