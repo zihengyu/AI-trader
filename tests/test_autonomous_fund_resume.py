@@ -168,7 +168,7 @@ def test_supervisor_keeps_runner_and_monitor_alive_with_a_restart_delay(tmp_path
             started[0].code = 1  # The runner crashed.
         return step >= 12
     stop = SimpleNamespace(is_set=lambda: False, wait=wait, set=lambda: None)
-    monkeypatch.setattr(service, "stop_child", lambda child: stopped.append(child.role))
+    monkeypatch.setattr(service, "stop_children", lambda children, **kw: stopped.extend(c.role for c in children))
     monkeypatch.setattr(service, "system_stopping", lambda: False)
     service.serve(env, tmp_path / "config.json", tmp_path, popen=popen, clock=lambda: clock[0], stop=stop,
                   install_signals=False)

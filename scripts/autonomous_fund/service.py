@@ -18,6 +18,7 @@ from . import stops
 from .risk import RiskError, instant
 
 RESTART_SECONDS = 30  # Same delay as the systemd units' RestartSec.
+WINDOWS_GRACE_SECONDS = 10  # Ctrl+C reaches the whole console; then the tree is ended.
 
 
 FATAL_HEALTH = {"heartbeat_stale", "heartbeat_unavailable", "runner_exited", "agent_call_stalled",
@@ -65,30 +66,47 @@ def stopped_by_signal(root):
     return stops.write(root, "operator", "stopped_by_operator")
 
 
-def stop_child(child, timeout=30):
-    if child.poll() is not None:
+def stop_children(children, timeout=30, clock=time.monotonic):
+    """Stop several supervised children with ONE shared grace period, then force the rest.
+
+    POSIX: SIGINT to each process group, then SIGKILL. Windows does not stop
+    grandchildren with their parent and has no SIGINT for another process: the
+    console Ctrl+C reaches every child, so wait briefly, then end each tree.
+    Never raises, so one stuck child cannot leave the others running.
+    """
+    alive = [child for child in children if child.poll() is None]
+    if not alive:
         return
-    if os.name != "posix":
-        # Windows does not stop grandchildren with their parent. Ctrl+C already
-        # reached the whole console, so allow a graceful exit, then end the tree.
+    if os.name == "posix":
+        for child in alive:
+            try:
+                os.killpg(child.pid, signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        grace = timeout
+    else:
+        grace = min(timeout, WINDOWS_GRACE_SECONDS)
+    deadline = clock() + grace
+    for child in alive:
         try:
-            child.wait(timeout=timeout)
+            child.wait(timeout=max(0.0, deadline - clock()))
         except subprocess.TimeoutExpired:
-            subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"], capture_output=True)
+            pass
+    for child in alive:
+        if child.poll() is not None:
+            continue
+        try:
+            if os.name == "posix":
+                os.killpg(child.pid, signal.SIGKILL)
+            else:
+                subprocess.run(["taskkill", "/PID", str(child.pid), "/T", "/F"], capture_output=True)
             child.wait(timeout=5)
-        return
-    try:
-        os.killpg(child.pid, signal.SIGINT)
-    except ProcessLookupError:
-        return
-    try:
-        child.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        if os.name == "posix":
-            os.killpg(child.pid, signal.SIGKILL)
-        else:
-            child.kill()
-        child.wait(timeout=5)
+        except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as exc:
+            print(f"Child {child.pid} did not stop: {type(exc).__name__}", flush=True)
+
+
+def stop_child(child, timeout=30):
+    stop_children([child], timeout)
 
 
 def main(argv=None):
@@ -220,8 +238,7 @@ def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.
             # Before the children: on Windows they may be terminated without
             # running their own cleanup, and Ctrl+C here is a manual close.
             stopped_by_signal(account_dir)
-        for child in children.values():
-            stop_child(child)
+        stop_children(list(children.values()))
 
 
 if __name__ == "__main__":

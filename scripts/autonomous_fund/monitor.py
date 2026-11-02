@@ -175,7 +175,8 @@ class Monitor:
             elif old and old[0] not in {"healthy", "stopped"}:
                 from . import stops
                 policy = self.resume_policy
-                automatic = policy and policy.auto_resume and stops.resumable(stops.read(self.root))
+                automatic = (policy and policy.auto_resume and stops.resumable(stops.read(self.root)) and
+                             self._resumes_last_day(db, now) < policy.max_auto_resumes_per_day)
                 text = (f"Health recovered; trading resumes by itself after {policy.auto_resume_after_seconds} s of "
                         "continuous health if no order is unresolved" if automatic else
                         "Health recovered; STOP still requires explicit operator resume")
@@ -186,6 +187,11 @@ class Monitor:
             state = "healthy"
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
         return state
+
+    @staticmethod
+    def _resumes_last_day(db, now):
+        day_ago = now - timedelta(hours=24)
+        return sum(instant(row[0]) >= day_ago for row in db.execute("SELECT at FROM events WHERE kind='auto_resume'"))
 
     def _auto_resume(self, db, now, underlying):
         """Lift a STOP that a service restart or a liveness fault wrote, never an operator's.
@@ -220,8 +226,7 @@ class Monitor:
             note_once("auto_resume_blocked", {"stop_reason": record["reason"], "action": (
                 "An order reservation is unresolved: verify it at the broker, resolve it, then resume explicitly")})
             return False
-        day_ago = now - timedelta(hours=24)
-        recent = sum(instant(row[0]) >= day_ago for row in db.execute("SELECT at FROM events WHERE kind='auto_resume'"))
+        recent = self._resumes_last_day(db, now)
         if recent >= policy.max_auto_resumes_per_day:
             note_once("auto_resume_exhausted", {"stop_reason": record["reason"], "resumes_last_24h": recent, "action": (
                 "Repeated restarts: inspect runtime.log and journalctl, then resume explicitly")})

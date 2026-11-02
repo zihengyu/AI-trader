@@ -336,14 +336,31 @@ def main(argv=None):
             failure = None
         except RiskError as exc:
             resolved, failure = None, exc
-        targets = [resolved] if explicit_run_dir else stops.stop_targets(resolved, os.environ)
+        others = [str(p) for p in stops.stop_targets(None, os.environ)]
+        if explicit_run_dir:
+            if not Path(args.run_dir).is_dir():
+                # A mistyped path must never report success while the real fund trades.
+                raise RiskError(f"No account directory at {args.run_dir}; recently active accounts: "
+                                + (", ".join(others) or "none") + ". Nothing was stopped.")
+            targets = [Path(args.run_dir)]
+        else:
+            targets = stops.stop_targets(resolved, os.environ)
         if not targets:
             raise failure or RiskError("No account directory found: run stop with --run-dir")
-        for target in targets:
-            Path(target).mkdir(parents=True, exist_ok=True)
-            stops.write(target, "operator", "operator_stop")  # Never lifted automatically.
-        print("STOP active in " + ", ".join(str(t) for t in targets) + ". Running process cancels known pending "
-              "orders on its next iteration; verify broker cancellations.")
+        stopped, failed = [], []
+        for target in targets:  # One failing directory never leaves the others trading.
+            try:
+                Path(target).mkdir(parents=True, exist_ok=True)
+                stops.write(target, "operator", "operator_stop")  # Never lifted automatically.
+                stopped.append(str(target))
+            except Exception as exc:
+                failed.append(f"{target} ({type(exc).__name__}: {exc})")
+        if stopped:
+            print("STOP active in " + ", ".join(stopped) + ". Running process cancels known pending "
+                  "orders on its next iteration; verify broker cancellations.")
+        if failed:
+            raise RiskError("STOP could not be written in " + "; ".join(failed) +
+                            ". Stop that fund another way (for example systemctl stop) and verify the broker.")
         return
     args.mode, args.run_dir, observe, origin = startup(args.mode, args.run_dir, os.environ)
     args.observe_only = args.observe_only or observe

@@ -94,14 +94,18 @@ def _strength(record):
 ACCOUNT_DIRECTORIES = ("artifacts/fund-local", "artifacts/fund-paper", "artifacts/autonomous-fund")
 
 
-def running(root, now=None, max_age_seconds=300):
-    """A runner heartbeat (local status.json or paper runner_health.json) younger than max_age_seconds."""
+def active(root, now=None, max_age_seconds=3600):
+    """A runner heartbeat (local status.json or paper runner_health.json) in any state within the last hour.
+
+    An account whose runner just exited is included on purpose: a supervisor may
+    restart it within seconds, and an emergency stop must reach it first.
+    """
     now = now or datetime.now(timezone.utc)
     for name in ("status.json", "runner_health.json"):
         try:
             body = json.loads((Path(root) / name).read_text(encoding="utf-8"))
             at = datetime.fromisoformat(str(body["heartbeat_at"]))
-            if body.get("runner_state", "running") == "running" and 0 <= (now - at).total_seconds() <= max_age_seconds:
+            if 0 <= (now - at).total_seconds() <= max_age_seconds:
                 return True
         except (OSError, ValueError, KeyError, TypeError):
             continue
@@ -109,12 +113,12 @@ def running(root, now=None, max_age_seconds=300):
 
 
 def stop_targets(resolved, environ, now=None):
-    """Where an emergency stop without --run-dir writes: the configured account and every running one."""
+    """Where an emergency stop without --run-dir writes: the configured account and every recently active one."""
     targets = [Path(resolved)] if resolved is not None else []
     candidates = [environ.get("FUND_RUN_DIR") or None, *ACCOUNT_DIRECTORIES]
     for candidate in filter(None, candidates):
         path = Path(candidate)
-        if all(path.resolve() != t.resolve() for t in targets) and running(path, now):
+        if all(path.resolve() != t.resolve() for t in targets) and active(path, now):
             targets.append(path)
     return targets
 

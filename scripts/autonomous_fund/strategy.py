@@ -19,7 +19,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service")
-NOTICE_WINDOWS = {"manual_stop": 21600, "stop_active": 21600}
+NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
@@ -201,6 +201,15 @@ def model_selection(config, model=None, research_model=None, decision_model=None
     return selected
 
 
+def _finite(value):
+    """float(value), or NaN for a missing or non-numeric provider value."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if number == number and abs(number) != float("inf") else float("nan")
+
+
 def account_digest(mode, account, config=None):
     # The binding names the ACCOUNT: mode plus account identity. Risk policy is
     # operator configuration, validated and audited (policy digest) at each
@@ -275,7 +284,7 @@ class AutonomousFund(Strategy):
             "limits": asdict(self.limits), "quant": self.quant.digest, "approval": asdict(approval_policy),
             "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
             "mandate": asdict(self.mandate), "universe": sorted(config["universe"].items())}).encode()).hexdigest()
-        self._history, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
+        self._bars, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
         self._last_report, self._overlay_logged, self._chase_noted = None, {}, set()
         self._triggers, self._move_noted, self._entry_noted, self._last_stressed = [], set(), set(), None
         self._scorecard_cache = None
@@ -770,9 +779,10 @@ class AutonomousFund(Strategy):
                         self.cancel_order(order)
                 from . import stops
                 record = stops.read(self.halt_path.parent) or {}
-                # One notice per STOP record: who stopped trading, why and since when.
+                # One notice per (who, why) and window, not per rewrite: a restart loop or a
+                # flapping watchdog reason must not turn into a stream of alerts.
                 self.notify("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
-                                            "since": record.get("at"), "orders": "no new orders"})
+                                            "orders": "no new orders"})
                 return
             if self.mode not in {"local", "paper"}:
                 # Native Pandas daily replay advances date rows without close
@@ -1237,7 +1247,9 @@ class AutonomousFund(Strategy):
         returned them, including a possible forming bar for today.
         """
         day, key = trading_day(now), (trading_day(now), symbol)
-        cache = self.__dict__.setdefault("_bars", {})
+        cache = getattr(self, "_bars", None)
+        if cache is None:
+            self._bars = cache = {}  # Test harnesses build the strategy without initialize().
         if key not in cache:
             length = self.quant.es_lookback_days + 5
             lab = getattr(self, "factor_lab", None)
@@ -1248,11 +1260,14 @@ class AutonomousFund(Strategy):
                 bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
                 frame = bars.df if bars is not None else None
                 if frame is not None and len(frame) and "close" in frame:
-                    volume = frame["volume"] if "volume" in frame else [float("nan")] * len(frame)
-                    rows = [(index.date(), float(close), float(shares))
+                    volume = frame["volume"] if "volume" in frame else [None] * len(frame)
+                    # Row by row: one bad value (a missing volume, say) never costs the whole symbol.
+                    rows = [(index.date(), _finite(close), _finite(shares))
                             for index, close, shares in zip(frame.index, frame["close"], volume)]
             except Exception as exc:
                 error = type(exc).__name__
+            if error:
+                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
             self._bars = {k: v for k, v in cache.items() if k[0] == day}
             self._bars[key] = (rows, error)
         return self._bars[key]
@@ -1265,15 +1280,9 @@ class AutonomousFund(Strategy):
 
     def _daily_closes(self, symbol, now):
         """Completed daily closes for risk estimation: the same window as before (es_lookback_days + 5 bars)."""
-        day, key = trading_day(now), (trading_day(now), symbol)
-        if key not in self._history:
-            rows, error = self._daily_bars(symbol, now)
-            if error:
-                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
-            window = rows[-(self.quant.es_lookback_days + 5):]
-            self._history = {k: v for k, v in self._history.items() if k[0] == day}
-            self._history[key] = [(d, close) for d, close, _ in self._completed(window, now)]
-        return self._history[key]
+        rows, _ = self._daily_bars(symbol, now)
+        window = rows[-(self.quant.es_lookback_days + 5):]
+        return [(d, close) for d, close, _ in self._completed(window, now)]
 
     def _risk_estimate(self, symbols, now):
         from .quant import RiskEstimate

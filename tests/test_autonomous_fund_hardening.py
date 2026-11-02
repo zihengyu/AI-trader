@@ -6,6 +6,7 @@ child processes only; no network, broker or model.
 import json
 import os
 import subprocess
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -180,3 +181,108 @@ def test_risk_and_the_factor_lab_share_one_history_request_per_symbol(tmp_path):
     assert sorted(s for s, _ in requests) == sorted(strategy.universe)  # Each symbol fetched once.
     assert all(length == FactorSettings().history_days for _, length in requests)
     assert len(closes) <= strategy.quant.es_lookback_days + 5 and all(d < str(QUANT_NOW.date()) for d, _ in closes)
+
+
+# ----- Second review -------------------------------------------------------------------------
+
+def test_one_failing_account_does_not_stop_the_emergency_stop_of_the_others(tmp_path, monkeypatch, capsys):
+    fresh(tmp_path / "artifacts/fund-paper")
+    real = stops.write
+
+    def flaky(root, kind, reason, now=None, detail=None):
+        if Path(root).name == "fund-local":
+            raise PermissionError("synthetic: owned by the service user")
+        return real(root, kind, reason, now, detail)
+    monkeypatch.setattr(stops, "write", flaky)
+    with pytest.raises(RiskError, match="fund-local"):
+        run_cli(tmp_path, monkeypatch, ["stop"], "FUND_MODE=local\n")
+    assert stops.read(tmp_path / "artifacts/fund-paper")["class"] == "operator"  # Still stopped.
+
+
+def test_stop_also_reaches_an_account_that_just_exited_and_will_be_restarted(tmp_path, monkeypatch):
+    exited = tmp_path / "artifacts/fund-paper"
+    fresh(exited, age=60)
+    body = json.loads((exited / "runner_health.json").read_text())
+    (exited / "runner_health.json").write_text(json.dumps({**body, "runner_state": "exited"}))
+    fresh(tmp_path / "artifacts/autonomous-fund", "status.json", age=2 * 3600)  # Idle for two hours.
+    run_cli(tmp_path, monkeypatch, ["stop"], "FUND_MODE=local\n")
+    assert stops.read(exited)["class"] == "operator"  # The supervisor's restart cannot lift it.
+    assert not (tmp_path / "artifacts/autonomous-fund/STOP").exists()
+
+
+def test_stop_refuses_a_mistyped_run_directory_instead_of_reporting_success(tmp_path, monkeypatch):
+    fresh(tmp_path / "artifacts/fund-paper")
+    with pytest.raises(RiskError, match="fund-paper"):  # The error names the account that is running.
+        run_cli(tmp_path, monkeypatch, ["stop", "--run-dir", "artifacts/fund-papr"], "FUND_MODE=local\n")
+    assert not (tmp_path / "artifacts/fund-papr").exists()
+
+
+class Hanging:
+    def __init__(self, pid, exits_after=None):
+        self.pid, self.timeouts, self.exits_after = pid, [], exits_after
+
+    def poll(self):
+        return 0 if self.exits_after is not None and len(self.timeouts) >= self.exits_after else None
+
+    def wait(self, timeout=None):
+        self.timeouts.append(timeout)
+        if self.poll() is None:
+            raise subprocess.TimeoutExpired("child", timeout)
+        return 0
+
+
+def test_windows_children_share_one_short_grace_period_and_a_stuck_one_never_blocks_the_rest(monkeypatch):
+    import scripts.autonomous_fund.service as service
+    calls = []
+    monkeypatch.setattr(service.os, "name", "nt")
+    monkeypatch.setattr(service.subprocess, "run", lambda command, **kwargs: calls.append(command[2]))
+    stuck, other = Hanging(1), Hanging(2)
+    clock = [0.0]
+
+    def tick():
+        clock[0] += 1
+        return clock[0]
+    service.stop_children([stuck, other], timeout=30, clock=tick)  # Must not raise.
+    assert calls == ["1", "2"]  # Both trees ended, even though the first never exited.
+    assert max(stuck.timeouts[0], other.timeouts[0]) <= service.WINDOWS_GRACE_SECONDS
+
+
+def test_repeated_stops_with_the_same_reason_are_announced_once(tmp_path):
+    from .test_autonomous_fund_stability import live
+    strategy = live(tmp_path)
+    del strategy.notify
+    strategy._notices = {}
+    stops.clear(tmp_path)
+    for minutes in (0, 1, 2):  # Restart loop: a fresh service STOP record each time.
+        stops.clear(tmp_path)
+        stops.write(tmp_path, "service", "service_start", NOW + timedelta(minutes=minutes))
+        strategy.on_trading_iteration()
+    stopped = [r for r in strategy.journal.all_events()
+               if r["kind"] == "notification" and r["body"]["kind"] == "stop_active"]
+    assert len(stopped) == 1
+
+
+def test_recovery_message_respects_the_daily_resume_limit(tmp_path):
+    from scripts.autonomous_fund.monitor import Monitor
+    journal = setup(tmp_path)
+    for minutes in range(3):
+        journal.event(NOW + timedelta(minutes=minutes), "auto_resume", {"stop": {}})
+    monitor = Monitor(tmp_path, FakeTelegram(), resume_policy=stops.ResumePolicy())
+    monitor.poll(NOW + timedelta(minutes=10))  # Stale heartbeat: a resumable liveness STOP.
+    heartbeat(tmp_path, NOW + timedelta(minutes=11))
+    monitor.poll(NOW + timedelta(minutes=11))
+    recovered = [r["body"]["details"] for r in journal.all_events()
+                 if r["kind"] == "notification" and r["body"]["kind"] == "watchdog_recovered"]
+    assert recovered and "explicit" in recovered[0]
+
+
+def test_a_bad_volume_value_never_costs_a_symbols_risk_history(tmp_path):
+    import pandas as pd
+    from .test_autonomous_fund_quant import NOW as QUANT_NOW, harness
+    days = pd.bdate_range(end=QUANT_NOW.date() - timedelta(days=1), periods=5, tz="America/New_York")
+    frame = pd.DataFrame({"close": [100.0, 101.0, 102.0, 103.0, 104.0],
+                          "volume": [1e6, None, "n/a", 1e6, 1e6]}, index=days)
+    strategy = harness(tmp_path)
+    strategy.get_historical_prices = lambda asset, length, timestep="day": type("Bars", (), {"df": frame})()
+    assert [c for _, c in strategy._daily_closes("ALFA", QUANT_NOW)] == [100.0, 101.0, 102.0, 103.0, 104.0]
+    assert not any(r["kind"] == "risk_history_unavailable" for r in strategy.journal.all_events())
