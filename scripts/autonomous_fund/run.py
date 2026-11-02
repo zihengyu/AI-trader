@@ -270,9 +270,10 @@ def run_local(args, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=["mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "acceptance", "show-config", "schwab-check", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+    parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
-    parser.add_argument("--run-dir", type=Path, default=Path("artifacts/autonomous-fund"))
+    parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
     parser.add_argument("--research-model", help="Researcher override; takes precedence over --model/AI_MODEL")
     parser.add_argument("--decision-model", help="Portfolio manager override; takes precedence over --model/AI_MODEL")
@@ -294,17 +295,80 @@ def main(argv=None):
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
     parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
+    parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
+    parser.add_argument("--expression", help="factor-lab: factor expression; use --expression=-vol(60) when it starts with '-'")
+    parser.add_argument("--horizon", type=int, default=5, help="factor-lab: forward horizon in sessions (1-20)")
+    parser.add_argument("--min-names", type=int, help="factor-lab: minimum names per date (default from config)")
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     args = parser.parse_args(argv)
-    if args.require_monitor and args.mode not in {"local", "paper"}:
-        raise RiskError("--require-monitor is available only for local/paper execution")
     if args.env_file:
         from .environment import load_environment
         from .settings import validate_env_file
-        validate_env_file(args.env_file)  # Before loading: a typo never half-applies.
-        load_environment(args.env_file)
+        # Before loading: a typo never half-applies. The emergency stop is never
+        # blocked by a configuration mistake; it reports it and still finds the account.
+        for step in (validate_env_file, load_environment):
+            try:
+                step(args.env_file)
+            except RiskError as exc:
+                if args.mode != "stop":
+                    raise
+                print(f"Warning: {exc}; STOP still proceeds.", flush=True)
+                if step is load_environment:
+                    # Still learn which account is configured (no secret is loaded).
+                    try:
+                        from dotenv import dotenv_values
+                        values = dotenv_values(args.env_file)
+                    except Exception:
+                        values = {}
+                    for name in ("FUND_MODE", "FUND_RUN_DIR"):
+                        if values.get(name) and not os.environ.get(name):
+                            os.environ[name] = values[name]
         args.model = args.model or os.environ.get("AI_MODEL")
+    from .settings import MODES, startup
+    explicit_run_dir = args.run_dir is not None
+    if args.mode == "stop":
+        # The emergency stop: the configured account plus every account whose
+        # runner is alive, so a fund started with an explicit mode is not missed.
+        from . import stops
+        try:
+            resolved = startup("stop", args.run_dir, os.environ)[1]
+            failure = None
+        except RiskError as exc:
+            resolved, failure = None, exc
+        others = [str(p) for p in stops.stop_targets(None, os.environ)]
+        if explicit_run_dir:
+            if not Path(args.run_dir).is_dir():
+                # A mistyped path must never report success while the real fund trades.
+                raise RiskError(f"No account directory at {args.run_dir}; recently active accounts: "
+                                + (", ".join(others) or "none") + ". Nothing was stopped.")
+            targets = [Path(args.run_dir)]
+        else:
+            targets = stops.stop_targets(resolved, os.environ)
+        if not targets:
+            raise failure or RiskError("No account directory found: run stop with --run-dir")
+        stopped, failed = [], []
+        for target in targets:  # One failing directory never leaves the others trading.
+            try:
+                Path(target).mkdir(parents=True, exist_ok=True)
+                stops.write(target, "operator", "operator_stop")  # Never lifted automatically.
+                stopped.append(str(target))
+            except Exception as exc:
+                failed.append(f"{target} ({type(exc).__name__}: {exc})")
+        if stopped:
+            print("STOP active in " + ", ".join(stopped) + ". Running process cancels known pending "
+                  "orders on its next iteration; verify broker cancellations.")
+        if failed:
+            raise RiskError("STOP could not be written in " + "; ".join(failed) +
+                            ". Stop that fund another way (for example systemctl stop) and verify the broker.")
+        return
+    args.mode, args.run_dir, observe, origin = startup(args.mode, args.run_dir, os.environ)
+    args.observe_only = args.observe_only or observe
+    if args.mode in MODES:
+        print(f"Mode {args.mode} ({MODES[args.mode]}); source: {origin}; account directory: {args.run_dir}; "
+              f"observe-only: {args.observe_only}. No live mode exists.", flush=True)
+    if args.require_monitor and args.mode not in {"local", "paper"}:
+        raise RiskError("--require-monitor is available only for local/paper execution")
     # Role models from the environment rank with the role CLI arguments, above AI_MODEL.
     args.research_model = args.research_model or os.environ.get("FUND_RESEARCH_MODEL") or None
     args.decision_model = args.decision_model or os.environ.get("FUND_DECISION_MODEL") or None
@@ -312,14 +376,17 @@ def main(argv=None):
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
     os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check"} else "true"
+    if args.mode == "serve":
+        from .service import serve
+        if not args.env_file:
+            raise RiskError("serve needs the .env file (the launchers select the checkout .env)")
+        serve(args.env_file, args.config, args.run_dir if explicit_run_dir else None)
+        return
     args.run_dir.mkdir(parents=True, exist_ok=True)
     os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
-    if args.mode == "stop":
-        (args.run_dir / "STOP").touch()
-        print("STOP active. Running process cancels known pending orders on its next iteration; verify broker cancellations.")
-        return
     if args.mode == "resume":
-        (args.run_dir / "STOP").unlink(missing_ok=True)
+        from . import stops
+        stops.clear(args.run_dir)
         print("Manual stop removed; drawdown and ambiguous-order locks remain.")
         return
     if args.mode in {"approvals", "approve", "reject"}:
@@ -368,13 +435,19 @@ def main(argv=None):
         from .settings import apply_environment, describe
         _, audit = apply_environment(json.loads(args.config.read_text(encoding="utf-8")), os.environ)
         rows = describe(config, os.environ, audit)
+        mode, run_dir, observe, origin = startup("start", None, os.environ)
         print(json.dumps({"config_file": str(args.config), "env_file": str(args.env_file) if args.env_file else None,
                           "precedence": "process environment > .env > config.json",
+                          "startup": {"mode": mode, "meaning": MODES[mode], "source": origin, "run_dir": str(run_dir),
+                                      "observe_only": observe, "live_trading": "not available"},
                           "models": selected_models(args, config), "settings": rows},
                          indent=2, ensure_ascii=False, default=str))
         return
     if args.mode == "validate-risk":
         print(json.dumps(validate_risk(args, config), indent=2, ensure_ascii=False))
+        return
+    if args.mode == "factor-lab":
+        print(json.dumps(factor_lab(args, config), indent=2, ensure_ascii=False, default=str))
         return
     if args.mode == "acceptance":
         from .validation import ValidationSettings, acceptance, acceptance_markdown
@@ -425,6 +498,39 @@ def main(argv=None):
         else:
             run_backtest(args, config)
         print(json.dumps(report(args.run_dir, config.get("model_prices_per_million")), indent=2))
+
+
+def factor_lab(args, config):
+    """Offline: test one factor expression on recorded daily CSVs (Date, Close and optional Volume)."""
+    import pandas as pd
+    from .factors import FactorSettings, canonical, evaluate
+    if not args.data_dir or not args.symbols or not args.expression:
+        raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
+    section = dict(config.get("factor_lab") or {})
+    if args.min_names:
+        section["min_names"] = args.min_names
+    settings = FactorSettings.from_config(section)
+    closes, volumes = {}, {}
+    for symbol in [s.strip().upper() for s in args.symbols.split(",") if s.strip()]:
+        path = Path(args.data_dir) / f"{symbol}.csv"
+        if not path.is_file():
+            raise RiskError(f"Missing history file {path.name}")
+        frame = pd.read_csv(path)
+        columns = {c.lower(): c for c in frame.columns}
+        if "date" not in columns or "close" not in columns:
+            raise RiskError(f"{path.name} needs Date and Close columns (daily bars)")
+        index = pd.to_datetime(frame[columns["date"]].astype(str).str[:10])
+        closes[symbol] = pd.Series(frame[columns["close"]].astype(float).to_numpy(), index=index)
+        shares = frame[columns["volume"]].astype(float).to_numpy() if "volume" in columns else float("nan")
+        volumes[symbol] = pd.Series(shares, index=index)
+    close = pd.DataFrame(closes).sort_index()
+    volume = pd.DataFrame(volumes).reindex(index=close.index, columns=close.columns)
+    expression = canonical(args.expression)
+    result = evaluate(expression, args.horizon, close, volume, settings, trials=1)
+    return {"expression": expression, "horizon_sessions": args.horizon, "names": close.shape[1],
+            "first_close": str(close.index[0].date()), "last_close": str(close.index[-1].date()),
+            "note": "One offline test (trials=1). In the running fund every distinct expression raises the bar.",
+            **result}
 
 
 def validate_risk(args, config):

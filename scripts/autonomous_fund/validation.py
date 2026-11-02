@@ -145,7 +145,7 @@ class ValidationSettings:
     FIELDS = {"shadow_enabled", "shadows_per_session", "min_pairs", "switch_t_stat", "acceptance"}
     ACCEPTANCE = {"min_sessions": 20, "min_iteration_ratio": 0.9, "max_watchdog_stops": 3,
                   "max_unresolved_intents": 0, "max_fill_details_unavailable": 0, "max_model_failure_rate": 0.2,
-                  "min_review_ratio": 0.9, "max_mean_slippage_bps": 25}
+                  "min_review_ratio": 0.9, "max_mean_slippage_bps": 25, "max_bot_crashes": 0}
 
     def __init__(self, shadow_enabled=False, shadows_per_session=1, min_pairs=20, switch_t_stat=2.0, acceptance=None):
         from .risk import RiskError
@@ -224,7 +224,8 @@ def acceptance(root, criteria=None, now=None):
                        "operator_drawdown_reset", "operator_attached_order", "operator_reserve_adjusted",
                        "telegram_command", "order_submitted", "fill", "fill_reconciled", "fill_details_unavailable",
                        "order_reprice_cancel", "buy_chase_limit", "protective_trigger", "agent", "decision_backoff",
-                       "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation"))
+                       "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation",
+                       "auto_resume"))
     zone = ZoneInfo("America/New_York")
     startups = [b for _, k, b in events if k == "startup"]
     interval = ((startups[-1].get("execution") or {}).get("iteration_seconds") or 60) if startups else 60
@@ -286,6 +287,10 @@ def acceptance(root, criteria=None, now=None):
         "drawdown_latches": count("drawdown_pause"), "protective_triggers": count("protective_trigger"),
         "postmarket_reviews": len(reviews), "review_ratio": len(reviews) / len(sessions) if sessions else None,
         "learning": learning,
+        # A crash that escaped every guard ended the process: never acceptable for unattended running.
+        "bot_crashes": sum(1 for n in notes if n.get("kind") == "bot_crash"),
+        "bookkeeping_errors": sum(1 for n in notes if n.get("kind") == "bookkeeping_error"),
+        "auto_resumes": count("auto_resume"),
     }
     checks = [
         ("min_sessions", metrics["sessions_observed"], criteria["min_sessions"], lambda v, t: v >= t),
@@ -300,6 +305,7 @@ def acceptance(root, criteria=None, now=None):
         ("min_review_ratio", metrics["review_ratio"], criteria["min_review_ratio"], lambda v, t: v is not None and v >= t),
         ("max_mean_slippage_bps", metrics["mean_slippage_bps_vs_arrival"], criteria["max_mean_slippage_bps"],
          lambda v, t: v is None or v <= t),
+        ("max_bot_crashes", metrics["bot_crashes"], criteria["max_bot_crashes"], lambda v, t: v <= t),
     ]
     results = [{"criterion": name, "value": value, "threshold": threshold, "passed": bool(test(value, threshold))
                 if value is not None or name == "max_mean_slippage_bps" else False}

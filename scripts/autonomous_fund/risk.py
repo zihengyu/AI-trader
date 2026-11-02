@@ -141,6 +141,9 @@ def _validate_levels(row, weight):
         raise RiskError("A stop-loss must be below the entry limit")
     if "stop_loss" in levels and "take_profit" in levels and levels["stop_loss"] >= levels["take_profit"]:
         raise RiskError("A stop-loss must be below the take-profit level")
+    if "entry_limit" in levels and "take_profit" in levels and levels["take_profit"] <= levels["entry_limit"]:
+        # Otherwise a fill near the entry limit triggers the take-profit at once: a paid round trip.
+        raise RiskError("A take-profit must be above the entry limit")
     if row.get("take_profit_weight") is not None:
         if "take_profit" not in levels or not 0 <= number(row["take_profit_weight"]) < weight:
             raise RiskError("take_profit_weight needs a take-profit level and must be below the target weight")

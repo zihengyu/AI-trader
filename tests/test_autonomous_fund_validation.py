@@ -292,6 +292,20 @@ def test_acceptance_report_fails_on_short_runs_unresolved_orders_and_watchdog_st
     assert {"min_sessions", "max_unresolved_intents", "max_watchdog_stops"} <= failed
 
 
+def test_acceptance_counts_crashes_bookkeeping_errors_and_automatic_resumes(tmp_path):
+    journal = synthetic_run(tmp_path)
+    at = datetime(2026, 11, 3, 15, tzinfo=timezone.utc)
+    journal.event(at, "notification", {"kind": "bookkeeping_error", "details": "export: OSError"})
+    journal.event(at, "auto_resume", {"stop": {"class": "service", "reason": "service_start"}})
+    clean = acceptance(tmp_path, {"min_sessions": 3}, now=datetime(2026, 11, 6, tzinfo=timezone.utc))
+    assert clean["verdict"] == "ready"  # Recovered bookkeeping errors and restarts are reported, not fatal.
+    assert clean["metrics"]["bookkeeping_errors"] == 1 and clean["metrics"]["auto_resumes"] == 1
+    journal.event(at, "notification", {"kind": "bot_crash", "details": "RuntimeError"})
+    crashed = acceptance(tmp_path, {"min_sessions": 3}, now=datetime(2026, 11, 6, tzinfo=timezone.utc))
+    assert crashed["verdict"] == "not_ready" and crashed["metrics"]["bot_crashes"] == 1
+    assert {row["criterion"] for row in crashed["criteria"] if not row["passed"]} == {"max_bot_crashes"}
+
+
 def test_acceptance_command_writes_json_and_markdown(tmp_path, capsys):
     from scripts.autonomous_fund import run
     synthetic_run(tmp_path)

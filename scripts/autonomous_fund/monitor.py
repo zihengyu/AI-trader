@@ -96,8 +96,9 @@ class Telegram:
 
 
 class Monitor:
-    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900):
+    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900, resume_policy=None):
         self.root, self.transport = Path(root), transport
+        self.resume_policy = resume_policy  # None: never resume automatically.
         if heartbeat_seconds < 30 or agent_seconds < 60:
             raise RiskError("Watchdog thresholds are too short")
         self.heartbeat_seconds, self.agent_seconds = heartbeat_seconds, agent_seconds
@@ -148,21 +149,25 @@ class Monitor:
         if latest and latest[1] == "agent_call_started" and (now - instant(latest[0])).total_seconds() > self.agent_seconds:
             state = "agent_call_stalled"
         if state == "healthy" and not (latest and latest[1] == "agent_call_started"):
-            from .market_data import SessionClock
-            market = SessionClock(now=lambda: now).status()
+            market = self._session_status(now)
             iteration = db.execute("SELECT at FROM events WHERE sequence>? AND kind IN "
                 "('iteration_started','iteration_finished') ORDER BY sequence DESC LIMIT 1", (saved["sequence"],)).fetchone()
             observed_at = instant(iteration[0] if iteration else saved[0])
+            if latest:
+                # A model call that just finished is progress too: a long but moving
+                # iteration (research, then manager) is not a stalled one.
+                observed_at = max(observed_at, instant(latest[0]))
             if (market["open"] and (now - instant(market["next_open"])).total_seconds() > 300 and
                     (now - observed_at).total_seconds() > self.heartbeat_seconds):
                 state = "iteration_stalled"
         if shutil.disk_usage(self.root).free < 200_000_000:
             state = "low_disk_space"
+        underlying = state
         if state not in {"healthy", "stopped"}:
             # Reassert every poll even after someone resumes an unhealthy run;
             # deduplication applies to alerts, never to the protective STOP.
-            (self.root / "STOP").touch()
-        # A deliberate manual stop is already a safe state. Never auto-resume.
+            from . import stops
+            stops.write(self.root, "watchdog", state, now)
         if (self.root / "STOP").exists() and state == "healthy":
             state = "stopped"
         old = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health'").fetchone()
@@ -171,10 +176,80 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_stop", "details": {"reason": state, "action": "STOP written; inspect broker orders and resume explicitly"}})))
             elif old and old[0] not in {"healthy", "stopped"}:
+                from . import stops
+                policy = self.resume_policy
+                automatic = (policy and policy.auto_resume and stops.resumable(stops.read(self.root)) and
+                             self._resumes_last_day(db, now) < policy.max_auto_resumes_per_day)
+                text = (f"Health recovered; trading resumes by itself after {policy.auto_resume_after_seconds} s of "
+                        "continuous health if no order is unresolved" if automatic else
+                        "Health recovered; STOP still requires explicit operator resume")
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
-                    "kind": "watchdog_recovered", "details": "Health recovered; STOP still requires explicit operator resume"})))
+                    "kind": "watchdog_recovered", "details": text})))
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
+        if self._auto_resume(db, now, underlying):
+            state = "healthy"
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
         return state
+
+    @staticmethod
+    def _resumes_last_day(db, now):
+        day_ago = now - timedelta(hours=24)
+        return sum(instant(row[0]) >= day_ago for row in db.execute("SELECT at FROM events WHERE kind='auto_resume'"))
+
+    def _session_status(self, now):
+        """One NYSE calendar for the monitor's lifetime (the schedule is cached per day)."""
+        from .market_data import SessionClock
+        if getattr(self, "_session_clock", None) is None:
+            self._session_clock = SessionClock(now=lambda: self._session_now)
+        self._session_now = now
+        return self._session_clock.status()
+
+    def _auto_resume(self, db, now, underlying):
+        """Lift a STOP that a service restart or a liveness fault wrote, never an operator's.
+
+        Requires continuous health for auto_resume_after_seconds after the stop,
+        no unresolved order reservation, and at most max_auto_resumes_per_day.
+        """
+        from . import stops
+        if underlying != "healthy":
+            db.execute("DELETE FROM fund_monitor_meta WHERE key='healthy_since'")
+            return False
+        db.execute("INSERT OR IGNORE INTO fund_monitor_meta VALUES('healthy_since',?)", (now.isoformat(),))
+        policy = self.resume_policy
+        if policy is None or not policy.auto_resume:
+            return False
+        record = stops.read(self.root)
+        if not stops.resumable(record):
+            return False
+        since = instant(db.execute("SELECT value FROM fund_monitor_meta WHERE key='healthy_since'").fetchone()[0])
+        begun = max(since, instant(record["at"])) if record.get("at") else since
+        if (now - begun).total_seconds() < policy.auto_resume_after_seconds:
+            return False
+        marker = f"{record['at']}|{record['reason']}"
+
+        def note_once(kind, details):
+            seen = db.execute("SELECT value FROM fund_monitor_meta WHERE key='auto_resume_note'").fetchone()
+            if not seen or seen[0] != f"{kind}|{marker}":
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+                    "kind": kind, "details": details})))
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('auto_resume_note',?)", (f"{kind}|{marker}",))
+        if db.execute("SELECT 1 FROM intents WHERE status!='terminal' LIMIT 1").fetchone():
+            note_once("auto_resume_blocked", {"stop_reason": record["reason"], "action": (
+                "An order reservation is unresolved: verify it at the broker, resolve it, then resume explicitly")})
+            return False
+        recent = self._resumes_last_day(db, now)
+        if recent >= policy.max_auto_resumes_per_day:
+            note_once("auto_resume_exhausted", {"stop_reason": record["reason"], "resumes_last_24h": recent, "action": (
+                "Repeated restarts: inspect runtime.log and journalctl, then resume explicitly")})
+            return False
+        if not stops.clear(self.root, record):
+            return False  # Someone changed STOP meanwhile; their record wins.
+        detail = {"stop": record, "healthy_since": since.isoformat()}
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "auto_resume", encode(detail)))
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+            "kind": "auto_resumed", "details": {"stop_reason": record["reason"], "stopped_at": record["at"],
+                                                "healthy_since": since.isoformat()}})))
+        return True
 
     def poll(self, now=None):
         now = instant(now or datetime.now(timezone.utc))
@@ -303,47 +378,58 @@ class Monitor:
         updates = self.transport.updates(offset)
         if not updates:
             return
-        for update in updates:
-            offset = max(offset, int(update.get("update_id", 0)) + 1)
-            message = update.get("message") or {}
-            text = str(message.get("text") or "").strip()
-            words = text.replace("，", " ").replace(",", " ").split()
-            if not words:
-                continue
-            verb = words[0].upper()
-            if verb not in APPROVE_WORDS | REJECT_WORDS | STATUS_WORDS:
-                continue
-            chat = str((message.get("chat") or {}).get("id"))
-            sender = str((message.get("from") or {}).get("id"))
-            reply_to = message.get("message_id")
-            if chat != str(self.transport.chat_id):
-                continue  # Never answer or act on another conversation.
-            if sender not in self.transport.approver_ids:
-                self._answer(now, "未授权的审批人：本操作已忽略。", reply_to, {"sender": sender, "result": "unauthorized"})
-                continue
-            if verb in STATUS_WORDS:
-                self._answer(now, self._status_text(now), reply_to, {"sender": sender, "result": "status"})
-                continue
-            sent_at = datetime.fromtimestamp(int(message.get("date", 0)), timezone.utc)
-            target, problem = self._target(words[1:], (message.get("reply_to_message") or {}).get("message_id"), sent_at, now)
-            if target is None:
-                self._answer(now, problem, reply_to, {"sender": sender, "result": "unresolved", "text": text[:100]})
-                continue
-            approve = verb in APPROVE_WORDS
-            try:
-                state = resolve_approval(self.root, target["id"], target["digest"], approve, now,
-                                         authority=f"telegram:{sender}")
-            except RiskError as exc:
-                self._answer(now, f"未执行：{exc}", reply_to, {"sender": sender, "result": "refused",
-                                                             "approval_id": target["id"]})
-                continue
-            word = "已批准" if state == "approved" else "已拒绝"
-            follow = ("交易进程将在下一次迭代重新通过全部风控后执行；硬性上限不受影响。" if state == "approved"
-                      else "该目标已停止，等待 AI 下一次复核；已提交的订单须撤单处理。")
-            self._answer(now, f"{word} {approval_code(target['id'])}。{follow}", reply_to,
-                         {"sender": sender, "result": state, "approval_id": target["id"]})
-        with operator_connection(self.root) as db:
-            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('telegram_offset',?)", (str(offset),))
+        try:
+            for update in updates:
+                offset = max(offset, int(update.get("update_id", 0)) + 1)
+                try:
+                    self._command(update, now)
+                except Exception as exc:  # One odd update must never stop the watchdog or be re-read forever.
+                    with operator_connection(self.root) as db:
+                        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "telegram_command", encode({
+                            "update_id": update.get("update_id"), "result": "error", "error": type(exc).__name__})))
+        finally:
+            with operator_connection(self.root) as db:
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('telegram_offset',?)", (str(offset),))
+
+    def _command(self, update, now):
+        """One Telegram update; the caller isolates failures and persists the offset."""
+        message = update.get("message") or {}
+        text = str(message.get("text") or "").strip()
+        words = text.replace("，", " ").replace(",", " ").split()
+        if not words:
+            return
+        verb = words[0].upper()
+        if verb not in APPROVE_WORDS | REJECT_WORDS | STATUS_WORDS:
+            return
+        chat = str((message.get("chat") or {}).get("id"))
+        sender = str((message.get("from") or {}).get("id"))
+        reply_to = message.get("message_id")
+        if chat != str(self.transport.chat_id):
+            return  # Never answer or act on another conversation.
+        if sender not in self.transport.approver_ids:
+            self._answer(now, "未授权的审批人：本操作已忽略。", reply_to, {"sender": sender, "result": "unauthorized"})
+            return
+        if verb in STATUS_WORDS:
+            self._answer(now, self._status_text(now), reply_to, {"sender": sender, "result": "status"})
+            return
+        sent_at = datetime.fromtimestamp(int(message.get("date", 0)), timezone.utc)
+        target, problem = self._target(words[1:], (message.get("reply_to_message") or {}).get("message_id"), sent_at, now)
+        if target is None:
+            self._answer(now, problem, reply_to, {"sender": sender, "result": "unresolved", "text": text[:100]})
+            return
+        approve = verb in APPROVE_WORDS
+        try:
+            state = resolve_approval(self.root, target["id"], target["digest"], approve, now,
+                                     authority=f"telegram:{sender}")
+        except RiskError as exc:
+            self._answer(now, f"未执行：{exc}", reply_to, {"sender": sender, "result": "refused",
+                                                         "approval_id": target["id"]})
+            return
+        word = "已批准" if state == "approved" else "已拒绝"
+        follow = ("交易进程将在下一次迭代重新通过全部风控后执行；硬性上限不受影响。" if state == "approved"
+                  else "该目标已停止，等待 AI 下一次复核；已提交的订单须撤单处理。")
+        self._answer(now, f"{word} {approval_code(target['id'])}。{follow}", reply_to,
+                     {"sender": sender, "result": state, "approval_id": target["id"]})
 
     def _target(self, args, replied_message, sent_at, now):
         with operator_connection(self.root) as db:
@@ -353,7 +439,9 @@ class Monitor:
                 for sequence, body in db.execute(
                         "SELECT e.sequence,e.body FROM events e JOIN fund_deliveries d ON d.sequence=e.sequence "
                         "WHERE e.kind='notification' AND d.message_id=?", (str(replied_message),)):
-                    delivered = json.loads(body).get("details") or {}
+                    details = json.loads(body).get("details")
+                    # Many notices carry plain text, not a request: never assume a dict.
+                    delivered = details if isinstance(details, dict) else {}
         live = [r for r in rows if instant(json.loads(r["body"])["expires_at"]) > now]
         candidates = live
         if args:
@@ -392,8 +480,8 @@ class Monitor:
 
 class RunnerHeartbeat:
     """Paper-run liveness, independent of a slow model call in that process."""
-    def __init__(self, root):
-        self.root, self.stopped = Path(root), threading.Event()
+    def __init__(self, root, interval=5):
+        self.root, self.stopped, self.interval = Path(root), threading.Event(), interval
 
     def _write(self, state):
         target = self.root / "runner_health.json"
@@ -402,8 +490,13 @@ class RunnerHeartbeat:
         temporary.replace(target)
 
     def _loop(self):
-        while not self.stopped.wait(5):
-            self._write("running")
+        while not self.stopped.wait(self.interval):
+            try:
+                self._write("running")
+            except Exception:
+                # A transient write failure (a reader holding the file on Windows,
+                # a full disk) must not end the heartbeat while the runner trades.
+                continue
 
     def __enter__(self):
         self._write("running")
@@ -439,9 +532,13 @@ def send_test(root):
 
 def run_monitor(args):
     from filelock import FileLock
+    from .stops import ResumePolicy
+    from .strategy import configuration
+    policy = ResumePolicy.from_config(configuration(args.config).get("service"))
     transport = None if args.console_only else Telegram()
     with FileLock(str(args.run_dir / "monitor.lock"), timeout=0):
-        monitor = Monitor(args.run_dir, transport, heartbeat_seconds=args.heartbeat_seconds, agent_seconds=args.agent_seconds)
+        monitor = Monitor(args.run_dir, transport, heartbeat_seconds=args.heartbeat_seconds, agent_seconds=args.agent_seconds,
+                          resume_policy=policy)
         while True:
             status = monitor.poll()
             if args.once:

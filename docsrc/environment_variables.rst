@@ -1423,7 +1423,13 @@ Operator settings for this application may also be supplied as ``FUND_*``
 variables in the process environment or the explicitly selected ``.env`` file
 (template ``scripts/autonomous_fund/.env.example``), with precedence process
 environment > ``.env`` > ``config.json``; blank values do not override. They
-cover model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
+cover the startup mode (``FUND_MODE``: ``local`` for real-time public data with a
+local virtual account, or ``paper`` for an Alpaca paper account; any other value,
+including ``live``, is refused because no live mode exists; ``FUND_RUN_DIR`` for
+the account directory, default ``artifacts/fund-<mode>``; ``FUND_OBSERVE_ONLY``
+for local runs without model calls or orders; ``FUND_AUTO_RESUME`` to let the
+independent monitor lift a STOP written by a service restart or a liveness fault
+after continuous health, never an operator's stop), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
 ``FUND_REASONING_EFFORT``, ``FUND_MAX_AGENT_RUNS_PER_DAY``,
 ``FUND_MIN_REVIEW_MINUTES``, ``FUND_MODEL_PRICES_JSON``), user limits
 (``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
@@ -1434,7 +1440,7 @@ envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER`
 ``FUND_STRESS_REQUIRES_APPROVAL``, ``FUND_APPROVAL_VALID_MINUTES``) and external
 parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
-``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``). Values are
+``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``, ``FUND_FACTOR_LAB``). Values are
 validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.env`` file fails startup
 with a suggestion, and ``show-config`` prints effective values and their sources with
 secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of

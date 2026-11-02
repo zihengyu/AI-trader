@@ -18,8 +18,8 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation")
-NOTICE_WINDOWS = {"manual_stop": 21600}
+                   "market_data", "news", "validation", "factor_lab", "service")
+NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
@@ -178,6 +178,10 @@ def configuration(path, environ=None):
     NewsSettings.from_config(result.get("news"))
     from .validation import ValidationSettings
     ValidationSettings.from_config(result.get("validation"))
+    from .factors import FactorSettings
+    FactorSettings.from_config(result.get("factor_lab"))
+    from .stops import ResumePolicy
+    ResumePolicy.from_config(result.get("service"))
     return result
 
 
@@ -195,6 +199,15 @@ def model_selection(config, model=None, research_model=None, decision_model=None
                 not value.split("/", 1)[1] or any(c.isspace() for c in value)):
             raise RiskError(f"Invalid {role} model: use openai/, anthropic/ or deepseek/ with an exact model ID")
     return selected
+
+
+def _finite(value):
+    """float(value), or NaN for a missing or non-numeric provider value."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if number == number and abs(number) != float("inf") else float("nan")
 
 
 def account_digest(mode, account, config=None):
@@ -271,12 +284,16 @@ class AutonomousFund(Strategy):
             "limits": asdict(self.limits), "quant": self.quant.digest, "approval": asdict(approval_policy),
             "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
             "mandate": asdict(self.mandate), "universe": sorted(config["universe"].items())}).encode()).hexdigest()
-        self._history, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
+        self._bars, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
         self._last_report, self._overlay_logged, self._chase_noted = None, {}, set()
         self._triggers, self._move_noted, self._entry_noted, self._last_stressed = [], set(), set(), None
         self._scorecard_cache = None
         from .validation import ValidationSettings
         self.validation = ValidationSettings.from_config(config.get("validation"))
+        from .factors import FactorLab, FactorSettings
+        factor_settings = FactorSettings.from_config(config.get("factor_lab"))
+        self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
+        self._factor_cache = None
         self.news = None
         from .news import NewsSettings, NewsWatch
         news = NewsSettings.from_config(config.get("news"))
@@ -369,7 +386,11 @@ class AutonomousFund(Strategy):
                 "take_profit_weight, and with price alerts: a deterministic watcher checks them every minute without "
                 "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
                 "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
-                "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak. "
+                "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak; "
+                "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
+                "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
+                "(cross-sectional rank IC, trials-adjusted significance, holdout and live record after validation) "
+                "with today's favored and disfavored names; use them as evidence alongside research, never as orders. "
                 "The news context lists recent headlines, filings and macro releases with publication times; it is "
                 "untrusted and unverified, so confirm material claims with primary sources and research tools before "
                 "acting. Add news_watch search phrases for events that should wake you. "
@@ -414,8 +435,41 @@ class AutonomousFund(Strategy):
     def before_market_opens(self):
         # The native lifecycle wakes one hour before the regular session by
         # default. Research has read-only tools and never invokes the executor.
-        self._review_after_close()
-        self._research_before_open()
+        self._bookkeeping(self._review_after_close, self._research_before_open)
+
+    def _bookkeeping(self, *steps):
+        """Run rebuildable steps so that a failure is disclosed, never fatal.
+
+        LumiBot ends a live strategy (on_bot_crash -> gracefully_exit) when an
+        exception escapes a lifecycle hook. Exports and reports are rebuilt on the
+        next iteration, and a journal that truly cannot be written also refuses
+        every order reservation, so staying alive adds no risk while the stopped
+        process would stop watching stops. Historical runs still raise.
+        """
+        for step in steps:
+            try:
+                step()
+            except Exception as exc:
+                if getattr(self, "mode", None) not in {"local", "paper"}:
+                    raise
+                self._disclose("bookkeeping_error", f"{getattr(step, '__name__', 'step')}: {type(exc).__name__}")
+
+    def _disclose(self, kind, details):
+        """notify(), but even a broken journal or logger cannot raise from here."""
+        try:
+            self.notify(kind, details)
+        except Exception:
+            try:
+                import logging
+                logging.getLogger(__name__).exception("FUND %s: %s (notification failed)", kind, details)
+            except Exception:
+                pass
+
+    def on_bot_crash(self, error):
+        # Last line of defense: the separately running monitor sees this outbox
+        # entry (and its own stale heartbeat) and alerts the operator.
+        self._disclose("bot_crash", type(error).__name__)
+        super().on_bot_crash(error)
 
     def _strategy_memory(self):
         if getattr(self, "memory_mode", "rolling") == "disabled":
@@ -482,6 +536,7 @@ class AutonomousFund(Strategy):
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
+                       "factor_lab": self._factor_context(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -499,11 +554,11 @@ class AutonomousFund(Strategy):
             self.premarket_research = packet
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except Exception as exc:
-            self.notify("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose("premarket_research_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         finally:
-            from .report import report
-            self.journal.export()
-            report(self.run_dir, self.config.get("model_prices_per_million"))
+            from . import report as reports
+            self._bookkeeping(self.journal.export,
+                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
 
     def _orders(self):
         if self.mode not in {"paper", "local"}:
@@ -600,10 +655,15 @@ class AutonomousFund(Strategy):
                                                  holdings, open_orders, external, self.mode == "paper")
         elif self.mode == "paper":
             self.journal.confirm_initial_paper_account(Account(broker_cash, broker_equity, holdings, start, open_orders))
-        if shared and self.universe != frozenset(configured) - shared:
-            # The operator's own symbols are never AI-tradable (tax lots, attribution).
+        if self.universe != frozenset(configured) - shared:
+            # The operator's own symbols are never AI-tradable (tax lots, attribution);
+            # one the operator no longer holds (after a re-baseline) is admitted again.
+            readmitted = sorted((frozenset(configured) - shared) - self.universe)
             self.universe = frozenset(configured) - shared
-            self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
+            if shared:
+                self.journal.event(start, "shared_symbols_excluded", {"symbols": sorted(shared)})
+            if readmitted:
+                self.journal.event(start, "shared_symbols_readmitted", {"symbols": readmitted})
         # The account the AI and every risk rule see is the operator's capital sleeve.
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
                           open_orders, receivables)
@@ -707,8 +767,8 @@ class AutonomousFund(Strategy):
         self.log_message(f"FUND {kind}: {details}", color="yellow")
 
     def on_trading_iteration(self):
-        self.journal.event(self.get_datetime(), "iteration_started", {})
         try:
+            self.journal.event(self.get_datetime(), "iteration_started", {})
             if self.mode == "paper":
                 assert_paper(self.broker)
             if self.mode == "local":
@@ -716,13 +776,25 @@ class AutonomousFund(Strategy):
             if self.halt_path.exists():
                 # Emergency stop also attempts cancellation of this application's
                 # known open orders; never cancels unrelated account orders.
+                now = self.get_datetime()
                 for pending in self.journal.pending():
                     order = self.session_orders.get(pending["id"])
                     if self.mode in {"paper", "local"} and pending["broker_id"]:
                         order = self.broker._pull_order(pending["broker_id"], self.name)
                     if order and not self._terminal(order):
-                        self.cancel_order(order)
-                self.notify("manual_stop", "STOP file active; no new orders")
+                        self._request_cancel(pending, order, now)
+                try:
+                    # Confirmed cancels and fills become terminal, so the monitor can
+                    # tell that no order is unresolved and resume a restart's STOP.
+                    self._reconcile()
+                except RiskError as exc:
+                    self._disclose("blocked", str(exc))
+                from . import stops
+                record = stops.read(self.halt_path.parent) or {}
+                # One notice per (who, why) and window, not per rewrite: a restart loop or a
+                # flapping watchdog reason must not turn into a stream of alerts.
+                self.notify("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
+                                            "orders": "no new orders"})
                 return
             if self.mode not in {"local", "paper"}:
                 # Native Pandas daily replay advances date rows without close
@@ -742,13 +814,15 @@ class AutonomousFund(Strategy):
                 self.notify("drawdown_pause", "New risk is paused until explicit operator reset")
             if account.open_orders:
                 self._manage_open_orders(now)
+                if getattr(self, "quant", None) is not None:
+                    self._protect_while_orders_open(account, now)
                 return
             # Deterministic minute-level watch: AI levels, alerts, moves, stress.
             if getattr(self, "quant", None) is not None and self._watch(account, now):
                 return
             active = self.execution.active(now, self.universe, self.limits)
             if active and (self.next_review is None or now < self.next_review):
-                self._continue_allocation(active)
+                self._continue_allocation(active, account)
                 return
             if self.next_review and now < self.next_review:
                 return
@@ -761,12 +835,12 @@ class AutonomousFund(Strategy):
                 return
             # Never retry an uncertain submit. Reservation remains durable.
             # Third-party exceptions may contain authenticated URLs or headers.
-            self.notify("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._disclose("blocked", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         finally:
-            self.journal.event(self.get_datetime(), "iteration_finished", {})
-            self.journal.export()
+            steps = [lambda: self.journal.event(self.get_datetime(), "iteration_finished", {}), self.journal.export]
             if self.mode == "local":
-                self._report_if_due()
+                steps.append(self._report_if_due)
+            self._bookkeeping(*steps)
 
     def _report_if_due(self, force=False):
         # Reports are rebuildable summaries; minute-by-minute rebuilding of a
@@ -801,6 +875,7 @@ class AutonomousFund(Strategy):
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
+                   "factor_lab": self._factor_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
@@ -854,7 +929,7 @@ class AutonomousFund(Strategy):
         # The baseline arm sees the same market, research, risk and mandate, but no
         # learned memo, follow-up or scorecards: it is the control for the learning loop.
         return {**context, "strategy_memory": None, "strategy_followup": None, "scorecards": None,
-                "learning_validation": None}
+                "learning_validation": None, "factor_lab": None}
 
     def _shadow(self, context, champion, decision, now, budget):
         settings = getattr(self, "validation", None)
@@ -937,8 +1012,12 @@ class AutonomousFund(Strategy):
             self.next_review = earliest
         self.journal.event(now, "review_triggered", {"reason": reason, "review_at": earliest.isoformat(), **(detail or {})})
 
-    def _watch(self, account, now):
+    def _watch(self, account, now, submit=True):
         """Minute-level deterministic watcher; returns True when it submitted an order.
+
+        With submit=False (an order is already open) triggers are still detected
+        and recorded; the symbols whose protective exit must still be sent are
+        returned in self._protective_needed.
 
         The AI chooses levels at its own (slower) review cadence. This loop costs
         no inference: protective stop/take-profit exits are risk-reducing sales
@@ -957,10 +1036,20 @@ class AutonomousFund(Strategy):
             except RiskError:
                 continue  # No fresh evidence: nothing is triggered from stale data.
         equity = number(account.equity)
+        for symbol in sorted(s for s, level in levels.items() if level["state"] == "triggered"
+                             and s not in account.positions):
+            # The exit completed; a newer decision's deferred levels for it take effect now.
+            self.execution.finish_level(symbol)
+            levels = self.execution.levels()
+        needed = set()
         for symbol in sorted(set(levels) & set(account.positions)):
             level, price = levels[symbol], prices.get(symbol)
             if price is None:
                 continue
+            if level["state"] == "triggered" and level.get("protective_target") is None:
+                # Left between two writes by an older version: watch again instead of staying stuck.
+                self.execution.rearm(symbol)
+                level = {k: v for k, v in level.items() if k not in self.execution.PROTECTIVE_KEYS}
             if level.get("protective_target") is None:
                 if level.get("stop_loss") and price.bid <= number(level["stop_loss"]):
                     target, kind = number(0), "stop_loss"
@@ -968,20 +1057,36 @@ class AutonomousFund(Strategy):
                     target, kind = number(level.get("take_profit_weight") or 0), "take_profit"
                 else:
                     continue
+                # Sized once, at the trigger: a rising price must not keep shaving off shares.
+                keep = desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0
                 if not self.execution.trigger_level(symbol, kind, now, {"bid": str(price.bid), "level": level,
-                                                                          "target_weight": str(target)}):
+                                                                          "target_weight": str(target)},
+                                                    target=target, keep=keep):
                     continue
-                self.execution.set_protective_target(symbol, target)
                 if latest and latest["state"] == "active":
                     self.execution.override(latest["id"], symbol, target, kind, now)
                 self._request_review(now, kind, {"symbol": symbol, "bid": str(price.bid)})
             else:
                 target = number(level["protective_target"])
+                keep = (int(level["protective_keep"]) if level.get("protective_keep") is not None else
+                        desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0)
+                if target > 0 and level.get("stop_loss") and price.bid <= number(level["stop_loss"]):
+                    # The stop is breached while a take-profit trim is still selling: exit fully.
+                    target, keep = number(0), 0
+                    self.execution.set_protective_target(symbol, target, keep, "stop_loss")
+                    if latest and latest["state"] == "active":
+                        self.execution.override(latest["id"], symbol, target, "stop_loss", now)
+                    self.journal.event(now, "protective_escalated", {"symbol": symbol, "bid": str(price.bid),
+                                                                     "stop_loss": level["stop_loss"]})
+                    self._request_review(now, "stop_loss", {"symbol": symbol, "bid": str(price.bid)})
             held = number(account.positions[symbol])
-            keep = desired_shares(equity, target, price.ask, self.limits) if target > 0 else 0
             quantity = int(held) - keep
             if quantity <= 0:
-                self.execution.finish_level(symbol)
+                # A partial take-profit keeps the stop on the remaining shares.
+                self.execution.finish_level(symbol, keep_levels=target > 0)
+                continue
+            if not submit:
+                needed.add(symbol)
                 continue
             # A protective exit prioritizes getting out: a marketable limit below the bid.
             buffer = number(getattr(self.execution_policy, "protective_limit_buffer", self.limits.limit_buffer))
@@ -989,6 +1094,7 @@ class AutonomousFund(Strategy):
             self._submit(Intent(symbol, "sell", quantity, limit), now, level["decision_id"], kind="protective",
                          max_submissions=self.limits.daily_orders + 5)
             return True
+        self._protective_needed = needed
         for alert in alerts:
             price = prices.get(alert["symbol"])
             if price is None:
@@ -1045,8 +1151,11 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == trading_day(now):
             return cached[1]
         from .review import _events
-        from .scorecard import score_decisions, score_predictions
-        rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated"))
+        from .scorecard import score_decisions, score_predictions, score_timing
+        rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated",
+                                                          "protective_trigger", "entry_waiting", "order_submitted"))
+        timing = [(r["at"], r["kind"], r["body"]) for r in rows
+                  if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
         reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"][-40:]
         # One allocation per session (its last), so frequent reviews are not over-counted.
         by_day = {}
@@ -1059,9 +1168,10 @@ class AutonomousFund(Strategy):
         for packet in reviews:
             for prediction in packet["review"].get("predictions", []):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
+        symbols |= {body["symbol"] for _, kind, body in timing if kind in {"protective_trigger", "entry_waiting"}}
         closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols & allowed)}
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
-                  "decisions": score_decisions(decisions, closes)}
+                  "decisions": score_decisions(decisions, closes), "timing": score_timing(timing, closes)}
         self._scorecard_cache = (trading_day(now), result)
         return result
 
@@ -1075,7 +1185,36 @@ class AutonomousFund(Strategy):
         predictions = cards["predictions"]
         return {"predictions": {k: predictions[k] for k in ("total", "scored", "correct", "hit_rate", "pending")} |
                 {"by_hypothesis": dict(list(predictions["by_hypothesis"].items())[:8])},
-                "decisions": cards["decisions"]["by_horizon"]}
+                "decisions": cards["decisions"]["by_horizon"],
+                "timing": {k: v for k, v in cards["timing"].items() if k != "recent"}}
+
+    def _request_cancel(self, pending, order, now, kind=None, detail=None):
+        """Ask once, then only again after CANCEL_RETRY_SECONDS: broker cancellation is asynchronous."""
+        requested = self.__dict__.setdefault("_cancel_requested", {})
+        last = requested.get(pending["id"])
+        if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
+            return
+        requested[pending["id"]] = instant(now)
+        self.cancel_order(order)
+        if kind:
+            self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **(detail or {})})
+
+    def _protect_while_orders_open(self, account, now):
+        """Stops and take-profits are still watched while an order is open; an exit that
+        must be sent takes priority, so our own non-protective orders are canceled."""
+        self._protective_needed = set()
+        self._watch(account, now, submit=False)
+        if not self._protective_needed:
+            return
+        for pending in self.journal.pending():
+            if self.execution.is_protective(pending["id"]):
+                continue
+            order = self.session_orders.get(pending["id"])
+            if self.mode in {"paper", "local"} and pending["broker_id"]:
+                order = self.broker._pull_order(pending["broker_id"], self.name)
+            if order and not self._terminal(order):
+                self._request_cancel(pending, order, now, "protective_priority_cancel",
+                                     {"protect": sorted(self._protective_needed)})
 
     def _manage_open_orders(self, now):
         """Cancel expired-target orders, and cancel stale limits so they can be repriced.
@@ -1093,13 +1232,7 @@ class AutonomousFund(Strategy):
         levels = self.execution.levels() if getattr(self, "quant", None) is not None else {}
 
         def cancel(pending, order, kind, detail):
-            last = requested.get(pending["id"])
-            if last is not None and 0 <= (instant(now) - last).total_seconds() < CANCEL_RETRY_SECONDS:
-                return
-            requested[pending["id"]] = instant(now)
-            self.cancel_order(order)
-            if kind:
-                self.journal.event(now, kind, {"intent_id": pending["id"], "broker_id": pending["broker_id"], **detail})
+            self._request_cancel(pending, order, now, kind, detail)
 
         for pending in self.journal.pending():
             order = self.session_orders.get(pending["id"])
@@ -1132,25 +1265,91 @@ class AutonomousFund(Strategy):
                     (instant(now) - submitted).total_seconds() >= interval):
                 cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
 
+    # ----- Factor lab: AI-proposed factors, objectively tested -----------------------
+    def _factor_panel(self, now):
+        """Completed daily closes and volumes of the universe; never today's forming bar. Cached per day."""
+        day = trading_day(now)
+        if self._factor_cache and self._factor_cache[0] == day:
+            return self._factor_cache[1]
+        from .factors import panel_from_rows
+        history, missing = {}, []
+        for symbol in sorted(self.universe):
+            rows, error = self._daily_bars(symbol, now)
+            if error or not rows:
+                missing.append(symbol)
+                continue
+            history[symbol] = [(day, close, shares) for day, close, shares in self._completed(rows, now)]
+        if missing:
+            self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
+        panel = panel_from_rows(history) if history else (None, None)
+        self._factor_cache = (day, panel)
+        return panel
+
+    def _factor_context(self, now):
+        """Once per trading day (warmed before the open): intraday decisions only reuse it.
+
+        Ranks come from the last completed close, so they cannot change during the
+        session; mining and testing happen in the post-market review.
+        """
+        lab = getattr(self, "factor_lab", None)
+        if lab is None:
+            return None
+        day = trading_day(now)
+        cached = getattr(self, "_factor_context_cache", None)
+        if cached and cached[0] == day:
+            return cached[1]
+        try:
+            close, volume = self._factor_panel(now)
+            context = lab.context(now, close, volume)
+        except Exception as exc:
+            return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+        self._factor_context_cache = (day, context)
+        return context
+
     # ----- Quantitative risk view -------------------------------------------------
-    def _daily_closes(self, symbol, now):
-        """Completed daily closes for risk estimation; cached per trading day."""
+    def _daily_bars(self, symbol, now):
+        """One daily-history request per symbol and trading day, shared by risk and the factor lab.
+
+        Returns (rows, error); rows are (date, close, volume) as the provider
+        returned them, including a possible forming bar for today.
+        """
         day, key = trading_day(now), (trading_day(now), symbol)
-        if key not in self._history:
-            rows = []
+        cache = getattr(self, "_bars", None)
+        if cache is None:
+            self._bars = cache = {}  # Test harnesses build the strategy without initialize().
+        if key not in cache:
+            length = self.quant.es_lookback_days + 5
+            lab = getattr(self, "factor_lab", None)
+            if lab is not None:
+                length = max(length, lab.settings.history_days)
+            rows, error = [], None
             try:
-                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), self.quant.es_lookback_days + 5,
-                                                  timestep="day")
+                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
                 frame = bars.df if bars is not None else None
-                if frame is not None and len(frame):
-                    frame = frame[frame.index.date < now.date()]  # Never today's forming/future bar.
-                    rows = [(str(index.date()), float(close)) for index, close in zip(frame.index, frame["close"])
-                            if close == close and close > 0]
+                if frame is not None and len(frame) and "close" in frame:
+                    volume = frame["volume"] if "volume" in frame else [None] * len(frame)
+                    # Row by row: one bad value (a missing volume, say) never costs the whole symbol.
+                    rows = [(index.date(), _finite(close), _finite(shares))
+                            for index, close, shares in zip(frame.index, frame["close"], volume)]
             except Exception as exc:
-                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": type(exc).__name__})
-            self._history = {k: v for k, v in self._history.items() if k[0] == day}
-            self._history[key] = rows
-        return self._history[key]
+                error = type(exc).__name__
+            if error:
+                self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
+            self._bars = {k: v for k, v in cache.items() if k[0] == day}
+            self._bars[key] = (rows, error)
+        return self._bars[key]
+
+    @staticmethod
+    def _completed(rows, now):
+        """Never today's forming (or a future) bar; only real, positive closes."""
+        today = instant(now).date()
+        return [(str(d), close, shares) for d, close, shares in rows if d < today and close == close and close > 0]
+
+    def _daily_closes(self, symbol, now):
+        """Completed daily closes for risk estimation: the same window as before (es_lookback_days + 5 bars)."""
+        rows, _ = self._daily_bars(symbol, now)
+        window = rows[-(self.quant.es_lookback_days + 5):]
+        return [(d, close) for d, close, _ in self._completed(window, now)]
 
     def _risk_estimate(self, symbols, now):
         from .quant import RiskEstimate
@@ -1255,7 +1454,9 @@ class AutonomousFund(Strategy):
         auto_budget = max(number(0), min(rooms["auto_exposure"], rooms["auto_turnover"], hard_budget))
         if stressed and policy.stress_requires_approval:
             auto_budget = number(0)
-        blocked = set()
+        # No purchase of a symbol whose protective exit is still in progress, even
+        # when a newer decision targets it: the stop completes first.
+        blocked = set(self.execution.exiting())
         # AI entry levels: buy only while the ask is at or below the chosen price,
         # and never below the AI's own stop for that symbol.
         for symbol, level in decision_levels(active["decision"]).items():
@@ -1330,10 +1531,11 @@ class AutonomousFund(Strategy):
         }
         return result
 
-    def _continue_allocation(self, active):
+    def _continue_allocation(self, active, account=None):
         if not active:
             return
-        account = self._snapshot()
+        # The iteration's own snapshot when it has one; a fresh one after slow model calls.
+        account = account if account is not None else self._snapshot()
         prices = {symbol: self._price(symbol) for symbol in set(active["weights"]) | set(account.positions)}
         now = self.get_datetime()
         result = self._candidates(active, account, prices, now)
@@ -1389,7 +1591,7 @@ class AutonomousFund(Strategy):
             raise RiskError("Orders require an open regular market session")
         if self.mode == "paper":
             assert_paper(self.broker)
-        cap = max_submissions or self.limits.daily_orders
+        cap = self.limits.daily_orders if max_submissions is None else max_submissions
         with self.journal.connection() as db:
             blocked = self.journal.blocked(db, intent, now, cap)
         if blocked:
@@ -1451,14 +1653,13 @@ class AutonomousFund(Strategy):
             self._reconcile()
             self._snapshot()
         except Exception as exc:
-            self.notify("report_error", type(exc).__name__)
+            self._disclose("report_error", type(exc).__name__)
         finally:
-            from .report import report
+            from . import report as reports
             # A failed closing mark must be disclosed, not block ordinary
             # read-only review of the evidence we actually retained.
-            self._review_after_close()
-            self.journal.export()
-            report(self.run_dir, self.config.get("model_prices_per_million"))
+            self._bookkeeping(self._review_after_close, self.journal.export,
+                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
 
     def on_abrupt_closing(self):
         if getattr(self, "news", None) is not None:

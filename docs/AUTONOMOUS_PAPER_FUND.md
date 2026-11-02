@@ -38,6 +38,34 @@ python -m venv .venv
 应用依赖固定 `litellm==1.105.1`，与框架要求的 MCP 1.x 配合使用；不修改共享依赖或升级 MCP 主版本。
 修改依赖前先停止正在运行的模拟盘。以后重新安装共享依赖后，也需重新应用本应用的依赖约束。
 
+### 启动模式：由 `.env` 的 `FUND_MODE` 决定
+
+在 `.env` 中设置 `FUND_MODE` 后，**不带命令**启动（或服务器服务重启）就按该模式运行；修改后重新启动即生效：
+
+| `FUND_MODE` | 含义 | 需要 |
+|---|---|---|
+| `local`（默认） | 真实行情本地模拟盘：Yahoo 实时行情＋本地虚拟资金，本地保守撮合，不连接任何券商 | 模型 Key |
+| `paper` | Alpaca 模拟账户：券商模拟撮合，不是真钱 | 模型 Key＋Alpaca Paper Key |
+
+```powershell
+.\scripts\run_autonomous_fund.ps1
+```
+
+Linux：`bash scripts/run_autonomous_fund.sh`。启动时第一行会打印模式、来源（`FUND_MODE`／命令行／默认）和账户目录。
+
+- **没有实盘选项**：`FUND_MODE` 只接受 `local`、`paper`，写 `live`、`schwab` 或其他任何值都拒绝启动。
+- **账户目录**：`FUND_RUN_DIR` 留空时为 `artifacts/fund-<模式>`，local 和 paper 的账本自动分开，切换模式不会混用账本；
+  若以前不带 `-RunDir` 启动过，账本在旧默认目录 `artifacts/autonomous-fund`，系统会识别并继续使用它。
+  `stop`、`resume`、`approvals`、`report`、`acceptance` 等命令不带 `--run-dir` 时，也作用于 `FUND_MODE` 对应的账户。
+- **只读观察**：`FUND_OBSERVE_ONLY=true`（仅 local）不调用模型、不下单。
+- **显式命令优先**：`-Mode local`／`-Mode paper`（Linux 为 `local`／`paper`）或 `-RunDir` 仍然有效，并覆盖 `.env`；
+  mock、backtest 等历史实验从不写入账户目录。
+- `stop` 即使 `.env` 有拼写错误或文件权限不对也会执行（并提示错误），仍会读出其中的 `FUND_MODE`／`FUND_RUN_DIR`；
+  不带 `--run-dir` 时，除了 `FUND_MODE` 对应的账户，还会停止所有最近一小时内有心跳的账户（包括刚退出、可能马上被服务重启的），
+  因此用 `-Mode paper` 等显式命令启动的账户也不会漏停；某个目录写入失败不影响其他账户，最后会列出失败的目录。
+  指定的 `--run-dir` 不存在时直接报错并列出最近活动的账户，不会因为路径写错而误报“已停止”。紧急停止不会被配置问题挡住。
+- `show-config` 会显示最终的启动模式、来源和账户目录。
+
 无需密钥的完整机械检查：
 
 ```powershell
@@ -53,12 +81,14 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 
 模型 Key、你给 AI 的约束和外部参数都可以写在仓库根目录的 `.env`（已被 Git 忽略；从
 `scripts/autonomous_fund/.env.example` 复制）。优先级为 **进程环境变量 > `.env` > `config.json`**：
-`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的值与默认值一致，留空表示不覆盖。
+`config.json` 保存完整的、经审阅的默认策略，`.env` 只覆盖你要改的项；模板里的风控与参数值与默认值一致，留空表示不覆盖；
+模板中的 `FUND_MODE=local` 决定不带命令启动时进入本地模拟盘。
 每个覆盖都按与 `config.json` 相同的规则校验，记入启动审计（`startup.environment_overrides`），并且会使旧目标失效、由 AI 按新规则重新决策。
 `.env` 中写错的 `FUND_*` 名称会直接拒绝启动并提示正确名称，避免约束被静默忽略。
 
 | 类别 | 变量 | 作用 |
 |---|---|---|
+| 启动 | `FUND_MODE`、`FUND_RUN_DIR`、`FUND_OBSERVE_ONLY`、`FUND_AUTO_RESUME` | 启动模式 local／paper（没有实盘）、账户目录、只读观察（见[启动模式](#启动模式由-env-的-fund_mode-决定)）、重启后安全条件下自动恢复交易 |
 | 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
 | 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
@@ -70,7 +100,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 通知 | `FUND_TELEGRAM_BOT_TOKEN`、`FUND_TELEGRAM_CHAT_ID`、`FUND_TELEGRAM_APPROVER_IDS`、`FUND_TELEGRAM_APPROVALS` | Telegram 通知与回复审批 |
 | 外部 | `FUND_ITERATION_SECONDS`、`FUND_LIVE_STREAM`、`FUND_RESEARCH_RESOLVER` | 盯盘间隔、实时推送报价、研究网页解析（Fake-IP 用 `doh`） |
 | 外部 | `FUND_NEWS_ENABLED`、`FUND_NEWS_POLL_SECONDS`、`FUND_NEWS_QUERIES`、`FUND_NEWS_RSS_FEEDS`、`FUND_SEC_USER_AGENT`、`FRED_API_KEY` | 实时资讯监控与数据源 |
-| 外部 | `FUND_SHADOW_AB` | 影子 A/B 验证 AI 的复盘学习 |
+| 外部 | `FUND_SHADOW_AB`、`FUND_FACTOR_LAB` | 影子 A/B 验证 AI 的复盘学习；因子实验室（AI 提出因子、代码客观检验） |
 | 券商 | `ALPACA_API_KEY`、`ALPACA_API_SECRET`、`ALPACA_IS_PAPER` | 仅 paper 模式 |
 | Schwab | `SCHWAB_ACCOUNT_NUMBER`、`SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL`、`SCHWAB_TOKEN`、`SCHWAB_TOKEN_PATH` | 仅用于只读体检 `schwab-check`（见“Schwab 实盘准备”） |
 
@@ -151,6 +181,8 @@ Remove-Variable fundKey
   到期订单撤销，停机期间已过时的分钟线不追补成交。成交、现金、持仓和审计事件同一事务提交，
   重启不会重复成交或重复扣费。本地已接受订单及意图 ID 同一事务保存，没有券商网络确认的不确定窗口。
 - 持有期间拆股同步调整数量和成本；无法整股表示的拆并股、供应商修改已处理动作时暂停撮合并记录异常。
+  Yahoo 在拆股后按拆股比例改写历史分红金额（如 0.40 变为 0.20），这种改写不算修改；真正的金额修改仍需人工核对。
+- 卖出（降风险）成交不要求其他持仓的报价新鲜，只要求本证券的成交价不早于已应用的拆股；买入仍要求所有持仓都有新鲜估值。
   分红仅按除息事件计入不可花费的应收款，因为此来源没有可靠付款日，首版不自动转为可交易现金。
   分红数量从除息日前的成交账本重建，除息日新买入不参与；若迟报时相关持仓已清空或重开，可能漏计，需人工补核。
   拆股迟报且已发生除息日后的交易时暂停撮合。复杂公司行动、退市、并购、换股和税务尚未完整覆盖，
@@ -364,12 +396,17 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
   普通调仓只有 0.1%），并在 `execution.protective_reprice_seconds`（默认 60 秒，普通单 180 秒）后未成交就撤单，
   按新报价重挂，直到减到目标，不会“触发一次就忘”。保护性卖出优先保证离场，而不是争取价格。
   同一决策内被止损的证券不会被重新买回，等 AI 下一次复核再决定。
+- 有挂单（例如一笔买单在等成交）时，止损／止盈照常检测；需要卖出时，先撤掉本应用的非保护性挂单，让止损优先。
+- 止盈减仓的股数在触发时一次算定，价格继续上涨也不会一股一股地追着卖；减仓完成后，剩余股份的**止损继续有效**。
+  减仓还没卖完时价格跌破止损，会改为全部卖出。
 - 买价已经跌到 AI 自己给出的 `stop_loss` 或以下时，不会再新买入该证券（记录 `stop_breached_no_buy`），
   已挂出的该证券买单会立即撤销（记录 `buy_canceled_stop_breached`），不等待 180 秒改价周期。
 - 价格提醒、持仓或目标证券相对本决策首次观测价的波动达到 `execution.review_on_move`（默认 3%）、
   市场进入压力状态时，会把下一次 AI 复核提前；提前复核仍遵守最短复核间隔、失败退避和每日模型预算。
   基金经理在 `watch_triggers` 中看到被唤醒的原因。
-- 每次新的 AI 决策替换全部旧价位和提醒。决策中的价位同样受校验：止损须低于入场价和止盈价，
+- 每次新的 AI 决策替换全部旧价位和提醒，**正在执行的止损／止盈卖出除外**：止损触发后提前唤醒的新决策不会中断它，
+  卖出完成前不买入该证券；新决策为该证券设的价位在卖出完成后才生效。
+  决策中的价位同样受校验：止损须低于入场价和止盈价，止盈须高于入场价（否则买入后立刻触发止盈，白付价差），
   `take_profit_weight` 须低于目标权重，提醒只能针对投资范围内的证券。
 
 这让“盯盘”成本接近零，而择时（入场价、止损、止盈、何时复核）仍由 AI 决定。
@@ -384,8 +421,49 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 - **决策记分卡**：每个交易日最后一个 AI 目标组合，从当日收盘起算 1／5／20 个交易日的收益，
   减去同等总敞口下 SPY 的收益，得到选股超额收益（不含费用和风控缩放，专门衡量 AI 的选股能力）。
 
-两张记分卡进入盘后复盘、研究和决策的上下文，复盘被要求据此保留、修正或撤回假设，结果写入日报和 `report.json` 的 `latest_scorecard`。
+另有**择时记分卡**（`scorecards.timing`），客观衡量 AI 自己设定的价位：每次止损／止盈离场后 1／5／20 个交易日的收盘价
+相对离场价的变化（继续下跌为正贡献、反弹为负）；每次等待入场价时，若之后买入，比较买入限价与开始等待时的卖价，
+若一直没买，比较之后的收盘价（上涨即错过的收益）。复盘据此校准止损和入场价的松紧，但不应因此放弃保护性止损。
+
+这些记分卡进入盘后复盘、研究和决策的上下文，复盘被要求据此保留、修正或撤回假设，结果写入日报和 `report.json` 的 `latest_scorecard`。
 这是客观反馈而不是自动改参数：风险参数、投资范围和权限仍只能由你修改。样本少时结论不稳定，重叠期限之间相关。
+
+## 因子实验室：AI 挖掘因子，代码客观检验
+
+因子挖掘只在盘后做：复盘的研究阶段结合以往检验结果研究可能的新规律，基金经理阶段把它写成最多 5 个因子表达式（`factor_proposals`），
+代码随即检验。盘中只使用已验证因子的排名：排名来自最近一个已完成收盘，开盘前预热一次，全天复用，不占用盘中盯盘和下单的时间。
+
+这些因子表达式由确定性代码（`factors.py`）用无前视的历史数据检验，
+结果在之后的每次决策和复盘中交给 AI。闭环是：**AI 发现规律 → 写成因子 → 代码检验 → 通过的因子及其实盘表现回到 AI → AI 修正或提出新因子**。
+
+**因子语言**（安全白名单，不执行任何 Python 代码）：数据 `close`、`volume`（已完成日线）；时序函数
+`ret(n)`、`vol(n)`、`delay`、`delta`、`ts_mean`、`ts_std`、`ts_max`、`ts_min`、`ts_rank`、`log`、`abs`、`sign`；
+横截面函数 `rank`、`zscore`、`demean`；`+ - * /`。所有运算只看过去，窗口 1–504 个交易日。例如：
+`rank(ret(126) - ret(21))`（中期动量）、`-vol(60)`（低波动）、`rank(close / ts_mean(close, 200) - 1)`、`-rank(ret(5))`（短期反转）。
+
+**检验标准**（防止“挖掘”变成过拟合）：
+- 每个日期在投资范围内计算因子值与之后 `horizon_sessions` 个交易日收益的横截面 rank IC（Spearman），
+  每隔 `horizon_sessions` 取一个日期，避免重叠收益虚增 t 值；
+- 前 70% 为样本内，`|t|` 必须超过随**累计尝试次数**提高的 Bonferroni 门槛（试 1 个约 1.96，50 个约 3.29，200 个约 3.66）；
+  同一表达式重复提出不算新尝试，但也不会重新检验；
+- 后 30% 为样本外，方向必须一致且 `t ≥ holdout_min_t`（默认 1.0）；
+- 通过后跟踪**验证日之后**的 IC，这是真正的样本外记录；至少 `live_min_observations`（默认 10）个观测后若平均 IC 与方向相反，自动退役。
+
+**AI 看到什么**（`factor_lab` 上下文）：语法、检验标准、已尝试次数和下一个门槛、已验证因子（样本内／样本外／实盘 IC、
+当前排名靠前和靠后的证券）、最近被拒绝或退役的因子及原因。因子**只是证据**，不会直接下单；
+AI 仍决定完整目标组合，量化风控和审批规则不变。影子 A/B 的对照组看不到因子实验室，因此 A/B 衡量的是包括因子在内的整个学习闭环。
+
+配置在 `config.json` 的 `factor_lab` 段（`.env` 中 `FUND_FACTOR_LAB=false` 可关闭）：历史长度 504 个交易日、
+每个日期至少 8 个证券、样本内至少 20 个观测、样本外至少 8 个、显著性 5%。离线检验单个表达式：
+
+```powershell
+.\scripts\run_autonomous_fund.ps1 -Mode factor-lab -DataDir data -Symbols SPY,TLT,GLD,IEF,DJP -Expression "rank(ret(60))" -Horizon 5 -MinNames 5
+```
+
+Linux 用 `--expression=...` 形式（表达式以 `-` 开头时必须如此），例如 `--expression=-vol(20)`。
+**实测**：仓库自带的 2019 年 5 只 ETF 日线上，`rank(ret(20))`、`-rank(ret(5))`、`-vol(20)`、`rank(ret(60))` 全部被拒绝
+（样本内 |t| 0.11–1.21，低于 1.96）。5 只证券、一年数据远不足以证明任何因子，这正是检验应有的结论；
+运行中的基金使用 27 只证券、两年日线。合成数据测试中，真实存在的动量规律在所有种子下都通过，纯噪声在所有种子下都被拒绝。
 
 ## 实时行情：Yahoo 推送报价
 
@@ -552,6 +630,7 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
 | `max_model_failure_rate` | 0.2 | 模型调用失败比例 |
 | `min_review_ratio` | 0.9 | 完成盘后复盘的交易日比例 |
 | `max_mean_slippage_bps` | 25 | 成交价相对首次提交限价的平均不利滑点（基点） |
+| `max_bot_crashes` | 0 | 绕过所有保护导致进程退出的崩溃（`bot_crash`）；记账错误和自动恢复次数只作为参考数据列出 |
 
 报告还列出人工干预次数（审批、复位、补单、出入金、Telegram 指令）、保护性卖单、改价撤单、追价封锁、回撤与单日亏损闸门、
 最新的影子 A/B 结论等。它只证明运行层面的可靠性，不证明盈利；本地虚拟账户也不能代替券商 Paper 的证据。
@@ -587,7 +666,8 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
 .\scripts\run_autonomous_fund.ps1 -Mode resume -RunDir artifacts/fund-paper
 ```
 
-`stop` 创建 STOP 文件；运行进程下一次迭代停止新单并尝试取消本应用已知未完成订单。
+`stop` 创建 STOP 文件（不带目录时包括所有正在运行的账户，并打印停止了哪些目录）；运行进程下一次迭代停止新单并尝试取消本应用已知未完成订单。
+每种停止原因（谁、为什么）在 6 小时内通知一次（`stop_active`），服务反复重启或原因来回切换不会刷屏。
 不要把创建文件当成券商已确认撤单。模型或网络调用进行中可能延迟处理；紧急时同时去券商界面核验并撤单。
 Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单。
 本地模拟盘的休市等待可被原生关闭钩子唤醒，Ctrl+C 后会退出等待并释放进程锁；
@@ -599,6 +679,51 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 回撤在 4%–8% 之间时由量化风控自动降低敞口预算并在回升后自动恢复，不需要人工；只有 8% 硬锁需要人工复位。
 本地模式将上述命令中的目录替换为 `artifacts/fund-local`；轮询器也在休市时处理本地 STOP 和到期撤单。
 回撤暂停需要操作员停掉进程后显式执行 `reset-drawdown`；新高水位从下一次净值开始，操作会留痕。
+
+**进程稳定性**：LumiBot 在实时模式下，只要有异常逃出生命周期钩子（每轮迭代、开盘前、收盘后），就会调用
+`on_bot_crash` 并结束整个策略。本应用的处理：
+
+- 每轮迭代的业务逻辑（读账户、盯盘、调用模型、下单）出错，只记录 `blocked` 通知，下一轮照常运行；
+- 账本导出、报告重建、迭代记录等**可重建的记账步骤**失败（数据库暂时被锁、磁盘写入失败、报告数据异常），
+  记录 `bookkeeping_error` 通知并在下一轮重试，不会结束进程。如果账本真的无法写入，所有订单预留也会被拒绝，
+  继续运行不会增加风险，而进程退出反而会停止盯止损；
+- 盘前研究、盘后复盘、因子检验、学习评估各自出错都只发通知，不影响交易进程；
+- 新闻轮询、Yahoo 实时推送在后台线程中逐轮捕获错误并自动重连；Paper 模式的心跳线程单次写入失败不会退出；
+- 监控进程逐条处理 Telegram 回复：某条回复处理出错只记录 `telegram_command` 错误，不会让监控退出或反复读同一条；
+- 模型调用很长（研究加决策超过 3 分钟）但仍在推进的迭代，不会被误判为“迭代卡死”；
+- STOP 期间仍会核对券商的订单状态，已撤销或已成交的订单会被标记结束，自动恢复因此不会一直被挡住；撤单请求同样限频；
+- 若仍有异常让进程崩溃，`on_bot_crash` 先写入 `bot_crash` 通知，独立监控进程据此（以及心跳超时）通过 Telegram 告警；
+- 历史回测中这些错误仍直接抛出，以免测试掩盖真正的 bug。
+
+**进程退出后的自动重启与自动恢复**：
+
+- Ubuntu：两个 systemd 服务（交易、监控）退出后 30 秒自动重启；
+- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易和监控两个进程，任一退出 30 秒后重启：
+
+  ```powershell
+  .\scripts\run_autonomous_fund.ps1 -Mode serve
+  ```
+
+  与服务器一样要求在 `.env` 配好 Telegram。开机自动启动可在“任务计划程序”中创建登录时运行的任务，
+  例如 `schtasks /Create /TN "LumiBot Fund" /SC ONLOGON /TR "powershell -NoProfile -ExecutionPolicy Bypass -File <repo>\scripts\run_autonomous_fund.ps1 -Mode serve"`；
+  长期运行请关闭电脑睡眠（`powercfg /change standby-timeout-ac 0`），睡眠期间进程冻结，心跳超时会触发 STOP。
+  Windows 下的 `serve` 只在模拟测试中验证过，尚未在真实 Windows 机器上运行。
+
+每次（重新）启动都会先写入 STOP，避免无人监控的成交。**STOP 文件记录原因**，分三级，后写入的不能降级：
+
+| 级别 | 来源 | 自动解除 |
+|---|---|---|
+| 人工 | `stop` 命令；**手动关闭**服务（`systemctl stop`／`restart`、在 `serve` 窗口按 Ctrl+C）；首次安装、**全新账户的第一次启动**（包括切换 `FUND_MODE`／`FUND_RUN_DIR` 后）、恢复的备份、旧版本留下的空 STOP | 永不，必须 `resume` |
+| 监控 | 看门狗或服务监督发现故障 | 仅进程级故障（心跳超时、进程退出或卡死、监控暂时不可用）；磁盘不足、版本不符、撮合错误、未配置通知不解除，且之后出现的进程级故障不能覆盖这些需要人工处理的原因 |
+| 服务 | **异常关闭**：进程自己退出（崩溃）、被系统杀死、断电或死机后重新启动、操作系统关机或重启 | 是 |
+
+自动恢复由独立监控进程执行（`config.json` 的 `service` 段，`.env` 中 `FUND_AUTO_RESUME=false` 可关闭），必须同时满足：
+交易进程连续健康至少 `auto_resume_after_seconds`（默认 180 秒，故障后从恢复时重新计时）；没有状态不明或未结束的订单预留
+（交易进程在 STOP 期间会撤销本应用的未完成订单）；24 小时内自动恢复不超过 `max_auto_resumes_per_day` 次（默认 3）。
+恢复、被挡住（`auto_resume_blocked`）或次数用完（`auto_resume_exhausted`）都会通过 Telegram 通知。
+手动关闭和异常关闭的区分：服务收到停止信号时，若操作系统正在关机或重启（systemd 报告 `stopping`）视为异常，开机后自动恢复；
+其他停止信号（你执行 `systemctl stop`／`restart` 或按 Ctrl+C）视为手动关闭，下次启动保持 STOP，核对后 `resume`，
+修改 `.env` 后重启服务同样需要 `resume`。无法判断时按手动处理。直接关闭窗口或在任务管理器中结束进程，程序来不及记录，按异常处理。
 
 `notify(kind, details)` 是通知扩展接口，默认输出控制台及持久化本地通知 outbox。
 同一状况（同类型、同内容）在 30 分钟内只记录一次，STOP 提示为 6 小时，避免每分钟写入相同告警；

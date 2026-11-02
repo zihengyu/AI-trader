@@ -1,7 +1,9 @@
 param(
-    [ValidateSet('mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'acceptance', 'show-config', 'schwab-check', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
-    [string]$Mode = 'mock',
-    [string]$RunDir = 'artifacts/autonomous-fund',
+    [ValidateSet('start', 'mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'factor-lab', 'acceptance', 'show-config', 'schwab-check', 'serve', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
+    # 'start' (default) runs FUND_MODE from .env: local or paper. No live mode exists.
+    [string]$Mode = 'start',
+    # Empty: FUND_RUN_DIR from .env, else artifacts/fund-<mode> (historical runs: artifacts/autonomous-fund).
+    [string]$RunDir = '',
     [string]$Model = '',
     [string]$ResearchModel = '',
     [string]$DecisionModel = '',
@@ -19,6 +21,10 @@ param(
     [string]$MemoryFile = '',
     [string]$Amount = '',
     [string]$Targets = '',
+    [string]$Symbols = '',
+    [string]$Expression = '',
+    [int]$Horizon = 0,
+    [int]$MinNames = 0,
     [switch]$RebaselineExternal
 )
 $ErrorActionPreference = 'Stop'
@@ -26,8 +32,8 @@ Push-Location (Split-Path $PSScriptRoot -Parent)
 try {
     $pythonPath = Join-Path (Get-Location) '.venv/Scripts/python.exe'
     if (-not (Test-Path -LiteralPath $pythonPath)) { throw 'Create .venv and install requirements.txt first.' }
-    $runArgs = @('-m', 'scripts.autonomous_fund.run', $Mode, '--run-dir', $RunDir, '--config', $Config,
-                 '--start', $Start, '--end', $End)
+    $runArgs = @('-m', 'scripts.autonomous_fund.run', $Mode, '--config', $Config, '--start', $Start, '--end', $End)
+    if ($RunDir) { $runArgs += @('--run-dir', $RunDir) }
     if ($Model) { $runArgs += @('--model', $Model) }
     if ($ResearchModel) { $runArgs += @('--research-model', $ResearchModel) }
     if ($DecisionModel) { $runArgs += @('--decision-model', $DecisionModel) }
@@ -48,8 +54,14 @@ try {
     if ($MemoryFile) { $runArgs += @('--memory-file', $MemoryFile) }
     if ($Amount) { $runArgs += @('--amount', $Amount) }
     if ($Targets) { $runArgs += @('--targets', $Targets) }
+    if ($Symbols) { $runArgs += @('--symbols', $Symbols) }
+    # One token: an expression may start with '-' (for example -vol(60)).
+    if ($Expression) { $runArgs += "--expression=$Expression" }
+    if ($Horizon -gt 0) { $runArgs += @('--horizon', $Horizon) }
+    if ($MinNames -gt 0) { $runArgs += @('--min-names', $MinNames) }
     if ($RebaselineExternal) { $runArgs += '--rebaseline-external' }
     if ($Mode -in @('mock', 'backtest', 'qualify')) {
+        if (-not $RunDir) { $RunDir = 'artifacts/autonomous-fund' }  # Same default as the Python runner.
         New-Item -ItemType Directory -Force -Path $RunDir | Out-Null
         $stdoutPath = Join-Path $RunDir 'stdout.log'
         $stderrPath = Join-Path $RunDir 'stderr.log'

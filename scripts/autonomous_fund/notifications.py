@@ -1,5 +1,6 @@
 """Human-readable messages built only from the selected account's journal."""
 import json
+from collections import Counter
 from zoneinfo import ZoneInfo
 
 from .execution import operator_connection
@@ -67,6 +68,16 @@ def approval_message(details):
             str(details.get("rationale") or "旧请求没有通知理由，请查看 approvals 中的完整原文。"))
 
 
+FACTOR_STATUS = {"validated": "通过", "rejected": "未通过", "insufficient_data": "数据不足", "invalid": "表达式无效"}
+HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
+                "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
+                "postmarket_review_error", "premarket_research_error", "model_budget_exhausted"}
+
+
+def _percent(value):
+    return "暂无" if value is None else f"{value * 100:.2f}%"
+
+
 def daily_document(root, sequence):
     # The AI supplies neither a file path nor an upload URL. Render one exact
     # journal row in memory, so a prompt cannot turn reports into file exfiltration.
@@ -78,6 +89,11 @@ def daily_document(root, sequence):
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
             "SELECT at,kind,body FROM events ORDER BY sequence") if instant(at) <= cutoff]
+        # The scorecard and factor tests are written just after the review itself
+        # (a live clock has moved on), so select them by session, not by time.
+        related = [(kind, json.loads(body)) for kind, body in db.execute(
+            "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
+            "json_extract(body,'$.session_date')=? ORDER BY sequence", (day,))]
     from .report import report
     snapshot = report(root, write_files=False, as_of=cutoff)
     review, session = packet["review"], packet["session"]
@@ -111,15 +127,38 @@ def daily_document(root, sequence):
              "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
              "```json", json.dumps(watch_events, ensure_ascii=False, indent=2), "```", "",
              "## AI 记分卡（只用已完成收盘价客观打分）", ""]
-    card = next((body for at, kind, body in reversed(events) if kind == "scorecard"), None)
+    # Only this session's card: an earlier one under today's heading would be stale.
+    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
     if card:
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
-                  "决策相对同敞口基准的超额收益（1/5/20 个交易日）：" + json.dumps(decisions, ensure_ascii=False),
-                  "样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
+                  "决策相对同敞口基准的超额收益（1/5/20 个交易日）：" + json.dumps(decisions, ensure_ascii=False)]
+        timing = card.get("timing")
+        if timing:
+            stop, profit = timing["protective_exits"]["stop_loss"], timing["protective_exits"]["take_profit"]
+            waits = timing["entry_waits"]
+            lines += [f"择时：止损 {stop['count']} 次，5 日后平均贡献 {_percent(stop['5']['mean_value_added'])}"
+                      f"（正＝避免了继续下跌）；止盈 {profit['count']} 次，5 日后平均贡献 "
+                      f"{_percent(profit['5']['mean_value_added'])}（负＝卖早了）；等待入场 {waits['count']} 次，"
+                      f"买入 {waits['entered']} 次，平均价格改善 {_percent(waits['mean_entry_improvement'])}，"
+                      f"未买入的 5 日后平均贡献 {_percent(waits['not_entered']['5']['mean_value_added'])}（负＝错过了上涨）"]
+        lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
-        lines += ["尚无可打分的样本。", ""]
+        lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
+    lines += ["## 因子挖掘（AI 提出，代码客观检验）", ""]
+    results = [result for kind, body in related if kind == "factor_tests" for result in body.get("results", [])]
+    for result in results:
+        sample, holdout = result.get("in_sample") or {}, result.get("holdout") or {}
+        lines.append(f"- {result.get('name')}：`{result.get('expression')}`（{result.get('horizon_sessions', '?')} 日）→ "
+                     f"{FACTOR_STATUS.get(result.get('status'), result.get('status'))}；样本内 t={sample.get('t')}，"
+                     f"样本外 t={holdout.get('t')}；{result.get('reason', '')}")
+    lines += ([] if results else ["本次没有提出新因子。"]) + [""]
+    health = Counter(body.get("kind") for at, kind, body in events if kind == "notification" and
+                     body.get("kind") in HEALTH_KINDS and instant(at).astimezone(zone).date().isoformat() == day)
+    lines += ["## 当日运行状况", "",
+              ("；".join(f"{kind} × {count}" for kind, count in sorted(health.items())) if health else
+               "当日没有阻断、故障、停止或自动恢复记录。"), ""]
     lines += ["## 下一交易日预测（将被自动打分）", "",
               "```json", json.dumps(review.get("predictions", []), ensure_ascii=False, indent=2), "```", "",
               "## 复盘结论", "", review["summary"], ""]

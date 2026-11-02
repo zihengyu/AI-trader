@@ -145,11 +145,22 @@ class QuantPolicy:
         return hashlib.sha256(json.dumps(asdict(self), sort_keys=True, default=str).encode()).hexdigest()
 
 
-def daily_returns(rows):
-    """[(date, close), ...] -> {date: simple return}, consecutive completed sessions only."""
+def daily_returns(rows, sessions=None):
+    """[(date, close), ...] -> {date: simple return}, consecutive completed sessions only.
+
+    With `sessions` (every session date seen across the universe), a pair of rows
+    that skips a session another symbol traded is not a one-day return and is
+    dropped, instead of entering the scenarios as a two-day move.
+    """
     ordered = sorted((str(day), float(close)) for day, close in rows)
+    previous_session = None
+    if sessions is not None:
+        sessions = sorted(set(map(str, sessions)))
+        previous_session = dict(zip(sessions[1:], sessions))
     result = {}
-    for (_, previous), (day, close) in zip(ordered, ordered[1:]):
+    for (before, previous), (day, close) in zip(ordered, ordered[1:]):
+        if previous_session is not None and previous_session.get(day) != before:
+            continue
         if previous > 0 and close > 0 and math.isfinite(previous) and math.isfinite(close):
             result[day] = close / previous - 1
     return result
@@ -160,7 +171,8 @@ class RiskEstimate:
 
     def __init__(self, histories, policy):
         self.policy = policy
-        returns = {symbol: daily_returns(rows) for symbol, rows in histories.items()}
+        sessions = {str(day) for rows in histories.values() for day, _ in rows}
+        returns = {symbol: daily_returns(rows, sessions) for symbol, rows in histories.items()}
         usable = {s for s, r in returns.items() if len(r) >= policy.min_history_days}
         # Drop the shortest histories until the common window is long enough.
         while usable:

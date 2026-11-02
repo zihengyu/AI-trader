@@ -339,11 +339,45 @@ def test_strategy_scorecards_read_reviews_and_one_decision_per_session(tmp_path)
     for hour in (14, 15, 16):
         strategy.journal.event(f"{day}T{hour}:00:00+00:00", "decision_validated",
                                {"targets": [{"symbol": "ALFA", "weight": .05}]})
+    strategy.journal.event(f"{day}T15:30:00+00:00", "protective_trigger",
+                           {"symbol": "BETA", "trigger": "stop_loss", "bid": "100", "level": {}, "target_weight": "0"})
     cards = strategy._scorecards(NOW)
     assert cards["predictions"]["total"] == 1 and cards["predictions"]["scored"] == 1
     assert cards["decisions"]["decisions"] == 1
+    stops = cards["timing"]["protective_exits"]["stop_loss"]
+    assert stops["count"] == 1 and stops["1"]["observed"] == 1 and stops["5"]["observed"] == 0  # Later: pending.
     summary = strategy._scorecard_summary(NOW)
-    assert set(summary) == {"predictions", "decisions"}
+    assert set(summary) == {"predictions", "decisions", "timing"} and "recent" not in summary["timing"]
+
+
+def test_timing_scorecard_grades_the_ais_own_exits_and_entry_waits():
+    from scripts.autonomous_fund.scorecard import score_timing
+    days = [str(d.date()) for d in DAYS[:25]]
+    path = lambda values: list(zip(days, values))  # noqa: E731
+    falls_then_rebounds = [100, 98, 96, 94, 92, 90] + [95] * 14 + [105] * 5
+    rises = [50 + i for i in range(25)]
+    closes = {"ALFA": path(falls_then_rebounds), "BETA": path(rises), "GAMMA": path([50] * 25),
+              "DELTA": path([20, 20.5, 21, 21.5, 21.8, 22] + [22] * 19)}
+    start = f"{days[0]}T15:00:00+00:00"
+    events = [
+        (start, "protective_trigger", {"symbol": "ALFA", "trigger": "stop_loss", "bid": "100"}),
+        (start, "protective_trigger", {"symbol": "BETA", "trigger": "take_profit", "bid": "50"}),
+        (start, "entry_waiting", {"decision_id": "d1", "symbol": "GAMMA", "entry_limit": "49", "ask": "50"}),
+        (f"{days[1]}T15:00:00+00:00", "order_submitted",
+         {"kind": "allocation", "decision_id": "d1", "symbol": "GAMMA", "side": "buy", "limit": "49"}),
+        (start, "entry_waiting", {"decision_id": "d1", "symbol": "DELTA", "entry_limit": "19", "ask": "20"}),
+    ]
+    card = score_timing(events, closes)
+    stop = card["protective_exits"]["stop_loss"]
+    assert stop["1"]["mean_value_added"] == pytest.approx(0.02) and stop["5"]["mean_value_added"] == pytest.approx(0.10)
+    assert stop["20"]["mean_value_added"] == pytest.approx(-0.05)  # The stop gave up the later rebound.
+    assert card["protective_exits"]["take_profit"]["5"]["mean_value_added"] == pytest.approx(-0.10)
+    waits = card["entry_waits"]
+    assert waits["count"] == 2 and waits["entered"] == 1 and waits["mean_entry_improvement"] == pytest.approx(0.02)
+    assert waits["not_entered"]["5"]["mean_value_added"] == pytest.approx(-0.10)  # The wait missed a 10% gain.
+    late = score_timing([(f"{days[-1]}T15:00:00+00:00", "protective_trigger",
+                          {"symbol": "ALFA", "trigger": "stop_loss", "bid": "105"})], closes)
+    assert late["protective_exits"]["stop_loss"]["1"]["observed"] == 0  # Never scored before the close exists.
 
 
 # ----- Research network and data boundary -------------------------------------------

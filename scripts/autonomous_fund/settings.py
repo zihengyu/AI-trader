@@ -13,6 +13,8 @@ a mistyped limit must never be silently ignored.
 import copy
 import difflib
 import json
+import sqlite3
+from pathlib import Path
 
 from .risk import RiskError
 
@@ -74,6 +76,11 @@ def _json(text):
 
 # name: (config path or None for a runtime-only value, parser, secret, section, Chinese description)
 SETTINGS = {
+    # ----- Startup mode (runtime selection; never part of the risk policy)
+    "FUND_MODE": (None, None, False, "启动", "启动模式：local（真实行情本地模拟盘）或 paper（Alpaca 模拟账户）；没有实盘选项"),
+    "FUND_RUN_DIR": (None, None, False, "启动", "账户运行目录（账本、报告、STOP）；留空为 artifacts/fund-<模式>"),
+    "FUND_OBSERVE_ONLY": (None, None, False, "启动", "仅 local：只读观察，不调用模型、不下单"),
+    "FUND_AUTO_RESUME": (("service", "auto_resume"), _bool, False, "启动", "服务重启或进程卡死造成的 STOP 在确认健康后自动解除；人工 stop 永不自动解除"),
     # ----- Model keys and model choice
     "DEEPSEEK_API_KEY": (None, None, True, "模型", "DeepSeek API Key（默认研究员和基金经理都用 DeepSeek）"),
     "OPENAI_API_KEY": (None, None, True, "模型", "OpenAI API Key（仅当选用 openai/ 模型时需要）"),
@@ -118,6 +125,7 @@ SETTINGS = {
     "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告"),
     "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选）"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
+    "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
     "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
     "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),
@@ -129,6 +137,88 @@ SETTINGS = {
     "SCHWAB_TOKEN": (None, None, True, "Schwab", "无浏览器服务器首次登录时粘贴的一次性 token"),
     "SCHWAB_TOKEN_PATH": (None, None, False, "Schwab", "token.json 的保存位置（请放在私有目录）"),
 }
+
+
+# ----- Startup mode ---------------------------------------------------------------------
+MODES = {"local": "真实行情本地模拟盘：Yahoo 行情 + 本地虚拟资金，不连接券商",
+         "paper": "Alpaca 模拟账户：券商模拟撮合，不是真钱"}
+# Commands that act on one trading account's directory. Historical, offline and
+# preflight commands keep their own directory and never write into an account.
+ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "stop", "resume", "attach-order", "reset-drawdown",
+                              "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
+                              "notify-test"})
+EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
+
+
+def configured_mode(environ):
+    """FUND_MODE, validated. No value of it can select real-money trading."""
+    raw = str(environ.get("FUND_MODE") or "").strip().lower()
+    if not raw:
+        return None
+    if raw not in MODES:
+        raise RiskError(f"FUND_MODE={raw}: choose local or paper. This application has no live (real-money) "
+                        "mode, and no setting can enable one.")
+    return raw
+
+
+def _earlier_book(mode):
+    """An account the operator started before per-mode directories existed."""
+    path = EARLIER_DEFAULT / "state.sqlite3"
+    if not path.is_file():
+        return False
+    try:
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+            rows = db.execute("SELECT body FROM events WHERE kind='startup'").fetchall()
+    except sqlite3.Error as exc:
+        # Never fall through to a fresh book while an existing one cannot be read.
+        raise RiskError(f"Cannot read the account book in {EARLIER_DEFAULT} ({type(exc).__name__}); "
+                        "fix it or pass --run-dir") from None
+    return any(json.loads(body).get("mode") == mode for (body,) in rows)
+
+
+def startup(command, run_dir, environ):
+    """Resolve (mode, run directory, observe-only, source) for a command.
+
+    `start` (or no command) runs FUND_MODE, local by default. An explicit command
+    or --run-dir always wins. Without --run-dir, account commands such as stop or
+    approvals act on the FUND_MODE account: FUND_RUN_DIR, else artifacts/fund-<mode>,
+    so local and paper books never share a directory. An account already kept in
+    the earlier default directory stays there. The emergency stop never fails on
+    a configuration mistake when it can still find the account directory.
+    """
+    custom = str(environ.get("FUND_RUN_DIR") or "").strip()
+    try:
+        configured = configured_mode(environ)
+    except RiskError:
+        if command != "stop":
+            raise
+        if run_dir is None and not custom:
+            raise RiskError("FUND_MODE is invalid, so the account directory is unknown: run stop with --run-dir") from None
+        return command, Path(run_dir or custom), False, "command line"
+    mode, source = command, "command line"
+    if command == "start":
+        mode, source = (configured, "FUND_MODE") if configured else ("local", "default (FUND_MODE unset)")
+    elif command in MODES and configured and configured != command:
+        source = f"command line (FUND_MODE={configured} not used)"
+    observe = False
+    if mode in MODES and str(environ.get("FUND_OBSERVE_ONLY") or "").strip():
+        try:
+            observe = _bool(environ["FUND_OBSERVE_ONLY"])
+        except RiskError as exc:
+            raise RiskError(f"FUND_OBSERVE_ONLY: {exc}") from None
+        if observe and mode != "local":
+            raise RiskError("FUND_OBSERVE_ONLY=true is a local-mode option; set it to false for paper")
+    if run_dir is None:
+        account = mode if mode in MODES else (configured or "local")
+        if mode not in ACCOUNT_COMMANDS:
+            run_dir = EARLIER_DEFAULT
+        elif custom and (mode not in MODES or configured in {None, mode}):
+            run_dir = Path(custom)
+        else:
+            run_dir = Path(f"artifacts/fund-{account}")
+            if not (run_dir / "state.sqlite3").exists() and _earlier_book(account):
+                run_dir = EARLIER_DEFAULT
+    return mode, Path(run_dir), observe, source
 
 
 def _set(config, path, value):

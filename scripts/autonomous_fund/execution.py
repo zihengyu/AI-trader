@@ -129,6 +129,8 @@ class ExecutionState:
                 CREATE TABLE IF NOT EXISTS fund_levels (
                     symbol TEXT PRIMARY KEY, decision_id TEXT NOT NULL, body TEXT NOT NULL,
                     state TEXT NOT NULL, set_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS fund_deferred_levels (
+                    symbol TEXT PRIMARY KEY, decision_id TEXT NOT NULL, body TEXT NOT NULL, set_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS fund_alerts (
                     id INTEGER PRIMARY KEY AUTOINCREMENT, decision_id TEXT NOT NULL, symbol TEXT NOT NULL,
                     body TEXT NOT NULL, state TEXT NOT NULL, set_at TEXT NOT NULL);
@@ -146,8 +148,11 @@ class ExecutionState:
         if db is None:
             with self.journal.connection() as connection:
                 return self.latest(now, connection)
-        rows = db.execute("SELECT * FROM fund_decisions ORDER BY rowid DESC").fetchall()
-        return next((dict(row) for row in rows if instant(row["accepted_at"]) <= instant(now)), None)
+        # Newest first and stop at the first match: no full-history read every minute.
+        for row in db.execute("SELECT * FROM fund_decisions ORDER BY rowid DESC"):
+            if instant(row["accepted_at"]) <= instant(now):
+                return dict(row)
+        return None
 
     def active(self, now, universe, limits, db=None):
         row = self.latest(now, db)
@@ -175,10 +180,17 @@ class ExecutionState:
             db.execute("UPDATE fund_approvals SET state='superseded' WHERE state IN ('pending','approved')")
             db.execute("INSERT INTO fund_decisions VALUES(?,?,?,?,?,?)",
                        (key, str(now), until.isoformat(), encode(body), self.digest, "active"))
-            # The newest AI decision replaces every standing level and alert.
-            db.execute("DELETE FROM fund_levels")
+            # The newest AI decision replaces every standing level and alert, except a
+            # protective exit already in progress: it completes first, and the new
+            # decision's levels for that symbol take effect when it does.
+            exiting = {row[0] for row in db.execute("SELECT symbol FROM fund_levels WHERE state='triggered'")}
+            db.execute("DELETE FROM fund_levels WHERE state!='triggered'")
+            db.execute("DELETE FROM fund_deferred_levels")
             for symbol, levels in decision_levels(body).items():
-                db.execute("INSERT INTO fund_levels VALUES(?,?,?,?,?)", (symbol, key, encode(levels), "active", str(now)))
+                if symbol in exiting:
+                    db.execute("INSERT INTO fund_deferred_levels VALUES(?,?,?,?)", (symbol, key, encode(levels), str(now)))
+                else:
+                    db.execute("INSERT INTO fund_levels VALUES(?,?,?,?,?)", (symbol, key, encode(levels), "active", str(now)))
             db.execute("UPDATE fund_alerts SET state='superseded' WHERE state='active'")
             for alert in body.get("alerts") or []:
                 db.execute("INSERT INTO fund_alerts(decision_id,symbol,body,state,set_at) VALUES(?,?,?,?,?)",
@@ -198,25 +210,70 @@ class ExecutionState:
             return {row["symbol"]: {**json.loads(row["body"]), "decision_id": row["decision_id"], "state": row["state"]}
                     for row in db.execute("SELECT * FROM fund_levels WHERE state IN ('active','triggered')")}
 
-    def set_protective_target(self, symbol, weight):
+    PROTECTIVE_KEYS = ("protective_target", "protective_keep", "protective_kind")
+
+    def set_protective_target(self, symbol, weight, keep=None, kind=None):
         with self.journal.connection() as db:
             row = db.execute("SELECT body FROM fund_levels WHERE symbol=?", (symbol,)).fetchone()
             if row:
                 body = {**json.loads(row[0]), "protective_target": str(weight)}
+                if keep is not None:
+                    body["protective_keep"] = int(keep)
+                if kind is not None:
+                    body["protective_kind"] = kind
                 db.execute("UPDATE fund_levels SET body=? WHERE symbol=?", (encode(body), symbol))
 
-    def finish_level(self, symbol):
+    def rearm(self, symbol):
+        """A level left 'triggered' without a protective target (an older two-write trigger) watches again."""
         with self.journal.connection() as db:
-            db.execute("UPDATE fund_levels SET state='done' WHERE symbol=? AND state='triggered'", (symbol,))
+            row = db.execute("SELECT body FROM fund_levels WHERE symbol=? AND state='triggered'", (symbol,)).fetchone()
+            if row:
+                body = {k: v for k, v in json.loads(row[0]).items() if k not in self.PROTECTIVE_KEYS}
+                db.execute("UPDATE fund_levels SET state='active', body=? WHERE symbol=?", (encode(body), symbol))
 
-    def trigger_level(self, symbol, kind, now, detail):
+    def finish_level(self, symbol, keep_levels=False):
+        """A protective exit completed.
+
+        A newer decision's deferred levels take effect; otherwise, after a partial
+        take-profit (keep_levels), the remaining shares keep their stop-loss and the
+        take-profit is spent; after a full exit the level is done.
+        """
         with self.journal.connection() as db:
-            changed = db.execute("UPDATE fund_levels SET state='triggered' WHERE symbol=? AND state='active'",
-                                 (symbol,)).rowcount
-            if changed:
-                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "protective_trigger", encode({
-                    "symbol": symbol, "trigger": kind, **detail})))
-        return bool(changed)
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT body FROM fund_levels WHERE symbol=? AND state='triggered'", (symbol,)).fetchone()
+            deferred = db.execute("SELECT * FROM fund_deferred_levels WHERE symbol=?", (symbol,)).fetchone()
+            if deferred:
+                db.execute("INSERT OR REPLACE INTO fund_levels VALUES(?,?,?,?,?)", (
+                    symbol, deferred["decision_id"], deferred["body"], "active", deferred["set_at"]))
+                db.execute("DELETE FROM fund_deferred_levels WHERE symbol=?", (symbol,))
+            elif row and keep_levels and "stop_loss" in json.loads(row[0]):
+                body = {k: v for k, v in json.loads(row[0]).items()
+                        if k not in self.PROTECTIVE_KEYS + ("take_profit", "take_profit_weight")}
+                db.execute("UPDATE fund_levels SET state='active', body=? WHERE symbol=?", (encode(body), symbol))
+            else:  # A full exit, or a trim with no stop left to keep watching.
+                db.execute("UPDATE fund_levels SET state='done' WHERE symbol=? AND state='triggered'", (symbol,))
+
+    def exiting(self):
+        """Symbols with a protective exit in progress: no purchase until it completes."""
+        with self.journal.connection() as db:
+            return {row[0] for row in db.execute("SELECT symbol FROM fund_levels WHERE state='triggered'")}
+
+    def trigger_level(self, symbol, kind, now, detail, target=None, keep=None):
+        """Trigger AND record the exit's target in one transaction: a crash between
+        two writes could otherwise leave a triggered level with no exit."""
+        with self.journal.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT body FROM fund_levels WHERE symbol=? AND state='active'", (symbol,)).fetchone()
+            if not row:
+                return False
+            body = json.loads(row[0])
+            if target is not None:
+                body.update(protective_target=str(target), protective_keep=int(keep or 0), protective_kind=kind)
+            db.execute("UPDATE fund_levels SET state='triggered', body=? WHERE symbol=? AND state='active'",
+                       (encode(body), symbol))
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "protective_trigger", encode({
+                "symbol": symbol, "trigger": kind, **detail})))
+        return True
 
     def alerts(self):
         with self.journal.connection() as db:
@@ -317,6 +374,9 @@ class ExecutionState:
                 body = json.loads(row["body"])
                 if (body.get("buys") is not None and instant(now) < instant(body["expires_at"]) and
                         body.get("day") == trading_day(now) and set(envelope["reasons"]) <= set(body["reasons"]) and
+                        # covers() also checks these: reusing a plan that cannot cover would stall silently.
+                        number(envelope["max_exposure_after"]) <= number(body["max_exposure_after"]) + TOLERANCE and
+                        number(envelope["max_buy_turnover_usd"]) <= number(body["max_buy_turnover_usd"]) and
                         all(symbol in body["buys"] and
                             number(scope["max_weight"]) <= number(body["buys"][symbol]["max_weight"]) + TOLERANCE and
                             number(scope["reference_limit"]) <= number(body["buys"][symbol]["max_limit"])
