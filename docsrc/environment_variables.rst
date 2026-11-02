@@ -1435,13 +1435,15 @@ after continuous health, never an operator's stop), model choice (``FUND_RESEARC
 (``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
 ``FUND_MAX_POSITION``, ``FUND_MAX_EXPOSURE``, ``FUND_MAX_DRAWDOWN``,
 ``FUND_DAILY_ORDERS``, ``FUND_DAILY_LOSS_LIMIT``, ``FUND_TARGET_VOL``,
-``FUND_MAX_ES``, ``FUND_MAX_SCENARIO_LOSS``, ``FUND_CASH_SWEEP``, ``FUND_EXCLUDE_SYMBOLS``,
+``FUND_MAX_ES``, ``FUND_MAX_SCENARIO_LOSS``, ``FUND_CASH_SWEEP``, ``FUND_EARNINGS_GUARD``,
+``FUND_EARNINGS_MAX_POSITION``, ``FUND_EXCLUDE_SYMBOLS``,
 ``FUND_INSTRUCTIONS``), the approval
 envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER``,
 ``FUND_STRESS_REQUIRES_APPROVAL``, ``FUND_APPROVAL_VALID_MINUTES``) and external
 parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
-``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``, ``FUND_FACTOR_LAB``). Values are
+``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``, ``FUND_FACTOR_LAB``,
+``FUND_MACRO``; optional data keys ``FRED_API_KEY`` and ``FINNHUB_API_KEY``). Values are
 validated like ``config.json``; an unknown ``FUND_*`` name in the selected ``.env`` file fails startup
 with a suggestion, and ``show-config`` prints effective values and their sources with
 secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of

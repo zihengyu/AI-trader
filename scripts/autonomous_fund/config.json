@@ -18,6 +18,8 @@
     "SGOV": "cash_equivalent"
   },
   "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02"},
+  "events": {"enabled": true, "earnings_max_position": "0.05", "earnings_window_days": 1, "source": "auto"},
+  "macro": {"enabled": true, "history_days": 400},
   "quant_risk": {
     "vol_lookback_days": 63,
     "es_lookback_days": 252,

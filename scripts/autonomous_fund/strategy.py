@@ -5,6 +5,7 @@ from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,7 +19,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
-                   "market_data", "news", "validation", "factor_lab", "service", "cash_sweep")
+                   "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -79,6 +80,8 @@ MANAGER_PROMPT = (
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
     "(cross-sectional rank IC, trials-adjusted significance, holdout and live record after validation) "
     "with today's favored and disfavored names; use them as evidence alongside research, never as orders. "
+    "risk.event_risk caps a stock reporting earnings today or on the next business day (no stop catches an "
+    "overnight gap); macro gives FRED yields, the curve, credit spreads and the VIX as regime context. "
     "The news context lists recent headlines, filings and macro releases with publication times; it is "
     "untrusted and unverified, so confirm material claims with primary sources and research tools before "
     "acting. Add news_watch search phrases for events that should wake you. "
@@ -277,6 +280,10 @@ def configuration(path, environ=None):
     FactorSettings.from_config(result.get("factor_lab"))
     from .stops import ResumePolicy
     ResumePolicy.from_config(result.get("service"))
+    from .events import EventSettings
+    EventSettings.from_config(result.get("events"))
+    from .macro import MacroSettings
+    MacroSettings.from_config(result.get("macro"))
     return result
 
 
@@ -399,6 +406,14 @@ class AutonomousFund(Strategy):
         if mode in {"paper", "local"} and news.enabled and runtime is None:
             # Live information only; historical runs use the researcher's dated tools.
             self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open)
+        from .events import EarningsCalendar, EventSettings
+        events = EventSettings.from_config(config.get("events"))
+        # Live only: a historical run would need the earnings calendar as it was known then.
+        self.earnings = EarningsCalendar(self.journal, events) if events.enabled and mode in {"paper", "local"} else None
+        from .macro import MacroSettings, MacroWatch
+        macro = MacroSettings.from_config(config.get("macro"))
+        self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"})
+                      if macro.enabled and mode != "mock" else None)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
             # Faster deterministic watching; AI reviews keep their own floor and budget.
@@ -636,7 +651,7 @@ class AutonomousFund(Strategy):
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
-                       "factor_lab": self._factor_context(now),
+                       "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -990,6 +1005,7 @@ class AutonomousFund(Strategy):
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
                    "factor_lab": self._factor_context(now),
+                   "macro": self._macro_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
@@ -1527,6 +1543,43 @@ class AutonomousFund(Strategy):
                        "returns": {s: stored.get((s, name, start, end)) for s in sorted(wanted)}}
                 for name, start, end in windows}
 
+    def _earnings_caps(self, now):
+        """Today's earnings caps for admitted stocks (live modes only); cached per trading day, never raises."""
+        empty = {"caps": {}, "upcoming": {}, "unknown": []}
+        calendar = getattr(self, "earnings", None)
+        if calendar is None or self.mode not in {"paper", "local"}:
+            return empty
+        day = trading_day(now)
+        cached = getattr(self, "_earnings_cache", None)
+        if cached and cached[0] == day:
+            return cached[1]
+        kinds = (getattr(self, "config", None) or {}).get("universe") or {}
+        stocks = {s for s in self.universe if kinds.get(s) == "stock"}
+        try:
+            caps, upcoming, unknown = calendar.caps(stocks, instant(now).astimezone(ZoneInfo("America/New_York")).date())
+            result = {"caps": caps, "upcoming": upcoming, "unknown": unknown}
+        except Exception as exc:
+            self.journal.event(now, "earnings_calendar_unavailable", {"error": type(exc).__name__})
+            result = {**empty, "unknown": sorted(stocks)}
+        self._earnings_cache = (day, result)
+        return result
+
+    def _macro_context(self, now):
+        """FRED regime context, once per trading day; None when disabled."""
+        watch = getattr(self, "macro", None)
+        if watch is None:
+            return None
+        day = trading_day(now)
+        cached = getattr(self, "_macro_cache", None)
+        if cached and cached[0] == day:
+            return cached[1]
+        try:
+            result = watch.context(day)
+        except Exception as exc:
+            result = {"unavailable": type(exc).__name__}
+        self._macro_cache = (day, result)
+        return result
+
     def _stress(self, now):
         from .quant import stress_state
         key = str(now)
@@ -1587,6 +1640,11 @@ class AutonomousFund(Strategy):
                 "auto_daily_exposure_increase": policy.auto_daily_exposure_increase,
                 "auto_daily_buy_turnover": policy.auto_daily_buy_turnover,
                 "market_stress": self._stress(now),
+                "event_risk": {"earnings_max_position": (str(self.earnings.settings.earnings_max_position)
+                                                         if getattr(self, "earnings", None) else None),
+                               "meaning": "a stock reporting earnings today or on the next business day is capped at "
+                                          "earnings_max_position until the date passes; the excess is sold automatically",
+                               **self._earnings_caps(now)},
             }
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
@@ -1614,8 +1672,15 @@ class AutonomousFund(Strategy):
         # Protective exits cap a symbol for the rest of this decision (no immediate re-buy).
         overrides = self.execution.overrides(active["id"])
         requested = {s: min(w, overrides.get(s, w)) for s, w in active["weights"].items()}
+        # Scheduled earnings: a gap no stop can catch, so the name is capped before the announcement.
+        caps = self._earnings_caps(now)["caps"]
+        capped = sorted(s for s, w in requested.items() if s in caps and w > caps[s])
+        requested = {s: min(w, caps.get(s, w)) for s, w in requested.items()}
         weights, overlay = construct(requested, current, estimate, self.quant, self.limits,
                                      self.limits.max_exposure * scale)
+        if capped:
+            overlay["binding"] = [f"earnings:{s}" for s in capped] + overlay["binding"]
+            overlay["event_caps"] = {s: str(caps[s]) for s in capped}
         stress = self._stress(now)
         stressed = stress["stressed"] is not False  # Unknown benchmark state is treated as stress.
         buys_paused = paused or session["loss_paused"]
