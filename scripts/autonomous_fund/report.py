@@ -18,14 +18,8 @@ REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_val
 
 
 
-def token_counts(raw):
-    """{input_tokens, output_tokens, cached_input_tokens} from one call's provider usage (several spellings)."""
-    return {
-        "input_tokens": int(raw.get("prompt_tokens", raw.get("input_tokens", raw.get("prompt_token_count", 0)))),
-        "output_tokens": int(raw.get("completion_tokens", raw.get("output_tokens", raw.get("candidates_token_count", 0)))),
-        "cached_input_tokens": int(raw.get("cache_read_input_tokens") or raw.get("cached_content_token_count") or
-                                   (raw.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
-    }
+from .costs import call_cost, cost_summary, rate_for, token_counts  # noqa: F401  (token_counts: rehearsal)
+
 
 def report(root, prices=None, write_files=True, *, as_of=None):
     if as_of is not None and write_files:
@@ -158,10 +152,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         rates = ({model: prices for model in by_model} if len(by_model) == 1 and "input" in prices
                  else prices)
         if by_model and all(model in rates for model in by_model):
-            estimates_by_model = {
-                model: (counts["input_tokens"] * float(rates[model]["input"]) +
-                        counts["output_tokens"] * float(rates[model]["output"])) / 1_000_000
-                for model, counts in by_model.items()}
+            # Cached prompt tokens at the operator's cached_input rate (ordinary input when not given).
+            estimates_by_model = {model: call_cost(counts, rates[model]) for model, counts in by_model.items()}
             estimate = sum(estimates_by_model.values())
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
@@ -198,6 +190,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "observed_fees": local_fees + sum(fee_by_order.values()) if not unknown_fee else None,
         "fill_details_incomplete": incomplete_fills,
         "model_usage": totals, "model_usage_by_model": by_model,
+        "model_costs": cost_summary([{"at": row["at"], "kind": "agent", "body": row} for row in usage],
+                                    accounts[-1]["equity"] if accounts else None, as_of or now, prices),
         "unfinished_model_calls": list(unfinished.values()),
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
         "latest_account": accounts[-1] if accounts else None,

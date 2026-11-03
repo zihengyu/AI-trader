@@ -109,6 +109,7 @@ def critic_strategy(tmp_path, run=None, runs_used=0):
                            get_datetime=lambda: NOW, scripted=True, agent_models={"critic": "m/x"})
     fake._record_agent = lambda name, result, phase=None: AutonomousFund._record_agent(fake, name, result, phase)
     fake._agent_call = lambda name, **kw: AutonomousFund._agent_call(fake, name, **kw)
+    fake._cost_exhausted = lambda now, step: AutonomousFund._cost_exhausted(fake, now, step)
     return fake, ModelBudget(), NOW
 
 

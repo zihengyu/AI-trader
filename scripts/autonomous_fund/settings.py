@@ -95,7 +95,8 @@ SETTINGS = {
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
     "FUND_SKIP_QUIET_REVIEWS": (("model_budget", "skip_quiet_reviews"), _bool, False, "模型", "到点复核时若无任何变化（无提醒、无成交、持仓和研究不变）则跳过本次模型调用"),
     "FUND_MAX_QUIET_MINUTES": (("model_budget", "max_quiet_minutes"), _int, False, "模型", "连续跳过复核的最长时间（分钟），到时一定调用基金经理"),
-    "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
+    "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON（input、output、cached_input 缓存命中价），用于费用估算和盈亏平衡"),
+    "FUND_MAX_DAILY_COST_USD": (("model_budget", "max_daily_cost_usd"), _decimal, False, "模型", "每个交易日模型费用上限（美元，按 FUND_MODEL_PRICES_JSON 估算）；到达后当天不再发起新决策、反方审查和盘前研究"),
     # ----- User constraints (the operator's mandate and hard limits)
     "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),
     "FUND_ALLOW_EXTERNAL_HOLDINGS": (("mandate", "allow_external_holdings"), _bool, False, "约束", "账户里是否允许你自己的持仓（AI 不碰、数量冻结）"),
@@ -110,6 +111,8 @@ SETTINGS = {
     "FUND_TARGET_VOL": (("quant_risk", "target_portfolio_vol"), _decimal, False, "约束", "组合年化波动率目标"),
     "FUND_MAX_ES": (("quant_risk", "max_portfolio_es"), _decimal, False, "约束", "1 日 97.5% 预期尾部损失上限"),
     "FUND_MAX_SCENARIO_LOSS": (("quant_risk", "max_scenario_loss"), _decimal, False, "约束", "历史危机情景（2008/2020/2022）下组合最大允许亏损"),
+    "FUND_MAX_PORTFOLIO_BETA": (("quant_risk", "max_portfolio_beta"), _decimal, False, "约束", "组合相对 SPY 的 beta 上限（各持仓权重×beta 之和）"),
+    "FUND_MAX_STYLE_EXPOSURE": (("quant_risk", "max_style_exposure"), _decimal, False, "约束", "动量、波动、规模三种风格暴露的上限（权重×标准分之和的绝对值）"),
     "FUND_CASH_SWEEP": (("cash_sweep", "enabled"), _bool, False, "约束", "闲置现金自动买入短期国债 ETF（SGOV），买入证券前先卖出筹款"),
     "FUND_EARNINGS_GUARD": (("events", "enabled"), _bool, False, "约束", "个股财报日（当天或下一个交易日）前自动把权重降到上限以内"),
     "FUND_EARNINGS_MAX_POSITION": (("events", "earnings_max_position"), _decimal, False, "约束", "财报前单只个股最大权重，例如 0.05"),

@@ -94,7 +94,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 启动 | `FUND_MODE`、`FUND_RUN_DIR`、`FUND_OBSERVE_ONLY`、`FUND_AUTO_RESUME` | 启动模式 local／paper（没有实盘）、账户目录、只读观察（见[启动模式](#启动模式由-env-的-fund_mode-决定)）、重启后安全条件下自动恢复交易 |
 | 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
-| 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
+| 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON`、`FUND_MAX_DAILY_COST_USD` | 每日调用上限、最短复核间隔、费用估算价格（含缓存命中价 `cached_input`）、每日模型费用上限 |
 | 模型 | `FUND_SKIP_QUIET_REVIEWS`、`FUND_MAX_QUIET_MINUTES` | 到点复核时无任何变化就跳过模型调用、连续跳过的最长分钟数（见[模型调用预算](#模型调用预算与失败退避)） |
 | 外部 | `FUND_DATA_DESK`、`FUND_DESK_INTRADAY_SECONDS` | 数据员（常驻服务，持续拉取整理资讯、盘中行情、宏观、财报）开关、盘中行情刷新间隔 |
 | 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
@@ -572,6 +572,8 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 | 波动率估计 | 最近 63 个交易日简单收益的 EWMA 方差（RiskMetrics λ=0.94），年化 | 下限 10% |
 | 相关性估计 | 相关性比波动率需要多得多的数据：用最近 252 个交易日、衰减更慢的 EWMA（`correlation_lambda` 0.97，等效样本约 65 天），再向平均相关系数收缩 `correlation_shrinkage`（常相关目标，收缩后仍半正定）。λ=0.94 的等效样本只有约 31 天，用来估 27×27 的相关矩阵噪声太大，几周的异常走势就会让组合波动估计大幅摆动 | 252 天、λ=0.97、收缩 25%；平盘序列与其他证券的相关系数按 1 处理且不参与收缩 |
 | 单名风险上限 | 权重 ≤ min(10%, 风险预算 ÷ 年化波动)；个股用 `max_name_risk`，普通 ETF 用 `max_etf_name_risk` | 个股 0.025：波动 25% 的股票上限 10%，波动 50% 的上限 5%；ETF 0.05（依据下文 2019 年真实数据回放校准） |
+| 组合 beta | 各持仓权重 × 相对 SPY 的事前 beta（来自上面的协方差）之和 ≤ `max_portfolio_beta`；超过时只按比例缩减 beta 为正、推高这项暴露的证券，负 beta 的不动 | 1.0（`FUND_MAX_PORTFOLIO_BETA`） |
+| 风格暴露 | 动量（12-1 个月收益）、波动（63 日实现波动）、规模（60 日日均成交额的对数，代表规模，只算股票）三种风格在交易范围内做截面标准分（截尾 ±3），组合暴露 = 权重 × 标准分之和，绝对值 ≤ `max_style_exposure`；超过时按比例缩减推高该方向的证券。AI 在 `risk.exposures` 里看到当前暴露、上限和每只证券的分数 | 0.75（`FUND_MAX_STYLE_EXPOSURE`）；只基于本系统约 30 个标的，不是全市场风险模型 |
 | 行业／主题组 | 运营者定义、可重叠的组，组内权重和 ≤ 组上限 | 科技 30%、通信 20%、可选消费 20%、金融 30%、医疗 25%、能源 15%、必需消费 25%、大型成长股 35%、宽基指数 40% |
 | 回撤分档预算 | 回撤 ≤ 4% 满额；4%–8% 线性降到 25%；≥8% 锁定增仓 | 总敞口预算 = 70% × 系数，超出部分自动卖出 |
 | 组合波动率目标 | 事前年化波动 √(wᵀΣw) 超过目标时整体等比例缩小 | 12% |
@@ -772,6 +774,11 @@ alpha t ≥ 1.65（单边 95%）、且没有触发回撤上限时，才给出 `e
   并发送一次 `model_budget_exhausted` 通知。
   盘中一次基础评估只需预留一次经理调用；盘前、盘后及可选评议／影子评估继续计入实际调用预算。
 - AI 指定的 `next_review_at` 不早于 `min_review_minutes`（默认 15 分钟）；目标执行窗口也按此下限计算。
+- **模型费用核算**：每次模型调用记录时，按 `FUND_MODEL_PRICES_JSON` 的价格（`input`、`output`、缓存命中的 `cached_input`，
+  不填缓存价时按普通输入计，偏保守）算出费用，和 token 一起记在日志里。`fund-logs.sh` 和每日报告显示：今天、近 30 天、
+  日均和按此速度一年的费用，以及**一年费用占净值的比例**——AI 每年至少要跑赢基准这么多才能打平模型费用。没有单价的调用
+  计为“无单价”，不当作 0。`FUND_MAX_DAILY_COST_USD` 设定每个交易日的费用上限：到达后当天不再发起新决策、反方审查和盘前研究
+  （已有目标、止损止盈照常执行，盘后复盘照常运行），并通知一次；设置上限时必须为每个在用的模型填好单价，否则启动时报错。
 - **跳过无变化的定时复核**（`skip_quiet_reviews`，默认 `true`，`FUND_SKIP_QUIET_REVIEWS`）：到了 AI 自己定的复核时间，
   只有同时满足以下条件才不调用模型（记录 `review_skipped`，`min_review_minutes` 后再检查）：没有待处理的盯盘唤醒
   （提醒、大幅波动、市场压力、新闻命中）；没有暂停加仓；上次模型决策在同一纽约交易日、距今不到 `max_quiet_minutes`
