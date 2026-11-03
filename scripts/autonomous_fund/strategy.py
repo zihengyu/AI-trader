@@ -63,9 +63,11 @@ RESEARCHER_PROMPT = (
     "market_snapshot already gives every eligible symbol's returns, volatility, beta, trend and liquidity from "
     "completed daily closes: use it instead of recomputing them with tools, and spend tool calls on news, filings "
     "and evidence it cannot contain. "
-    "In live runs a data desk (数据员) process collects news, intraday prices, FRED and earnings continuously: "
-    "data_desk shows its freshness, the session so far and what is new since the last decision, and the "
-    "desk_latest tool returns the newest version of any section at the moment you call it. "
+    "In live runs a data desk (数据员) process collects news, intraday and pre-market prices, global markets "
+    "(index futures, rates, the dollar, oil, gold, Asia and Europe), the US economic release calendar, FRED and "
+    "earnings continuously: data_desk shows its freshness, the session so far and what is new since the last "
+    "decision, and the desk_latest tool returns the newest version of any section at the moment you call it. "
+    "Stale or suspect values are labeled; never treat them as current. "
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
     "of time; an unfinished run returns nothing."
@@ -107,8 +109,10 @@ MANAGER_PROMPT = (
     "propose a portfolio that already fits; scaled weights are reported back in risk_overlay. "
     "market_snapshot gives each symbol's returns, volatility, beta, trend and liquidity from completed daily "
     "closes; use it rather than recomputing them with tools. "
-    "In live runs data_desk and the desk_latest tool give the data desk's continuously updated intraday prices, "
-    "news, macro and earnings; check desk_latest before acting on minutes-old context. "
+    "In live runs data_desk and the desk_latest tool give the data desk's continuously updated intraday and "
+    "pre-market prices, global markets, the economic release calendar (scheduled CPI, jobs, GDP, FOMC dates), "
+    "news, macro and earnings; check desk_latest before acting on minutes-old context, and weigh scheduled "
+    "releases and moves labeled suspect (possible splits or bad data) explicitly. "
     "Sales execute automatically. Purchases run automatically inside a daily risk-increase "
     "envelope; purchases beyond it, or during market stress, wait for one operator approval "
     "of the whole plan. Choose next_review_at no earlier than min_review_minutes. "
@@ -1652,10 +1656,11 @@ class AutonomousFund(Strategy):
         if news is None:
             return None
         symbols = set(self.universe) if account is None else set(account.positions)
-        if self.last_decision:
-            symbols |= {t["symbol"] for t in self.last_decision.get("targets", [])}
+        targets = {t["symbol"] for t in (self.last_decision or {}).get("targets", [])}
+        symbols |= targets
+        held = set(account.positions) if account is not None else set()
         try:
-            return news.recent(symbols, now)
+            return news.recent(symbols, now, held=held, targets=targets)
         except Exception as exc:
             return {"unavailable": type(exc).__name__}
 
@@ -1926,7 +1931,9 @@ class AutonomousFund(Strategy):
             full, error = (store.bars(day, symbol, length) if store is not None else None), None
             if full is None:
                 full, error = self._fetch_daily_bars(symbol, length, now)
-                if full and store is not None:
+                from .datastore import bars_settled
+                # Before 06:00 New York the day's split or dividend may be missing: used now, not stored.
+                if full and store is not None and bars_settled(now):
                     try:
                         store.save_bars(day, symbol, length, full)
                     except OSError:
@@ -1993,14 +2000,18 @@ class AutonomousFund(Strategy):
 
         Args:
             section: intraday (session so far: last, change, day range and volume, movers, breadth),
-                snapshot (daily returns, volatility, beta, trend, liquidity), macro (FRED regime),
-                earnings (upcoming dates and caps), news (recent headlines, filings, releases)
-                or status (which datasets are fresh and when they were updated)
+                premarket (pre-market trades versus the previous close), global (index futures, VIX,
+                10-year yield, dollar, EUR, JPY, crude, gold, Tokyo, Hong Kong, Europe), calendar
+                (scheduled US releases such as CPI, jobs, GDP, FOMC), snapshot (daily returns,
+                volatility, beta, trend, liquidity), macro (FRED regime), earnings (upcoming dates
+                and caps), news (recent headlines, filings, releases) or status (dataset freshness)
         """
         return self._desk_section(str(section).strip().lower(), self.get_datetime())
 
     def _desk_section(self, section, now):
         readers = {"intraday": lambda: self._intraday(now), "snapshot": lambda: self._market_snapshot(now),
+                   "premarket": lambda: self._premarket(now), "global": lambda: self._global_markets(now),
+                   "calendar": lambda: self._economic_calendar(now),
                    "macro": lambda: self._macro_context(now), "earnings": lambda: self._earnings_caps(now),
                    "news": lambda: self._news_context(None, now),
                    "status": lambda: self.desk_status.summary(now) if getattr(self, "desk_status", None) else None}
@@ -2011,10 +2022,41 @@ class AutonomousFund(Strategy):
         except Exception as exc:  # A tool answer, never an exception inside the model run.
             return {"section": section, "unavailable": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__}
 
-    def _intraday(self, now):
-        """The desk's newest intraday pulse of today's session, or None."""
+    def _desk_read(self, now, name, max_age_minutes):
+        """A dataset the desk prepared today; older than max_age_minutes it is flagged stale, never shown as current."""
         store = getattr(self, "daily_store", None)
-        return store.get(trading_day(now), "intraday") if store is not None else None
+        value = store.get(trading_day(now), name) if store is not None else None
+        if not isinstance(value, dict):
+            return value
+        try:
+            age = (instant(now) - instant(value["as_of"])).total_seconds() / 60
+        except (KeyError, TypeError, ValueError):
+            return value
+        if age > max_age_minutes:
+            return {"stale": True, "as_of": value["as_of"], "age_minutes": round(age),
+                    "note": "the data desk has not refreshed this; use desk_latest or your own tools for current data"}
+        return value
+
+    def _intraday(self, now):
+        """The desk's newest intraday pulse of today's session (flagged stale when the desk stopped refreshing)."""
+        from .datadesk import DeskSettings
+        interval = DeskSettings.from_config((getattr(self, "config", None) or {}).get("data_desk")).intraday_seconds
+        return self._desk_read(now, "intraday", max(15, 3 * interval / 60))
+
+    def _premarket(self, now):
+        return self._desk_read(now, "premarket", 60)
+
+    def _global_markets(self, now):
+        return self._desk_read(now, "global_markets", 90)
+
+    def _economic_calendar(self, now):
+        """Scheduled US releases from today on (the desk's FRED release calendar), or None."""
+        store = getattr(self, "daily_store", None)
+        calendar = store.get(trading_day(now), "econ_calendar") if store is not None else None
+        if not isinstance(calendar, dict):
+            return None
+        today = trading_day(now)
+        return {**calendar, "releases": [r for r in calendar.get("releases") or [] if r.get("date", "") >= today]}
 
     def _desk_context(self, now):
         """What the data desk prepared: its freshness, the intraday pulse and what is new since the last decision."""
@@ -2028,9 +2070,18 @@ class AutonomousFund(Strategy):
                 row = db.execute("SELECT count(*), sum(material IS NOT NULL) FROM fund_news WHERE observed_at>? "
                                  "AND baseline=0", (instant(since).astimezone(ZoneInfo("UTC")).isoformat(),)).fetchone()
             new = {"since": since, "items": row[0] or 0, "material": row[1] or 0}
-        return {"desk": status.summary(now), "intraday": self._intraday(now), "news_since_last_decision": new,
-                "tool": "desk_latest(section) returns the newest intraday, snapshot, macro, earnings, news or status "
-                        "at the moment you call it"}
+        from .market_data import SessionClock
+        session = SessionClock(now=lambda: now).status()
+        # While open, next_open is the open of the current session.
+        opened = instant(session["next_open"]) if session.get("open") and session.get("next_open") else None
+        # The pre-market view matters before the open and for the first hour of the session (gaps).
+        early = not session.get("open") or opened is None or instant(now) - opened <= timedelta(hours=1)
+        return {"desk": status.summary(now), "intraday": self._intraday(now),
+                "premarket": self._premarket(now) if early else None,
+                "global_markets": self._global_markets(now), "economic_calendar": self._economic_calendar(now),
+                "news_since_last_decision": new,
+                "tool": "desk_latest(section) returns the newest intraday, premarket, global, calendar, snapshot, "
+                        "macro, earnings, news or status at the moment you call it"}
 
     def _market_snapshot(self, now):
         """Returns, volatility, beta, trend and liquidity per tradable symbol, once per trading day.

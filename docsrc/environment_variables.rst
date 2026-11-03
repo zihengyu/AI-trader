@@ -1209,6 +1209,9 @@ FRED_API_KEY
   ``realtime_start`` and ``realtime_end`` for point-in-time backtests.
   Built-in FRED agent tools are not exposed during backtests without this key
   because LumiBot does not use revised public CSV fallbacks for macro data.
+- Autonomous paper fund: its data desk uses the key for the economic release
+  calendar (scheduled CPI, jobs, GDP, FOMC and similar release dates); without
+  it the calendar is unavailable and macro series use the public CSV download.
 
 LUMIBOT_FRED_CACHE_DIR
 ^^^^^^^^^^^^^^^^^^^^^^

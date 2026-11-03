@@ -255,7 +255,11 @@ def run_local(args, config):
     from .market_data import LiveTape, MarketDataSettings
     market = MarketDataSettings.from_config(config.get("market_data"))
     tape = LiveTape() if market.live_stream else None
-    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds), journal, Limits(**config["limits"]),
+    from .datadesk import yahoo_cooldown_writer
+    # Trading has priority on Yahoo: its failures pause the data desk's Yahoo requests (same server IP).
+    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds,
+                                                on_backoff=yahoo_cooldown_writer(args.run_dir)), journal,
+                              Limits(**config["limits"]),
                               matching_enabled=not args.observe_only, require_monitor=args.require_monitor,
                               starting_cash=Mandate.from_config(config.get("mandate")).local_account_usd)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={

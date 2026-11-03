@@ -86,8 +86,18 @@ def monitor_ready(root, now=None, after=None):
     return age is not None and 0 <= age <= MONITOR_FRESH_SECONDS and state.get("health") in {"healthy", "stopped"}
 
 
-DESK_LABELS = {"news": "资讯", "intraday": "盘中行情", "macro": "宏观", "earnings": "财报日历", "bars": "日线",
-               "snapshot": "行情快照", "sec": "SEC 财报"}
+DESK_LABELS = {"news": "资讯", "intraday": "盘中行情", "premarket": "盘前行情", "global": "全球市场", "macro": "宏观",
+               "calendar": "经济日历", "earnings": "财报日历", "bars": "日线", "snapshot": "行情快照", "sec": "SEC 财报"}
+
+
+NOTE_LABELS = (("needs FRED_API_KEY", "需要在 .env 填 FRED_API_KEY，免费申请"),
+               ("Yahoo is failing for the trading process", "交易进程的 Yahoo 请求出错，暂时让路"),
+               ("no pre-market trades yet", "暂无盘前成交"), ("no account journal yet", "账本尚未创建"),
+               ("no daily bars", "等待日线"))
+
+
+def _note(text):
+    return next((label for prefix, label in NOTE_LABELS if str(text).startswith(prefix)), text)
 
 
 def desk_line(root, now):
@@ -105,7 +115,8 @@ def desk_line(root, now):
             continue
         age = item.get("updated_minutes_ago")
         text = f"{label} {age:g} 分钟前" if age is not None else f"{label} 尚无成功"
-        parts.append(text + (f"（出错：{item['error']}）" if item.get("error") else ""))
+        note = f"（出错：{item['error']}）" if item.get("error") else (f"（{_note(item['note'])}）" if item.get("note") else "")
+        parts.append(text + note)
     state = "运行中" if view["running"] else "已停止（交易进程自己拉取数据，交易不受影响）"
     busy = view.get("busy_with") or {}
     doing = f"，正在处理 {DESK_LABELS.get(busy.get('job'), busy.get('job'))}" if busy.get("job") else ""

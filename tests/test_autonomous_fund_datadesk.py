@@ -67,7 +67,7 @@ def test_jobs_run_on_their_own_cadence_and_a_failing_job_backs_off_without_stopp
     clock = [NOW]
     desk = DataDesk(tmp_path, config(), "local", clock=lambda: clock[0], environ={})
     ran = []
-    for name in ("news", "intraday", "earnings", "bars", "snapshot"):
+    for name in ("news", "intraday", "premarket", "global", "calendar", "earnings", "bars", "snapshot"):
         setattr(desk, f"_job_{name}", lambda now, n=name: ran.append(n) or {"ok": True})
 
     def broken(now):
@@ -75,7 +75,8 @@ def test_jobs_run_on_their_own_cadence_and_a_failing_job_backs_off_without_stopp
         raise ConnectionError("FRED down")
     desk._job_macro = broken
     desk.tick()
-    assert sorted(ran) == ["bars", "earnings", "intraday", "macro", "news", "snapshot"]  # No SEC contact: no SEC job.
+    # No SEC contact: no SEC job; the market is open: no pre-market job.
+    assert sorted(ran) == ["bars", "calendar", "earnings", "global", "intraday", "macro", "news", "snapshot"]
     state = DeskStatus(tmp_path).read()
     assert state["jobs"]["macro"]["error"] == "ConnectionError" and state["jobs"]["news"]["ok_at"]
     assert desk.next_run["news"] == NOW + timedelta(seconds=300) and desk.next_run["macro"] == NOW + timedelta(seconds=60)
@@ -334,3 +335,188 @@ def test_a_job_whose_every_source_failed_is_an_error_not_fresh_data(tmp_path):
     desk._source = good
     desk.run_job("bars")
     assert DeskStatus(tmp_path).read()["jobs"]["bars"]["ok_at"]
+
+
+# ----- Trading has priority on Yahoo -------------------------------------------------------------------
+
+def test_the_trading_processes_yahoo_failures_make_the_desk_stand_back(tmp_path):
+    from scripts.autonomous_fund.datadesk import Idle, cooldown_path, yahoo_cooldown_writer, yahoo_paused_until
+    from scripts.autonomous_fund.market_data import YahooRealtimeData
+    from lumibot.entities import Asset
+    write = yahoo_cooldown_writer(tmp_path)
+    source = YahooRealtimeData(now=lambda: NOW, fetch=lambda *a: (_ for _ in ()).throw(ConnectionError("429")),
+                               on_backoff=write)
+    with pytest.raises(RiskError):
+        source.execution_bars(Asset("ALFA", asset_type="stock"))
+    until = yahoo_paused_until(tmp_path, datetime.now(timezone.utc))
+    assert until is not None and cooldown_path(tmp_path).is_file()
+    write((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp())  # An older end never shortens it.
+    assert yahoo_paused_until(tmp_path, datetime.now(timezone.utc)) == until
+    clock = datetime.now(timezone.utc)
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: clock, environ={},
+                    source=SimpleNamespace(execution_bars=offline, session_bars=offline))
+    for job in (desk._job_intraday, desk._job_premarket, desk._job_global):
+        with pytest.raises(Idle, match="trading process"):
+            job(clock)
+
+
+def test_desk_requests_are_paced_and_a_failing_round_stops_early():
+    desk = object.__new__(DataDesk)
+    pauses, asked = [], []
+    desk._sleep = pauses.append
+
+    def fetch(symbol):
+        asked.append(symbol)
+        raise ConnectionError("throttled")
+    frames = DataDesk._requests(desk, ["A", "B", "C", "D", "E"], fetch)
+    assert asked == ["A", "B", "C"] and "three times in a row" in str(frames["E"])  # D and E never asked.
+    assert pauses and all(p == 0.3 for p in pauses)
+
+
+def test_the_pulse_uses_todays_minutes_only_and_reads_closes_from_the_store(tmp_path):
+    asked = {"session": 0, "execution": 0}
+    today = minutes("2026-11-03 14:30", 20, first=101.0)
+
+    def session(asset):
+        asked["session"] += 1
+        return today
+
+    def execution(asset):
+        asked["execution"] += 1
+        return today
+    source = SimpleNamespace(session_bars=session, execution_bars=execution,
+                             get_historical_prices=lambda *a, **k: SimpleNamespace(df=None))
+    desk = DataDesk(tmp_path, config(), "local", source=source, clock=lambda: NOW, environ={}, sleep=lambda s: None)
+    DailyStore(tmp_path / "cache" / "daily").save_bars(DAY, "SPY", 1, [(datetime(2026, 11, 2).date(), 100.0, 1, 1, 1, 1)])
+    desk._job_intraday(NOW)
+    assert asked["session"] > 0 and asked["execution"] == 0
+    pulse = DailyStore(tmp_path / "cache" / "daily").get(DAY, "intraday")
+    assert pulse["symbols"]["SPY"]["previous_close"] == 100.0 and "previous_close" not in pulse["symbols"]["QQQ"]
+
+
+def test_an_implausible_gap_is_flagged_and_kept_out_of_the_movers():
+    frames = {"ALFA": minutes("2026-11-03 14:30", 20, first=100.0), "BETA": minutes("2026-11-03 14:30", 20, first=50.0)}
+    pulse = intraday_pulse(frames, {"ALFA": ("2026-11-02", 99.0), "BETA": ("2026-11-02", 100.0)}, NOW)
+    assert "possibly a split" in pulse["symbols"]["BETA"]["suspect"] and "suspect" not in pulse["symbols"]["ALFA"]
+    assert [m["symbol"] for m in pulse["leaders"] + pulse["laggards"]] == ["ALFA", "ALFA"]
+
+
+def test_a_stale_pulse_is_labeled_not_shown_as_current(tmp_path):
+    strategy = runner(tmp_path)
+    strategy.daily_store.put(DAY, "intraday", {"as_of": (NOW - timedelta(minutes=40)).isoformat(), "symbols": {"ALFA": {}}})
+    stale = strategy._intraday(NOW)
+    assert stale["stale"] and stale["age_minutes"] == 40 and "symbols" not in stale
+    strategy.daily_store.put(DAY, "intraday", {"as_of": (NOW - timedelta(minutes=5)).isoformat(), "symbols": {}})
+    assert not strategy._intraday(NOW).get("stale")
+
+
+def test_daily_bars_are_stored_only_after_six_in_the_morning_new_york(tmp_path):
+    from tests.test_autonomous_fund_prefetch import frame
+    from scripts.autonomous_fund.strategy import history_length
+    early = datetime(2026, 11, 3, 9, 30, tzinfo=timezone.utc)  # 04:30 New York.
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: early, environ={})
+    assert not desk.enabled("bars", early) and desk.enabled("bars", NOW)
+    strategy = runner(tmp_path)
+    strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=frame())
+    rows, error = strategy._daily_bars("ALFA", early)
+    assert rows and error is None
+    assert strategy.daily_store.bars(DAY, "ALFA", history_length(strategy.quant)) is None  # Used, not stored.
+
+
+# ----- New data: pre-market, global markets, the economic calendar ---------------------------------------
+
+def test_premarket_moves_use_trades_before_the_open_only():
+    from scripts.autonomous_fund.datadesk import premarket_moves
+    at = datetime(2026, 11, 3, 13, 50, tzinfo=timezone.utc)  # 08:50 New York.
+    frames = {"ALFA": pd.concat([minutes("2026-11-02 20:50", 5, first=99.0), minutes("2026-11-03 12:00", 100, first=101.0)]),
+              "BETA": minutes("2026-11-02 20:50", 5, first=50.0)}
+    moves = premarket_moves(frames, {"ALFA": ("2026-11-02", 100.0)}, at)
+    alfa = moves["symbols"]["ALFA"]
+    assert alfa["change"] == pytest.approx(110.9 / 100 - 1, abs=1e-5) and alfa["volume"] == 100_000
+    assert moves["unavailable"] == {"BETA": "no pre-market trades yet"}
+    desk = object.__new__(DataDesk)
+    desk._calendar_clock = None
+    assert DataDesk.before_open(desk, at) and not DataDesk.before_open(desk, NOW)
+    assert not DataDesk.before_open(desk, datetime(2026, 11, 7, 13, 50, tzinfo=timezone.utc))  # A Saturday.
+
+
+def test_global_markets_report_the_move_since_the_previous_day_and_keep_the_last_good_view(tmp_path):
+    def chart(symbol, period, interval, prepost):
+        assert prepost and interval == "15m"
+        if symbol == "^HSI":
+            raise ConnectionError("unreachable")
+        return pd.concat([minutes("2026-11-02 20:00", 4, first=100.0), minutes("2026-11-03 13:00", 4, first=102.0)])
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: NOW, environ={}, chart=chart, sleep=lambda s: None)
+    desk._job_global(NOW)
+    view = DailyStore(tmp_path / "cache" / "daily").get(DAY, "global_markets")
+    futures = view["markets"]["ES=F"]
+    assert futures["previous"] == pytest.approx(100.3) and futures["change"] == pytest.approx(102.3 / 100.3 - 1, abs=1e-5)
+    assert futures["meaning"] == "S&P 500 E-mini futures" and view["unavailable"] == {"^HSI": "ConnectionError"}
+    desk._gets["chart"] = lambda *a: (_ for _ in ()).throw(ConnectionError("down"))
+    with pytest.raises(RiskError):
+        desk._job_global(NOW)
+    assert DailyStore(tmp_path / "cache" / "daily").get(DAY, "global_markets")["markets"]  # Not replaced by nothing.
+
+
+def test_the_economic_calendar_keeps_the_market_moving_releases_and_needs_a_fred_key(tmp_path):
+    from scripts.autonomous_fund.datadesk import Idle
+    pages = []
+
+    def get(url, params=None, timeout=None):
+        pages.append(params["offset"])
+        rows = [{"release_id": i, "release_name": "Some Regional Survey", "date": "2026-11-05"} for i in range(1000)]
+        if params["offset"]:
+            rows = [{"release_id": 10, "release_name": "Consumer Price Index", "date": "2026-11-12"},
+                    {"release_id": 50, "release_name": "Employment Situation", "date": "2026-11-06"},
+                    {"release_id": 101, "release_name": "FOMC Press Release", "date": "2026-12-09"},
+                    {"release_id": 10, "release_name": "Consumer Price Index", "date": "2026-11-12"}]
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"release_dates": rows})
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: NOW, environ={}, calendar_get=get)
+    with pytest.raises(Idle, match="FRED_API_KEY"):
+        desk._job_calendar(NOW)
+    desk.environ = {"FRED_API_KEY": "synthetic"}
+    assert desk._job_calendar(NOW) == {"major": 2, "other": 1} and pages == [0, 1000]
+    calendar = DailyStore(tmp_path / "cache" / "daily").get(DAY, "econ_calendar")
+    assert [r["release"] for r in calendar["releases"]] == ["Employment Situation", "Consumer Price Index"]
+
+
+def test_the_context_carries_premarket_before_and_early_in_the_session_and_upcoming_releases(tmp_path):
+    strategy = runner(tmp_path)
+    store = strategy.daily_store
+    store.put(DAY, "premarket", {"as_of": (NOW - timedelta(minutes=40)).isoformat(), "symbols": {"ALFA": {}}})
+    store.put(DAY, "econ_calendar", {"releases": [{"date": "2026-11-02", "release": "Past"},
+                                                  {"date": "2026-11-06", "release": "Employment Situation"}]})
+    early = strategy._desk_context(NOW)  # 30 minutes after the open.
+    assert early["premarket"]["symbols"] and [r["release"] for r in early["economic_calendar"]["releases"]] == [
+        "Employment Situation"]
+    assert strategy._desk_context(NOW + timedelta(hours=2))["premarket"] is None
+    assert strategy.desk_latest("calendar")["data"]["releases"][0]["release"] == "Employment Situation"
+
+
+def test_news_from_several_sources_is_one_story_ranked_by_relevance(tmp_path):
+    from scripts.autonomous_fund.news import NewsSettings, NewsWatch
+    journal = Journal(tmp_path, "synthetic-digest")
+    watch = NewsWatch(journal, NewsSettings(enabled=True))
+    rows = [("a", "yahoo", "headline", ["OTHER"], None, "Other company opens a plant", 50),
+            ("b", "yahoo", "headline", ["ALFA"], None, "Alfa wins large contract - Reuters", 40),
+            ("c", "google_news", "headline", ["ALFA"], None, "Alfa wins large contract | Bloomberg", 30),
+            ("d", "federal_reserve", "macro", [], None, "Federal Reserve issues statement", 20),
+            ("e", "sec_edgar", "filing", ["ALFA"], "sec_filing", "8-K Alfa Corp", 10)]
+    with journal.connection() as db:
+        for key, source, kind, symbols, material, title, minutes_ago in rows:
+            db.execute("INSERT INTO fund_news(id,observed_at,published_at,source,kind,symbols,query,title,url,"
+                       "material,baseline) VALUES(?,?,?,?,?,?,?,?,?,?,0)",
+                       (key, (NOW - timedelta(minutes=minutes_ago)).isoformat(), None, source, kind,
+                        json.dumps(symbols), None, title, f"https://example.test/{key}", material))
+    context = watch.recent({"ALFA", "OTHER"}, NOW, held={"ALFA"})
+    titles = [item["title"] for item in context["items"]]
+    assert titles[0] == "8-K Alfa Corp" and titles[-1] == "Other company opens a plant"
+    contract = next(item for item in context["items"] if item["title"].startswith("Alfa wins"))
+    assert contract["also_reported"] == {"copies": 2, "sources": ["google_news", "yahoo"]} and "held" in contract["relevance"]
+    assert context["duplicates_merged"] == 1 and context["mentions_24h"] == {"ALFA": 2}
+
+
+def test_the_desk_service_yields_cpu_io_and_memory_to_trading():
+    from scripts.autonomous_fund.deploy import generate
+    desk = generate("/srv/fund", None, "/srv/fund/.env", "fundbot", None)["lumibot-fund-desk.service"]
+    assert all(line in desk.splitlines() for line in ("Nice=10", "CPUWeight=20", "IOWeight=20", "OOMScoreAdjust=500"))

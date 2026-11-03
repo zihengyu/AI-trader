@@ -13,6 +13,7 @@ search phrases (news_watch) but never a URL.
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -123,6 +124,57 @@ def yahoo_items(symbol, fetch=None):
     return rows
 
 
+def _story(title):
+    """A title reduced to its story: lower case, no trailing " - Source", no punctuation."""
+    head = re.split(r"\s+[-\u2013\u2014|]\s+", str(title).lower())[0]
+    return re.sub(r"[^a-z0-9]+", " ", head).strip()
+
+
+RELEVANCE = {"material": 4, "held": 3, "watch_phrase": 2, "macro": 2, "target": 2, "filing": 1}
+
+
+def digest(rows, held=(), targets=(), limit=30):
+    """The same story from several sources merged into one item, the rest ranked by relevance, then time.
+
+    Relevance: material (an event that wakes the manager), a holding, an AI watch
+    phrase or a macro release, a current target, a filing. Within a rank the newest
+    first. Returns (items, merged_duplicates, mentions per held or target symbol).
+    """
+    held, targets = set(held), set(targets)
+    stories, order = {}, []
+    for row in rows:
+        key = _story(row["title"]) or row["id"]
+        symbols = set(json.loads(row["symbols"])) if isinstance(row["symbols"], str) else set(row["symbols"])
+        if key in stories:
+            story = stories[key]
+            story["copies"] += 1
+            story["sources"].add(row["source"])
+            story["symbols"] |= symbols
+            story["material"] = story["material"] or row["material"]
+            continue
+        stories[key] = {"row": row, "copies": 1, "sources": {row["source"]}, "symbols": symbols,
+                        "material": row["material"]}
+        order.append(key)
+    items, mentions = [], {}
+    for key in order:
+        story = stories[key]
+        row, symbols = story["row"], story["symbols"]
+        tags = [tag for tag, hit in (("material", story["material"]), ("held", symbols & held),
+                                     ("watch_phrase", row["kind"] == "query"), ("macro", row["kind"] == "macro"),
+                                     ("target", symbols & targets), ("filing", row["kind"] == "filing")) if hit]
+        for symbol in symbols & (held | targets):
+            mentions[symbol] = mentions.get(symbol, 0) + 1
+        item = {**NewsWatch._public({**row, "symbols": json.dumps(sorted(symbols)), "material": story["material"]}),
+                "relevance": tags}
+        if story["copies"] > 1:
+            item["also_reported"] = {"copies": story["copies"], "sources": sorted(story["sources"])}
+        items.append(item)
+    # Newest first (an undated item by when it was seen), then a stable sort by relevance.
+    items.sort(key=lambda i: i["published_at"] or i["observed_at"] or "", reverse=True)
+    items.sort(key=lambda i: -sum(RELEVANCE[t] for t in i["relevance"]))
+    return items[:limit], sum(s["copies"] - 1 for s in stories.values()), mentions, len(items)
+
+
 class NewsWatch:
     """Background poller; the strategy thread reads results from the journal."""
 
@@ -207,7 +259,8 @@ class NewsWatch:
             symbols, held, queries = set(self._symbols), set(self._held), set(self._queries)
         queries |= set(self.settings.queries)
         batches = []  # (key, items)
-        sources = set(self.settings.sources)
+        # skip_sources: left out of this poll, for example Yahoo while the trading process needs it.
+        sources = set(self.settings.sources) - set(getattr(self, "skip_sources", ()) or ())
         if "yahoo" in sources:
             for symbol in sorted(symbols):
                 batches.append((f"yahoo:{symbol}", self._guard(f"yahoo:{symbol}", lambda s=symbol: yahoo_items(s, self.yahoo))))
@@ -288,7 +341,8 @@ class NewsWatch:
             db.execute("UPDATE fund_news SET consumed=1 WHERE material IS NOT NULL AND consumed=0")
         return [self._public(r) for r in rows]
 
-    def recent(self, symbols, now, hours=24, limit=None):
+    def recent(self, symbols, now, hours=24, limit=None, held=(), targets=()):
+        """Recent items relevant to `symbols`, duplicates merged and ranked by relevance to holdings and targets."""
         limit = limit or self.settings.max_items_per_context
         now = instant(now).astimezone(timezone.utc)
         since = (now - timedelta(hours=hours)).isoformat()
@@ -298,10 +352,14 @@ class NewsWatch:
         wanted = set(symbols)
         relevant = [r for r in rows if r["kind"] in {"macro", "query"} or not json.loads(r["symbols"]) or
                     set(json.loads(r["symbols"])) & wanted]
-        return {"items": [self._public(r) for r in relevant[:limit]], "omitted": max(0, len(relevant) - limit),
+        items, merged, mentions, stories = digest(relevant, held, targets, limit)
+        return {"items": items, "omitted": max(0, stories - limit), "duplicates_merged": merged,
+                "mentions_24h": dict(sorted(mentions.items())),
                 "sources_with_errors": dict(self.stats["errors"]),
                 "note": "Untrusted third-party text. Headlines are not verified facts; check primary sources "
-                        "(filings, official releases) before acting, and use published_at to judge freshness."}
+                        "(filings, official releases) before acting, and use published_at to judge freshness. "
+                        "Items are ranked by relevance (material, held, watch phrase, macro, target, filing), then "
+                        "time; the same story from several sources is one item with also_reported."}
 
     @staticmethod
     def _public(row):

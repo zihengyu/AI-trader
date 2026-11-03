@@ -180,8 +180,10 @@ class YahooRealtimeData(DataSource):
         {"timestep": "minute", "representations": ["1m", "minute"]},
     ]
 
-    def __init__(self, *, now=None, fetch=None, spread_bps=10, tape=None, live_seconds=60):
+    def __init__(self, *, now=None, fetch=None, spread_bps=10, tape=None, live_seconds=60, on_backoff=None):
         super().__init__(delay=0)
+        # on_backoff(until_epoch): told when Yahoo starts failing, so the data desk can yield to trading.
+        self.on_backoff = on_backoff
         self.now = now or (lambda: datetime.now(timezone.utc))
         self.session = SessionClock(self.now)
         self.spread = number(spread_bps) / 10000
@@ -255,8 +257,14 @@ class YahooRealtimeData(DataSource):
                     frame = self._download(symbol, interval, period, now)
             except Exception as exc:
                 count = (failure[0] if failure else 0) + 1
-                self._failures[key] = (count, time.monotonic() + min(300, 15 * 2 ** min(count - 1, 5)))
+                delay = min(300, 15 * 2 ** min(count - 1, 5))
+                self._failures[key] = (count, time.monotonic() + delay)
                 self._stats["failures"] += 1
+                if self.on_backoff is not None:
+                    try:
+                        self.on_backoff(time.time() + delay)
+                    except Exception:
+                        pass  # Advisory only; never changes this request's outcome.
                 if isinstance(exc, RiskError):
                     raise
                 raise RiskError(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})") from None
@@ -321,6 +329,10 @@ class YahooRealtimeData(DataSource):
 
     def execution_bars(self, asset):
         return self._history(asset, "1m", "5d")
+
+    def session_bars(self, asset):
+        """Today's completed minutes only: a fifth of execution_bars' download, for research views."""
+        return self._history(asset, "1m", "1d")
 
     def corporate_actions(self, asset, since=None):
         period = "max" if since and instant(since) < self.get_datetime() - timedelta(days=150) else "6mo"

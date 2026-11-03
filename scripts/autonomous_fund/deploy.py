@@ -69,6 +69,8 @@ def generate(repo, run_dir, env_file, user, mode):
         "[Service]", "Type=exec", f"User={user}", f"WorkingDirectory={unit_path(repo)}",
         "ExecStart=" + " ".join(unit_quote(arg) for arg in desk_args),
         "Restart=always", "RestartSec=30", "KillSignal=SIGINT", "TimeoutStopSec=30",
+        # The trading process comes first: less CPU and I/O, and the first to go under memory pressure.
+        "Nice=10", "CPUWeight=20", "IOWeight=20", "OOMScoreAdjust=500",
         "Environment=PYTHONUNBUFFERED=1 LUMIBOT_DISABLE_DOTENV=true",
         "UMask=0077", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict", "ProtectHome=read-only",
         "ReadWritePaths=" + " ".join(unit_quote(p) for p in sorted({repo / "artifacts", run_dir or repo / "artifacts"})),

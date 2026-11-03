@@ -21,6 +21,14 @@ from datetime import date
 from pathlib import Path
 
 KEEP_DAYS = 3
+SETTLED_HOUR = 6  # New York: a new day's splits and dividends are applied in the daily history by then.
+
+
+def bars_settled(now):
+    """True once a trading day's completed daily bars may be stored for the whole day."""
+    from zoneinfo import ZoneInfo
+    from .risk import instant
+    return instant(now).astimezone(ZoneInfo("America/New_York")).hour >= SETTLED_HOUR
 
 
 class DailyStore:

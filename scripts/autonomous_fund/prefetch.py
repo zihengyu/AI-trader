@@ -80,7 +80,10 @@ def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, cloc
     stocks = sorted({s for s, kind in universe.items() if kind == "stock"} |
                     (set(lab.research_universe) if lab.enabled else set()))
 
-    if mode == "local":
+    from .datastore import bars_settled
+    if mode == "local" and not bars_settled(now):
+        report["bars"] = "skipped: before 06:00 New York a new day's splits and dividends may not be applied yet"
+    elif mode == "local":
         from .market_data import YahooRealtimeData
         length = history_length(quant, lab if lab.enabled else None)
         symbols = sorted(set(universe) | set(stocks) | {quant.stress_benchmark, "SPY", "QQQ"})

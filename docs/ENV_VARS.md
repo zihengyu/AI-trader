@@ -486,6 +486,7 @@ bound to one deployment or backtest.
 - Purpose: Required official FRED/ALFRED API key for macro data tools.
 - Default: unset.
 - Notes: Required for FRED macro data tools. Lumibot requests vintage observations with `realtime_start` and `realtime_end` for point-in-time backtests. Built-in FRED agent tools are not exposed during backtests without this key because Lumibot does not use revised public CSV fallbacks for macro data.
+- Autonomous fund: the data desk also needs it for the economic release calendar (FRED `releases/dates`: the scheduled CPI, jobs, GDP, PCE, PPI, retail sales, claims and FOMC dates for three weeks); without it that dataset reports "needs FRED_API_KEY" and the fund's macro series use the public CSV download.
 
 ### `LUMIBOT_FRED_CACHE_DIR`
 - Purpose: Override the local FRED macro data cache.
