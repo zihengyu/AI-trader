@@ -1,5 +1,6 @@
 """Application-local file and network boundaries for read-only research tools."""
 import ipaddress
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +14,12 @@ from .risk import RiskError
 
 # RFC 2544 benchmarking range; Clash/OpenClash "fake-ip" DNS answers live here.
 FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+# The agents' DuckDB runs SQL the model writes. 2026-11-03: one such query (trailing returns and
+# volatility over the universe) never finished and kept both cores of the server busy for 12 hours,
+# because DuckDB has no statement timeout and a Python timeout cannot stop native code.
+DUCKDB_QUERY_SECONDS = 60
+DUCKDB_THREADS = 1  # Never more than one core, whatever the query.
+DUCKDB_MEMORY_LIMIT = "1GB"
 RESEARCH_HOSTS = ("www.sec.gov", "efts.sec.gov", "finance.yahoo.com", "www.reuters.com", "www.federalreserve.gov")
 
 
@@ -117,6 +124,39 @@ def diagnose(resolve, hosts=RESEARCH_HOSTS):
     return {"hosts": rows, "research_http_usable": not blocked, "advice": advice}
 
 
+def limit_queries(layer, seconds=DUCKDB_QUERY_SECONDS):
+    """Stop an agent's DuckDB query that runs longer than `seconds`.
+
+    A timer interrupts the connection (DuckDB's own cancellation, which stops the
+    native work); the agent gets an error telling it to simplify the query. Applied
+    to this strategy's query layer only, so LumiBot itself is unchanged.
+    """
+    original = getattr(layer, "query", None)
+    if original is None:
+        return layer  # A bare connection (tests, tools without the query layer): settings still apply.
+
+    def query(*, sql, limit=200):
+        fired = threading.Event()
+
+        def stop():
+            fired.set()
+            layer.connection.interrupt()
+        timer = threading.Timer(seconds, stop)
+        timer.daemon = True
+        timer.start()
+        try:
+            return original(sql=sql, limit=limit)
+        except Exception as exc:
+            if fired.is_set():
+                raise TimeoutError(f"DuckDB query stopped after {seconds} s; use fewer rows, avoid cross joins and "
+                                   "compute per symbol or over a shorter window") from exc
+            raise
+        finally:
+            timer.cancel()
+    layer.query = query
+    return layer
+
+
 def isolate_research(strategy, root, network=None):
     # Native DuckDB's prefix check accepts multiple statements. Engine-level
     # permissions prevent COPY/read_text/ATTACH/extension access to the risk
@@ -130,7 +170,10 @@ def isolate_research(strategy, root, network=None):
     allowed = ", ".join("'" + str(folder.resolve()).replace("'", "''") + "'" for folder in folders)
     connection.execute(f"SET allowed_directories=[{allowed}]")
     connection.execute("SET enable_external_access=false")
-    connection.execute("SET lock_configuration=true")
+    connection.execute(f"SET threads={DUCKDB_THREADS}")
+    connection.execute(f"SET memory_limit='{DUCKDB_MEMORY_LIMIT}'")
+    connection.execute("SET lock_configuration=true")  # The model's SQL cannot change any of the above.
+    limit_queries(strategy.agents.duckdb)
     strategy._agent_browser_manager = ResearchBrowser(
         state_root=root / "browser", upload_root=root / "browser" / "uploads")
     settings = ResearchNetwork.from_config(network)

@@ -340,6 +340,27 @@ def test_research_sql_cannot_access_risk_files_or_unlock_engine(tmp_path):
     connection.close()
 
 
+def test_a_runaway_agent_query_is_stopped_and_never_takes_more_than_one_core(tmp_path):
+    """2026-11-03: a researcher's DuckDB query never finished and kept both server cores busy for 12 hours."""
+    import time
+    from types import SimpleNamespace
+    from lumibot.components.agents.duckdb_tools import DuckDBQueryLayer
+    from scripts.autonomous_fund.boundary import DUCKDB_QUERY_SECONDS, isolate_research, limit_queries
+    layer = DuckDBQueryLayer(strategy=None)
+    isolate_research(SimpleNamespace(agents=SimpleNamespace(duckdb=layer)), tmp_path)
+    assert DUCKDB_QUERY_SECONDS == 60
+    assert layer.connection.execute("SELECT current_setting('threads')").fetchone()[0] == 1
+    assert "MiB" in layer.connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+    assert layer.query(sql="SELECT 1 AS one")["rows"] == [{"one": 1}]
+    limit_queries(layer, seconds=1)  # The same guard with a test-sized limit.
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="stopped after 1 s"):
+        layer.query(sql="SELECT count(*) AS n FROM range(200000) a, range(200000) b WHERE (a.range * b.range) % 7 = 3")
+    assert time.monotonic() - started < 10
+    assert layer.query(sql="SELECT 2 AS two")["rows"] == [{"two": 2}]  # The connection still works afterwards.
+    layer.connection.close()
+
+
 @pytest.mark.parametrize("url", ["file:///risk-config.json", "javascript:alert(1)", "data:text/html,local"])
 def test_browser_cannot_navigate_to_local_files_or_script_urls(url):
     from scripts.autonomous_fund.boundary import web_url

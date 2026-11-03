@@ -59,7 +59,8 @@ if command -v systemd-run >/dev/null 2>&1 && [[ -z "${AI_FUND_NO_SANDBOX:-}" ]];
   echo "在交易服务相同的文件沙箱中彩排（$how；以 $user 身份在后台运行，需要 sudo 启动一次临时任务）……"
   started="$(date +%s)"
   # A hard 30-minute limit and low CPU priority: a stuck rehearsal can never run for hours or
-  # take CPU from the trading process (2026-11-03: one used both cores for 12 hours).
+  # take CPU from the trading process (2026-11-03: one hung in a model's DuckDB query and used
+  # both cores for 12 hours; that query is now stopped after 60 s, see boundary.py).
   run sudo systemd-run --quiet --collect --unit="$unit" --uid="$user" --gid="$(id -gn "$user")" \
     -p RuntimeMaxSec=1800 -p Nice=10 -p CPUWeight=20 "${properties[@]}" "${command[@]}"
   echo "彩排已在后台运行，断开 SSH 也不会中断。重新连上后查看结果：bash scripts/fund-rehearse.sh --show"
