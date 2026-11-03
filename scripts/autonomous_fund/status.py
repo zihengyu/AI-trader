@@ -5,6 +5,7 @@ heartbeat and the journal) and never changes trading state.
 """
 import json
 import sqlite3
+import sys
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,7 +109,28 @@ def summary(root, mode, now=None):
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")
     with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        failure = db.execute("SELECT at,body FROM events WHERE kind='operation_error' ORDER BY sequence DESC LIMIT 1").fetchone()
+        retries = {key: json.loads(value) for key, value in db.execute(
+            "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
+    if retries.get("decision_failures") and retries.get("decision_retry_at"):
+        label = "基金经理失败退避" if retries.get("decision_failure_role") == "manager" else "AI 失败退避"
+        lines.append(f"{label}：连续失败 {retries['decision_failures']} 次；"
+                     f"记录的重试时间 {retries['decision_retry_at']}")
+    if failure:
+        detail = json.loads(failure[1])
+        # mkdir(parents=True) handles missing parents before its final EROFS.
+        # Those ENOENT contexts must not replace the errno that escaped.
+        causes = detail.get("causes") or []
+        origin = detail if "errno" in detail else next(
+            (cause for cause in causes if "errno" in cause), detail)
+        frames = origin.get("frames") or detail.get("frames") or []
+        location = next((frame for frame in reversed(frames)
+                         if frame.get("module", "").split(".")[0] not in sys.stdlib_module_names),
+                        frames[-1] if frames else {})
+        code = f" errno={origin['errno']} ({origin.get('errno_name', '')})" if "errno" in origin else ""
+        lines.append(f"最近业务异常：{failure[0]} {detail.get('phase')} {detail.get('error')}{code}；"
+                     f"位置 {location.get('module', '?')}.{location.get('function', '?')}:{location.get('line', '?')}")
     if rows:
         lines.append("最近通知：")
         for at, body in rows:

@@ -2489,7 +2489,9 @@ class Broker(ABC):
         """Return the remaining time for the market to open in seconds"""
         open_time_this_day = self.utc_to_local(self.market_hours(close=False, next=False))
         open_time_next_day = self.utc_to_local(self.market_hours(close=False, next=True))
-        now = self.utc_to_local(datetime.now())
+        # utc_to_local treats naive input as UTC; datetime.now() is host-local.
+        # An aware instant keeps non-UTC hosts from choosing the wrong session.
+        now = self.utc_to_local(datetime.now(timezone.utc))
         open_time = open_time_this_day if open_time_this_day > now else open_time_next_day
         current_time = datetime.now().astimezone(tz=_local_tz())
         if self.is_market_open():

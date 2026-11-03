@@ -412,6 +412,10 @@ def main(argv=None):
         # Read-only commands leave no stray directory (LumiBot creates its cache folder on import).
         args.run_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("LUMIBOT_CACHE_FOLDER", str(args.run_dir.resolve() / "cache"))
+        # Native memory otherwise uses <checkout>/.lumibot/memory, outside the
+        # service's writable artifacts subtree. Configure it before lazy load.
+        if not os.environ.get("LUMIBOT_MEMORY_DIR"):
+            os.environ["LUMIBOT_MEMORY_DIR"] = str(args.run_dir.resolve() / "memory")
     if args.mode == "resume":
         from . import stops
         stops.clear(args.run_dir)

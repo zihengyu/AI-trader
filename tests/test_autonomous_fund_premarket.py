@@ -198,9 +198,10 @@ def test_native_startup_restart_preopen_and_open_execution(tmp_path, monkeypatch
     clock.value += timedelta(minutes=5)
     source._cache.clear()
     strategy.on_trading_iteration()
-    assert [name for name, _ in calls] == ["researcher", "researcher", "researcher", "critic", "manager"]
-    assert model_calls == [("researcher", "deepseek/deepseek-flash")] * 3 + [
-        ("critic", "deepseek/deepseek-flash"), ("manager", "deepseek/deepseek-v4-pro")]  # Critic: researcher model.
+    # Regular-session decisions now go straight to the manager with the saved
+    # premarket packet; a fresh researcher run must not delay opening decisions.
+    assert [name for name, _ in calls] == ["researcher", "researcher", "critic", "manager"]
+    assert model_calls == [("researcher", "deepseek/deepseek-flash")] * 2 + [("critic", "deepseek/deepseek-flash"), ("manager", "deepseek/deepseek-v4-pro")]
     assert strategy.agents["researcher"].allow_trading is False
     assert strategy.agents["manager"].allow_trading is False
     assert calls[-1][1]["premarket_research"]["phase"] == "before_market_opens"

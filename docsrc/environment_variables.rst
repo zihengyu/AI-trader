@@ -1215,6 +1215,10 @@ LUMIBOT_MEMORY_DIR
 
 - Purpose: Override local SQLite agent memory root.
 - Default: ``.lumibot/memory`` under the current working directory.
+- Autonomous fund CLI: an unset or empty value is configured as
+  ``<run-dir>/memory`` before native memory loads. Explicit nonempty overrides
+  are preserved and must be writable by the service. Read-only status and
+  configuration commands do not configure or create memory.
 
 LUMIBOT_MEMORY_EXPORT_PARQUET
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

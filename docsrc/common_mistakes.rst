@@ -6,6 +6,77 @@ Common Mistakes and How to Avoid Them
 
 This page documents the most common mistakes made when writing Lumibot strategies, along with the correct patterns to use instead.
 
+Pre-Open Hooks Delayed on a Non-UTC Server
+--------------------------------------------------------------------------------
+
+Continuous local, paper and live strategies should select the same opening
+instant regardless of the server timezone. The shared broker clock now uses an
+explicitly timezone-aware UTC instant when selecting the next session. Earlier
+versions could interpret a local wall clock as UTC, choose tomorrow's session and
+miss today's ``before_market_opens()`` hook and opening bell. Background telemetry
+could continue while the strategy slept.
+
+Deploy the corrected runtime and restart an affected runner so its existing long
+wait is recalculated. Keep its account state and inspect the normal STOP and order
+status before resuming. Changing a strategy's timezone or pre-open buffer is not
+needed to compensate for this bug. Alpaca's provider-clock overrides and
+backtesting's simulated clock retain their existing behavior.
+
+Healthy Process, Failed Autonomous Fund Iterations
+--------------------------------------------------------------------------------
+
+In the optional autonomous paper-fund application, fresh heartbeats, ``healthy``
+monitoring and a cleared STOP indicate process liveness. An individual research
+or trading iteration may still fail. Identical short alerts are deduplicated for
+30 minutes, so the absence of a new alert does not establish business recovery.
+
+The maintenance status now displays the most recent ``operation_error`` with its
+timestamp, phase, module, function, line number and OS errno when available. It
+also shows the persisted AI failure count and retry time. Detailed safe records
+are written to the journal and runtime log without exception messages, local
+variables, source text, filenames or authenticated request contents. Use the
+retained location to diagnose the underlying fault; additional diagnostics alone
+do not remediate that fault.
+
+Read-Only Native Memory in the Autonomous Fund Service
+--------------------------------------------------------------------------------
+
+The generic native memory default is ``.lumibot/memory`` under the working
+directory. The fund's systemd service permits writes under ``artifacts`` and
+the selected account directory. Previously its CLI configured the cache but
+omitted the separate memory root, so the first lazy ``MemoryStore`` load could
+raise ``EROFS`` before either agent reached its model call.
+
+The fund CLI now defaults an unset or empty ``LUMIBOT_MEMORY_DIR`` to
+``<run-dir>/memory``. Explicit nonempty overrides remain in effect; select a
+path the service may write. Restart the updated runner to load this setting,
+keeping the same account journal and normal STOP/resume checks. Status displays
+the final exception's OS errno before looking for an OS cause and identifies
+the nearest non-standard-library caller. Intermediate handled ``ENOENT``
+contexts from recursive directory creation no longer hide the final ``EROFS``.
+
+Research Failures Delaying the Autonomous Fund Manager
+--------------------------------------------------------------------------------
+
+In the optional local and broker-paper fund application, regular-session
+portfolio assessments now invoke the manager directly. Saved premarket research
+is supplied with its original times and a status identifying missing, invalid or
+previous-session work. The manager retains its own read-only research tools and
+must verify material claims and disclose gaps. A fresh researcher call is no
+longer a prerequisite for an opening or later portfolio assessment.
+
+Manager failures still use the persisted review backoff and daily inference
+budget. On startup, a matching legacy journal failure attributable only to the
+researcher is detached from the manager's retry schedule and audited as
+``research_backoff_detached``. Manager and unattributed failures retain their
+retry times. STOP, order reconciliation, approvals and execution checks remain
+in force. Restart the updated runner to load this behavior; a manager call can
+still fail if the underlying runtime fault affects both roles.
+
+Historical replays retain their dated research and evidence validation before a
+manager decision. Pre-open and post-close research remain read-only lifecycle
+work; this change does not introduce background research workers.
+
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------
 
