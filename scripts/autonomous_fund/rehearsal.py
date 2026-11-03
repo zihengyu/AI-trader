@@ -113,6 +113,26 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         probe.unlink()
     stages.run("memory directory writable", writable, kind="required")
 
+    def caches():
+        # Every directory a LumiBot research tool writes to: the service makes the rest read-only.
+        problems = []
+        for name in ("LUMIBOT_CACHE_FOLDER", "LUMIBOT_SEC_CACHE_DIR", "LUMIBOT_FRED_CACHE_DIR",
+                     "LUMIBOT_TRADING_DAYS_CACHE_DIR"):
+            value = os.environ.get(name)
+            if not value:
+                problems.append(f"{name} unset (defaults to the read-only home directory)")
+                continue
+            try:
+                folder = Path(value)
+                folder.mkdir(parents=True, exist_ok=True)
+                (folder / ".rehearsal-write-test").write_text("ok", encoding="utf-8")
+                (folder / ".rehearsal-write-test").unlink()
+            except OSError as exc:
+                problems.append(f"{name}: {exc.strerror or type(exc).__name__}")
+        if problems:
+            raise RiskError("; ".join(problems))
+    stages.run("research cache directories writable", caches, kind="required")
+
     def copy():
         root.mkdir(parents=True, exist_ok=True)
         if (account_dir / "state.sqlite3").is_file():
@@ -231,6 +251,7 @@ def _finish(scratch, stages, root, keep, extra=None):
 
 LABELS = {
     "memory directory writable": "记忆库目录可写（昨天的 EROFS）",
+    "research cache directories writable": "研究工具缓存目录可写（SEC／FRED／交易日历）",
     "copy the account": "复制账户",
     "start the strategy (startup and pre-open research)": "启动策略（含盘前研究，真实模型）",
     "account snapshot": "账户快照",

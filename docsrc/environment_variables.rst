@@ -1193,6 +1193,12 @@ LUMIBOT_SEC_CACHE_DIR
 
 - Purpose: Override local SEC fundamentals and filing cache.
 - Default: ``~/.lumibot/cache/sec``.
+- Autonomous fund CLI: an unset or empty value is configured as
+  ``<run-dir>/cache/sec-tools``, because the service mounts the home directory
+  read-only. ``LUMIBOT_FRED_CACHE_DIR`` (``<run-dir>/cache/fred-tools``) and
+  ``LUMIBOT_TRADING_DAYS_CACHE_DIR`` (``<run-dir>/cache/trading-days``) are
+  configured the same way; explicit values are preserved. When
+  ``LUMIBOT_SEC_USER_AGENT`` is unset, the fund copies ``FUND_SEC_USER_AGENT``.
 
 FRED_API_KEY
 ^^^^^^^^^^^^

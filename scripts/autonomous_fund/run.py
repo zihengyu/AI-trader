@@ -424,6 +424,15 @@ def main(argv=None):
         # service's writable artifacts subtree. Configure it before lazy load.
         if not os.environ.get("LUMIBOT_MEMORY_DIR"):
             os.environ["LUMIBOT_MEMORY_DIR"] = str(args.run_dir.resolve() / "memory")
+        # LumiBot's SEC/FRED research tools and trading-day cache default to the home
+        # directory, which the service mounts read-only (2026-11-03 rehearsal EROFS).
+        for name, folder in (("LUMIBOT_SEC_CACHE_DIR", "sec-tools"), ("LUMIBOT_FRED_CACHE_DIR", "fred-tools"),
+                             ("LUMIBOT_TRADING_DAYS_CACHE_DIR", "trading-days")):
+            if not os.environ.get(name):
+                os.environ[name] = str(args.run_dir.resolve() / "cache" / folder)
+        # The AI's own SEC tool identifies the operator, as SEC's fair-access policy asks.
+        if os.environ.get("FUND_SEC_USER_AGENT") and not os.environ.get("LUMIBOT_SEC_USER_AGENT"):
+            os.environ["LUMIBOT_SEC_USER_AGENT"] = os.environ["FUND_SEC_USER_AGENT"]
     if args.mode == "resume":
         from . import stops
         stops.clear(args.run_dir)

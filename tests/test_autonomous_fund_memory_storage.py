@@ -122,3 +122,40 @@ def test_status_does_not_create_or_configure_native_memory(tmp_path, monkeypatch
     run.main(["status", "--run-dir", str(root)])
     assert "LUMIBOT_MEMORY_DIR" not in os.environ
     assert not root.exists()
+
+
+def test_native_research_caches_live_in_the_account_not_the_read_only_home(
+        tmp_path, monkeypatch, entrypoint_environment):
+    """2026-11-03 rehearsal: the AI's get_company_facts tool failed with EROFS on /home/<user>/.lumibot.
+
+    LumiBot's SEC and FRED clients and the trading-day cache default to the home
+    directory, which the service sandbox mounts read-only (ProtectHome=read-only).
+    """
+    from lumibot.fundamentals.sec import SECFundamentals
+    from lumibot.macro.fred import FREDMacroData
+    import scripts.autonomous_fund.report as reports
+    for key in ("LUMIBOT_SEC_CACHE_DIR", "LUMIBOT_FRED_CACHE_DIR", "LUMIBOT_TRADING_DAYS_CACHE_DIR",
+                "LUMIBOT_SEC_USER_AGENT"):
+        monkeypatch.delenv(key, raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("FUND_SEC_USER_AGENT", "Synthetic Operator ops@example.com")
+    root = tmp_path / "artifacts" / "selected-book"
+    seen = {}
+
+    def start(args, config, *credentials):
+        seen["sec"] = SECFundamentals().cache_dir
+        seen["fred"] = FREDMacroData().cache_dir
+        seen["agent"] = SECFundamentals().user_agent
+        seen["days"] = os.environ.get("LUMIBOT_TRADING_DAYS_CACHE_DIR")
+
+    monkeypatch.setattr(run, "models_ready", lambda *args: {})
+    monkeypatch.setattr(reports, "report", lambda *args: {})
+    monkeypatch.setattr(run, "run_local", start)
+    run.main(["local", "--run-dir", str(root), "--config", str(config_file(tmp_path))])
+    resolved = root.resolve()
+    assert resolved in Path(seen["sec"]).resolve().parents and resolved in Path(seen["fred"]).resolve().parents
+    assert resolved in Path(seen["days"]).resolve().parents
+    assert seen["agent"] == "Synthetic Operator ops@example.com"  # The AI's SEC tool names the operator.
+    assert not (home / ".lumibot").exists() and not (home / ".cache" / "lumibot").exists()

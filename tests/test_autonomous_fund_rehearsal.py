@@ -28,6 +28,8 @@ def rehearsal(tmp_path, monkeypatch):
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     monkeypatch.setenv("IS_BACKTESTING", "false")
     monkeypatch.setenv("LUMIBOT_MEMORY_DIR", str(tmp_path / "account" / "memory"))
+    for name in ("LUMIBOT_SEC_CACHE_DIR", "LUMIBOT_FRED_CACHE_DIR", "LUMIBOT_TRADING_DAYS_CACHE_DIR"):
+        monkeypatch.setenv(name, str(tmp_path / "account" / "cache" / name.lower()))  # As the CLI sets them.
     clock = Clock()
 
     def run(account, **kw):
@@ -101,3 +103,10 @@ def test_the_script_runs_the_rehearsal_inside_the_service_sandbox(tmp_path):
         assert "--uid=nobody" in result.stdout and "rehearse" in result.stdout and "--no-models" in result.stdout
     assert subprocess.run(["bash", str(ROOT / "scripts" / "fund-rehearse.sh"), "--live"], capture_output=True,
                           env=variables).returncode == 2
+
+
+def test_research_caches_left_in_the_home_directory_fail_the_rehearsal(tmp_path, rehearsal, monkeypatch):
+    monkeypatch.delenv("LUMIBOT_SEC_CACHE_DIR")
+    report = rehearsal(tmp_path / "account", models=False)
+    stage = next(r for r in report["stages"] if r["stage"] == "research cache directories writable")
+    assert report["verdict"] == "fail" and stage["status"] == "fail" and "LUMIBOT_SEC_CACHE_DIR" in stage["detail"]

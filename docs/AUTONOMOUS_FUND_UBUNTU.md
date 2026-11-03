@@ -224,6 +224,10 @@ STOP、回撤锁、审批状态、模糊订单、每日订单计数、单日亏�
 同时影响研究员和经理。启动入口现在默认设置 `LUMIBOT_MEMORY_DIR=<账户目录>/memory`，
 与行情缓存分别管理；显式配置的非空 `LUMIBOT_MEMORY_DIR` 仍优先，服务使用的路径须在其允许写入的目录中。
 更新并重启 runner 才会采用新默认值，无需放宽 `ProtectSystem` 或删除账本。
+2026-11-03 的盘前彩排又发现同类问题：AI 的 SEC 财报工具（`get_company_facts`）、FRED 工具和交易日历缓存默认写在
+`~/.lumibot`、`~/.cache` 下，而服务把家目录设为只读，于是工具报 `EROFS`。启动入口现在把未设置的
+`LUMIBOT_SEC_CACHE_DIR`、`LUMIBOT_FRED_CACHE_DIR`、`LUMIBOT_TRADING_DAYS_CACHE_DIR` 也指向 `<账户目录>/cache/`，
+并把 `FUND_SEC_USER_AGENT` 传给 AI 的 SEC 工具；彩排的“研究工具缓存目录可写”一项专门检查这些目录。
 `status` 优先显示实际抛出的系统错误码及非标准库调用位置，递归建目录时先前处理过的 `ENOENT`
 不再覆盖最后的 `EROFS`。故障证据和验证边界见
 `docs/investigations/2026-11-03_FUND_SERVICE_MEMORY_STORAGE.md`。
