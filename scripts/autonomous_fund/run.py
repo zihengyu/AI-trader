@@ -282,7 +282,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -397,7 +397,7 @@ def main(argv=None):
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
-    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse"} else "true"
+    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse", "prefetch"} else "true"
     if args.mode == "serve":
         from .service import serve
         if not args.env_file:
@@ -478,6 +478,11 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "prefetch":
+        from .prefetch import prefetch
+        from .settings import configured_mode
+        print(json.dumps(prefetch(args.run_dir, config, configured_mode(os.environ)), indent=2, ensure_ascii=False))
         return
     if args.mode == "rehearse" and args.latest:
         from .rehearsal import latest, text

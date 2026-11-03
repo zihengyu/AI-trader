@@ -35,7 +35,7 @@ fi
 echo "3/3 停止服务……"
 run sudo systemctl stop "${units[@]}"
 if (( disable )); then
-  run sudo systemctl disable --now "${units[@]}" lumibot-fund-backup.timer
+  run sudo systemctl disable --now "${units[@]}" lumibot-fund-backup.timer lumibot-fund-prefetch.timer
   echo "    已取消开机自启（含每日备份定时器）。"
 fi
 echo

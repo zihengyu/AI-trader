@@ -390,6 +390,24 @@ def model_selection(config, model=None, research_model=None, decision_model=None
     return selected
 
 
+def history_length(quant, factor_settings=None):
+    """Daily bars risk and the factor lab need: one download serves both."""
+    length = quant.es_lookback_days + 5
+    return max(length, factor_settings.history_days) if factor_settings is not None else length
+
+
+def daily_rows(bars):
+    """[(date, close, volume, open, high, low)] from a Bars result, row by row (one bad value never drops a symbol)."""
+    frame = bars.df if bars is not None else None
+    if frame is None or not len(frame) or "close" not in frame:
+        return []
+    def column(name):
+        return frame[name] if name in frame else [None] * len(frame)
+    return [(index.date(), _finite(c), _finite(v), _finite(o), _finite(h), _finite(l))
+            for index, c, v, o, h, l in zip(frame.index, frame["close"], column("volume"), column("open"),
+                                             column("high"), column("low"))]
+
+
 def _finite(value):
     """float(value), or NaN for a missing or non-numeric provider value."""
     try:
@@ -501,11 +519,14 @@ class AutonomousFund(Strategy):
         if mode in {"paper", "local"} and news.enabled and runtime is None:
             # Live information only; historical runs use the researcher's dated tools.
             self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open)
+        # Live runs share each trading day's research data with the scheduled prefetch job.
+        from .datastore import DailyStore
+        self.daily_store = DailyStore(self.run_dir / "cache" / "daily") if mode in {"paper", "local"} else None
         from .events import EarningsCalendar, EventSettings
         events = EventSettings.from_config(config.get("events"))
         # Live only: a historical run would need the earnings calendar as it was known then.
         # Scripted-model runs (tests, mock) stay off the network, like the news watch.
-        self.earnings = (EarningsCalendar(self.journal, events)
+        self.earnings = (EarningsCalendar(self.journal, events, store=self.daily_store)
                          if events.enabled and mode in {"paper", "local"} and runtime is None else None)
         from .construction import ConstructionSettings
         self.construction = ConstructionSettings.from_config(config.get("construction"))
@@ -515,7 +536,7 @@ class AutonomousFund(Strategy):
             self.history_fallback = AlpacaDailyHistory(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"])
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
-        self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"})
+        self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"}, store=self.daily_store)
                       if macro.enabled and mode != "mock" and runtime is None else None)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
@@ -1789,55 +1810,54 @@ class AutonomousFund(Strategy):
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_bars(self, symbol, now):
-        """One daily-history request per symbol and trading day, shared by risk and the factor lab.
+        """One daily-history read per symbol and trading day, shared by risk and the factor lab.
 
-        Returns (rows, error); rows are (date, close, volume) as the provider
-        returned them, including a possible forming bar for today.
+        Returns (rows, error); rows are (date, close, volume). The day's data store
+        (filled ahead by the scheduled prefetch) is read first; only a missing
+        symbol is fetched, and what was fetched is written back for restarts.
         """
         day, key = trading_day(now), (trading_day(now), symbol)
         cache = getattr(self, "_bars", None)
         if cache is None:
             self._bars = cache = {}  # Test harnesses build the strategy without initialize().
         if key not in cache:
-            length = self.quant.es_lookback_days + 5
-            lab = getattr(self, "factor_lab", None)
-            if lab is not None:
-                length = max(length, lab.settings.history_days)
-            rows, error = [], None
-            try:
-                bars = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
-                frame = bars.df if bars is not None else None
-                if frame is not None and len(frame) and "close" in frame:
-                    volume = frame["volume"] if "volume" in frame else [None] * len(frame)
-                    # Row by row: one bad value (a missing volume, say) never costs the whole symbol.
-                    rows = [(index.date(), _finite(close), _finite(shares))
-                            for index, close, shares in zip(frame.index, frame["close"], volume)]
-                    if all(column in frame for column in ("open", "high", "low")):
-                        # Kept beside the rows for the factor lab's open/high/low fields.
-                        self.__dict__.setdefault("_ohlc", {})[key] = {
-                            str(index.date()): (_finite(o), _finite(h), _finite(l))
-                            for index, o, h, l in zip(frame.index, frame["open"], frame["high"], frame["low"])
-                            if index.date() < instant(now).date()}
-            except Exception as exc:
-                error = type(exc).__name__
-            fallback = getattr(self, "history_fallback", None)
-            if (error or not rows) and fallback is not None:
-                # A second, official source for the same completed daily bars (risk and factor history only).
-                try:
-                    bars = fallback.bars(symbol, length, instant(now).astimezone(ZoneInfo("America/New_York")).date())
-                    rows = [(d, close, shares) for d, close, shares, _, _, _ in bars]
-                    self.__dict__.setdefault("_ohlc", {})[key] = {str(d): (o, h, l) for d, _, _, o, h, l in bars}
-                    self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
-                                                                      "feed": fallback.feed, "yahoo_error": error})
-                    error = None
-                except Exception as exc:
-                    error = error or type(exc).__name__
+            length = history_length(self.quant, getattr(getattr(self, "factor_lab", None), "settings", None))
+            store = getattr(self, "daily_store", None)
+            full, error = (store.bars(day, symbol, length) if store is not None else None), None
+            if full is None:
+                full, error = self._fetch_daily_bars(symbol, length, now)
+                if full and store is not None:
+                    try:
+                        store.save_bars(day, symbol, length, full)
+                    except OSError:
+                        pass  # The store is a cache: the bars are still used this time.
             if error:
                 self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
+            rows = [(d, close, shares) for d, close, shares, _, _, _ in full or []]
             self._bars = {k: v for k, v in cache.items() if k[0] == day}
             self._ohlc = {k: v for k, v in (getattr(self, "_ohlc", None) or {}).items() if k[0] == day}
+            self._ohlc[key] = {str(d): (o, h, l) for d, _, _, o, h, l in full or [] if d < instant(now).date()}
             self._bars[key] = (rows, error)
         return self._bars[key]
+
+    def _fetch_daily_bars(self, symbol, length, now):
+        """([(date, close, volume, open, high, low)], error) from the data source, then the Alpaca fallback."""
+        rows, error = [], None
+        try:
+            rows = daily_rows(self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day"))
+        except Exception as exc:
+            error = type(exc).__name__
+        fallback = getattr(self, "history_fallback", None)
+        if (error or not rows) and fallback is not None:
+            # A second, official source for the same completed daily bars (risk and factor history only).
+            try:
+                rows = fallback.bars(symbol, length, instant(now).astimezone(ZoneInfo("America/New_York")).date())
+                self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
+                                                                  "feed": fallback.feed, "yahoo_error": error})
+                error = None
+            except Exception as exc:
+                error = error or type(exc).__name__
+        return rows, error
 
     @staticmethod
     def _completed(rows, now):

@@ -47,7 +47,10 @@ def test_linux_secret_permissions_fail_closed(tmp_path):
 def test_generated_units_quote_paths_and_have_independent_recovery():
     units = generate('/srv/fund checkout', '/srv/fund checkout/artifacts/book', '/srv/fund checkout/.env', 'fundbot', 'local')
     assert set(units) == {'lumibot-fund-runner.service', 'lumibot-fund-monitor.service', 'lumibot-fund-backup.service',
-                          'lumibot-fund-backup.timer'}
+                          'lumibot-fund-backup.timer', 'lumibot-fund-prefetch.service', 'lumibot-fund-prefetch.timer'}
+    prefetch = units['lumibot-fund-prefetch.service']
+    assert 'Type=oneshot' in prefetch and '"prefetch"' in prefetch and 'ProtectHome=read-only' in prefetch
+    assert 'OnCalendar=Mon..Fri *-*-* 07:15:00 America/New_York' in units['lumibot-fund-prefetch.timer']
     backup = units['lumibot-fund-backup.service']
     assert 'Type=oneshot' in backup and '"rotate-backup"' in backup and 'Restart=' not in backup
     assert '"--run-dir" "/srv/fund checkout/artifacts/book"' in backup and 'ProtectSystem=strict' in backup

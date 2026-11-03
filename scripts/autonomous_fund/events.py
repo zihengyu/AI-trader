@@ -114,11 +114,13 @@ def within(event_day, today, window_days):
 
 
 class EarningsCalendar:
-    def __init__(self, journal, settings, environ=None, get=None, yahoo=None, timeout_seconds=10):
+    def __init__(self, journal, settings, environ=None, get=None, yahoo=None, timeout_seconds=10, store=None):
         import requests
-        self.journal, self.settings, self.timeout_seconds = journal, settings, timeout_seconds
+        self.journal, self.settings, self.timeout_seconds, self.store = journal, settings, timeout_seconds, store
         self.environ = os.environ if environ is None else environ
         self.get, self.yahoo = get or requests.get, yahoo or yahoo_dates
+        if journal is None:  # The prefetch job: fetch() only, results go to the daily store.
+            return
         with journal.connection() as db:
             db.execute("""CREATE TABLE IF NOT EXISTS fund_earnings (symbol TEXT NOT NULL, day TEXT NOT NULL,
                 source TEXT, dates TEXT, error TEXT, PRIMARY KEY (symbol, day))""")
@@ -130,6 +132,17 @@ class EarningsCalendar:
                 raise RiskError("events.source finnhub needs FINNHUB_API_KEY")
             return "finnhub"
         return "yahoo"
+
+    def fetch(self, symbol, today):
+        """(source, dates or None, error or None) for one symbol from the configured calendar."""
+        source = dates = error = None
+        try:
+            source = self.source()
+            dates = (finnhub_dates(symbol, today, self.environ["FINNHUB_API_KEY"], self.get)
+                     if source == "finnhub" else bounded(lambda: self.yahoo(symbol), self.timeout_seconds))
+        except Exception as exc:
+            error = str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__
+        return source, dates, error
 
     def dates(self, symbols, today, may_fetch=None):
         """{symbol: {"dates": [...], "source": s} | {"unavailable": error}}; one fetch per symbol per day.
@@ -143,20 +156,19 @@ class EarningsCalendar:
             stored = {r["symbol"]: dict(r) for r in db.execute("SELECT * FROM fund_earnings WHERE day=?",
                                                                (today.isoformat(),))}
         result = {}
+        prefetched = (self.store.get(today.isoformat(), "earnings") if self.store is not None else None) or {}
         for symbol in sorted(symbols):
             row = stored.get(symbol)
+            if row is None and symbol in prefetched:  # Fetched ahead by the scheduled prefetch.
+                item = prefetched[symbol]
+                row = {"source": item.get("source"), "error": item.get("error"),
+                       "dates": json.dumps(item["dates"]) if item.get("dates") is not None else None}
             if row is None and may_fetch is not None and not may_fetch():
                 self.deferred.append(symbol)
                 result[symbol] = {"unavailable": "deferred"}
                 continue
             if row is None:
-                source, dates, error = None, None, None
-                try:
-                    source = self.source()
-                    dates = (finnhub_dates(symbol, today, self.environ["FINNHUB_API_KEY"], self.get)
-                             if source == "finnhub" else bounded(lambda: self.yahoo(symbol), self.timeout_seconds))
-                except Exception as exc:
-                    error = str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__
+                source, dates, error = self.fetch(symbol, today)
                 with self.journal.connection() as db:
                     db.execute("INSERT OR REPLACE INTO fund_earnings VALUES (?,?,?,?,?)",
                                (symbol, today.isoformat(), source, json.dumps(dates) if dates is not None else None,

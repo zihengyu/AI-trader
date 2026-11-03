@@ -16,7 +16,8 @@ build_dir="${AI_FUND_UNIT_BUILD:-$repo/artifacts/fund-systemd}"
 user="${AI_FUND_USER:-$(id -un)}"
 units=(lumibot-fund-runner.service lumibot-fund-monitor.service)
 # Installed with the services; the timer takes a daily journal snapshot after the close.
-backup_units=(lumibot-fund-backup.service lumibot-fund-backup.timer)
+backup_units=(lumibot-fund-backup.service lumibot-fund-backup.timer
+              lumibot-fund-prefetch.service lumibot-fund-prefetch.timer)
 yes=0
 restart=0
 for arg in "$@"; do
@@ -62,7 +63,7 @@ if (( changed )); then
 fi
 
 echo "3/4 启动服务……"
-run sudo systemctl enable --now "${units[@]}" lumibot-fund-backup.timer
+run sudo systemctl enable --now "${units[@]}" lumibot-fund-backup.timer lumibot-fund-prefetch.timer
 fresh=()
 if (( restart )); then
   # enable --now leaves a running service on its old code; a restart loads the update.

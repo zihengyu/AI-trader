@@ -99,9 +99,9 @@ def regime(series):
 
 
 class MacroWatch:
-    def __init__(self, settings, environ=None, get=None, historical=False):
+    def __init__(self, settings, environ=None, get=None, historical=False, store=None):
         import requests
-        self.settings, self.historical = settings, historical
+        self.settings, self.historical, self.store = settings, historical, store
         self.environ = os.environ if environ is None else environ
         self.get = get or requests.get
         self._raw = {}  # series -> (fetched_on, observations)
@@ -128,6 +128,11 @@ class MacroWatch:
             cached = self._raw.get(name)
             # A historical run fetches each series once and slices it by date; live runs refresh daily.
             stale = cached is None or (not self.historical and cached[0] != today)
+            if stale and self.store is not None and not self.historical:
+                saved = self.store.get(today.isoformat(), f"fred_{name}")  # Prefetched today: no network.
+                if saved is not None:
+                    self._raw[name] = cached = (today, [tuple(row) for row in saved])
+                    stale = False
             if stale and may_fetch is not None and not may_fetch():
                 deferred.append(name)
                 series[name] = {"meaning": meaning, "unavailable": "deferred"}
@@ -135,6 +140,8 @@ class MacroWatch:
             if stale:
                 try:
                     self._raw[name] = cached = (today, self._fetch(name, today))
+                    if self.store is not None and not self.historical:
+                        self.store.put(today.isoformat(), f"fred_{name}", cached[1])
                 except Exception as exc:
                     self._raw[name] = cached = (today, exc)
             if isinstance(cached[1], Exception):

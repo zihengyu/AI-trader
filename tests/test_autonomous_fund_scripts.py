@@ -56,11 +56,11 @@ def test_start_installs_starts_waits_for_the_monitor_and_resumes_a_manual_stop(t
     assert result.returncode == 0, result.stdout + result.stderr
     assert "+ sudo install -m 644" in result.stdout and "+ sudo systemctl daemon-reload" in result.stdout
     assert ("+ sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service "
-            "lumibot-fund-backup.timer") in result.stdout
+            "lumibot-fund-backup.timer lumibot-fund-prefetch.timer") in result.stdout
     assert "已恢复交易" in result.stdout and not (book / "STOP").exists()
     assert sorted(p.name for p in (tmp_path / "build").iterdir()) == [
         "lumibot-fund-backup.service", "lumibot-fund-backup.timer", "lumibot-fund-monitor.service",
-        "lumibot-fund-runner.service"]
+        "lumibot-fund-prefetch.service", "lumibot-fund-prefetch.timer", "lumibot-fund-runner.service"]
     assert "+ sudo install -m 644" in result.stdout and "lumibot-fund-backup.timer" in result.stdout
     assert not (ROOT / "artifacts" / "autonomous-fund").exists()  # Checking the config leaves no stray directory.
 
@@ -130,7 +130,8 @@ def test_units_only_writes_the_unit_files(tmp_path):
     from scripts.autonomous_fund import deploy
     deploy.main(["units", "--user", "nobody", "--env-file", str(tmp_path / ".env"), "--output-dir", str(tmp_path)])
     assert sorted(p.name for p in tmp_path.iterdir()) == ["lumibot-fund-backup.service", "lumibot-fund-backup.timer",
-                                                          "lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
+                                                          "lumibot-fund-monitor.service", "lumibot-fund-prefetch.service",
+                                                          "lumibot-fund-prefetch.timer", "lumibot-fund-runner.service"]
 
 
 def test_rotating_backups_keep_the_newest_snapshots_only(tmp_path):
