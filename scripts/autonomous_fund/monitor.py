@@ -15,6 +15,11 @@ from .journal import encode
 from .risk import RiskError, instant
 
 
+DECISION_GRACE_MINUTES = 90  # After the open, the first valid decision is expected within this.
+DECISION_DROUGHT_HOURS = 3  # Later, a decision is expected within this after the manager's own next_review_at.
+LEGITIMATE_PAUSES = ("model_budget_exhausted", "model_cost_budget_exhausted")
+
+
 def require_monitor(root, now):
     """Server execution gate, independent of AI and the supervising PID."""
     try:
@@ -309,6 +314,7 @@ class Monitor:
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
             self._note_desk(db, now)
+            self._note_decision_drought(db, now)
         if self.transport is not None:
             self._deliver(now)
             if getattr(self.transport, "replies_enabled", False):
@@ -326,6 +332,67 @@ class Monitor:
         except Exception:  # Metrics are a convenience; they never affect supervision.
             pass
         return status
+
+    def _note_decision_drought(self, db, now):
+        """Alert once a day when the session runs without a valid decision and nothing explains it.
+
+        A healthy process can still fail to decide (a model failing on every
+        retry, an order stuck open, a logic fault); the heartbeat cannot show it.
+        Expected: a validated decision within DECISION_GRACE_MINUTES of the open,
+        and later within DECISION_DROUGHT_HOURS of the latest decision's own
+        next_review_at (covering quiet-review skips). Not a drought: a STOP, an
+        exhausted run or cost budget, or an observe-only run.
+        """
+        from zoneinfo import ZoneInfo
+        try:
+            session = self._session_status(now)
+        except Exception:
+            return
+        if not session.get("open"):
+            return
+        if (self.root / "STOP").exists():
+            # Trading is held on purpose; the clock restarts when the STOP lifts.
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('decision_drought_paused_at',?)", (now.isoformat(),))
+            return
+        zone = ZoneInfo("America/New_York")
+        day = now.astimezone(zone).date().isoformat()
+        noted = db.execute("SELECT value FROM fund_monitor_meta WHERE key='decision_drought_noted'").fetchone()
+        if noted and noted[0] == day:
+            return
+        opened = instant(session["next_open"])  # While open, next_open is the current session's open.
+        paused = db.execute("SELECT value FROM fund_monitor_meta WHERE key='decision_drought_paused_at'").fetchone()
+        clock = max(opened, instant(paused[0])) if paused else opened
+        last = db.execute("SELECT at,body FROM events WHERE kind='decision_validated' "
+                          "ORDER BY sequence DESC LIMIT 1").fetchone()
+        last_at = instant(last["at"]) if last else None
+        if last_at is not None and last_at >= opened:
+            try:
+                due = max(last_at, instant(json.loads(last["body"]).get("next_review_at") or last["at"]))
+            except (TypeError, ValueError, RiskError):
+                due = last_at
+            expected = max(due + timedelta(hours=DECISION_DROUGHT_HOURS), clock + timedelta(minutes=DECISION_GRACE_MINUTES))
+        else:
+            expected = clock + timedelta(minutes=DECISION_GRACE_MINUTES)
+        if now < expected:
+            return
+        startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+        if startup and json.loads(startup[0]).get("observe_only"):
+            return
+        since = opened.isoformat()
+        for row in db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200"):
+            if instant(row["at"]) < opened:
+                break
+            if json.loads(row["body"]).get("kind") in LEGITIMATE_PAUSES:
+                return  # The day's model budget is spent: deciding nothing is the configured behavior.
+        failures = sum(instant(r[0]) >= opened for r in db.execute(
+            "SELECT at FROM events WHERE kind='decision_backoff' ORDER BY sequence DESC LIMIT 100"))
+        db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('decision_drought_noted',?)", (day,))
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
+            "kind": "decision_drought", "details": {
+                "session_open": since, "last_decision_at": last_at.isoformat() if last_at else None,
+                "minutes_without_decision": round((now - (last_at if last_at and last_at >= opened else opened))
+                                                  .total_seconds() / 60),
+                "decision_failures_today": failures}})))
 
     def _note_desk(self, db, now):
         """Tell the operator once per six hours when the data desk stopped updating (trading is unaffected)."""

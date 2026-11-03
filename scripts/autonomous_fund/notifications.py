@@ -77,7 +77,7 @@ FACTOR_STATUS = {"validated": "通过", "rejected": "未通过", "insufficient_d
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
-                "model_cost_budget_exhausted"}
+                "model_cost_budget_exhausted", "decision_drought"}
 
 
 def _percent(value):
@@ -309,6 +309,12 @@ def readable(kind, details, sequence=None):
     elif kind == "data_desk_stale" and isinstance(details, dict):
         text = (f"ℹ️ 数据员已 {details.get('heartbeat_minutes_ago')} 分钟没有更新：交易进程改为自己拉取行情、资讯和宏观数据，"
                 "交易不受影响。查看：bash scripts/fund-logs.sh errors；重启：bash scripts/fund-restart.sh -y")
+    elif kind == "decision_drought" and isinstance(details, dict):
+        last = details.get("last_decision_at")
+        text = (f"⚠️ 交易时段已经 {details.get('minutes_without_decision')} 分钟没有有效的投资决策"
+                f"（今天最近一次：{_when(last) if last else '还没有'}；今天决策失败重试 "
+                f"{details.get('decision_failures_today', 0)} 次）。进程是健康的，但没有做出决策，常见原因是模型持续失败或"
+                "订单一直未完成。查看：bash scripts/fund-logs.sh errors")
     elif kind == "model_cost_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型费用已到上限（约 ${details.get('cost_usd')} / ${details.get('limit_usd')}）："
                 "当天不再发起新决策、反方审查和盘前研究；已有目标和止损照常执行，明天恢复。")
