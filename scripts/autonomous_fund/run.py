@@ -5,6 +5,7 @@ import json
 import logging
 from logging.handlers import RotatingFileHandler
 import os
+import sys
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -529,9 +530,13 @@ def main(argv=None):
         models, runtime = rehearsal_options(args.no_models, args.real_models)
         result = rehearse(args.run_dir, config, models=models, runtime=runtime)
         print(text(result))
-        if result["verdict"] != "ready":
-            raise SystemExit(1)
-        return
+        # 2026-11-03: a rehearsal printed its report and then never exited. Something it had
+        # started (the agents' native DuckDB, research and network clients) kept the interpreter
+        # alive at shutdown and used both CPU cores for 12 hours. The report is already
+        # saved (rehearsal.json) and the copy's journal committed, so leave at once.
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0 if result["verdict"] == "ready" else 1)
     if args.mode == "schwab-check":
         from .schwab import schwab_check
         result = schwab_check(args, config)

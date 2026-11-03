@@ -20,6 +20,10 @@ case "${1:-status}" in
     for unit in "${units[@]}"; do
       printf '%s：%s\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || true)"
     done
+    if systemctl is-active --quiet lumibot-fund-rehearsal 2>/dev/null; then
+      printf '注意：彩排仍在运行（开始于 %s）；正常不超过 15 分钟，卡住时停止：sudo systemctl stop lumibot-fund-rehearsal\n' \
+        "$(systemctl show -p ActiveEnterTimestamp --value lumibot-fund-rehearsal 2>/dev/null || true)"
+    fi
     fund status ;;
   logs)
     run journalctl -u "${units[0]}" -u "${units[1]}" -u "${units[2]}" -f -n 50 ;;

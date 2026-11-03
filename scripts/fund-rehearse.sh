@@ -51,13 +51,17 @@ if command -v systemd-run >/dev/null 2>&1 && [[ -z "${AI_FUND_NO_SANDBOX:-}" ]];
     [[ -n "$line" ]] && properties+=(-p "$line")
   done < <("$py" -m scripts.autonomous_fund.deploy sandbox --user "$user" --env-file "$env_file")
   if systemctl is-active --quiet "$unit" 2>/dev/null; then
-    echo "已有一次彩排在运行。实时进度：journalctl -u $unit -f -o cat；结束后：bash scripts/fund-rehearse.sh --show"
+    since="$(systemctl show -p ActiveEnterTimestamp --value "$unit" 2>/dev/null || true)"
+    echo "已有一次彩排在运行（开始于 ${since:-未知}）。实时进度：journalctl -u $unit -f -o cat；结束后：bash scripts/fund-rehearse.sh --show"
+    echo "正常彩排不超过 15 分钟；如果已经运行很久，可以停掉它（只影响彩排副本）：sudo systemctl stop $unit"
     exit 0
   fi
   echo "在交易服务相同的文件沙箱中彩排（$how；以 $user 身份在后台运行，需要 sudo 启动一次临时任务）……"
   started="$(date +%s)"
+  # A hard 30-minute limit and low CPU priority: a stuck rehearsal can never run for hours or
+  # take CPU from the trading process (2026-11-03: one used both cores for 12 hours).
   run sudo systemd-run --quiet --collect --unit="$unit" --uid="$user" --gid="$(id -gn "$user")" \
-    "${properties[@]}" "${command[@]}"
+    -p RuntimeMaxSec=1800 -p Nice=10 -p CPUWeight=20 "${properties[@]}" "${command[@]}"
   echo "彩排已在后台运行，断开 SSH 也不会中断。重新连上后查看结果：bash scripts/fund-rehearse.sh --show"
   [[ -n "${AI_FUND_DRY_RUN:-}" ]] && exit 0
   # While connected: follow the log, then print the result.
