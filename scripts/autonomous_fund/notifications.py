@@ -80,6 +80,30 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "model_cost_budget_exhausted", "decision_drought"}
 
 
+ATTRIBUTION_LABELS = {"market": "市场（beta×基准）", "selection": "选股", "cash_equivalent": "现金等价物",
+                      "timing": "当日交易择时（相对收盘）", "slippage": "执行滑点（相对到达价）", "fees": "费用"}
+
+
+def attribution_lines(result):
+    """The daily attribution as readable lines; missing parts are named, never filled in."""
+    if not result:
+        return ["无数据（这次复盘没有归因）。"]
+    if result.get("status") == "unavailable":
+        return [f"不可用：{result.get('reason')}"]
+    lines = [f"- 观测收益 {_percent(result['observed_return'])}（{result['previous_session']} → {result['session_date']}，"
+             f"基准 {result['benchmark']} {_percent(result.get('benchmark_return'))}）"]
+    lines += [f"- {ATTRIBUTION_LABELS[key]}：{_percent(value)}" for key, value in result["components"].items()]
+    lines.append(f"- 未解释（收盘前估值、分红、公司行为等，不强行配平）：{_percent(result['unexplained'])}")
+    groups = result.get("selection_by_group") or {}
+    if groups:
+        lines.append("- 选股按组：" + "；".join(f"{name} {_percent(value)}" for name, value in groups.items()))
+    for key, label in (("unavailable", "缺数据"), ("fees_unknown", "费用未知"), ("arrival_unknown", "缺到达价（滑点并入择时）"),
+                       ("beta_assumed", "beta 按 1 计")):
+        if result.get(key):
+            lines.append(f"- {label}：" + "；".join(result[key]))
+    return lines
+
+
 DIRECTIONS = {"up": "看涨", "down": "看跌", "outperform": "跑赢基准", "underperform": "跑输基准"}
 VERDICTS = {"informative": "有预测信息", "not_informative": "未优于朴素基准", "insufficient_sample": "样本不足"}
 
@@ -150,7 +174,8 @@ def daily_document(root, sequence):
              "约束遵守情况（AI 自评，需人工抽查）：" + (review.get("mandate_compliance") or "本次未填写"), "",
              "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
              "```json", json.dumps(watch_events, ensure_ascii=False, indent=2), "```", "",
-             "## AI 记分卡（只用已完成收盘价客观打分）", ""]
+             "## 当日归因（代码按收盘价计算）", ""] + attribution_lines(packet.get("attribution")) + [
+             "", "## AI 记分卡（只用已完成收盘价客观打分）", ""]
     # Only this session's card: an earlier one under today's heading would be stale.
     card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
     if card:

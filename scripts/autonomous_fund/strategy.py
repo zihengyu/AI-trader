@@ -1947,6 +1947,55 @@ class AutonomousFund(Strategy):
         self._scorecard_cache = (trading_day(now), result)
         return result
 
+    def _attribution(self, session, now):
+        """Code-computed attribution of a completed session (attribution.py) for the review; never raises."""
+        from .attribution import attribute
+        from .review import _events
+        day = session["session_date"]
+        try:
+            if getattr(self, "quant", None) is None:
+                return {"status": "unavailable", "session_date": day, "reason": "quantitative risk history is off"}
+            zone = ZoneInfo("America/New_York")
+            rows = _events(self.journal, instant(now), kinds=("account", "fill", "fill_reconciled", "order_submitted"))
+
+            def local_day(row):
+                return instant(row["at"]).astimezone(zone).date().isoformat()
+            accounts = [r for r in rows if r["kind"] == "account"]
+            before = [r for r in accounts if local_day(r) < day]
+            ending = [r for r in accounts if local_day(r) == day]
+            if not before or not ending:
+                return {"status": "unavailable", "session_date": day,
+                        "reason": "needs an account mark before the session and one during it"}
+            start, end = before[-1]["body"], ending[-1]["body"]
+            submitted = {str(r["body"].get("broker_id")): r["body"] for r in rows if r["kind"] == "order_submitted"}
+            try:
+                with self.journal.connection() as db:
+                    arrivals = {row[0]: float(row[1]) for row in db.execute("SELECT intent_id,reference FROM fund_orders")}
+            except Exception:
+                arrivals = {}
+            orders = {}
+            for row in rows:
+                if row["kind"] in {"fill", "fill_reconciled"} and local_day(row) == day:
+                    orders.setdefault(str(row["body"].get("broker_id")), {}).setdefault(row["kind"], []).append(row["body"])
+            fills = []
+            for broker_id, kinds in orders.items():
+                # A reconciled record is the whole order; callbacks may be its partial fills: never both.
+                chosen = kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds else kinds["fill"]
+                arrival = arrivals.get((submitted.get(broker_id) or {}).get("intent_id"))
+                fills += [{"symbol": b["symbol"], "side": b["side"], "quantity": b["quantity"], "price": b["price"],
+                           "fee": b.get("trade_cost"), "arrival": arrival} for b in chosen]
+            symbols = ({"SPY"} | set(start.get("positions") or {}) | set(start.get("cash_equivalents") or {}) |
+                       {f["symbol"] for f in fills})
+            closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols)}
+            groups = {}
+            for name, _, members in self.quant.groups:
+                for member in members:
+                    groups.setdefault(member, name)
+            return attribute(start, end, fills, closes, local_day(before[-1]), day, groups)
+        except Exception as exc:
+            return {"status": "unavailable", "session_date": day,
+                    "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+
     def _scorecard_summary(self, now):
         try:
             cards = self._scorecards(now)
