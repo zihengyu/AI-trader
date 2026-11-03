@@ -160,7 +160,9 @@ def agent_calls(journal, after=0):
             awaiting.setdefault(name, []).append(calls[-1])
         elif row["kind"] == "agent" and awaiting.get(body.get("name")):
             call = awaiting[body["name"]].pop(0)
-            if body.get("cache_hit"):
+            if str(body.get("model") or "").startswith("scripted/"):
+                call["scripted"] = True  # The free rehearsal's scripted AI: no inference, no tokens.
+            elif body.get("cache_hit"):
                 call["cache_hit"] = True
             elif body.get("usage"):
                 try:
@@ -174,7 +176,8 @@ def agent_calls(journal, after=0):
 def _call_text(call):
     if call.get("seconds") is None:
         return f"{call['name']} 未结束"
-    tokens = (f"（输入 {call['input_tokens']} / 输出 {call['output_tokens']} tokens）"
+    tokens = ("（模拟 AI）" if call.get("scripted") else
+              f"（输入 {call['input_tokens']} / 输出 {call['output_tokens']} tokens）"
               if "input_tokens" in call else "（缓存命中）" if call.get("cache_hit") else "")
     return f"{call['name']} {call['seconds']} 秒{tokens}"
 
@@ -385,7 +388,7 @@ LABELS = {
     "memory directory writable": "记忆库目录可写（昨天的 EROFS）",
     "research cache directories writable": "研究工具缓存目录可写（SEC／FRED／交易日历）",
     "copy the account": "复制账户",
-    "start the strategy (startup and pre-open research)": "启动策略（含盘前研究，真实模型）",
+    "start the strategy (startup and pre-open research)": "启动策略（含盘后复盘和盘前研究）",
     "account snapshot": "账户快照",
     "risk context (history, volatility, stress windows)": "风控数据（历史、波动率、危机情景）",
     "data desk": "数据员（常驻数据服务）",
@@ -407,6 +410,28 @@ DETAILS = {"copied": "已复制真实账本", "fresh": "没有账本，用新账
            "--no-models": "--no-models，未调用模型"}
 
 
+# The report keeps English details (machine-readable); the operator's text shows them in Chinese.
+PHRASES = (("order sizes need live quotes and are planned at the open", "下单数量需要实时报价，开盘后由交易进程计算"),
+           ("pre-open research closed_startup", "盘前研究：休市时启动后已运行"),
+           ("pre-open research before_market_opens", "盘前研究：开盘前已运行"),
+           ("pre-open research not run", "盘前研究未运行（当天已做过）"), ("observe-only, no model calls", "只观察，不调用模型"),
+           ("models: ", "模型："), ("running; ", "运行中；"), ("binding: none", "约束：无"), ("binding: ", "约束："),
+           (" capped", " 只财报前受限"), (" unknown", " 只日期未知"), (" symbols", " 个标的"),
+           ("no history: ", "无历史："), (" min", " 分钟"), ("(error)", "（出错）"),
+           ("calendar ", "经济日历 "), ("earnings ", "财报日历 "), ("global ", "全球市场 "), ("macro ", "宏观 "),
+           ("news ", "资讯 "), ("sec ", "SEC 财报 "), ("intraday ", "盘中行情 "), ("premarket ", "盘前行情 "),
+           ("snapshot ", "行情快照 "), ("bars ", "日线 "))
+
+
+def _zh(detail):
+    """Known phrases in Chinese; whole words only, so an error message such as "minute" stays intact."""
+    import re
+    text_ = str(detail or "")
+    for english, chinese in PHRASES:
+        text_ = re.sub(re.escape(english) + (r"\b" if english[-1].isalpha() else ""), chinese, text_)
+    return text_
+
+
 def text(report):
     marks = {"ok": "通过", "fail": "失败", "skipped": "跳过", "warn": "注意"}
     mode = {"scripted": "模拟 AI：完整流程、真实数据、不调用模型、0 模型费用",
@@ -415,7 +440,7 @@ def text(report):
     lines += [f"方式：{mode}", ""] if mode else [""]
     for row in report["stages"]:
         where = f"；位置 {row['where']}" if row.get("where") else ""
-        detail = DETAILS.get(row.get("detail"), row.get("detail"))
+        detail = _zh(DETAILS.get(row.get("detail"), row.get("detail")))
         lines.append(f"[{marks.get(row['status'], row['status'])}] {LABELS.get(row['stage'], row['stage'])}："
                      f"{row['seconds']} 秒" + (f"；{detail}" if detail else "") + where)
     calls = report.get("agent_calls") or []

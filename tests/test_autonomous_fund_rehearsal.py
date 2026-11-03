@@ -173,3 +173,29 @@ def test_a_scripted_rehearsal_still_uses_live_data_and_says_how_it_ran(tmp_path,
     assert stage["FRED macro context"]["detail"] != "disabled"
     assert stage["critic and manager decision (scripted AI)"]["status"] == "ok"
     assert "模拟 AI：完整流程、真实数据、不调用模型、0 模型费用" in text(report)
+
+
+def test_the_report_text_is_chinese_and_marks_scripted_calls(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from scripts.autonomous_fund.rehearsal import agent_calls, text
+    journal = Journal(tmp_path / "copy", "synthetic-scripted")
+    start = datetime(2026, 11, 3, 8, 40, tzinfo=timezone.utc)
+    journal.event(start, "agent_call_started", {"id": "a", "name": "manager"})
+    journal.event(start + timedelta(seconds=1), "agent_call_finished", {"id": "a", "name": "manager"})
+    journal.event(start, "agent", {"name": "manager", "model": "scripted/no-inference",
+                                   "usage": {"input_tokens": 0, "output_tokens": 0}})
+    report = {"verdict": "ready", "copy": "c", "ai": "scripted", "agent_calls": agent_calls(journal), "stages": [
+        {"stage": "data desk", "status": "ok", "seconds": 0.0, "detail": "running; calendar 1.6 min, news 2 min"},
+        {"stage": "earnings calendar", "status": "ok", "seconds": 0.0, "detail": "0 capped, 0 unknown"},
+        {"stage": "critic and manager decision (scripted AI)", "status": "ok", "seconds": 1.5,
+         "detail": "models: researcher, critic, manager; order sizes need live quotes and are planned at the open"}]}
+    shown = text(report)
+    assert "运行中；经济日历 1.6 分钟、资讯 2 分钟" not in shown  # Separators stay as written.
+    assert "运行中；经济日历 1.6 分钟, 资讯 2 分钟" in shown and "0 只财报前受限, 0 只日期未知" in shown
+    assert "模型：researcher, critic, manager；" not in shown and "下单数量需要实时报价" in shown
+    assert "manager 1.0 秒（模拟 AI）" in shown and "tokens" not in shown.split("每次模型调用")[1]
+
+
+def test_translation_never_breaks_words_inside_error_messages():
+    from scripts.autonomous_fund.rehearsal import _zh
+    assert _zh("quote older than one minute; 3 symbols") == "quote older than one minute; 3 个标的"

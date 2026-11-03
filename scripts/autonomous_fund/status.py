@@ -93,7 +93,8 @@ DESK_LABELS = {"news": "资讯", "intraday": "盘中行情", "premarket": "盘�
 NOTE_LABELS = (("needs FRED_API_KEY", "需要在 .env 填 FRED_API_KEY，免费申请"),
                ("Yahoo is failing for the trading process", "交易进程的 Yahoo 请求出错，暂时让路"),
                ("no pre-market trades yet", "暂无盘前成交"), ("no account journal yet", "账本尚未创建"),
-               ("waiting for the day's daily bars", "等美东 06:00 后的当天日线；期间交易进程自己计算"))
+               ("waiting for the day's daily bars", "等美东 06:00 后的当天日线；期间交易进程自己计算"),
+               ("no daily bars for", "等美东 06:00 后的当天日线；期间交易进程自己计算"))
 
 
 def _note(text):
