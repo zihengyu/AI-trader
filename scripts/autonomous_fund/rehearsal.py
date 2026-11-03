@@ -101,7 +101,45 @@ def _snapshot_judge(value):
     return verdict, detail
 
 
-def agent_calls(journal):
+def _last_sequence(book):
+    """The copy's newest event: everything after it was written by this rehearsal."""
+    import sqlite3
+    from contextlib import closing
+    path = Path(book) / "state.sqlite3"
+    if not path.is_file():
+        return 0
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        return db.execute("SELECT coalesce(max(sequence), 0) FROM events").fetchone()[0]
+
+
+FAILED_STAGES = {"postmarket_review_error", "premarket_research_error"}
+
+
+def answer_problems(journal, after=0):
+    """Model answers this rehearsal lost or degraded: schema mismatches, unusable critiques, failed stages."""
+    problems, located = [], set()
+    rows = [r for r in journal.all_events() if r["sequence"] > after]
+    for row in rows:
+        body = row["body"] if isinstance(row["body"], dict) else {}
+        if row["kind"] == "agent" and body.get("parse_error"):
+            problems.append(f"{body.get('name')}: answer did not match its schema ({str(body['parse_error'])[:160]})")
+        elif row["kind"] == "critic_unavailable":
+            problems.append(f"critic unavailable: {body.get('error')}")
+        elif row["kind"] == "operation_error" and body.get("notification") in FAILED_STAGES:
+            frames = body.get("frames") or []
+            where = next((f for f in reversed(frames) if "autonomous_fund" in str(f.get("module", ""))),
+                         frames[-1] if frames else {})
+            located.add(body["notification"])
+            problems.append(f"{body['notification']}: {body.get('error')} at {where.get('module', '?')}."
+                            f"{where.get('function', '?')}:{where.get('line', '?')}")
+    for row in rows:  # A RiskError has no diagnostic event: its notification carries the reason.
+        body = row["body"] if isinstance(row["body"], dict) else {}
+        if row["kind"] == "notification" and body.get("kind") in FAILED_STAGES - located:
+            problems.append(f"{body['kind']}: {str(body.get('details'))[:160]}")
+    return problems
+
+
+def agent_calls(journal, after=0):
     """Each model call's duration, and its tokens when the provider reported them, from the copy's events.
 
     The `agent` event recorded right after a finished call carries its usage; a
@@ -111,6 +149,8 @@ def agent_calls(journal):
     from .risk import instant
     started, calls, awaiting = {}, [], {}
     for row in journal.all_events():
+        if row["sequence"] <= after:
+            continue  # The account's own history, not this run.
         body = row["body"]
         if row["kind"] == "agent_call_started":
             started[body["id"]] = (body["name"], instant(row["at"]))
@@ -199,9 +239,15 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         if (account_dir / "state.sqlite3").is_file():
             deploy.backup(account_dir, book)
             # The SEC cache and what the data desk prepared, so the copy reads them like the runner.
-            for name in ("sec", "daily", "desk"):
+            for name in ("sec", "daily"):
                 if (account_dir / "cache" / name).is_dir():
                     shutil.copytree(account_dir / "cache" / name, book / "cache" / name)
+            desk = account_dir / "cache" / "desk"
+            if desk.is_dir():
+                try:  # The real desk's live status (only ever read here), not a copy that ages during the run.
+                    os.symlink(desk.resolve(), book / "cache" / "desk", target_is_directory=True)
+                except OSError:
+                    shutil.copytree(desk, book / "cache" / "desk")
             stops.clear(book)  # The copy's own STOP; orders are intercepted below.
             return "copied"
         book.mkdir(parents=True)
@@ -211,9 +257,11 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return _finish(scratch, stages, root, keep)
     from .datadesk import DeskStatus
     stages.run("data desk", lambda: DeskStatus(account_dir).summary(), judge=_desk_judge)
+    # Only what happens from here on is this rehearsal's work (the copy holds the account's history).
+    start_sequence = _last_sequence(book)
     # The copy's own native memory, so the rehearsal never writes into the real one.
     os.environ["LUMIBOT_MEMORY_DIR"] = str((scratch / "memory").resolve())
-    rehearsal_config = {**config, "news": {**(config.get("news") or {}), "enabled": False}}
+    rehearsal_config = config
     submitted = []
 
     def build():
@@ -230,6 +278,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         strategy._execute = lambda intent, now, account=None, prices=None: submitted.append(intent)
         strategy._executor._initialize()  # Startup, including the pre-open research.
         strategy.validation = None  # No shadow call: one decision is enough to rehearse.
+        if strategy.news is not None:
+            strategy.news.standby = lambda: True  # Reads the copied news; never polls from the rehearsal.
         strategy.journal.set_meta("critique_cache", None)  # Rehearse a real critic call, never a reused one.
         return strategy
     strategy = stages.run("start the strategy (startup and pre-open research)", build, kind="model")
@@ -277,6 +327,9 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return "ok", detail
     stages.run("critic and manager decision (real models)", decide, kind="model", judge=judge_decision)
     decision = strategy.last_decision
+    # Paid answers that were lost or degraded (a schema mismatch, an unusable critique, a failed review).
+    stages.run("model answers", lambda: answer_problems(strategy.journal, start_sequence),
+               judge=lambda found: ("warn", "; ".join(found)[:800]) if found else ("ok", "every answer usable"))
 
     def construction():
         from .quant import construct, drawdown_scale
@@ -295,7 +348,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
                        judge=lambda v: ("ok", f"binding: {', '.join(v['binding']) or 'none'}"))
     report = _finish(scratch, stages, root, keep, extra={"decision": decision, "construction": built,
                                                          "orders_intercepted": [str(i) for i in submitted],
-                                                         "agent_calls": agent_calls(strategy.journal)})
+                                                         "agent_calls": agent_calls(strategy.journal,
+                                                                                    after=start_sequence)})
     return report
 
 
@@ -326,6 +380,7 @@ LABELS = {
     "account snapshot": "账户快照",
     "risk context (history, volatility, stress windows)": "风控数据（历史、波动率、危机情景）",
     "data desk": "数据员（常驻数据服务）",
+    "model answers": "模型回答是否可用（格式不符、反方审查失败、复盘失败）",
     "market snapshot": "行情快照（收益、波动、beta、均线、成交额）",
     "factor research (history, research universe, SEC)": "因子研究数据（研究股票池、SEC 财报）",
     "earnings calendar": "财报日历",
@@ -337,6 +392,7 @@ LABELS = {
 }
 DETAILS = {"copied": "已复制真实账本", "fresh": "没有账本，用新账户", "disabled": "未启用",
            "desk not running": "没有运行：交易进程会自己拉数据，但盘中更慢；运行 bash scripts/fund-restart.sh -y 启动它",
+           "every answer usable": "每个回答都可用",
            "pre-open research not run": "盘前研究未运行（已运行过或在开盘前一小时窗口外）",
            "--no-models": "--no-models，未调用模型"}
 
