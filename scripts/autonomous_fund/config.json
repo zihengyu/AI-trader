@@ -118,6 +118,11 @@
     "max_active": 8,
     "cost_bps": 10.0,
     "max_redundancy": 0.7,
+    "walk_forward_windows": 4,
+    "min_window_agreement": 3,
+    "model_knowledge_cutoff": {},
+    "negative_control_runs": 20,
+    "negative_control_days": 7,
     "research_universe": [
       "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "NFLX", "DIS", "T", "VZ",
       "TSLA", "MCD", "LOW", "BKNG", "WMT", "KO", "PEP", "PM", "LLY", "MRK", "ABBV", "PFE",

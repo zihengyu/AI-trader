@@ -142,6 +142,8 @@ SETTINGS = {
     "FINNHUB_API_KEY": (None, None, True, "外部", "Finnhub Key（可选）：更可靠的财报日历；不填用 Yahoo"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
     "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
+    "FUND_MODEL_KNOWLEDGE_CUTOFF_JSON": (("factor_lab", "model_knowledge_cutoff"), _json, False, "外部",
+                                         "各模型训练数据截止日 JSON，例如 {\"deepseek-chat\": \"YYYY-MM-DD\"}；之后的样本单独记为干净样本外，未填写的模型标为可能受记忆影响"),
     "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
     "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),

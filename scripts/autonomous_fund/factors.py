@@ -19,6 +19,15 @@ Evidence standard, so that "mining" does not become overfitting:
 - the in-sample t-statistic must clear a Bonferroni bar that rises with every
   distinct expression ever tried in this account;
 - the later holdout must agree in sign with t >= holdout_min_t;
+- walk-forward: the sampled dates are cut into walk_forward_windows + 1 blocks;
+  each later block is a test window trained on everything before it except
+  the last observation (a horizon-session embargo, so no training return
+  overlaps the test), and at least min_window_agreement windows must show the
+  overall direction with their own training data agreeing: a factor that
+  worked in one stretch only is rejected even when the fixed split passed;
+- the proposing models' knowledge cutoffs (operator-supplied) split off the
+  clean out-of-sample record, dates the models cannot have memorized; without
+  a known cutoff every historical test is flagged as possibly memorized;
 - the top-minus-bottom quintile spread must survive trading costs (turnover of
   the quintiles x cost_bps) in the factor's direction;
 - a candidate whose ranks are highly correlated with an already validated
@@ -34,8 +43,8 @@ import ast
 import hashlib
 import json
 import math
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from datetime import date, datetime, timezone
 from statistics import NormalDist
 
 import numpy as np
@@ -297,6 +306,49 @@ def rank_similarity(left, right, dates):
     return float(np.mean(values)) if values else None
 
 
+WINDOW_MIN_OBSERVATIONS = 3  # A walk-forward test window with fewer observations cannot agree.
+
+
+def walk_forward(sampled, windows, direction, embargo=1):
+    """Consecutive forward test windows over the non-overlapping sampled ICs.
+
+    The sampled series is cut into `windows` + 1 equal blocks; the first only
+    trains. Each later block is tested with a training set of every earlier
+    observation except the last `embargo`: with one observation every horizon
+    sessions, the dropped one is the forward return ending where the test begins.
+    A window agrees when it has enough observations and both its mean IC and its
+    training mean IC have the overall direction's sign.
+    """
+    size, results = len(sampled) // (windows + 1), []
+    for k in range(1, windows + 1):
+        start, end = k * size, (k + 1) * size if k < windows else len(sampled)
+        train, test = sampled.iloc[:max(0, start - embargo)], sampled.iloc[start:end]
+        summary = summarize(test)
+        trained = float(train["ic"].mean()) if len(train) else None
+        agrees = bool(summary["n"] >= WINDOW_MIN_OBSERVATIONS and summary["mean_ic"] is not None and
+                      summary["mean_ic"] * direction > 0 and trained is not None and trained * direction > 0)
+        results.append({"window": k, "train_n": len(train),
+                        "train_last_date": str(train.index[-1].date()) if len(train) else None,
+                        "first_date": str(test.index[0].date()) if len(test) else None,
+                        "last_date": str(test.index[-1].date()) if len(test) else None,
+                        "n": summary["n"], "mean_ic": summary["mean_ic"], "t": summary["t"],
+                        "train_mean_ic": round(trained, 4) if trained is not None else None, "agrees": agrees})
+    return results
+
+
+def knowledge(sampled, cutoff):
+    """The record on dates the proposing models cannot have memorized, or a flag that it is unknown."""
+    if cutoff is None:
+        return {"cutoff": None, "memory_risk": "unknown_cutoff", "clean_out_of_sample": None,
+                "meaning": "no knowledge cutoff is configured for the proposing model: every historical test may "
+                           "reflect returns the model memorized; only the live record after validation is clean"}
+    clean = sampled[sampled.index.date > cutoff]
+    return {"cutoff": cutoff.isoformat(), "clean_out_of_sample": summarize(clean),
+            "memory_risk": "partly_after_cutoff" if len(clean) else "all_before_cutoff",
+            "meaning": "clean_out_of_sample covers dates after the proposing models' knowledge cutoff; earlier "
+                       "results may reflect memorized returns"}
+
+
 def critical_t(trials, significance):
     """Bonferroni two-sided bar: every distinct expression tried raises it."""
     return round(NormalDist().inv_cdf(1 - significance / (2 * max(1, trials))), 2)
@@ -321,16 +373,36 @@ class FactorSettings:
     max_redundancy: float = 0.7
     # Non-tradable stocks that widen the stock cross-section (current constituents: survivorship-biased).
     research_universe: tuple = ()
+    # Walk-forward test windows, and how many must agree with the overall direction.
+    walk_forward_windows: int = 4
+    min_window_agreement: int = 3
+    # Operator-supplied training-data cutoffs, {model: "YYYY-MM-DD"}; unknown models are flagged.
+    model_knowledge_cutoff: dict = field(default_factory=dict)
+    # Random-ranking diagnostics: how many, and every how many days.
+    negative_control_runs: int = 20
+    negative_control_days: int = 7
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise RiskError("factor_lab.enabled must be true/false")
         for key, low, high in (("history_days", 120, 2520), ("min_names", 3, 500), ("min_observations", 5, 500),
                                ("min_holdout_observations", 3, 500), ("live_min_observations", 3, 500),
-                               ("max_proposals_per_review", 0, 10), ("max_active", 1, 20)):
+                               ("max_proposals_per_review", 0, 10), ("max_active", 1, 20),
+                               ("walk_forward_windows", 2, 10), ("min_window_agreement", 1, 10),
+                               ("negative_control_runs", 0, 200), ("negative_control_days", 1, 90)):
             value = getattr(self, key)
             if type(value) is not int or not low <= value <= high:
                 raise RiskError(f"factor_lab.{key} must be {low}..{high}")
+        if self.min_window_agreement > self.walk_forward_windows:
+            raise RiskError("factor_lab.min_window_agreement cannot exceed walk_forward_windows")
+        cutoffs = self.model_knowledge_cutoff
+        if not isinstance(cutoffs, dict) or any(not isinstance(k, str) or not k for k in cutoffs):
+            raise RiskError("factor_lab.model_knowledge_cutoff must map model names to YYYY-MM-DD dates")
+        try:
+            parsed = {k: date.fromisoformat(v) for k, v in cutoffs.items()}
+        except (TypeError, ValueError):
+            raise RiskError("factor_lab.model_knowledge_cutoff must map model names to YYYY-MM-DD dates") from None
+        object.__setattr__(self, "model_knowledge_cutoff", {k: v.isoformat() for k, v in parsed.items()})
         object.__setattr__(self, "research_universe", tuple(self.research_universe))
         if (len(self.research_universe) > 300 or len(set(self.research_universe)) != len(self.research_universe) or
                 any(not isinstance(s, str) or not s or len(s) > 10 or s != s.strip().upper()
@@ -342,6 +414,16 @@ class FactorSettings:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
                 raise RiskError(f"factor_lab.{key} must be {low}..{high}")
 
+    def cutoff(self, models):
+        """The latest knowledge cutoff of the proposing models, or None when any of them is unknown."""
+        found = []
+        for model in {m for m in models if m}:
+            value = self.model_knowledge_cutoff.get(model) or self.model_knowledge_cutoff.get(model.split("/")[-1])
+            if value is None:
+                return None
+            found.append(date.fromisoformat(value))
+        return max(found) if found else None
+
     @classmethod
     def from_config(cls, section):
         section = dict(section or {})
@@ -351,17 +433,21 @@ class FactorSettings:
         return cls(**section)
 
 
-def evaluate(expression, horizon, close, volume, settings, trials, extra=None):
-    """In-sample and holdout evidence with a verdict. close/volume end at the last completed session."""
+def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None):
+    """In-sample, holdout and walk-forward evidence with a verdict. close/volume end at the last completed session."""
     if type(horizon) is not int or not 1 <= horizon <= 20:
         raise RiskError("Factor horizon must be 1..20 sessions")
-    factor = compute(expression, close, volume, extra)
+    return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff)
+
+
+def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None):
+    """The evidence standard applied to a computed factor panel (also used by the negative control)."""
     rows = daily_ic(factor, close, horizon, settings.min_names)
     sampled = rows.iloc[::horizon]  # Non-overlapping forward windows: honest t-statistics.
     split = int(round(len(sampled) * (1 - settings.holdout_fraction)))
     inside, holdout = sampled.iloc[:split], sampled.iloc[split:]
     result = {"in_sample": summarize(inside), "holdout": summarize(holdout), "trials": trials,
-              "critical_t": critical_t(trials, settings.significance),
+              "critical_t": critical_t(trials, settings.significance), "knowledge": knowledge(sampled, cutoff),
               "first_date": str(sampled.index[0].date()) if len(sampled) else None,
               "last_date": str(sampled.index[-1].date()) if len(sampled) else None}
     ins, out = result["in_sample"], result["holdout"]
@@ -381,6 +467,11 @@ def evaluate(expression, horizon, close, volume, settings, trials, extra=None):
     spread = ins["mean_spread"]
     net = (spread * direction - 4 * turnover * settings.cost_bps / 10_000
            if spread is not None and turnover is not None else None)
+    windows = walk_forward(sampled, settings.walk_forward_windows, direction)
+    agreeing = sum(w["agrees"] for w in windows)
+    result.update(walk_forward={"windows": windows, "agreeing": agreeing, "required": settings.min_window_agreement,
+                                "agreement_rate": round(agreeing / len(windows), 3) if windows else None,
+                                "embargo_sessions": horizon})
     result.update(decay=decay, rank_autocorrelation=rank_autocorrelation(factor, dates),
                   in_sample_last_date=str(inside.index[-1].date()) if len(inside) else None,
                   quintile_turnover=round(turnover, 3) if turnover is not None else None,
@@ -391,10 +482,44 @@ def evaluate(expression, horizon, close, volume, settings, trials, extra=None):
     if out["t"] is None or out["mean_ic"] * direction <= 0 or out["t"] * direction < settings.holdout_min_t:
         return {**result, "status": "rejected", "direction": direction,
                 "reason": f"holdout does not confirm the in-sample sign with t >= {settings.holdout_min_t}"}
+    if agreeing < settings.min_window_agreement:
+        return {**result, "status": "rejected", "direction": direction,
+                "reason": f"only {agreeing} of {len(windows)} walk-forward windows agree with the direction; "
+                          f"{settings.min_window_agreement} required"}
     if net is not None and net <= 0:
         return {**result, "status": "rejected", "direction": direction,
                 "reason": f"the quintile spread does not survive {settings.cost_bps:g} bps per side on its turnover"}
-    return {**result, "status": "validated", "direction": direction, "reason": "in-sample and holdout agree"}
+    return {**result, "status": "validated", "direction": direction,
+            "reason": "in-sample, holdout and walk-forward windows agree"}
+
+
+def negative_control(close, settings, horizon=5, runs=None, seed=0):
+    """Random rankings through the full evidence standard with one trial: how often does luck pass?
+
+    Each run shuffles every date's ranking (independent random values per name).
+    The share clearing the in-sample bar should be near the significance level and
+    the share validated below it; more means the standard is too loose for this
+    cross-section. A diagnostic only: it changes no threshold.
+    """
+    runs = settings.negative_control_runs if runs is None else runs
+    rng, mask = np.random.default_rng(seed), close.notna()
+    evaluated = passed_in_sample = validated = 0
+    for _ in range(runs):
+        factor = pd.DataFrame(rng.standard_normal(close.shape), index=close.index, columns=close.columns).where(mask)
+        outcome = evaluate_factor(factor, horizon, close, settings, 1)
+        if outcome["status"] == "insufficient_data":
+            continue
+        evaluated += 1
+        t = outcome["in_sample"]["t"]
+        passed_in_sample += t is not None and abs(t) >= outcome["critical_t"]
+        validated += outcome["status"] == "validated"
+    share = (lambda count: round(count / evaluated, 3) if evaluated else None)
+    return {"runs": runs, "evaluated": evaluated, "horizon_sessions": horizon,
+            "in_sample_pass_rate": share(passed_in_sample), "validated_rate": share(validated),
+            "significance": settings.significance,
+            "too_loose": bool(evaluated and validated / evaluated > settings.significance),
+            "meaning": "random rankings tested like a proposal with one trial: in_sample_pass_rate should be near "
+                       "significance and validated_rate below it; too_loose means luck validates too often here"}
 
 
 def live_record(expression, horizon, direction, since, close, volume, settings, extra=None, tradable=None):
@@ -479,9 +604,13 @@ class FactorLab:
         with self.journal.connection() as db:
             return db.execute("SELECT count(*) FROM fund_factors").fetchone()[0]
 
-    def test(self, proposals, now, session_date, close, volume=None, extra=None):
-        """Evaluate the review's proposals in their cross-section; a repeated expression is not a new trial."""
+    def test(self, proposals, now, session_date, close, volume=None, extra=None, models=()):
+        """Evaluate the review's proposals in their cross-section; a repeated expression is not a new trial.
+
+        `models` wrote the proposals; their knowledge cutoff separates the clean out-of-sample record.
+        """
         panels = as_panels(close, volume, extra)
+        cutoff = self.settings.cutoff(models)
         results = []
         for proposal in list(proposals)[:self.settings.max_proposals_per_review]:
             name, horizon = proposal["name"], proposal["horizon_sessions"]
@@ -509,7 +638,7 @@ class FactorLab:
             trials = self.trials() + (0 if existing else 1)
             try:
                 close_, volume_, extra_ = _fields(data)
-                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_)
+                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_, cutoff)
                 if outcome["status"] == "validated":
                     outcome = self._redundancy(outcome, expression, universe, data)
             except RiskError as exc:
@@ -575,6 +704,23 @@ class FactorLab:
             active.append({**row, "live": live})
         return active
 
+    def _negative_control(self, now, panels):
+        """The latest random-ranking diagnostic, rerun every negative_control_days on the stock cross-section."""
+        saved = self.journal.get_meta("factor_negative_control")
+        today = datetime.fromisoformat(str(now)).date() if not isinstance(now, datetime) else now.date()
+        if saved and (today - date.fromisoformat(saved["as_of"])).days < self.settings.negative_control_days:
+            return saved
+        if not panels or not self.settings.negative_control_runs:
+            return saved
+        data = panels.get("stocks") or panels.get("etfs")
+        if data is None:
+            return saved
+        result = {"as_of": today.isoformat(),
+                  **negative_control(data["close"], self.settings, seed=today.toordinal())}
+        self.journal.set_meta("factor_negative_control", result)
+        self.journal.event(now, "factor_negative_control", result)
+        return result
+
     def context(self, now, close, volume=None, extra=None, tradable=None):
         """What the AI sees: grammar, standard, validated factors with live record and current ranks."""
         if close is not None:
@@ -587,13 +733,17 @@ class FactorLab:
             return (live.get("t") or 0) * item["direction"], abs(evidence["in_sample"]["t"] or 0)
         active.sort(key=strength, reverse=True)
         tried = self.rows()
+        control = self._negative_control(now, as_panels(close, volume, extra) if close is not None else None)
         return {
             "grammar": GRAMMAR,
             "evidence_standard": (
                 "Cross-sectional rank IC versus the next horizon_sessions close-to-close return, on non-overlapping "
                 "dates. Validated means the in-sample |t| clears a Bonferroni bar that rises with every distinct "
                 "expression tried, and a later holdout agrees in sign. live is the record after validation. "
-                "Direction -1 means low factor values were favored. The quintile spread must survive costs on its "
+                "Direction -1 means low factor values were favored. walk_forward_agreeing windows (each trained "
+                "only on earlier dates, with a horizon embargo) must show the direction too. memory_risk says whether "
+                "the history predates the proposing model's knowledge cutoff (unknown_cutoff: it may be memorized; "
+                "the live record is always clean). The quintile spread must survive costs on its "
                 "turnover, and a factor that mostly re-ranks like a validated one is redundant. Each factor names its "
                 "cross-section (stocks incl. the research universe, or etfs); favored lists only tradable names. "
                 "Evidence, not orders: weigh it with research."),
@@ -602,13 +752,22 @@ class FactorLab:
                            "universe": r.get("universe") or "stocks",
                            "direction": r["direction"], "validated_on": r["validated_at"],
                            "in_sample": json.loads(r["evidence"])["in_sample"],
-                           "holdout": json.loads(r["evidence"])["holdout"], "live": r["live"]}
+                           "holdout": json.loads(r["evidence"])["holdout"], "live": r["live"],
+                           **_evidence_flags(json.loads(r["evidence"]))}
                           for r in active[:self.settings.max_active]],
+            "negative_control": control,
             "recently_rejected": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
                                    "status": r["status"], "reason": r["reason"]}
                                   for r in tried if r["status"] in {"rejected", "insufficient_data", "retired",
                                                                     "redundant"}][-10:],
         }
+
+
+def _evidence_flags(evidence):
+    """Walk-forward agreement and memorization risk; factors validated before they existed show None."""
+    windows, memory = evidence.get("walk_forward") or {}, evidence.get("knowledge") or {}
+    return {"walk_forward_agreeing": (f"{windows['agreeing']}/{len(windows['windows'])}" if windows else None),
+            "memory_risk": memory.get("memory_risk"), "clean_out_of_sample": memory.get("clean_out_of_sample")}
 
 
 def panel_from_rows(history):
