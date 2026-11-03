@@ -474,10 +474,12 @@ bound to one deployment or backtest.
 - Purpose: Contact-style SEC EDGAR user agent header.
 - Values: Human-readable app/contact string.
 - Default: LumiBot support contact.
+- Autonomous fund CLI: when unset, the launcher copies the operator's `FUND_SEC_USER_AGENT`, so the AI's own SEC tools identify the operator.
 
 ### `LUMIBOT_SEC_CACHE_DIR`
 - Purpose: Override the local SEC fundamentals and filing cache.
 - Default: `~/.lumibot/cache/sec`.
+- Autonomous fund CLI: when unset or empty, the launcher selects `<run-dir>/cache/sec-tools`; the service mounts the home directory read-only (`ProtectHome=read-only`), so the default failed with EROFS in the AI's `get_company_facts` tool. The same applies to `LUMIBOT_FRED_CACHE_DIR` (`<run-dir>/cache/fred-tools`) and `LUMIBOT_TRADING_DAYS_CACHE_DIR` (`<run-dir>/cache/trading-days`). Explicit nonempty values are preserved and must be writable by the service.
 
 ### `FRED_API_KEY`
 - Purpose: Required official FRED/ALFRED API key for macro data tools.
