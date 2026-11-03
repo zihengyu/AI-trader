@@ -232,6 +232,8 @@ def review_after_close(strategy):
                "strategy_followup": strategy._strategy_evaluations(),
                "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
+               # Code-computed; the review must not re-estimate where the return came from.
+               "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
@@ -239,7 +241,9 @@ def review_after_close(strategy):
         strategy.journal.event(now, "postmarket_review_started", session)
         result = _run_stage(strategy, "researcher",
             task_prompt="用中文复盘指定交易日。核对实际研究、完整目标持仓、下单、成交、未成交、持仓和现金，"
-                        "区分选股、择时、执行与市场整体表现。可使用只读研究工具，核对消息与价格的真实时间。"
+                        "区分选股、择时、执行与市场整体表现：context.attribution 是代码按收盘价算出的当日归因"
+                        "（市场 beta、选股、现金等价物、当日交易择时、相对到达价的滑点、费用和未解释部分），以它为准，不要自行估算，"
+                        "缺失的部分如实说明。可使用只读研究工具，核对消息与价格的真实时间。"
                         "引用日志证据请使用 event:<sequence>，外部资料请给出来源和时间。"
                         "披露数据缺失、陈旧估值和费用不确定性；不要编造收盘净值或把没成交当成成交。"
                         "结合 factor_lab 中已验证、被拒绝、冗余和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
@@ -294,6 +298,7 @@ def review_after_close(strategy):
               "previous_version": memory["version"] if memory else None,
               "input_as_of": saved["context"]["as_of"], "completed_at": strategy.get_datetime().isoformat(),
               "models": {"researcher": saved["model"], "manager": result.model},
+              "attribution": saved["context"].get("attribution"),
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)
@@ -310,7 +315,7 @@ def review_after_close(strategy):
                     "session_date": day, "error": "no history for the cross-section of some proposals",
                     "skipped": [p["name"] for p in review["factor_proposals"] if p not in testable]})
             if testable:
-                lab.test(testable, strategy.get_datetime(), day, panels)
+                lab.test(testable, strategy.get_datetime(), day, panels, models=tuple(packet["models"].values()))
             strategy._factor_context_cache = None  # The next context includes these results.
         except Exception as exc:  # Evidence tooling must never cost the saved review.
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {

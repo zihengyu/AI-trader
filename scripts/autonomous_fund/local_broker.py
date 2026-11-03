@@ -14,6 +14,7 @@ from lumibot.entities import Asset, Order, Position
 from lumibot.trading_builtins import PollingStream
 
 from .journal import encode
+from .market_data import CachedMarketHours
 from .risk import RiskError, instant, number, trading_day
 
 
@@ -21,7 +22,7 @@ class VirtualRiskCancellation(RiskError):
     pass
 
 
-class LocalPaperBroker(Broker):
+class LocalPaperBroker(CachedMarketHours, Broker):
     IS_BACKTESTING_BROKER = False
     LOCAL_SIMULATION = True
 

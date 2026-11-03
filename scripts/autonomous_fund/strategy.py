@@ -9,7 +9,9 @@ from time import monotonic
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
@@ -63,6 +65,14 @@ RESEARCHER_PROMPT = (
     "evidence, and carry useful selection/timing lessons into current research. "
     "operator_mandate instructions come from the human operator and bound what may be proposed. "
     "Use scorecards (scored predictions and allocation excess returns) to weigh past ideas. "
+    "Before the open also return ideas (at most 8): each a falsifiable call registered unchanged as a prediction "
+    "and scored later on completed closes from the first close after you made it. Fields: symbol, direction "
+    "(up, down, outperform or underperform the benchmark, default SPY), horizon_sessions (1-20), thesis, "
+    "edge_source (why the price may not yet reflect it), catalyst, invalidation (what would prove it wrong), "
+    "confidence (your probability of being right, 0.5-0.95) and evidence_refs (1-based positions in your evidence). "
+    "An empty ideas list is a valid answer when nothing has enough edge; never invent ideas to fill it. "
+    "scorecards.research_ideas shows your hit rate and Brier score by confidence against a coin and against "
+    "always calling up; state lower confidence where that record is weak. "
     "market_snapshot already gives every eligible symbol's returns, volatility, beta, trend and liquidity from "
     "completed daily closes: use it instead of recomputing them with tools, and spend tool calls on news, filings "
     "and evidence it cannot contain. "
@@ -133,6 +143,9 @@ MANAGER_PROMPT = (
     "change or new research since your allocation completed); you are still called at least every "
     "model_budget.max_quiet_minutes, so set alerts and news_watch for anything that should wake you sooner. "
     "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak; "
+    "research_ideas lists the researcher's registered ideas for this session (idea_id, call, confidence); cite those "
+    "your targets act on in idea_refs (optional). scorecards.research_ideas scores past ideas against naive baselines "
+    "and separates stock selection from the market's direction. "
     "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
     "(cross-sectional rank IC in their own cross-section, stocks incl. a non-tradable research universe or ETFs; "
@@ -164,10 +177,43 @@ class Evidence(BaseModel):
     estimate_reason: str
 
 
+def _confidence(value):
+    """A stated probability kept within 0.5..0.95 instead of rejecting the research.
+
+    Below 0.5 a directional call is really the opposite call; above 0.95 is not a
+    credible confidence for a market move. Non-numbers still fail validation.
+    """
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value == value:
+        return min(max(float(value), 0.5), 0.95)
+    return value
+
+
+class Idea(BaseModel):
+    """A falsifiable research call, registered before the open and scored later on completed closes."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    symbol: str = Field(min_length=1, max_length=12)
+    direction: Literal["up", "down", "outperform", "underperform"]
+    horizon_sessions: int = Field(ge=1, le=20)
+    benchmark: str = Field(default="SPY", min_length=1, max_length=12)
+    thesis: bounded_text(800, 1)
+    edge_source: bounded_text(500, 1)
+    catalyst: bounded_text(400) = ""
+    invalidation: bounded_text(400, 1)
+    confidence: Annotated[float, BeforeValidator(_confidence), Field(ge=0.5, le=0.95, allow_inf_nan=False)]
+    evidence_refs: bounded_list(int, 12) = Field(default_factory=list)
+
+
+def _idea_key(idea):
+    """Ideas that make the same call: a restatement is not a new prediction."""
+    return (idea["symbol"], idea["direction"], int(idea["horizon_sessions"]), idea.get("benchmark") or "SPY")
+
+
 class Research(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     summary: str = Field(min_length=1)
     evidence: list[Evidence] = Field(min_length=1)
+    # Empty means no opportunity with enough edge was found, which is an acceptable answer.
+    ideas: bounded_list(Idea, 8) = Field(default_factory=list)
 
 
 class Target(BaseModel):
@@ -220,6 +266,8 @@ class Decision(BaseModel):
     targets: list[Target]
     alerts: bounded_list(Alert, 20) = Field(default_factory=list)
     news_watch: bounded_list(NewsQuery, 8) = Field(default_factory=list)
+    # Optional: the registered research ideas (idea_id) this portfolio acts on, for attribution.
+    idea_refs: bounded_list(bounded_text(40, 1), 16) = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -416,6 +464,8 @@ def configuration(path, environ=None):
     CriticSettings.from_config(result.get("critic"))
     from .datadesk import DeskSettings
     DeskSettings.from_config(result.get("data_desk"))
+    from .performance import PerformanceSettings
+    PerformanceSettings.from_config(result.get("performance"))
     budget = ModelBudget.from_config(result.get("model_budget"))
     if budget.max_daily_cost_usd is not None:
         from .costs import rate_for
@@ -561,6 +611,8 @@ class AutonomousFund(Strategy):
         from .validation import ValidationSettings
         self.validation = ValidationSettings.from_config(config.get("validation"))
         from .factors import FactorLab, FactorSettings
+        from .performance import PerformanceSettings
+        self.performance = PerformanceSettings.from_config(config.get("performance"))
         factor_settings = FactorSettings.from_config(config.get("factor_lab"))
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
         self.sec = None
@@ -678,6 +730,8 @@ class AutonomousFund(Strategy):
                            "observe_only": observe_only, "execution_revision": EXECUTION_REVISION,
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "prompt_version": self.prompt_version,
+                           "performance": {"benchmarks": self.performance.definitions(),
+                                           "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
                            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
                            "mandate": asdict(self.mandate),
@@ -900,12 +954,19 @@ class AutonomousFund(Strategy):
             packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
                       "session_open": opens_at.isoformat(), "phase": slot, "research": research,
                       "model": result.model, "cache_hit": result.cache_hit}
+            try:
+                packet["idea_ids"] = self._register_ideas(research, packet)
+            except Exception as exc:  # Scoring is evidence; it never costs the research itself.
+                packet["idea_ids"] = []
+                self._disclose_failure("idea_registration_error", exc, phase="premarket_research")
             self.journal.event(self.get_datetime(), "premarket_research", packet)
             self.premarket_research = packet
             # The operator reads the research on Telegram before the session.
             self._disclose("premarket_research", {
                 "session_open": opens_at.isoformat(), "phase": slot, "summary": research["summary"],
                 "evidence_count": len(research["evidence"]),
+                "ideas": [{k: idea.get(k) for k in ("symbol", "direction", "horizon_sessions", "confidence", "thesis")}
+                          for idea in research.get("ideas", [])[:8]],
                 "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
                              for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
@@ -915,6 +976,56 @@ class AutonomousFund(Strategy):
             from . import report as reports
             self._bookkeeping(self.journal.export,
                               lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
+
+    def _register_ideas(self, research, packet):
+        """Register each new pre-open idea once, as an immutable research prediction; returns their ids.
+
+        The journal is append-only, so a registered idea is never revised. A later
+        research pass for the same session that restates an idea (same symbol,
+        direction, horizon and benchmark) registers nothing: the first statement is
+        scored, once. Ids are `<session date>#<n>`; evidence_refs are 1-based
+        positions in the research's evidence, and positions that do not exist are
+        dropped and listed.
+        """
+        from .costs import scripted
+        # A runtime may hand back a plain dict: validate here so every idea carries its defaults.
+        research = Research.model_validate(research).model_dump()
+        ideas = research["ideas"]
+        if not ideas or scripted({"model": packet.get("model")}):
+            return []  # A scripted test answer is not a prediction.
+        day = trading_day(instant(packet["session_open"]))
+        with self.journal.connection() as db:
+            earlier = [json.loads(row[0]) for row in db.execute(
+                "SELECT body FROM events WHERE kind='research_idea' ORDER BY sequence DESC LIMIT 200")]
+        today = [body for body in earlier if body.get("session_date") == day]
+        seen, evidence, ids = {_idea_key(body) for body in today}, research.get("evidence") or [], []
+        for idea in ideas:
+            idea = {**idea, "symbol": idea["symbol"].strip().upper(),
+                    "benchmark": (idea.get("benchmark") or "SPY").strip().upper()}
+            if _idea_key(idea) in seen:
+                continue
+            seen.add(_idea_key(idea))
+            refs = sorted({ref for ref in idea["evidence_refs"] if 1 <= ref <= len(evidence)})
+            body = {**idea, "idea_id": f"{day}#{len(today) + len(ids) + 1}", "source": "research",
+                    "formed_at": packet["completed_at"], "session_date": day, "session_open": packet["session_open"],
+                    "phase": packet["phase"], "model": packet.get("model"),
+                    "prompt_version": getattr(self, "prompt_version", None), "evidence_refs": refs,
+                    "dropped_evidence_refs": sorted(set(idea["evidence_refs"]) - set(refs)),
+                    "cited_evidence": [{k: evidence[ref - 1].get(k) for k in ("source", "available_at", "observed_at")}
+                                       for ref in refs]}
+            self.journal.event(instant(packet["completed_at"]), "research_idea", body)
+            ids.append(body["idea_id"])
+        return ids
+
+    def _session_ideas(self, session_open):
+        """The ideas registered for one session, with the ids a decision may cite in idea_refs."""
+        day = trading_day(instant(session_open))
+        with self.journal.connection() as db:
+            rows = [json.loads(row[0]) for row in db.execute(
+                "SELECT body FROM events WHERE kind='research_idea' ORDER BY sequence DESC LIMIT 200")]
+        return [{k: body.get(k) for k in ("idea_id", "symbol", "direction", "horizon_sessions", "benchmark",
+                                          "confidence", "invalidation")}
+                for body in reversed(rows) if body.get("session_date") == day]
 
     def _orders(self):
         if self.mode not in {"paper", "local"}:
@@ -1046,10 +1157,53 @@ class AutonomousFund(Strategy):
         try:
             benchmarks = {symbol: str(self.get_last_price(Asset(symbol, asset_type="stock"))) for symbol in ("SPY", "QQQ")}
             if all(number(value) > 0 for value in benchmarks.values()):
+                # The predefined benchmarks' other components (SGOV for risk_matched) when priced.
+                for symbol in getattr(getattr(self, "performance", None), "symbols", lambda: [])():
+                    if symbol not in benchmarks:
+                        try:
+                            value = self.get_last_price(Asset(symbol, asset_type="stock"))
+                        except Exception:
+                            value = None
+                        if value is not None and number(value) > 0:
+                            benchmarks[symbol] = str(value)
                 self.journal.event(start, "benchmark", benchmarks)
         except Exception:
             self.journal.event(start, "benchmark_unavailable", {})
+        self._record_benchmark_actions(start)
         return account
+
+    def _record_benchmark_actions(self, now):
+        """Once a trading day: the benchmarks' recent dividends and splits, so they are total returns.
+
+        Only where the data source reports corporate actions (the local Yahoo source);
+        elsewhere the benchmarks stay price returns and the report says so. Never
+        blocks the iteration.
+        """
+        settings = getattr(self, "performance", None)
+        source = getattr(getattr(self, "broker", None), "data_source", None)
+        fetch = getattr(source, "corporate_actions", None)
+        day = trading_day(now)
+        if settings is None or fetch is None or getattr(self, "_benchmark_actions_day", None) == day:
+            return
+        self._benchmark_actions_day = day
+        seen, checked = set(self.journal.get_meta("benchmark_actions_seen") or []), []
+        for symbol in settings.symbols():
+            try:
+                actions = fetch(Asset(symbol, asset_type="stock"), since=instant(now) - timedelta(days=40))
+            except Exception:
+                continue
+            checked.append(symbol)
+            for action in actions:
+                for kind in ("dividend", "split"):
+                    amount = action.get(kind)
+                    key = f"{symbol}:{action.get('date')}:{kind}"
+                    if amount and float(amount) > 0 and key not in seen:
+                        seen.add(key)
+                        self.journal.event(now, "benchmark_action", {"symbol": symbol, "date": str(action["date"]),
+                                                                     kind: str(amount)})
+        if checked:
+            self.journal.event(now, "benchmark_actions_checked", {"symbols": checked})
+            self.journal.set_meta("benchmark_actions_seen", sorted(seen)[-500:])
 
     def _price(self, symbol, record=True):
         asset, now = Asset(symbol, asset_type="stock"), self.get_datetime()
@@ -1252,7 +1406,11 @@ class AutonomousFund(Strategy):
                 raise ValueError("Invalid research packet clock")
         except (KeyError, TypeError, ValueError, RiskError):
             return {**absent, "research_status": {"state": "invalid"}}
-        return {"research": research, "premarket_research": packet,
+        try:
+            ideas = self._session_ideas(packet["session_open"])
+        except Exception:
+            ideas = None
+        return {"research": research, "premarket_research": packet, "research_ideas": ideas,
                 "research_status": {
                     "state": "available" if trading_day(opens) == trading_day(now) else "previous_session",
                     "as_of": packet["as_of"], "completed_at": packet["completed_at"],
@@ -1747,10 +1905,11 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == trading_day(now):
             return cached[1]
         from .review import _events
-        from .scorecard import score_decisions, score_predictions, score_timing
+        from .scorecard import score_decisions, score_ideas, score_predictions, score_timing
         rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated",
                                                           "protective_trigger", "entry_waiting", "order_submitted",
-                                                          "construction_variant"))
+                                                          "construction_variant", "research_idea"))
+        ideas = [r["body"] for r in rows if r["kind"] == "research_idea"][-200:]
         variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
         timing = [(r["at"], r["kind"], r["body"]) for r in rows
                   if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
@@ -1768,8 +1927,14 @@ class AutonomousFund(Strategy):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
         symbols |= {body["symbol"] for _, kind, body in timing if kind in {"protective_trigger", "entry_waiting"}}
         symbols |= {s for _, body in variants for arm in ("ai", "risk_budget") for s in body.get(arm, {})}
-        closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols & allowed)}
+        lab = getattr(self, "factor_lab", None)
+        idea_symbols = {i["symbol"] for i in ideas} | {i.get("benchmark") or "SPY" for i in ideas}
+        # Research ideas may name the factor lab's non-tradable research universe too.
+        allowed_ideas = allowed | (set(lab.settings.research_universe) if lab is not None else set())
+        closes = {symbol: self._daily_closes(symbol, now)
+                  for symbol in sorted((symbols & allowed) | (idea_symbols & allowed_ideas))}
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
+                  "ideas": score_ideas(ideas, closes),
                   "decisions": score_decisions(decisions, closes), "timing": score_timing(timing, closes)}
         settings = getattr(self, "construction", None)
         if settings is not None:
@@ -1784,6 +1949,55 @@ class AutonomousFund(Strategy):
         self._scorecard_cache = (trading_day(now), result)
         return result
 
+    def _attribution(self, session, now):
+        """Code-computed attribution of a completed session (attribution.py) for the review; never raises."""
+        from .attribution import attribute
+        from .review import _events
+        day = session["session_date"]
+        try:
+            if getattr(self, "quant", None) is None:
+                return {"status": "unavailable", "session_date": day, "reason": "quantitative risk history is off"}
+            zone = ZoneInfo("America/New_York")
+            rows = _events(self.journal, instant(now), kinds=("account", "fill", "fill_reconciled", "order_submitted"))
+
+            def local_day(row):
+                return instant(row["at"]).astimezone(zone).date().isoformat()
+            accounts = [r for r in rows if r["kind"] == "account"]
+            before = [r for r in accounts if local_day(r) < day]
+            ending = [r for r in accounts if local_day(r) == day]
+            if not before or not ending:
+                return {"status": "unavailable", "session_date": day,
+                        "reason": "needs an account mark before the session and one during it"}
+            start, end = before[-1]["body"], ending[-1]["body"]
+            submitted = {str(r["body"].get("broker_id")): r["body"] for r in rows if r["kind"] == "order_submitted"}
+            try:
+                with self.journal.connection() as db:
+                    arrivals = {row[0]: float(row[1]) for row in db.execute("SELECT intent_id,reference FROM fund_orders")}
+            except Exception:
+                arrivals = {}
+            orders = {}
+            for row in rows:
+                if row["kind"] in {"fill", "fill_reconciled"} and local_day(row) == day:
+                    orders.setdefault(str(row["body"].get("broker_id")), {}).setdefault(row["kind"], []).append(row["body"])
+            fills = []
+            for broker_id, kinds in orders.items():
+                # A reconciled record is the whole order; callbacks may be its partial fills: never both.
+                chosen = kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds else kinds["fill"]
+                arrival = arrivals.get((submitted.get(broker_id) or {}).get("intent_id"))
+                fills += [{"symbol": b["symbol"], "side": b["side"], "quantity": b["quantity"], "price": b["price"],
+                           "fee": b.get("trade_cost"), "arrival": arrival} for b in chosen]
+            symbols = ({"SPY"} | set(start.get("positions") or {}) | set(start.get("cash_equivalents") or {}) |
+                       {f["symbol"] for f in fills})
+            closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols)}
+            groups = {}
+            for name, _, members in self.quant.groups:
+                for member in members:
+                    groups.setdefault(member, name)
+            return attribute(start, end, fills, closes, local_day(before[-1]), day, groups)
+        except Exception as exc:
+            return {"status": "unavailable", "session_date": day,
+                    "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+
     def _scorecard_summary(self, now):
         try:
             cards = self._scorecards(now)
@@ -1794,6 +2008,8 @@ class AutonomousFund(Strategy):
         predictions = cards["predictions"]
         return {"predictions": {k: predictions[k] for k in ("total", "scored", "correct", "hit_rate", "pending")} |
                 {"by_hypothesis": dict(list(predictions["by_hypothesis"].items())[:8])},
+                "research_ideas": {k: v for k, v in cards["ideas"].items() if k != "recent"} |
+                                  {"recent": cards["ideas"]["recent"][-6:]} if cards.get("ideas") else None,
                 "decisions": cards["decisions"]["by_horizon"],
                 "decisions_by_prompt_version": dict(list(cards["decisions"].get("by_prompt_version", {}).items())[-3:]),
                 "construction": cards.get("construction"),

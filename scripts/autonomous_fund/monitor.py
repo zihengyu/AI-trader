@@ -15,6 +15,11 @@ from .journal import encode
 from .risk import RiskError, instant
 
 
+DECISION_GRACE_MINUTES = 90  # After the open, the first valid decision is expected within this.
+DECISION_DROUGHT_HOURS = 3  # Later, a decision is expected within this after the manager's own next_review_at.
+LEGITIMATE_PAUSES = ("model_budget_exhausted", "model_cost_budget_exhausted")
+
+
 def require_monitor(root, now):
     """Server execution gate, independent of AI and the supervising PID."""
     try:
@@ -284,6 +289,7 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
                     "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
                     "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
+            self._queue_weekly(db, reviews, now)
             # Drop stale first-start alerts; retain recent requests and failures.
             # A durable cursor bounds each poll to new notifications. It never
             # advances past one stamped in the future, which is revisited later.
@@ -305,10 +311,12 @@ class Monitor:
                     if previous["body"] == row["body"] and abs((instant(row["at"]) - instant(previous["at"])).total_seconds()) < 1800:
                         duplicate = True
                         break
-                stale = body.get("kind") != "postmarket_report" and now - instant(row["at"]) > timedelta(hours=1)
+                stale = (body.get("kind") not in {"postmarket_report", "weekly_report"} and
+                         now - instant(row["at"]) > timedelta(hours=1))
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
             self._note_desk(db, now)
+            self._note_decision_drought(db, now)
         if self.transport is not None:
             self._deliver(now)
             if getattr(self.transport, "replies_enabled", False):
@@ -326,6 +334,104 @@ class Monitor:
         except Exception:  # Metrics are a convenience; they never affect supervision.
             pass
         return status
+
+    def _week_ends(self, day):
+        """True when `day` is the last NYSE session of its ISO week (cached; holidays and early weeks included)."""
+        cache = self.__dict__.setdefault("_week_end_cache", {})
+        if day not in cache:
+            import pandas_market_calendars as mcal
+            from datetime import date
+            session = date.fromisoformat(day)
+            schedule = mcal.get_calendar("NYSE").schedule(start_date=session + timedelta(days=1),
+                                                          end_date=session + timedelta(days=10))
+            following = schedule.index[0].date() if len(schedule) else None
+            cache[day] = following is None or following.isocalendar()[:2] != session.isocalendar()[:2]
+        return cache[day]
+
+    def _queue_weekly(self, db, reviews, now):
+        """One weekly report per ISO week, after the review of the week's last session (recent reviews only)."""
+        from .notifications import week_of
+        sent = {row[0] for row in db.execute(
+            "SELECT json_extract(body,'$.details.week') FROM events WHERE kind='notification' "
+            "AND json_extract(body,'$.kind')='weekly_report'")}
+        for review in reviews[-7:]:
+            packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
+            completed = instant(packet["completed_at"])
+            if completed > now or now - completed > timedelta(days=7):
+                continue
+            week = week_of(packet["session_date"])[2]
+            if week in sent:
+                continue
+            try:
+                last = self._week_ends(packet["session_date"])
+            except Exception:
+                continue  # Without the calendar the week's end is unknown: no guessed report.
+            if last:
+                sent.add(week)
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
+                    "kind": "weekly_report", "details": {"review_sequence": review["sequence"], "week": week,
+                                                         "session_date": packet["session_date"]}})))
+
+    def _note_decision_drought(self, db, now):
+        """Alert once a day when the session runs without a valid decision and nothing explains it.
+
+        A healthy process can still fail to decide (a model failing on every
+        retry, an order stuck open, a logic fault); the heartbeat cannot show it.
+        Expected: a validated decision within DECISION_GRACE_MINUTES of the open,
+        and later within DECISION_DROUGHT_HOURS of the latest decision's own
+        next_review_at (covering quiet-review skips). Not a drought: a STOP, an
+        exhausted run or cost budget, or an observe-only run.
+        """
+        from zoneinfo import ZoneInfo
+        try:
+            session = self._session_status(now)
+        except Exception:
+            return
+        if not session.get("open"):
+            return
+        if (self.root / "STOP").exists():
+            # Trading is held on purpose; the clock restarts when the STOP lifts.
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('decision_drought_paused_at',?)", (now.isoformat(),))
+            return
+        zone = ZoneInfo("America/New_York")
+        day = now.astimezone(zone).date().isoformat()
+        noted = db.execute("SELECT value FROM fund_monitor_meta WHERE key='decision_drought_noted'").fetchone()
+        if noted and noted[0] == day:
+            return
+        opened = instant(session["next_open"])  # While open, next_open is the current session's open.
+        paused = db.execute("SELECT value FROM fund_monitor_meta WHERE key='decision_drought_paused_at'").fetchone()
+        clock = max(opened, instant(paused[0])) if paused else opened
+        last = db.execute("SELECT at,body FROM events WHERE kind='decision_validated' "
+                          "ORDER BY sequence DESC LIMIT 1").fetchone()
+        last_at = instant(last["at"]) if last else None
+        if last_at is not None and last_at >= opened:
+            try:
+                due = max(last_at, instant(json.loads(last["body"]).get("next_review_at") or last["at"]))
+            except (TypeError, ValueError, RiskError):
+                due = last_at
+            expected = max(due + timedelta(hours=DECISION_DROUGHT_HOURS), clock + timedelta(minutes=DECISION_GRACE_MINUTES))
+        else:
+            expected = clock + timedelta(minutes=DECISION_GRACE_MINUTES)
+        if now < expected:
+            return
+        startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+        if startup and json.loads(startup[0]).get("observe_only"):
+            return
+        since = opened.isoformat()
+        for row in db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200"):
+            if instant(row["at"]) < opened:
+                break
+            if json.loads(row["body"]).get("kind") in LEGITIMATE_PAUSES:
+                return  # The day's model budget is spent: deciding nothing is the configured behavior.
+        failures = sum(instant(r[0]) >= opened for r in db.execute(
+            "SELECT at FROM events WHERE kind='decision_backoff' ORDER BY sequence DESC LIMIT 100"))
+        db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('decision_drought_noted',?)", (day,))
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
+            "kind": "decision_drought", "details": {
+                "session_open": since, "last_decision_at": last_at.isoformat() if last_at else None,
+                "minutes_without_decision": round((now - (last_at if last_at and last_at >= opened else opened))
+                                                  .total_seconds() / 60),
+                "decision_failures_today": failures}})))
 
     def _note_desk(self, db, now):
         """Tell the operator once per six hours when the data desk stopped updating (trading is unaffected)."""
@@ -376,6 +482,12 @@ class Monitor:
                     filename, document = daily_document(self.root, body["details"]["review_sequence"])
                     result = self.transport.send_document(
                         f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
+                        filename, document)
+                elif body.get("kind") == "weekly_report":
+                    from .notifications import weekly_document
+                    filename, document = weekly_document(self.root, body["details"]["review_sequence"])
+                    result = self.transport.send_document(
+                        f"LumiBot 模拟账户 · {body['details']['week']} 周报（{body['details']['session_date']} 收盘后）",
                         filename, document)
                 elif body.get("kind") == "approval_required" and (
                         "side" in body.get("details", {}) or "buys" in body.get("details", {})):

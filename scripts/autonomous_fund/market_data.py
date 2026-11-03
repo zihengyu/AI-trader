@@ -11,6 +11,28 @@ import pandas as pd
 import pandas_market_calendars as mcal
 
 from lumibot.data_sources import DataSource
+
+
+class CachedMarketHours:
+    """Broker mixin: one exchange-calendar build per UTC day instead of three a second.
+
+    LumiBot's live loop checks the lifecycle hooks every second, asking
+    `market_close_time()` twice and `market_open_time()` once; each answer
+    rebuilt a full exchange calendar (holiday rules included) in
+    `Broker.market_hours`. That alone kept a CPU core busy around the clock on a
+    small server (2026-11-03). The answer depends only on the date passed, or
+    today's UTC date, which is also the cache key, so the result is identical.
+    """
+
+    def market_hours(self, market="NASDAQ", close=True, next=False, date=None):
+        moment = date if date is not None else datetime.now(timezone.utc)
+        key = (getattr(self, "market", None) or market, bool(close), bool(next), pd.Timestamp(moment).date())
+        cache = self.__dict__.setdefault("_market_hours_cache", {})
+        if key not in cache:
+            if len(cache) >= 32:
+                cache.clear()  # Old days are never asked again; keep the cache small.
+            cache[key] = super().market_hours(market=market, close=close, next=next, date=date)
+        return cache[key]
 from lumibot.entities import Bars, Quote
 
 from .risk import RiskError, instant, number

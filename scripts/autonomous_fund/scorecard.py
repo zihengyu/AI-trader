@@ -6,6 +6,8 @@ only, so a later review sees an objective track record rather than its own
 narrative. Nothing here calls a model, a broker or the network, and nothing is
 estimated when a close is missing: such items stay `pending` or `unavailable`.
 """
+import math
+from datetime import date, datetime, time
 from zoneinfo import ZoneInfo
 
 from .risk import instant
@@ -66,6 +68,124 @@ def score_predictions(reviews, closes):
             "recent": items[-12:],
             "interpretation": "Scored on completed closes only. Small samples are noise; a hypothesis "
                               "should be retired when its scored record is persistently weak."}
+
+
+CONFIDENCE_BUCKETS = ((0.5, 0.6), (0.6, 0.7), (0.7, 0.8), (0.8, 0.96))
+MIN_INFORMATIVE_IDEAS = 30  # Below this a hit rate is noise, whatever the p-value says.
+IDEA_SIGNIFICANCE = 0.05
+RISING = {"up": True, "outperform": True, "down": False, "underperform": False}
+
+
+def _start_index(days, formed_at):
+    """Index of the first completed close after `formed_at` (16:00 New York on its session day).
+
+    None when the series has no such close yet, or does not reach back before the
+    formation (an idea older than the window cannot be placed honestly).
+    """
+    formed = instant(formed_at).astimezone(ZONE)
+    for index, day in enumerate(days):
+        if datetime.combine(date.fromisoformat(day), time(16), ZONE) > formed:
+            return index if index > 0 else None
+    return "pending"
+
+
+def binomial_tail(successes, trials):
+    """P(X >= successes) for X ~ Binomial(trials, 1/2), exact (integers, no underflow)."""
+    if trials <= 0:
+        return None
+    return sum(math.comb(trials, k) for k in range(successes, trials + 1)) / 2 ** trials
+
+
+def _idea_outcome(idea, closes):
+    symbol, benchmark = idea["symbol"], idea.get("benchmark") or "SPY"
+    horizon = int(idea["horizon_sessions"])
+    item = {key: idea.get(key) for key in ("idea_id", "symbol", "direction", "horizon_sessions", "confidence",
+                                           "formed_at")}
+    item["benchmark"] = benchmark
+    if not closes.get(symbol) or not closes.get(benchmark):
+        return {**item, "status": "unavailable", "reason": "no completed closes"}
+    days, values = _series(closes[symbol])
+    base_days, base_values = _series(closes[benchmark])
+    start, base_start = _start_index(days, idea["formed_at"]), _start_index(base_days, idea["formed_at"])
+    if start is None or base_start is None:
+        return {**item, "status": "unavailable", "reason": "the close history does not cover the formation time"}
+    if start == "pending" or base_start == "pending" or start + horizon >= len(days) \
+            or base_start + horizon >= len(base_days):
+        return {**item, "status": "pending"}
+    if days[start] != base_days[base_start] or days[start + horizon] != base_days[base_start + horizon]:
+        return {**item, "status": "unavailable", "reason": "symbol and benchmark sessions differ"}
+    mine = values[start + horizon] / values[start] - 1
+    market = base_values[base_start + horizon] / base_values[base_start] - 1
+    rising, relative = RISING[idea["direction"]], idea["direction"] in {"outperform", "underperform"}
+    move = mine - market if relative else mine
+    exposure = beta(closes[symbol], closes[benchmark], days[start])  # Closes through the start only.
+    residual = mine - exposure * market if exposure is not None else None
+    return {**item, "status": "correct" if (move > 0) == rising and move != 0 else "incorrect",
+            "start_day": days[start], "end_day": days[start + horizon], "symbol_return": mine,
+            "benchmark_return": market, "beta": exposure, "residual_return": residual,
+            # Beyond the beta-matched market move: was the stock chosen, not just the market's direction?
+            "selection_correct": None if residual is None or residual == 0 else (residual > 0) == rising,
+            # The naive "always up" caller: up for absolute ideas, outperform for relative ones.
+            "always_up_correct": move > 0}
+
+
+def score_ideas(ideas, closes):
+    """Score research ideas registered before the open: calibration, Brier and naive baselines.
+
+    Each idea is measured from the first completed close after it was formed (so a
+    pre-market move the researcher had already seen is never credited) to the close
+    `horizon_sessions` later. An idea counts as informative only when the sample is
+    large enough and it beats both naive baselines: a coin (50% hit rate, Brier 0.25)
+    and "always up" (a sign test on the ideas where the two disagree, i.e. the
+    down/underperform calls). Selection is judged separately on the return beyond the
+    beta-matched benchmark move. Overlapping horizons are correlated, so the p-values
+    are optimistic; they gate nothing and are evidence for the AI and the operator.
+    """
+    items = [_idea_outcome(idea, closes) for idea in ideas]
+    scored = [i for i in items if i["status"] in {"correct", "incorrect"}]
+    hits = [i["status"] == "correct" for i in scored]
+    count, correct = len(scored), sum(hits)
+    brier = sum((float(i["confidence"]) - h) ** 2 for i, h in zip(scored, hits)) / count if count else None
+    buckets = {}
+    for low, high in CONFIDENCE_BUCKETS:
+        rows = [(i, h) for i, h in zip(scored, hits) if low <= float(i["confidence"]) < high]
+        stated = sum(float(i["confidence"]) for i, _ in rows) / len(rows) if rows else None
+        rate = sum(h for _, h in rows) / len(rows) if rows else None
+        buckets[f"{low:.1f}-{min(high, 0.95):.2f}"] = {
+            "scored": len(rows), "hit_rate": rate, "mean_confidence": stated,
+            "calibration_gap": rate - stated if rows else None}
+    up = [i["always_up_correct"] for i in scored]
+    wins = sum(h and not u for h, u in zip(hits, up))
+    losses = sum(u and not h for h, u in zip(hits, up))
+    picks = [i["selection_correct"] for i in scored if i["selection_correct"] is not None]
+    versus_coin = binomial_tail(correct, count)
+    versus_up = binomial_tail(wins, wins + losses)
+    if count < MIN_INFORMATIVE_IDEAS:
+        verdict = "insufficient_sample"
+    elif (versus_coin is not None and versus_coin < IDEA_SIGNIFICANCE and versus_up is not None
+          and versus_up < IDEA_SIGNIFICANCE and brier < 0.25):
+        verdict = "informative"
+    else:
+        verdict = "not_informative"
+    return {
+        "total": len(items), "scored": count, "correct": correct, "hit_rate": correct / count if count else None,
+        "pending": sum(i["status"] == "pending" for i in items),
+        "unavailable": sum(i["status"] == "unavailable" for i in items),
+        "brier": brier, "brier_skill_vs_coin": 1 - brier / 0.25 if brier is not None else None,
+        "by_confidence": buckets,
+        "baselines": {
+            "coin": {"hit_rate": 0.5, "brier": 0.25, "p_value": versus_coin},
+            "always_up": {"hit_rate": sum(up) / count if count else None, "ideas_where_different": wins + losses,
+                          "better": wins, "worse": losses, "p_value": versus_up}},
+        "selection": {"scored": len(picks), "hit_rate": sum(picks) / len(picks) if picks else None,
+                      "p_value": binomial_tail(sum(picks), len(picks))},
+        "verdict": verdict, "minimum_sample": MIN_INFORMATIVE_IDEAS,
+        "recent": items[-12:],
+        "interpretation": "Ideas are scored on completed closes from the first close after they were formed. "
+                          "informative needs at least minimum_sample scored ideas, a hit rate above a coin and "
+                          "above always-up (p < 0.05 each) and a Brier score under 0.25. selection uses the return "
+                          "beyond the beta-matched benchmark. Overlapping horizons make p-values optimistic.",
+    }
 
 
 BETA_LOOKBACK = 126

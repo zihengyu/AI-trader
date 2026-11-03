@@ -214,6 +214,15 @@ def summary(root, mode, now=None):
         retries = {key: json.loads(value) for key, value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
+        decisions = [r[0] for r in db.execute("SELECT at FROM events WHERE kind='decision_validated' "
+                                              "ORDER BY sequence DESC LIMIT 200")]
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo("America/New_York")
+    today = now.astimezone(zone).date()
+    todays = [instant(at) for at in decisions if instant(at).astimezone(zone).date() == today]
+    lines.append(f"决策：今天 {len(todays)} 次有效决策" + (
+        f"，最近一次 {max(todays).astimezone(zone):%H:%M}（纽约）" if todays else "") + (
+        f"；累计 {len(decisions)}{'+' if len(decisions) == 200 else ''} 次" if decisions else "；还没有过有效决策"))
     if retries.get("decision_failures") and retries.get("decision_retry_at"):
         label = "基金经理失败退避" if retries.get("decision_failure_role") == "manager" else "AI 失败退避"
         lines.append(f"{label}：连续失败 {retries['decision_failures']} 次；"

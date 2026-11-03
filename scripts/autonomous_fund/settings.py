@@ -96,6 +96,8 @@ SETTINGS = {
     "FUND_SKIP_QUIET_REVIEWS": (("model_budget", "skip_quiet_reviews"), _bool, False, "模型", "到点复核时若无任何变化（无提醒、无成交、持仓和研究不变）则跳过本次模型调用"),
     "FUND_MAX_QUIET_MINUTES": (("model_budget", "max_quiet_minutes"), _int, False, "模型", "连续跳过复核的最长时间（分钟），到时一定调用基金经理"),
     "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON（input、output、cached_input 缓存命中价），用于费用估算和盈亏平衡"),
+    "FUND_DATA_COSTS_USD_PER_MONTH": (("performance", "data_costs_usd_per_month"), _decimal, False, "模型",
+                                      "付费数据订阅的月费（美元），计入系统净收益；默认 0"),
     "FUND_MAX_DAILY_COST_USD": (("model_budget", "max_daily_cost_usd"), _decimal, False, "模型", "每个交易日模型费用上限（美元，按 FUND_MODEL_PRICES_JSON 估算）；到达后当天不再发起新决策、反方审查和盘前研究"),
     # ----- User constraints (the operator's mandate and hard limits)
     "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),
@@ -142,6 +144,8 @@ SETTINGS = {
     "FINNHUB_API_KEY": (None, None, True, "外部", "Finnhub Key（可选）：更可靠的财报日历；不填用 Yahoo"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
     "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
+    "FUND_MODEL_KNOWLEDGE_CUTOFF_JSON": (("factor_lab", "model_knowledge_cutoff"), _json, False, "外部",
+                                         "各模型训练数据截止日 JSON，例如 {\"deepseek-chat\": \"YYYY-MM-DD\"}；之后的样本单独记为干净样本外，未填写的模型标为可能受记忆影响"),
     "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
     "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),

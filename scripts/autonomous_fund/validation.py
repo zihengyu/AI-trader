@@ -197,36 +197,112 @@ def shadow_pairs(shadows, closes, horizon=1):
     return [by_day[day] for day in sorted(by_day)]
 
 
-def session_returns(events, sessions, zone):
-    """Session-to-session equity returns from the last account mark of each completed session.
+def session_pairs(events, sessions, zone):
+    """Consecutive completed sessions' last account marks, and every benchmark symbol's last mark per session.
 
     A pair spanning an operator reserve adjustment is dropped: moving cash in or
-    out of the sleeve is not a return. Returns (returns, benchmark returns,
-    aligned) where aligned says every pair also has SPY marks on both days.
+    out of the sleeve is not a return. Returns (pairs, marks) with pairs as dicts
+    (start/end day and time, starting equity, return) and marks {symbol: {day: price}}.
     """
     from .risk import instant
-    marks, spy, adjusted = {}, {}, []
+    accounts, marks, adjusted = {}, {}, []
     for at, kind, body in events:
         moment = instant(at)
         day = moment.astimezone(zone).date()
         if kind == "account" and day in sessions:
-            marks[day] = (moment, float(body["equity"]))
-        elif kind == "benchmark" and day in sessions and body.get("SPY"):
-            spy[day] = float(body["SPY"])
+            accounts[day] = (moment, float(body["equity"]))
+        elif kind == "benchmark" and day in sessions:
+            for symbol, value in body.items():
+                try:
+                    price = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if price > 0:
+                    marks.setdefault(symbol, {})[day.isoformat()] = price
         elif kind == "operator_reserve_adjusted":
             adjusted.append(moment)
-    days = sorted(marks)
-    returns, market, aligned = [], [], True
+    days, pairs = sorted(accounts), []
     for a, b in zip(days, days[1:]):
-        (start, before), (end, after) = marks[a], marks[b]
+        (start, before), (end, after) = accounts[a], accounts[b]
         if any(start < t <= end for t in adjusted) or before <= 0:
             continue
-        returns.append(after / before - 1)
-        if a in spy and b in spy and spy[a] > 0:
-            market.append(spy[b] / spy[a] - 1)
+        pairs.append({"start_day": a.isoformat(), "end_day": b.isoformat(), "start": start, "end": end,
+                      "equity_start": before, "return": after / before - 1})
+    return pairs, marks
+
+
+def session_returns(events, sessions, zone):
+    """(returns, SPY returns, aligned): aligned says every pair also has SPY marks on both days."""
+    pairs, marks = session_pairs(events, sessions, zone)
+    spy = marks.get("SPY", {})
+    returns = [p["return"] for p in pairs]
+    market = [spy[p["end_day"]] / spy[p["start_day"]] - 1 for p in pairs
+              if p["start_day"] in spy and p["end_day"] in spy]
+    return returns, market, len(market) == len(returns)
+
+
+def interval_model_costs(events, pairs):
+    """Model cost (USD) between each pair's marks; None when a call there was unpriced."""
+    from .costs import scripted
+    from .risk import instant
+    calls = [(instant(at), body) for at, kind, body in events
+             if kind == "agent" and not scripted(body) and not body.get("cache_hit")]
+    costs = []
+    for pair in pairs:
+        inside = [body for at, body in calls if pair["start"] < at <= pair["end"]]
+        if any(body.get("cost_usd") is None and body.get("usage") for body in inside):
+            costs.append(None)
         else:
-            aligned = False
-    return returns, market, aligned and len(market) == len(returns)
+            costs.append(sum(float(body.get("cost_usd") or 0) for body in inside))
+    return costs
+
+
+def benchmark_report(events, pairs, marks, startups):
+    """Net returns and the comparison with every benchmark defined so far (old definitions stay reported)."""
+    from .performance import (SESSIONS_PER_MONTH, PerformanceSettings, benchmark_comparison, benchmark_series,
+                              net_returns)
+    configured = [b.get("performance") for b in startups if b.get("performance")]
+    definitions, current = {}, configured[-1]["benchmarks"] if configured else PerformanceSettings().definitions()
+    for entry in configured:
+        for definition in entry["benchmarks"]:
+            definitions.setdefault(definition["id"], definition)
+    for definition in current:
+        definitions.setdefault(definition["id"], definition)
+    actions = {}
+    for _, kind, body in events:
+        if kind == "benchmark_action":
+            actions.setdefault(body["symbol"], []).append(body)
+    monthly = (configured[-1].get("data_costs_usd_per_month") if configured
+               else PerformanceSettings().data_costs_usd_per_month)
+    per_session = float(monthly) / SESSIONS_PER_MONTH if monthly is not None else None
+    returns = [p["return"] for p in pairs]
+    window = [(p["start_day"], p["end_day"]) for p in pairs]
+    current_ids = {d["id"] for d in current}
+    recorded = {s for _, kind, b in events if kind == "benchmark_actions_checked" for s in b.get("symbols", [])}
+    comparisons = []
+    for definition in definitions.values():
+        row = benchmark_comparison(definition, returns, benchmark_series(definition, window, marks, actions),
+                                   definition["id"] in current_ids)
+        row["dividends"] = ("included" if set(definition["weights"]) <= recorded else
+                            "excluded: no dividend records for " + ", ".join(sorted(set(definition["weights"]) - recorded)))
+        comparisons.append(row)
+    return {"returns": net_returns(pairs, interval_model_costs(events, pairs), per_session),
+            "data_costs_usd_per_month": monthly, "benchmarks": comparisons}
+
+
+def trial_count(prompt_versions, risk_policies, factor_expressions, construction_runs=0, shadow_runs=0):
+    """Configurations tried, for the deflated Sharpe ratio: each kind listed, and their sum.
+
+    Prompt versions x risk policies that traded (as before), plus every factor
+    expression tested (rejected ones too), plus one for the alternative portfolio
+    construction and one for the learning control arm once those comparisons ran.
+    Never fewer than before this count existed.
+    """
+    traded = max(1, prompt_versions) * max(1, risk_policies)
+    parts = {"prompt_versions_x_risk_policies": traded, "factor_expressions": int(factor_expressions),
+             "construction_alternative": 1 if construction_runs else 0,
+             "learning_control_arm": 1 if shadow_runs else 0}
+    return {**parts, "total": sum(parts.values())}
 
 
 def acceptance(root, criteria=None, now=None):
@@ -252,12 +328,17 @@ def acceptance(root, criteria=None, now=None):
         references = {(r[0], r[1], r[2]): float(r[3]) for r in db.execute(
             "SELECT decision_id,symbol,side,reference FROM fund_orders ORDER BY rowid DESC")} if "fund_orders" in tables else {}
         approvals = dict(db.execute("SELECT state,count(*) FROM fund_approvals GROUP BY state")) if "fund_approvals" in tables else {}
+        # Every configuration tried counts against the deflated Sharpe ratio, including rejected factors.
+        factor_trials = db.execute("SELECT count(*) FROM fund_factors").fetchone()[0] if "fund_factors" in tables else 0
+        construction_runs, shadow_runs = (db.execute("SELECT count(*) FROM events WHERE kind=?", (kind,)).fetchone()[0]
+                                          for kind in ("construction_variant", "shadow_decision"))
         events = rows(("startup", "account", "iteration_finished", "notification", "operator_approval",
                        "operator_drawdown_reset", "operator_attached_order", "operator_reserve_adjusted",
                        "telegram_command", "order_submitted", "fill", "fill_reconciled", "fill_details_unavailable",
                        "order_reprice_cancel", "buy_chase_limit", "protective_trigger", "agent", "decision_backoff",
                        "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation",
-                       "auto_resume", "benchmark", "decision_validated"))
+                       "auto_resume", "benchmark", "decision_validated", "benchmark_action",
+                       "benchmark_actions_checked"))
     zone = ZoneInfo("America/New_York")
     startups = [b for _, k, b in events if k == "startup"]
     interval = ((startups[-1].get("execution") or {}).get("iteration_seconds") or 60) if startups else 60
@@ -346,15 +427,45 @@ def acceptance(root, criteria=None, now=None):
     verdict = "ready" if all(r["passed"] for r in results) else "not_ready"
     from .performance import capital_stage, evidence
     returns, market, aligned = session_returns(events, {day for day, _, _ in sessions}, zone)
-    configurations = (len({b.get("prompt_version") or "unversioned" for _, k, b in events if k == "decision_validated"})
-                      or 1) * (len({b.get("risk_policy_digest") for b in startups}) or 1)
-    stats = evidence(returns, market if aligned else None, configurations)
+    pairs, marks = session_pairs(events, {day for day, _, _ in sessions}, zone)
+    tried = trial_count(
+        len({b.get("prompt_version") or "unversioned" for _, k, b in events if k == "decision_validated"}),
+        len({b.get("risk_policy_digest") for b in startups}), factor_trials, construction_runs, shadow_runs)
+    stats = evidence(returns, market if aligned else None, tried["total"])
+    stats["configurations_breakdown"] = tried
+    net = benchmark_report(events, pairs, marks, startups)
     limit = ((startups[-1].get("limits") or {}).get("drawdown")) if startups else None
     stage = capital_stage(verdict, stats, drawdown, float(limit) if limit is not None else None)
     return {"as_of": now.isoformat(), "mode": mode, "verdict": verdict,
             "criteria": results, "metrics": metrics, "performance_evidence": stats, "capital_stage": stage,
+            "net_returns": net["returns"], "benchmarks": net["benchmarks"],
+            "data_costs_usd_per_month": net["data_costs_usd_per_month"],
             "limitations": "Operational readiness evidence from this journal only. It does not prove profitability; "
                            "a local virtual book is not broker evidence, and live trading needs separate approval."}
+
+
+def _number(value, digits=2):
+    return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "—"
+
+
+def _net_lines(net, monthly, pct):
+    if not net:
+        return ["- 无数据"]
+    account, system, costs = net["account"], net["system"], net["costs_usd"]
+    lines = [f"- 账户净收益（已扣成交费用和滑点）：年化 {pct(account.get('annual_return'))}，"
+             f"交易日 {account.get('sessions')}"]
+    if system.get("status") == "unknown_costs":
+        lines.append(f"- 系统净收益（再扣模型和数据费用）：未知（{system['sessions_with_unknown_costs']} 个交易日的费用未知，"
+                     "不按 0 计）")
+    else:
+        lines.append(f"- 系统净收益（再扣模型和数据费用）：年化 {pct(system.get('annual_return'))}")
+    lines.append(f"- 期间模型费用 {_number(costs.get('model'))} 美元；数据费用 "
+                 f"{_number(costs.get('data')) if costs.get('data') is not None else '未知'} 美元（月费 {monthly if monthly is not None else '未知'}）")
+    return lines
+
+
+TRIAL_LABELS = {"prompt_versions_x_risk_policies": "提示词版本×风控配置", "factor_expressions": "因子表达式（含未通过）",
+                "construction_alternative": "组合构建对照", "learning_control_arm": "学习对照组"}
 
 
 def acceptance_markdown(result):
@@ -373,10 +484,24 @@ def acceptance_markdown(result):
               f"- 交易日：{stats.get('sessions')}；年化夏普：{stats.get('sharpe_annualized')}",
               f"- 真实夏普 > 0 的概率（PSR）：{pct(stats.get('probabilistic_sharpe'))}；"
               f"扣除 {stats.get('configurations_tried')} 种配置试错后的概率（DSR）：{pct(stats.get('deflated_sharpe'))}",
+              f"- 试错计数：" + ("；".join(f"{TRIAL_LABELS.get(k, k)} {v}" for k, v in
+                                        (stats.get("configurations_breakdown") or {}).items() if k != "total") or "—"),
               f"- 达到 95% 置信所需的最短记录：{stats.get('min_track_record_sessions')} 个交易日",
               f"- 相对 SPY：beta {regression.get('beta')}，年化 alpha {regression.get('alpha_annualized')}，"
               f"alpha t 值 {regression.get('alpha_t')}",
-              "", f"## 分阶段资金就绪度：**{stage.get('stage')}**", ""]
+              f"- 年化收益 {pct(stats.get('annual_return'))}，最大回撤 {pct(stats.get('max_drawdown'))}，"
+              f"Sortino {_number(stats.get('sortino_annualized'))}，按自相关修正的夏普（Lo）"
+              f"{_number(stats.get('sharpe_lo_adjusted'))}；alpha t 值（Newey-West）{_number(regression.get('alpha_t_newey_west'))}"]
+    lines += ["", "## 净收益口径", ""] + _net_lines(result.get("net_returns"), result.get("data_costs_usd_per_month"), pct)
+    lines += ["", "## 事先定义的基准", "", "| 基准 | 定义 | 当前 | 交易日 | 年化超额 | 信息比率 | alpha t（OLS／NW） | 分红 |",
+              "|---|---|---|---|---|---|---|---|"]
+    for row in result.get("benchmarks") or []:
+        weights = " + ".join(f"{float(w) * 100:g}% {s}" for s, w in row["weights"].items())
+        reg = row.get("regression") or {}
+        lines.append(f"| {row['id']} | {weights} | {'是' if row['current'] else '旧定义'} | {row['sessions']} | "
+                     f"{pct(row.get('annual_excess_return'))} | {_number(row.get('information_ratio'))} | "
+                     f"{_number(reg.get('alpha_t'))}／{_number(reg.get('alpha_t_newey_west'))} | {row.get('dividends')} |")
+    lines += ["", f"## 分阶段资金就绪度：**{stage.get('stage')}**", ""]
     lines += [f"- {reason}" for reason in stage.get("reasons", [])] or ["- 全部条件满足"]
     lines += ["", stage.get("notice", ""),
               "", "## 关键指标", "", "```json", json_dump(metrics), "```", "", result["limitations"], ""]
