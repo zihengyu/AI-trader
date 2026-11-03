@@ -207,7 +207,7 @@ def test_strategy_builds_separate_stock_and_etf_panels_with_research_names_and_o
     strategy._factor_cache = None
     strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=frame)
     seen = {}
-    strategy.sec = SimpleNamespace(errors={}, panels=lambda symbols, index: seen.setdefault("symbols", symbols) and {
+    strategy.sec = SimpleNamespace(errors={}, deferred=[], panels=lambda symbols, index, may_download=None: seen.setdefault("symbols", symbols) and {
         "earnings": pd.DataFrame(5.0, index=index, columns=sorted(symbols))})
     panels = strategy._factor_panel(days[-1].to_pydatetime())
     assert list(panels["stocks"]["close"].columns) == ["ALFA", "WIDE"]  # Research names widen the stocks.

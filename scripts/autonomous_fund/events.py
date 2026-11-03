@@ -131,15 +131,24 @@ class EarningsCalendar:
             return "finnhub"
         return "yahoo"
 
-    def dates(self, symbols, today):
-        """{symbol: {"dates": [...], "source": s} | {"unavailable": error}}; one fetch per symbol per day."""
+    def dates(self, symbols, today, may_fetch=None):
+        """{symbol: {"dates": [...], "source": s} | {"unavailable": error}}; one fetch per symbol per day.
+
+        may_fetch(): when it returns False, symbols not fetched yet today are left
+        `deferred` (listed in self.deferred) for a later call instead of blocking.
+        """
         today = _day(today)
+        self.deferred = []
         with self.journal.connection() as db:
             stored = {r["symbol"]: dict(r) for r in db.execute("SELECT * FROM fund_earnings WHERE day=?",
                                                                (today.isoformat(),))}
         result = {}
         for symbol in sorted(symbols):
             row = stored.get(symbol)
+            if row is None and may_fetch is not None and not may_fetch():
+                self.deferred.append(symbol)
+                result[symbol] = {"unavailable": "deferred"}
+                continue
             if row is None:
                 source, dates, error = None, None, None
                 try:
@@ -159,10 +168,10 @@ class EarningsCalendar:
                 result[symbol] = {"dates": json.loads(row["dates"]), "source": row["source"]}
         return result
 
-    def caps(self, stocks, today):
+    def caps(self, stocks, today, may_fetch=None):
         """(caps, upcoming, unknown): the weight cap per stock reporting inside the window."""
         caps, upcoming, unknown = {}, {}, []
-        for symbol, item in self.dates(stocks, today).items():
+        for symbol, item in self.dates(stocks, today, may_fetch).items():
             if "unavailable" in item:
                 unknown.append(symbol)
                 continue

@@ -2,7 +2,10 @@
 # One-step start of the AI paper fund on Ubuntu (systemd):
 # check .env -> install/update the two services -> start them -> wait for the
 # independent monitor -> offer to resume trading when it is stopped by hand.
-# Usage: bash scripts/fund-start.sh [-y]   (-y: resume without asking)
+# Usage: bash scripts/fund-start.sh [-y] [--restart]
+#   -y         resume without asking
+#   --restart  also restart running services so updated code takes effect
+#              (used by fund-restart.sh; a plain start leaves running services as they are)
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$repo"
@@ -15,7 +18,14 @@ units=(lumibot-fund-runner.service lumibot-fund-monitor.service)
 # Installed with the services; the timer takes a daily journal snapshot after the close.
 backup_units=(lumibot-fund-backup.service lumibot-fund-backup.timer)
 yes=0
-[[ "${1:-}" == "-y" ]] && yes=1
+restart=0
+for arg in "$@"; do
+  case "$arg" in
+    -y) yes=1 ;;
+    --restart) restart=1 ;;
+    *) echo "用法：bash scripts/fund-start.sh [-y] [--restart]" >&2; exit 2 ;;
+  esac
+done
 run() { if [[ -n "${AI_FUND_DRY_RUN:-}" ]]; then echo "+ $*"; else "$@"; fi; }
 fund() { "$py" -m scripts.autonomous_fund.run "$@" --env-file "$env_file"; }
 
@@ -53,11 +63,19 @@ fi
 
 echo "3/4 启动服务……"
 run sudo systemctl enable --now "${units[@]}" lumibot-fund-backup.timer
+fresh=()
+if (( restart )); then
+  # enable --now leaves a running service on its old code; a restart loads the update.
+  # Stopping writes a manual STOP, so trading resumes only through the step below.
+  [[ -z "${AI_FUND_DRY_RUN:-}" ]] && fresh=(--fresh-after "$(date +%s)")
+  run sudo systemctl restart "${units[@]}"
+  echo "    已重启两个服务（加载新代码）。"
+fi
 
 echo "4/4 等待独立监控就绪（最多 3 分钟，第一次启动时监控可能先重启一次）……"
 ready=0
 for _ in $(seq 1 36); do
-  if fund status --check-monitor >/dev/null 2>&1; then ready=1; break; fi
+  if fund status --check-monitor "${fresh[@]}" >/dev/null 2>&1; then ready=1; break; fi
   [[ -n "${AI_FUND_DRY_RUN:-}" ]] && break
   sleep 5
 done
@@ -69,22 +87,28 @@ if (( ! ready )); then
   exit 1
 fi
 
-case "$(fund status --stop-class)" in
-  none)
-    echo "交易正在运行。日常查看：bash scripts/fund-logs.sh" ;;
-  operator)
-    answer=n
-    if (( yes )); then
-      answer=y
-    elif [[ -t 0 ]]; then
-      read -r -p "交易处于人工停止状态（首次启动、stop 或手动关闭），现在恢复交易吗？[y/N] " answer
-    fi
-    if [[ "$answer" =~ ^[Yy]$ ]]; then
-      fund resume >/dev/null
-      echo "已恢复交易。日常查看：bash scripts/fund-logs.sh"
-    else
-      echo "交易保持停止。准备好后运行：bash scripts/fund-start.sh -y"
-    fi ;;
-  *)
-    echo "交易暂停中，原因见上面的“交易”一行；属于自动恢复的情况会在满足条件后自己恢复。" ;;
-esac
+stop_class="$(fund status --stop-class)"
+if [[ "$stop_class" == none ]]; then
+  echo "交易正在运行。日常查看：bash scripts/fund-logs.sh"
+elif [[ "$(fund status --needs-operator)" == yes ]]; then
+  # Operator stops, faults that need a person, and STOPs whose automatic resumes ran out.
+  if [[ "$stop_class" == operator ]]; then
+    question="交易处于人工停止状态（首次启动、stop 或手动关闭），现在恢复交易吗？[y/N] "
+  else
+    question="交易因监控／服务停止且不会再自动恢复（原因见上面的“交易”一行）。确认原因已处理，现在恢复交易吗？[y/N] "
+  fi
+  answer=n
+  if (( yes )); then
+    answer=y
+  elif [[ -t 0 ]]; then
+    read -r -p "$question" answer
+  fi
+  if [[ "$answer" =~ ^[Yy]$ ]]; then
+    fund resume >/dev/null
+    echo "已恢复交易。日常查看：bash scripts/fund-logs.sh"
+  else
+    echo "交易保持停止。准备好后运行：bash scripts/fund-start.sh -y"
+  fi
+else
+  echo "交易暂停中，原因见上面的“交易”一行；满足条件（进程健康 3 分钟、没有不明订单）后会自动恢复。"
+fi

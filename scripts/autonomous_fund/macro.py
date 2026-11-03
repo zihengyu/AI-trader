@@ -120,13 +120,19 @@ class MacroWatch:
         response.raise_for_status()
         return parse_csv(response.text)
 
-    def context(self, as_of_day):
+    def context(self, as_of_day, may_fetch=None):
+        """may_fetch(): when False, series not fetched yet are `deferred` to a later call."""
         today = date.fromisoformat(str(as_of_day)[:10])
-        series = {}
+        series, deferred = {}, []
         for name, meaning in SERIES.items():
             cached = self._raw.get(name)
             # A historical run fetches each series once and slices it by date; live runs refresh daily.
-            if cached is None or (not self.historical and cached[0] != today):
+            stale = cached is None or (not self.historical and cached[0] != today)
+            if stale and may_fetch is not None and not may_fetch():
+                deferred.append(name)
+                series[name] = {"meaning": meaning, "unavailable": "deferred"}
+                continue
+            if stale:
                 try:
                     self._raw[name] = cached = (today, self._fetch(name, today))
                 except Exception as exc:
@@ -138,4 +144,4 @@ class MacroWatch:
             else:
                 series[name] = {"meaning": meaning, **summarize(cached[1], today)}
         return {"source": "FRED (St. Louis Fed)", "as_of_day": today.isoformat(), "series": series,
-                "regime": regime(series)}
+                "regime": regime(series), "deferred": deferred}

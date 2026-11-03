@@ -314,6 +314,10 @@ def main(argv=None):
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     parser.add_argument("--check-monitor", action="store_true",
                         help="status: exit 0 only when the independent monitor is fresh and healthy (or stopped)")
+    parser.add_argument("--fresh-after", type=float,
+                        help="status --check-monitor: also require a monitor state written after this Unix time")
+    parser.add_argument("--needs-operator", action="store_true",
+                        help="status: print yes when only a person can lift the STOP (scripts use it)")
     parser.add_argument("--stop-class", action="store_true",
                         help="status: print only the STOP class (operator, watchdog, service or none)")
     args = parser.parse_args(argv)
@@ -399,11 +403,13 @@ def main(argv=None):
         return
     if args.mode == "status":
         # Read-only: never creates an account directory or journal.
-        from .status import monitor_ready, stop_class, summary
-        if args.stop_class:
+        from .status import monitor_ready, needs_operator, stop_class, summary
+        if args.needs_operator:
+            print("yes" if needs_operator(args.run_dir) else "no")
+        elif args.stop_class:
             print(stop_class(args.run_dir))
         elif args.check_monitor:
-            if not monitor_ready(args.run_dir):
+            if not monitor_ready(args.run_dir, after=args.fresh_after):
                 raise SystemExit(3)
         else:
             print(summary(args.run_dir, (os.environ.get("FUND_MODE") or "local").strip().lower()))

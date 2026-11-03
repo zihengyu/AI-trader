@@ -198,11 +198,13 @@ class SecFundamentals:
         rows = json.loads(path.read_text(encoding="utf-8")).values()
         return {str(row["ticker"]).upper(): int(row["cik_str"]) for row in rows}
 
-    def fields(self, symbol, cik):
+    def fields(self, symbol, cik, allow_download=True):
         """{field: [(filed, value)]} from the cached extract, refreshed when a new filing is likely."""
         path = self.root / f"{symbol.replace('.', '-')}.json"
         cached = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else None
         today = self.today()
+        if cached and not allow_download:  # A due refresh waits for a call with time to download.
+            return {k: [tuple(x) for x in v] for k, v in cached["fields"].items()}
         if cached:
             latest = max((filed for series in cached["fields"].values() for filed, _ in series), default=None)
             checked = _d(cached["checked"])
@@ -225,8 +227,13 @@ class SecFundamentals:
         path.write_text(json.dumps({"checked": today.isoformat(), "fields": fields}), encoding="utf-8")
         return fields
 
-    def panels(self, symbols, index):
-        """{field: DataFrame(index x symbols)} as-of values; NaN where a company or field is unavailable."""
+    def panels(self, symbols, index, may_download=None):
+        """{field: DataFrame(index x symbols)} as-of values; NaN where a company or field is unavailable.
+
+        may_download(): when it returns False, companies without a usable cached
+        extract are skipped and listed in self.deferred for a later call.
+        """
+        self.deferred = []
         try:
             ciks = self.ciks()
         except Exception as exc:
@@ -238,8 +245,12 @@ class SecFundamentals:
             if cik is None:
                 self.errors.setdefault(symbol, "no SEC CIK")
                 continue
+            allowed = may_download is None or may_download()
+            if not allowed and not (self.root / f"{symbol.replace('.', '-')}.json").is_file():
+                self.deferred.append(symbol)  # Nothing cached yet: fetched in a later call.
+                continue
             try:
-                fields = self.fields(symbol, cik)
+                fields = self.fields(symbol, cik, allow_download=allowed)
             except Exception as exc:
                 self.errors[symbol] = type(exc).__name__
                 continue

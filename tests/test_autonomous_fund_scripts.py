@@ -45,7 +45,7 @@ def script(name, tmp_path, env, *args):
                           env=variables, timeout=300)
 
 
-@pytest.mark.parametrize("name", ["fund-start.sh", "fund-stop.sh", "fund-logs.sh"])
+@pytest.mark.parametrize("name", ["fund-start.sh", "fund-stop.sh", "fund-logs.sh", "fund-restart.sh"])
 def test_scripts_are_valid_bash(name):
     assert subprocess.run(["bash", "-n", str(ROOT / "scripts" / name)]).returncode == 0
 
@@ -145,3 +145,65 @@ def test_rotating_backups_keep_the_newest_snapshots_only(tmp_path):
     assert stops.read(made[-1])["reason"] == "restored_backup"  # A restore always starts stopped.
     with pytest.raises(Exception):
         deploy.rotate(book, tmp_path / "backups", keep=0)
+
+
+def watchdog_book(tmp_path, exhausted):
+    book, env = account_book(tmp_path, stop=None)
+    stops.write(book, "watchdog", "iteration_stalled")
+    if exhausted:
+        journal = Journal(book, "synthetic-script-account")
+        journal.event(datetime.now(timezone.utc), "notification", {"kind": "auto_resume_exhausted", "details": {
+            "stop_reason": "iteration_stalled", "resumes_last_24h": 3}})
+    return book, env
+
+
+def test_exhausted_automatic_resumes_hand_the_stop_to_the_operator(tmp_path):
+    book, env = watchdog_book(tmp_path / "exhausted", exhausted=True)
+    status = script("fund-logs.sh", tmp_path / "exhausted", env)
+    assert "自动恢复次数已用完" in status.stdout and "会自动恢复" not in status.stdout.split("交易：")[1].split("\n")[0]
+    result = script("fund-start.sh", tmp_path / "exhausted", env, "-y")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "已恢复交易" in result.stdout and not (book / "STOP").exists()
+
+
+def test_a_resumable_stop_with_resumes_left_is_left_to_the_monitor(tmp_path):
+    book, env = watchdog_book(tmp_path / "waiting", exhausted=False)
+    result = script("fund-start.sh", tmp_path / "waiting", env, "-y")
+    assert result.returncode == 0 and "会自动恢复" in result.stdout and (book / "STOP").exists()
+
+
+def test_an_old_exhaustion_notice_does_not_cover_a_newer_stop(tmp_path):
+    from scripts.autonomous_fund.status import needs_operator
+    book, _ = watchdog_book(tmp_path, exhausted=True)
+    stops.clear(book)
+    stops.write(book, "watchdog", "heartbeat_stale", now=datetime.now(timezone.utc).replace(year=2099))
+    assert not needs_operator(book)  # The notice predates this STOP: the monitor may still resume it.
+
+
+def test_restart_really_restarts_running_services_then_resumes(tmp_path):
+    book, env = account_book(tmp_path)
+    result = script("fund-restart.sh", tmp_path, env, "-y")
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert out.index("+ sudo systemctl enable --now") < out.index(
+        "+ sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service")
+    assert "已恢复交易" in out and not (book / "STOP").exists()
+    plain = script("fund-start.sh", tmp_path, env)
+    assert "systemctl restart" not in plain.stdout  # A plain start never restarts a running fund.
+
+
+def test_restart_with_update_pulls_fast_forward_and_reinstalls_pinned_dependencies(tmp_path):
+    _, env = account_book(tmp_path)
+    result = script("fund-restart.sh", tmp_path, env, "--update")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "pull --ff-only" in result.stdout and "constraints-py312-linux.txt" in result.stdout
+    assert "交易保持停止" in result.stdout  # No -y and no terminal: never resumes by itself.
+    assert script("fund-restart.sh", tmp_path, env, "--force").returncode == 2
+
+
+def test_a_restart_is_confirmed_only_by_a_newer_monitor_state(tmp_path):
+    from scripts.autonomous_fund.status import monitor_ready
+    book, _ = account_book(tmp_path)
+    written = datetime.now(timezone.utc).timestamp()
+    assert monitor_ready(book) and monitor_ready(book, after=written - 60)
+    assert not monitor_ready(book, after=written + 1)  # The previous monitor's last write does not count.
