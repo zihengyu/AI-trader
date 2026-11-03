@@ -497,8 +497,11 @@ class AutonomousFund(Strategy):
 
     def initialize(self, config, run_dir, mode, account_binding, model=None, runtime=None, observe_only=False,
                    research_model=None, decision_model=None, memory_mode="rolling", frozen_memory=None,
-                   require_monitor=False):
+                   require_monitor=False, live_data=None):
         self.mode = mode
+        # Scripted models (tests, mock) stay off the network unless live_data says otherwise: the free
+        # rehearsal pairs a scripted AI with every real data source.
+        live_data = runtime is None if live_data is None else bool(live_data)
         self.require_monitor = require_monitor
         self.config = config
         self.limits = Limits(**config["limits"])
@@ -541,7 +544,7 @@ class AutonomousFund(Strategy):
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
         self.sec = None
         agent = os.environ.get("FUND_SEC_USER_AGENT", "").strip()
-        if self.factor_lab is not None and agent and mode != "mock" and runtime is None:
+        if self.factor_lab is not None and agent and mode != "mock" and live_data:
             from .fundamentals import SecFundamentals
             try:
                 self.sec = SecFundamentals(self.run_dir / "cache" / "sec", agent)
@@ -557,7 +560,7 @@ class AutonomousFund(Strategy):
         self.news = None
         from .news import NewsSettings, NewsWatch
         news = NewsSettings.from_config(config.get("news"))
-        if live and news.enabled and runtime is None:
+        if live and news.enabled and live_data:
             # Live information only; historical runs use the researcher's dated tools. While the
             # data desk is collecting news, this thread stands by and only reads what it stored.
             self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open,
@@ -567,17 +570,17 @@ class AutonomousFund(Strategy):
         # Live only: a historical run would need the earnings calendar as it was known then.
         # Scripted-model runs (tests, mock) stay off the network, like the news watch.
         self.earnings = (EarningsCalendar(self.journal, events, store=self.daily_store)
-                         if events.enabled and mode in {"paper", "local"} and runtime is None else None)
+                         if events.enabled and mode in {"paper", "local"} and live_data else None)
         from .construction import ConstructionSettings
         self.construction = ConstructionSettings.from_config(config.get("construction"))
         self.history_fallback = None
-        if mode == "local" and runtime is None and os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET"):
+        if mode == "local" and live_data and os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET"):
             from .history import AlpacaDailyHistory
             self.history_fallback = AlpacaDailyHistory(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"])
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
         self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"}, store=self.daily_store)
-                      if macro.enabled and mode != "mock" and runtime is None else None)
+                      if macro.enabled and mode != "mock" and live_data else None)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
             # Faster deterministic watching; AI reviews keep their own floor and budget.

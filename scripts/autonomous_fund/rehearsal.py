@@ -192,8 +192,15 @@ def _prune(root, keep):
 
 
 def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now=None,
-             root=Path("artifacts/fund-rehearsal"), keep=KEEP, clock=time.monotonic):
-    """Run the rehearsal; returns the report (also written as rehearsal.json in the copy)."""
+             root=Path("artifacts/fund-rehearsal"), keep=KEEP, clock=time.monotonic, live_data=True):
+    """Run the rehearsal; returns the report (also written as rehearsal.json in the copy).
+
+    runtime: a scripted AI (the free default from the CLI) answers every model call
+    without inference, so the whole flow runs on real data at no model cost; None
+    uses the real models. models=False runs the data stages only. live_data=False
+    keeps a scripted run off the network (tests).
+    """
+    ai = "none" if not models else ("scripted" if runtime is not None else "real")
     from . import deploy, stops
     from .local_broker import LocalPaperBroker
     from .market_data import YahooRealtimeData
@@ -254,7 +261,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return "fresh"
     origin = stages.run("copy the account", copy, kind="required", judge=lambda v: ("ok", v or ""))
     if origin is None:
-        return _finish(scratch, stages, root, keep)
+        return _finish(scratch, stages, root, keep, extra={"ai": ai})
     from .datadesk import DeskStatus
     stages.run("data desk", lambda: DeskStatus(account_dir).summary(), judge=_desk_judge)
     # Only what happens from here on is this rehearsal's work (the copy holds the account's history).
@@ -272,7 +279,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
                                   starting_cash=Mandate.from_config(rehearsal_config.get("mandate")).local_account_usd)
         strategy = AutonomousFund(broker=broker, name="RehearsalFund", parameters={
             "config": rehearsal_config, "run_dir": str(book), "mode": "local",
-            "account_binding": "local-virtual-account", "runtime": runtime, "observe_only": not models})
+            "account_binding": "local-virtual-account", "runtime": runtime, "observe_only": not models,
+            "live_data": live_data})
         # Never an order: every submission path only records what it would have sent.
         strategy._submit = lambda intent, now, decision_id, **kw: submitted.append(intent)
         strategy._execute = lambda intent, now, account=None, prices=None: submitted.append(intent)
@@ -284,7 +292,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return strategy
     strategy = stages.run("start the strategy (startup and pre-open research)", build, kind="model")
     if strategy is None:
-        return _finish(scratch, stages, root, keep)
+        return _finish(scratch, stages, root, keep, extra={"ai": ai})
     research = next((r["body"] for r in reversed(strategy.journal.all_events())
                      if r["kind"] == "premarket_research"), None)
     stages.rows[-1]["detail"] = ("pre-open research " + (research.get("phase", "saved") if research else "not run")
@@ -292,7 +300,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     at = strategy.get_datetime()
     account = stages.run("account snapshot", strategy._snapshot, kind="required")
     if account is None:
-        return _finish(scratch, stages, root, keep)
+        return _finish(scratch, stages, root, keep, extra={"ai": ai})
     stages.run("risk context (history, volatility, stress windows)", lambda: strategy._risk_context(account, at),
                kind="required", judge=_context_judge)
     stages.run("market snapshot", lambda: strategy._market_snapshot(at), judge=_snapshot_judge)
@@ -305,7 +313,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     if not models:
         stages.rows.append({"stage": "critic and manager decision", "kind": "model", "status": "skipped",
                             "detail": "--no-models", "seconds": 0.0})
-        return _finish(scratch, stages, root, keep)
+        return _finish(scratch, stages, root, keep, extra={"ai": ai})
     strategy.next_review = None
 
     def decide():
@@ -325,7 +333,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         if not any(r["kind"] == "decision_validated" for r in strategy.journal.all_events()):
             return "fail", detail + "; no validated decision"
         return "ok", detail
-    stages.run("critic and manager decision (real models)", decide, kind="model", judge=judge_decision)
+    stages.run("critic and manager decision (real models)" if ai == "real" else
+               "critic and manager decision (scripted AI)", decide, kind="model", judge=judge_decision)
     decision = strategy.last_decision
     # Paid answers that were lost or degraded (a schema mismatch, an unusable critique, a failed review).
     stages.run("model answers", lambda: answer_problems(strategy.journal, start_sequence),
@@ -346,7 +355,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
                 "worst_scenario_loss": overlay["constructed_metrics"]["worst_scenario_loss"]}
     built = stages.run("risk construction of the targets", construction, kind="required",
                        judge=lambda v: ("ok", f"binding: {', '.join(v['binding']) or 'none'}"))
-    report = _finish(scratch, stages, root, keep, extra={"decision": decision, "construction": built,
+    report = _finish(scratch, stages, root, keep, extra={"ai": ai, "decision": decision, "construction": built,
                                                          "orders_intercepted": [str(i) for i in submitted],
                                                          "agent_calls": agent_calls(strategy.journal,
                                                                                     after=start_sequence)})
@@ -387,6 +396,7 @@ LABELS = {
     "FRED macro context": "FRED 宏观数据",
     "scorecards": "记分卡",
     "critic and manager decision (real models)": "反方审查＋基金经理决策（真实模型）",
+    "critic and manager decision (scripted AI)": "反方审查＋基金经理决策（模拟 AI，验证流程）",
     "critic and manager decision": "反方审查＋基金经理决策",
     "risk construction of the targets": "目标组合的量化风控",
 }
@@ -399,7 +409,10 @@ DETAILS = {"copied": "已复制真实账本", "fresh": "没有账本，用新账
 
 def text(report):
     marks = {"ok": "通过", "fail": "失败", "skipped": "跳过", "warn": "注意"}
-    lines = [f"盘前彩排：{'全部通过' if report['verdict'] == 'ready' else '有失败项'}（账本副本：{report['copy']}）", ""]
+    mode = {"scripted": "模拟 AI：完整流程、真实数据、不调用模型、0 模型费用",
+            "real": "真实模型：完整流程，会产生模型费用", "none": "只检查数据，不调用模型"}.get(report.get("ai"))
+    lines = [f"盘前彩排：{'全部通过' if report['verdict'] == 'ready' else '有失败项'}（账本副本：{report['copy']}）"]
+    lines += [f"方式：{mode}", ""] if mode else [""]
     for row in report["stages"]:
         where = f"；位置 {row['where']}" if row.get("where") else ""
         detail = DETAILS.get(row.get("detail"), row.get("detail"))
