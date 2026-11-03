@@ -84,6 +84,27 @@ def _context_judge(value):
     return "ok", ""
 
 
+def agent_calls(journal):
+    """Each model call's duration from the copy's own agent_call_started/finished events."""
+    from .risk import instant
+    started, calls = {}, []
+    for row in journal.all_events():
+        body = row["body"]
+        if row["kind"] == "agent_call_started":
+            started[body["id"]] = (body["name"], instant(row["at"]))
+        elif row["kind"] == "agent_call_finished" and body.get("id") in started:
+            name, began = started.pop(body["id"])
+            calls.append({"name": name, "seconds": round((instant(row["at"]) - began).total_seconds(), 1)})
+    calls += [{"name": name, "seconds": None, "unfinished": True} for name, _ in started.values()]
+    return calls
+
+
+def latest(root=Path("artifacts/fund-rehearsal")):
+    """The newest saved report, or None."""
+    reports = sorted(Path(root).glob("*/rehearsal.json")) if Path(root).is_dir() else []
+    return json.loads(reports[-1].read_text(encoding="utf-8")) if reports else None
+
+
 def _prune(root, keep):
     runs = sorted(p for p in Path(root).iterdir() if p.is_dir() and len(p.name) == 15 and p.name[8] == "-")
     for old in runs[:-keep]:
@@ -228,13 +249,16 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     built = stages.run("risk construction of the targets", construction, kind="required",
                        judge=lambda v: ("ok", f"binding: {', '.join(v['binding']) or 'none'}"))
     report = _finish(scratch, stages, root, keep, extra={"decision": decision, "construction": built,
-                                                         "orders_intercepted": [str(i) for i in submitted]})
+                                                         "orders_intercepted": [str(i) for i in submitted],
+                                                         "agent_calls": agent_calls(strategy.journal)})
     return report
 
 
 def _finish(scratch, stages, root, keep, extra=None):
+    from .strategy import MONITOR_AGENT_SECONDS
     rows = stages.rows
-    verdict = "fail" if any(r["status"] == "fail" for r in rows) else "ready"
+    slow = [c for c in (extra or {}).get("agent_calls", []) if (c.get("seconds") or 0) >= MONITOR_AGENT_SECONDS]
+    verdict = "fail" if slow or any(r["status"] == "fail" for r in rows) else "ready"
     report = {"verdict": verdict, "at": datetime.now(timezone.utc).isoformat(), "copy": str(scratch),
               "stages": rows, **(extra or {}),
               "note": "A copy of the account; no order, STOP, approval or Telegram message of the real account "
@@ -277,6 +301,11 @@ def text(report):
         detail = DETAILS.get(row.get("detail"), row.get("detail"))
         lines.append(f"[{marks.get(row['status'], row['status'])}] {LABELS.get(row['stage'], row['stage'])}："
                      f"{row['seconds']} 秒" + (f"；{detail}" if detail else "") + where)
+    calls = report.get("agent_calls") or []
+    if calls:
+        lines += ["", "每次模型调用耗时（监控在单次调用超过 900 秒时会停止交易）："
+                  + "、".join(f"{c['name']} {c['seconds']} 秒" if c.get("seconds") is not None else f"{c['name']} 未结束"
+                             for c in calls)]
     built = report.get("construction")
     if built:
         lines += ["", "AI 目标 → 风控后：" + json.dumps(built["targets"], ensure_ascii=False) + " → "

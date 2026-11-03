@@ -159,3 +159,26 @@ def test_native_research_caches_live_in_the_account_not_the_read_only_home(
     assert resolved in Path(seen["days"]).resolve().parents
     assert seen["agent"] == "Synthetic Operator ops@example.com"  # The AI's SEC tool names the operator.
     assert not (home / ".lumibot").exists() and not (home / ".cache" / "lumibot").exists()
+
+
+def test_every_agent_call_ends_before_the_monitor_would_stop_the_runner(monkeypatch, entrypoint_environment, tmp_path):
+    """2026-11-03 rehearsal: a 300 s run timeout is per ATTEMPT and LumiBot retries a timeout up to 10 times live,
+
+    so one researcher call could run ~54 minutes, past the monitor's 900 s agent_call_stalled limit.
+    """
+    from scripts.autonomous_fund import strategy
+    import scripts.autonomous_fund.report as reports
+    monkeypatch.delenv("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", raising=False)
+    assert max(strategy.agent_worst_case_seconds(role) for role in strategy.AGENT_RUN_TIMEOUTS) > 900  # Unbounded.
+    seen = {}
+    monkeypatch.setattr(run, "models_ready", lambda *args: {})
+    monkeypatch.setattr(reports, "report", lambda *args: {})
+    monkeypatch.setattr(run, "run_local", lambda args, config, *c: seen.update(
+        attempts=os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS"),
+        worst={role: strategy.agent_worst_case_seconds(role) for role in strategy.AGENT_RUN_TIMEOUTS}))
+    run.main(["local", "--run-dir", str(tmp_path / "artifacts" / "book"), "--config", str(config_file(tmp_path))])
+    assert seen["attempts"] == "2"
+    assert all(seconds < strategy.MONITOR_AGENT_SECONDS for seconds in seen["worst"].values()), seen
+    monkeypatch.setenv("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", "1")  # An explicit operator choice is kept.
+    run.main(["local", "--run-dir", str(tmp_path / "artifacts" / "book"), "--config", str(config_file(tmp_path))])
+    assert seen["attempts"] == "1"

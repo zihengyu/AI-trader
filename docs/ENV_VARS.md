@@ -508,6 +508,7 @@ bound to one deployment or backtest.
 ### `LUMIBOT_AGENT_MAX_RUN_ATTEMPTS`
 - Purpose: Override the retry budget for a single agent model call.
 - Default: `2` in backtests, `10` in live trading.
+- Autonomous fund CLI: when unset, the launcher selects `2`. The run timeout is per attempt and a timeout is retried, so ten live attempts let one call outlast the independent monitor's 900-second agent limit; with two, the researcher (420 s per attempt) and the critic/manager (300 s) end in about 842 s and 602 s at worst. An explicit value is preserved, and a value that lets a call exceed the monitor limit is journaled at startup (`agent_time_budget_exceeds_monitor`).
 - Notes: Backtests default to a lower retry budget so a bad provider window does not multiply model spend across many simulated iterations.
 
 ### `TELEGRAM_BOT_TOKEN`

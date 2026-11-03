@@ -1261,6 +1261,9 @@ LUMIBOT_AGENT_MAX_RUN_ATTEMPTS
 - Default: ``2`` in backtests, ``10`` in live trading.
 - Notes: Backtests default to a lower retry budget so a bad provider window does
   not multiply model spend across many simulated iterations.
+- Autonomous fund CLI: an unset value is configured as ``2`` so every agent
+  call (attempts x per-attempt run timeout) ends before the independent
+  monitor's 900-second agent limit; explicit values are preserved.
 
 Telegram notifications
 ----------------------

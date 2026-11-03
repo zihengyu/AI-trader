@@ -32,6 +32,13 @@ CANCEL_RETRY_SECONDS = 240
 # the next one. The independent monitor treats 180 seconds without an iteration or model-call
 # event during the session as a stalled runner; required risk data stays synchronous.
 PREPARATION_BUDGET_SECONDS = 45
+# One agent call lasts up to attempts x run timeout + LumiBot's retry backoff: the run timeout
+# is per ATTEMPT and a timeout is retried. The independent monitor stops a runner after
+# MONITOR_AGENT_SECONDS in one call (agent_call_stalled), so every role must end before it.
+# The research role works outside the session and gets more time per attempt.
+AGENT_RUN_TIMEOUTS = {"researcher": 420, "critic": 300, "manager": 300}
+AGENT_RUN_ATTEMPTS = 2  # The fund CLI's default for LUMIBOT_AGENT_MAX_RUN_ATTEMPTS.
+MONITOR_AGENT_SECONDS = 900
 
 
 # System prompts are module constants so their digest (prompt_version) identifies
@@ -51,7 +58,10 @@ RESEARCHER_PROMPT = (
     "Review supplied strategy_memory as provisional hypotheses; look for supporting and contrary "
     "evidence, and carry useful selection/timing lessons into current research. "
     "operator_mandate instructions come from the human operator and bound what may be proposed. "
-    "Use scorecards (scored predictions and allocation excess returns) to weigh past ideas."
+    "Use scorecards (scored predictions and allocation excess returns) to weigh past ideas. "
+    "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
+    "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
+    "of time; an unfinished run returns nothing."
 )
 CRITIC_PROMPT = (
     "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
@@ -253,6 +263,19 @@ class ModelBudget:
         if unknown:
             raise RiskError("Unknown model_budget settings: " + ", ".join(sorted(unknown)))
         return cls(**section)
+
+
+def agent_worst_case_seconds(role, attempts=None):
+    """Longest one call of `role` can take under LumiBot's retry policy (seconds)."""
+    from lumibot.components.agents.runtime import GoogleADKRuntime
+    if attempts is None:
+        raw = os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS")
+        try:
+            attempts = max(int(raw), 1) if raw else GoogleADKRuntime._MAX_RUN_ATTEMPTS
+        except ValueError:
+            attempts = GoogleADKRuntime._MAX_RUN_ATTEMPTS
+    backoff = GoogleADKRuntime._RETRY_BACKOFF_SECONDS
+    return attempts * AGENT_RUN_TIMEOUTS[role] + sum(backoff[min(i, len(backoff) - 1)] for i in range(attempts - 1))
 
 
 def prompt_version(models, extra=None):
@@ -527,22 +550,30 @@ class AutonomousFund(Strategy):
         isolate_research(self, self.run_dir / "cache", config.get("research_network"))
         common = dict(allow_trading=False, allow_network=True,
                       reasoning_effort=config.get("reasoning_effort"), _runtime=runtime,
-                      model_request_timeout_seconds=120, run_timeout_seconds=300)
+                      model_request_timeout_seconds=120)
         # Both roles are read-only by the user's explicit structured-target contract.
         # Native permissions remove every tool marked as mutating trading state.
         self.agents.create(
             name="researcher", model=self.agent_models["researcher"], output_schema=Research, **common,
-            system_prompt=RESEARCHER_PROMPT,
+            run_timeout_seconds=AGENT_RUN_TIMEOUTS["researcher"], system_prompt=RESEARCHER_PROMPT,
         )
         self.agents.create(
             name="manager", model=self.agent_models["manager"], output_schema=Decision, **common,
-            system_prompt=MANAGER_PROMPT,
+            run_timeout_seconds=AGENT_RUN_TIMEOUTS["manager"], system_prompt=MANAGER_PROMPT,
         )
+        if mode in {"paper", "local"}:
+            worst = {role: agent_worst_case_seconds(role) for role in AGENT_RUN_TIMEOUTS}
+            if max(worst.values()) >= MONITOR_AGENT_SECONDS:
+                # An explicit LUMIBOT_AGENT_MAX_RUN_ATTEMPTS that lets one call outlive the monitor.
+                self.journal.event(self.get_datetime(), "agent_time_budget_exceeds_monitor",
+                                   {"worst_case_seconds": worst, "monitor_seconds": MONITOR_AGENT_SECONDS})
+                self.log_message("Agent retries can outlast the monitor's agent limit; lower "
+                                 "LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", color="yellow")
         self.critic = CriticSettings.from_config(config.get("critic"))
         if self.critic.enabled:
             self.agent_models["critic"] = self.critic.model or self.agent_models["researcher"]
             self.agents.create(name="critic", model=self.agent_models["critic"], output_schema=Critique, **common,
-                               system_prompt=CRITIC_PROMPT)
+                               run_timeout_seconds=AGENT_RUN_TIMEOUTS["critic"], system_prompt=CRITIC_PROMPT)
             self._critic_ready = True
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
                          + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))

@@ -295,6 +295,7 @@ def main(argv=None):
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
     parser.add_argument("--once", action="store_true", help="One local scheduler iteration or monitor poll, then exit")
+    parser.add_argument("--latest", action="store_true", help="rehearse: print the newest saved report, run nothing")
     parser.add_argument("--no-models", action="store_true",
                         help="rehearse: data stages only, no model calls (no model cost)")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
@@ -430,6 +431,11 @@ def main(argv=None):
                              ("LUMIBOT_TRADING_DAYS_CACHE_DIR", "trading-days")):
             if not os.environ.get(name):
                 os.environ[name] = str(args.run_dir.resolve() / "cache" / folder)
+        # LumiBot retries a timed-out agent run up to 10 times live; two attempts keep every
+        # call inside the monitor's agent limit (strategy.agent_worst_case_seconds).
+        if not os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS"):
+            from .strategy import AGENT_RUN_ATTEMPTS
+            os.environ["LUMIBOT_AGENT_MAX_RUN_ATTEMPTS"] = str(AGENT_RUN_ATTEMPTS)
         # The AI's own SEC tool identifies the operator, as SEC's fair-access policy asks.
         if os.environ.get("FUND_SEC_USER_AGENT") and not os.environ.get("LUMIBOT_SEC_USER_AGENT"):
             os.environ["LUMIBOT_SEC_USER_AGENT"] = os.environ["FUND_SEC_USER_AGENT"]
@@ -472,6 +478,15 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "rehearse" and args.latest:
+        from .rehearsal import latest, text
+        saved = latest()
+        if saved is None:
+            raise RiskError("No rehearsal report yet: run bash scripts/fund-rehearse.sh")
+        print(text(saved))
+        if saved["verdict"] != "ready":
+            raise SystemExit(1)
         return
     if args.mode == "rehearse":
         from .rehearsal import rehearse, text
