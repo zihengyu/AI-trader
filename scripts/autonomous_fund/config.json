@@ -47,6 +47,8 @@
     "correlation_lambda": "0.97",
     "correlation_shrinkage": "0.25",
     "max_scenario_loss": "0.35",
+    "max_portfolio_beta": "1.0",
+    "max_style_exposure": "0.75",
     "stress_scenarios": {"gfc_2008": ["2008-09-01", "2009-03-09"], "covid_2020": ["2020-02-19", "2020-03-23"],
                          "rates_2022": ["2022-01-03", "2022-10-12"]},
     "groups": {
@@ -65,7 +67,7 @@
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
   "execution": {"reprice_after_seconds": 180, "max_buy_chase": "0.0075", "report_interval_seconds": 300, "review_on_move": "0.03", "iteration_seconds": 30,
                 "protective_limit_buffer": "0.005", "protective_reprice_seconds": 60},
-  "model_budget": {"max_agent_runs_per_day": 60, "reserved_review_runs": 4, "min_review_minutes": 15, "failure_backoff_minutes": [5, 15, 60], "skip_quiet_reviews": true, "max_quiet_minutes": 120},
+  "model_budget": {"max_agent_runs_per_day": 60, "reserved_review_runs": 4, "min_review_minutes": 15, "failure_backoff_minutes": [5, 15, 60], "skip_quiet_reviews": true, "max_quiet_minutes": 120, "max_daily_cost_usd": null},
   "mandate": {
     "capital_usd": "10000",
     "allow_external_holdings": false,

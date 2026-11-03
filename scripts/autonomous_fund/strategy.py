@@ -111,6 +111,9 @@ MANAGER_PROMPT = (
     "caps, sector/group caps, the drawdown exposure budget, the daily loss stop and liquidity. "
     "Use the supplied risk context (volatility estimates, name caps, groups, budgets, stress) to "
     "propose a portfolio that already fits; scaled weights are reported back in risk_overlay. "
+    "risk.exposures gives the portfolio's beta and style tilts (momentum, volatility, size) and each name's scores; "
+    "over max_portfolio_beta or max_style_exposure the names pushing the exposure are scaled down, so spread bets "
+    "across styles deliberately. "
     "market_snapshot gives each symbol's returns, volatility, beta, trend and liquidity from completed daily "
     "closes; use it rather than recomputing them with tools. "
     "In live runs data_desk and the desk_latest tool give the data desk's continuously updated intraday and "
@@ -273,6 +276,9 @@ class ModelBudget:
     failure_backoff_minutes: tuple = (5, 15, 60)
     skip_quiet_reviews: bool = True
     max_quiet_minutes: int = 120
+    # USD per New York trading day (estimated from model_prices_per_million): beyond it no new decision,
+    # critique or pre-open research starts that day; the once-a-day post-market review still runs.
+    max_daily_cost_usd: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "failure_backoff_minutes", tuple(self.failure_backoff_minutes))
@@ -288,6 +294,10 @@ class ModelBudget:
             raise RiskError("skip_quiet_reviews must be true or false")
         if type(self.max_quiet_minutes) is not int or not self.min_review_minutes <= self.max_quiet_minutes <= 1440:
             raise RiskError("max_quiet_minutes must be min_review_minutes..1440")
+        if self.max_daily_cost_usd is not None:
+            object.__setattr__(self, "max_daily_cost_usd", str(self.max_daily_cost_usd))
+            if not number("0") < number(self.max_daily_cost_usd) <= number("10000"):
+                raise RiskError("max_daily_cost_usd must be a positive amount up to 10000")
 
     @classmethod
     def from_config(cls, section):
@@ -406,6 +416,17 @@ def configuration(path, environ=None):
     CriticSettings.from_config(result.get("critic"))
     from .datadesk import DeskSettings
     DeskSettings.from_config(result.get("data_desk"))
+    budget = ModelBudget.from_config(result.get("model_budget"))
+    if budget.max_daily_cost_usd is not None:
+        from .costs import rate_for
+        models = set(model_selection(result).values())
+        critic = CriticSettings.from_config(result.get("critic"))
+        if critic.enabled and critic.model:
+            models.add(critic.model)
+        prices = result.get("model_prices_per_million")
+        unpriced = sorted(m for m in models if not rate_for(prices, m, len(models)))
+        if unpriced:
+            raise RiskError("FUND_MAX_DAILY_COST_USD needs FUND_MODEL_PRICES_JSON rates for: " + ", ".join(unpriced))
     return result
 
 
@@ -854,6 +875,8 @@ class AutonomousFund(Strategy):
                 # Missing account data must be disclosed, but does not prevent
                 # ordinary read-only market research while orders are disabled.
                 account = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+            if self._cost_exhausted(now, "premarket_research"):
+                return
             context = {"as_of": now.isoformat(), "historical": False, "phase": slot,
                        "market": market, "orders_enabled": False,
                        "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
@@ -1061,10 +1084,22 @@ class AutonomousFund(Strategy):
         return result
 
     def _record_agent(self, name, result, phase=None):
-        self.journal.event(self.get_datetime(), "agent", {
+        from .costs import call_cost, rate_for, token_counts
+        now = self.get_datetime()
+        tokens = token_counts(result.usage) if result.usage else None
+        cost = None
+        if tokens is not None and not self.scripted and not result.cache_hit:
+            # Priced once, here, so status, reports and the daily document need no price table.
+            models = set((getattr(self, "agent_models", None) or {}).values()) or {result.model}
+            cost = call_cost(tokens, rate_for((getattr(self, "config", None) or {}).get("model_prices_per_million"),
+                                              result.model, len(models)))
+            if cost:
+                self.journal.counter("model_cost_microusd", now, int(round(cost * 1e6)))
+        self.journal.event(now, "agent", {
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
             "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
-            "mock": self.scripted, "phase": phase})
+            "mock": self.scripted, "phase": phase, "tokens": tokens,
+            "cost_usd": round(cost, 6) if cost is not None else None})
         if result.parse_error or result.parsed is None:
             raise RiskError("Invalid structured agent answer")
         parsed = result.parsed
@@ -1260,8 +1295,22 @@ class AutonomousFund(Strategy):
                 encode({"previous_retry_at": retry, "role": "researcher"})))
         return None
 
+    def _cost_exhausted(self, now, step):
+        """True (and one notice per day) when today's estimated model cost reached max_daily_cost_usd."""
+        budget = getattr(self, "model_budget", None) or ModelBudget()
+        if budget.max_daily_cost_usd is None:
+            return False
+        spent = self.journal.counter("model_cost_microusd", now) / 1e6
+        if spent < float(budget.max_daily_cost_usd):
+            return False
+        self.notify("model_cost_budget_exhausted", {"day": trading_day(now), "cost_usd": round(spent, 4),
+                                                    "limit_usd": budget.max_daily_cost_usd, "skipped": step})
+        return True
+
     def _decide(self, account, now, paused):
         budget = getattr(self, "model_budget", None) or ModelBudget()
+        if self._cost_exhausted(now, "decision"):
+            return  # Accepted targets keep executing and protective levels stay armed; tomorrow resumes.
         runs = self.journal.counter("agent_runs", now)
         live = self.mode in {"local", "paper"}
         required_runs = 1 if live else 2
@@ -1297,6 +1346,8 @@ class AutonomousFund(Strategy):
                        "news_watch": "search phrases; a new matching headline wakes you for an early review"},
                    "model_budget": {"min_review_minutes": budget.min_review_minutes,
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day,
+                                    "cost_today_usd": round(self.journal.counter("model_cost_microusd", now) / 1e6, 4),
+                                    "max_daily_cost_usd": budget.max_daily_cost_usd,
                                     "skip_quiet_reviews": budget.skip_quiet_reviews,
                                     "max_quiet_minutes": budget.max_quiet_minutes}}
         champion = self._champion()
@@ -1345,6 +1396,20 @@ class AutonomousFund(Strategy):
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow(context, champion, decision, now, budget)
+
+    def _holding_weights(self, account):
+        """{symbol: weight of equity} of the current holdings at their last prices (exposure reporting)."""
+        equity = float(number(account.equity) or 0)
+        if equity <= 0:
+            return {}
+        weights = {}
+        for symbol, quantity in account.positions.items():
+            try:
+                price = float(self.get_last_price(Asset(symbol, asset_type="stock")) or 0)
+            except Exception:
+                continue  # A missing quote leaves the name out of the reported exposure.
+            weights[symbol] = float(number(quantity)) * price / equity
+        return weights
 
     def _holdings_key(self, account):
         """The AI-managed holdings as comparable text (the cash sweep is cash, not a holding)."""
@@ -1406,6 +1471,9 @@ class AutonomousFund(Strategy):
             return saved["critique"]
         if self.journal.counter("agent_runs", now) + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
             self.journal.event(now, "critic_skipped", {"reason": "model_budget"})
+            return None
+        if self._cost_exhausted(now, "critique"):
+            self.journal.event(now, "critic_skipped", {"reason": "model_cost_budget"})
             return None
         try:
             critique = self._record_agent("critic", self._agent_call("critic",
@@ -2151,12 +2219,39 @@ class AutonomousFund(Strategy):
             # The benchmark's own history gives every name an ex-ante beta for stress proxies.
             names = set(symbols) | {self.quant.stress_benchmark}
             scenarios = self._scenario_returns(names, now)
-            estimate = RiskEstimate({s: self._daily_closes(s, now) for s in names}, self.quant, scenarios=scenarios)
-            if getattr(self, "_scenario_deferred", None):
+            styles, complete = self._style_scores(now)
+            estimate = RiskEstimate({s: self._daily_closes(s, now) for s in names}, self.quant, scenarios=scenarios,
+                                    styles=styles)
+            if getattr(self, "_scenario_deferred", None) or not complete:
                 # Names still downloading are proxied pessimistically meanwhile; not cached.
                 return estimate
             self._estimates[key] = estimate
         return self._estimates[key]
+
+    def _style_scores(self, now):
+        """({style: {symbol: z}}, complete) across the tradable names, once per trading day.
+
+        Uses the daily bars the risk engine already reads. While some are still
+        downloading (no preparation budget left), the scores are left out and not
+        cached: z-scores over part of the universe would be wrong, so only the
+        beta limit applies until the next iteration completes them.
+        """
+        from .quant import style_values, style_zscores
+        day = trading_day(now)
+        cached = getattr(self, "_style_cache", None)
+        if cached and cached[0] == day:
+            return cached[1], True
+        kinds = (getattr(self, "config", None) or {}).get("universe") or {}
+        raw = {}
+        for symbol in sorted(self.universe):
+            if (day, symbol) not in (getattr(self, "_bars", None) or {}) and not self._may_prepare():
+                return {}, False
+            rows, _ = self._daily_bars(symbol, now)
+            for name, value in style_values(self._completed(rows, now), kinds.get(symbol, "stock") == "stock").items():
+                raw.setdefault(name, {})[symbol] = value
+        styles = {name: style_zscores(values) for name, values in sorted(raw.items()) if len(values) >= 5}
+        self._style_cache = (day, styles)
+        return styles, True
 
     def _scenario_returns(self, symbols, now):
         """Historical stress-window returns, persisted so each long history is fetched once per symbol.
@@ -2315,7 +2410,7 @@ class AutonomousFund(Strategy):
         """What the manager needs to propose a portfolio that already fits."""
         if getattr(self, "quant", None) is None:
             return None
-        from .quant import drawdown_scale
+        from .quant import STYLE_MEANING, drawdown_scale
         try:
             estimate = self._risk_estimate(set(self.universe), now)
             session = self._session(now, account)
@@ -2342,6 +2437,14 @@ class AutonomousFund(Strategy):
                                            float(self.quant.name_risk(s)) / estimate.annual_vol(s)), 4)
                               for s in estimate.vol},
                 "missing_history": sorted(estimate.missing),
+                "exposures": {
+                    "max_portfolio_beta": str(self.quant.max_portfolio_beta),
+                    "max_style_exposure": str(self.quant.max_style_exposure),
+                    "current": {k: round(v, 3) for k, v in estimate.exposures(self._holding_weights(account)).items()},
+                    "name_scores": {s: {"beta": round(estimate.exposure_beta(s), 2),
+                                        **{n: round(v[s], 2) for n, v in estimate.styles.items() if s in v}}
+                                    for s in sorted(self.universe)},
+                    "meaning": STYLE_MEANING + " Over a limit, the names pushing the exposure are scaled down pro rata."},
                 "groups": {name: {"limit": cap, "members": list(members)} for name, cap, members in self.quant.groups},
                 "drawdown": str(session["drawdown"]), "drawdown_exposure_budget": str(self.limits.max_exposure * scale),
                 "daily_loss": str(session["day_loss"]), "daily_loss_limit": str(self.quant.daily_loss_limit),

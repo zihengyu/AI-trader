@@ -135,6 +135,11 @@ class QuantPolicy:
     correlation_shrinkage: Decimal = Decimal("0.25")
     # Buy-and-hold loss of the current weights in each historical stress window.
     max_scenario_loss: Decimal = Decimal("0.35")
+    # Portfolio exposures (sum of weight x score): beta to the stress benchmark and cross-sectional
+    # style z-scores (momentum, volatility, size). Over a limit, the names pushing it are scaled
+    # down pro rata, like a group cap; the AI sees every exposure in its risk context.
+    max_portfolio_beta: Decimal = Decimal("1.0")
+    max_style_exposure: Decimal = Decimal("0.75")
     stress_scenarios: tuple = tuple((name, start, end) for name, (start, end) in sorted(DEFAULT_SCENARIOS.items()))
     groups: tuple = ()
     etf_symbols: tuple = ()
@@ -183,6 +188,8 @@ class QuantPolicy:
         _fraction(self.correlation_lambda, "correlation_lambda", Decimal("0.5"), Decimal("0.999"))
         _fraction(self.correlation_shrinkage, "correlation_shrinkage", inclusive_low=True)
         _fraction(self.max_scenario_loss, "max_scenario_loss")
+        _fraction(self.max_portfolio_beta, "max_portfolio_beta", Decimal("0.1"), Decimal("3"))
+        _fraction(self.max_style_exposure, "max_style_exposure", Decimal("0.1"), Decimal("5"))
         _scenarios({name: (start, end) for name, start, end in self.stress_scenarios})
         for key in ("min_annual_vol", "unknown_annual_vol", "target_portfolio_vol", "max_portfolio_es",
                     "max_name_risk", "max_etf_name_risk", "max_adv_participation", "drawdown_soft", "daily_loss_limit",
@@ -243,10 +250,12 @@ class RiskEstimate:
     to {"benchmark": return or None, "returns": {symbol: return or None}}.
     """
 
-    def __init__(self, histories, policy, scenarios=None):
+    def __init__(self, histories, policy, scenarios=None, styles=None):
         self.policy = policy
         self.benchmark = policy.stress_benchmark
         self.scenarios = dict(scenarios or {})
+        # {style: {symbol: cross-sectional z-score}}; a name without a score counts as neutral (0).
+        self.styles = {name: dict(scores) for name, scores in (styles or {}).items()}
         sessions = {str(day) for rows in histories.values() for day, _ in rows}
         returns = {symbol: daily_returns(rows, sessions) for symbol, rows in histories.items()}
         usable = {s for s, r in returns.items() if len(r) >= policy.min_history_days}
@@ -289,6 +298,21 @@ class RiskEstimate:
             return None
         i, b = self.symbols.index(symbol), self.symbols.index(self.benchmark)
         return float(self.cov[i, b] / self.cov[b, b]) if self.cov[b, b] > 0 else None
+
+    def exposure_beta(self, symbol):
+        """Beta for the exposure limit: the estimate, or the same pessimism as a missing stress history."""
+        beta = self.beta(symbol)
+        if beta is None:
+            beta = float(self.policy.unknown_annual_vol) / max(self.annual_vol(self.benchmark), 1e-9)
+        return beta
+
+    def exposures(self, weights):
+        """{"beta": sum w*beta, style: sum w*z} of a portfolio (fractions of equity times scores)."""
+        weights = {s: float(w) for s, w in weights.items() if float(w) > 0}
+        result = {"beta": sum(w * self.exposure_beta(s) for s, w in weights.items())}
+        for name, scores in sorted(self.styles.items()):
+            result[name] = sum(w * scores.get(s, 0.0) for s, w in weights.items())
+        return result
 
     def _scenario_return(self, name, symbol):
         """(return, proxied). A missing window is never milder than the benchmark's own loss."""
@@ -352,6 +376,37 @@ class RiskEstimate:
                 "gross_exposure": sum(weights.values()), "scenario_losses": losses,
                 "worst_scenario": worst, "worst_scenario_loss": losses[worst] if worst else None,
                 "scenario_proxied": proxied, "scenarios_unavailable": unavailable}
+
+
+STYLE_MEANING = ("Cross-sectional z-scores within the tradable universe, completed sessions only: momentum = the "
+                 "12-1 month return (252 to 21 sessions ago); volatility = 63-session realized volatility; size = "
+                 "log 60-session mean dollar volume, a size proxy for stocks (ETFs count as neutral). Winsorized at "
+                 "+-3; a name without enough history counts as neutral. Exposure = sum of weight x score; beta = "
+                 "sum of weight x ex-ante beta to the stress benchmark.")
+
+
+def style_zscores(values, clip=3.0):
+    """{symbol: z} of raw style values across names, winsorized; all zero when the values do not vary."""
+    names = sorted(values)
+    data = np.array([float(values[n]) for n in names], dtype=float)
+    spread = float(data.std())
+    if not len(names) or spread <= 0:
+        return {n: 0.0 for n in names}
+    return {n: float(np.clip((v - data.mean()) / spread, -clip, clip)) for n, v in zip(names, data)}
+
+
+def style_values(rows, stock=True):
+    """Raw style values from completed (date, close, volume) rows; a style without enough history is absent."""
+    closes = [c for _, c, _ in rows]
+    result = {}
+    if len(closes) >= 253:
+        result["momentum"] = closes[-22] / closes[-253] - 1
+    if len(closes) >= 64:
+        result["volatility"] = float(np.std(np.diff(np.log(closes[-64:])), ddof=1) * math.sqrt(TRADING_DAYS))
+    dollars = [c * v for _, c, v in rows[-60:] if v is not None and v == v and v > 0]
+    if stock and len(dollars) >= 40:
+        result["size"] = math.log(sum(dollars) / len(dollars))
+    return result
 
 
 def _ewma_cov(returns, lam):
@@ -454,6 +509,33 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
                     binding.append(f"group:{name}")
         if not changed:
             break
+    def scores(name):
+        if name == "beta":
+            return {s: estimate.exposure_beta(s) for s in weights}
+        return estimate.styles.get(name, {})
+    limits_by_exposure = [("beta", float(policy.max_portfolio_beta), False)] + [
+        (name, float(policy.max_style_exposure), True) for name in sorted(estimate.styles)]
+    for _ in range(20):  # Each pass only reduces weights, so the passes converge.
+        changed = False
+        for name, cap, two_sided in limits_by_exposure:
+            score = scores(name)
+            exposure = sum(w * score.get(s, 0.0) for s, w in weights.items())
+            for sign in ((1, -1) if two_sided else (1,)):
+                if sign * exposure <= cap + 1e-12:
+                    continue
+                # Scale the names pushing the exposure past the limit, pro rata, to meet it exactly.
+                pushing = [s for s, w in weights.items() if sign * w * score.get(s, 0.0) > 0]
+                push = sum(sign * weights[s] * score[s] for s in pushing)
+                factor = max(0.0, (cap - (sign * exposure - push)) / push)
+                for s in pushing:
+                    weights[s] *= factor
+                exposure = sum(w * score.get(s, 0.0) for s, w in weights.items())
+                changed = True
+                label = "portfolio_beta" if name == "beta" else f"style:{name}"
+                if label not in binding:
+                    binding.append(label)
+        if not changed:
+            break
     budget = min(float(exposure_budget), float(limits.max_exposure))
     total = sum(weights.values())
     if total > budget:
@@ -487,12 +569,20 @@ def construct(targets, current, estimate, policy, limits, exposure_budget):
     for name, cap, members in policy.groups:
         if sum(result.get(s, 0) for s in members) > Decimal(cap) + Decimal("0.000001"):
             raise RiskError("Quantitative construction failed its group post-condition")
+    exposures = estimate.exposures(result)
+    # Flooring a weight can move a mixed-sign exposure by at most one weight step times the largest score.
+    slack = 1e-9 + len(result) * float(WEIGHT_STEP) * 10
+    if exposures["beta"] > float(policy.max_portfolio_beta) + slack or any(
+            abs(exposures[name]) > float(policy.max_style_exposure) + slack for name in estimate.styles):
+        raise RiskError("Quantitative construction failed its exposure post-condition")
     return result, {
         "requested": {s: str(w) for s, w in targets.items()},
         "constructed": {s: str(w) for s, w in result.items()},
         "binding": binding, "scale": scale, "exposure_budget": budget,
         "requested_metrics": estimate.metrics({s: float(w) for s, w in targets.items()}),
         "constructed_metrics": after,
+        "requested_exposures": estimate.exposures({s: float(w) for s, w in targets.items()}),
+        "constructed_exposures": exposures,
         "name_caps": {s: min(float(limits.max_position), float(policy.name_risk(s)) / estimate.annual_vol(s))
                       for s in sorted(set(targets) | set(current)) if s in estimate.vol},
         "missing_history": sorted(estimate.missing & (set(targets) | set(current))),

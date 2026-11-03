@@ -68,10 +68,16 @@ def approval_message(details):
             str(details.get("rationale") or "旧请求没有通知理由，请查看 approvals 中的完整原文。"))
 
 
+def _cost_text(costs):
+    from .status import cost_line
+    return cost_line(costs) or "模型费用：没有可估算的调用（设置 FUND_MODEL_PRICES_JSON 后显示）"
+
+
 FACTOR_STATUS = {"validated": "通过", "rejected": "未通过", "insufficient_data": "数据不足", "invalid": "表达式无效"}
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
-                "postmarket_review_error", "premarket_research_error", "model_budget_exhausted"}
+                "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
+                "model_cost_budget_exhausted"}
 
 
 def _percent(value):
@@ -115,6 +121,7 @@ def daily_document(root, sequence):
              f"运行至报告截止的最大观测回撤：{snapshot['max_observed_drawdown']}",
              f"运行至报告截止的已确认交易费用 USD：{snapshot['observed_fees']}（null 表示不完整）",
              f"运行至报告截止的模型 usage：{encode(snapshot['model_usage_by_model'])}",
+             _cost_text(snapshot.get("model_costs")),
              f"没有确认结束的模型调用（用量未知）：{encode(snapshot['unfinished_model_calls'])}",
              "模型美元费用须按配置费率查看 report；本报告不把缺少费率或未知 usage 当作零费用。", "",
              "## 买卖、成交及人工审批记录", "",
@@ -302,6 +309,9 @@ def readable(kind, details, sequence=None):
     elif kind == "data_desk_stale" and isinstance(details, dict):
         text = (f"ℹ️ 数据员已 {details.get('heartbeat_minutes_ago')} 分钟没有更新：交易进程改为自己拉取行情、资讯和宏观数据，"
                 "交易不受影响。查看：bash scripts/fund-logs.sh errors；重启：bash scripts/fund-restart.sh -y")
+    elif kind == "model_cost_budget_exhausted" and isinstance(details, dict):
+        text = (f"ℹ️ 今日模型费用已到上限（约 ${details.get('cost_usd')} / ${details.get('limit_usd')}）："
+                "当天不再发起新决策、反方审查和盘前研究；已有目标和止损照常执行，明天恢复。")
     elif kind == "drawdown_pause":
         text = "🚨 回撤触及上限，暂停增加仓位；卖出和止损照常。确认后由人工复位（reset-drawdown）。"
     elif kind == "construction_switched" and isinstance(details, dict):
