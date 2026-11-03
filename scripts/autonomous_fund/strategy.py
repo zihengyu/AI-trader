@@ -729,6 +729,8 @@ class AutonomousFund(Strategy):
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
+                       # Warms today's earnings calendar before the open, off the trading path.
+                       "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -1610,11 +1612,8 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == day:
             return cached[1]
         try:
-            panels = self._factor_panel(now)
-            if isinstance(panels, tuple):  # Older test doubles return (close, volume).
-                panels = panels[0] if panels[0] is None else {"stocks": {"close": panels[0], "volume": panels[1]},
-                                                              "etfs": {"close": panels[0], "volume": panels[1]}}
-            context = lab.context(now, panels, tradable=set(self.universe))
+            from .factors import as_panels
+            context = lab.context(now, as_panels(self._factor_panel(now)), tradable=set(self.universe))
             sec = getattr(self, "sec", None)
             context["fundamentals"] = ({"source": "SEC EDGAR company facts (point in time)",
                                         "errors": dict(list(sec.errors.items())[:10])} if sec is not None else
@@ -1718,11 +1717,15 @@ class AutonomousFund(Strategy):
             db.execute("""CREATE TABLE IF NOT EXISTS fund_scenario_returns (symbol TEXT NOT NULL, scenario TEXT NOT NULL,
                 start TEXT NOT NULL, end TEXT NOT NULL, value REAL, recorded_at TEXT NOT NULL,
                 PRIMARY KEY (symbol, scenario, start, end))""")
-            stored = {(r["symbol"], r["scenario"], r["start"], r["end"]): r["value"]
-                      for r in db.execute("SELECT * FROM fund_scenario_returns")}
+            rows = list(db.execute("SELECT * FROM fund_scenario_returns"))
+        stored = {(r["symbol"], r["scenario"], r["start"], r["end"]): r["value"] for r in rows}
+        # A gap ("no history in this window") is rechecked monthly: a provider may have
+        # returned a shortened history; a found return is a historical fact and is kept.
+        recheck = {(r["symbol"], r["scenario"], r["start"], r["end"]) for r in rows if r["value"] is None and
+                   (instant(now) - instant(r["recorded_at"])).days >= 30}
         failed = self.__dict__.setdefault("_scenario_failed", set())
         for symbol in sorted(wanted):
-            needed = [w for w in windows if (symbol, *w) not in stored]
+            needed = [w for w in windows if (symbol, *w) not in stored or (symbol, *w) in recheck]
             if not needed or (today, symbol) in failed:
                 continue
             first = min(start for _, start, _ in needed)
@@ -1733,6 +1736,8 @@ class AutonomousFund(Strategy):
                 rows = [] if frame is None or "close" not in frame else [
                     (str(index.date()), _finite(close)) for index, close in zip(frame.index, frame["close"])]
                 rows = [(d, c) for d, c in rows if d < today and c == c and c > 0]
+                if not rows:  # Nothing came back: a failed read, not evidence that no history exists.
+                    raise RiskError("empty history")
             except Exception as exc:
                 failed.add((today, symbol))
                 self.journal.event(now, "scenario_history_unavailable", {"symbol": symbol, "error": type(exc).__name__})
@@ -2002,12 +2007,18 @@ class AutonomousFund(Strategy):
         if result["orders"]:
             order = result["orders"][0]
             if sweep is not None and order.side == "buy":
-                from .cash import funding_sell
-                funding = funding_sell(account, order, self._sweep_quote(now), self.limits, sweep)
-                if funding is not None:
-                    # Fund the purchase first; it follows on a later iteration through the same checks.
-                    self._submit(funding, now, active["id"], kind="cash_sweep")
-                    return
+                from .cash import funding_needed, funding_sell
+                # The sweep quote is needed only when real cash cannot fund this purchase.
+                if funding_needed(account, order, self.limits, sweep) > 0:
+                    try:
+                        funding = funding_sell(account, order, self._sweep_quote(now), self.limits, sweep)
+                    except RiskError as exc:
+                        self.journal.event(now, "cash_sweep_unavailable", {"step": "funding", "error": str(exc)})
+                        return  # The purchase cannot be funded now; retried on a later iteration.
+                    if funding is not None:
+                        # Fund the purchase first; it follows on a later iteration through the same checks.
+                        self._submit(funding, now, active["id"], kind="cash_sweep")
+                        return
             self._execute(order, now, account, prices)
         elif result["request"]:
             from .execution import ApprovalPending
@@ -2016,11 +2027,15 @@ class AutonomousFund(Strategy):
             self.execution.complete(active["id"], now)
             if sweep is not None:
                 # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
+                # Parking is optional: a failure is recorded, never raised past a completed allocation.
                 from .cash import park_buy
-                park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
-                                min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
-                if park is not None:
-                    self._submit(park, now, active["id"], kind="cash_sweep")
+                try:
+                    park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
+                                    min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
+                    if park is not None:
+                        self._submit(park, now, active["id"], kind="cash_sweep")
+                except RiskError as exc:
+                    self.journal.event(now, "cash_sweep_unavailable", {"step": "park", "error": str(exc)})
 
     def _sweep_quote(self, now):
         quote = self._price(self.cash_sweep.symbol)

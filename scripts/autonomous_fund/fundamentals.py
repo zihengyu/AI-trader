@@ -158,7 +158,7 @@ def extract(payload):
 def as_of(series, index):
     """Align [(filed, value)] to trading dates: a filing counts only from the day AFTER it was accepted."""
     values, position, current = [], 0, None
-    ordered = sorted(series)
+    ordered = sorted(series, key=lambda item: item[0])  # By filing date only: values may be None.
     for stamp in index:
         day = stamp.date() if hasattr(stamp, "date") else _d(stamp)
         while position < len(ordered) and _d(ordered[position][0]) < day:

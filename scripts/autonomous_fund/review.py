@@ -300,10 +300,8 @@ def review_after_close(strategy):
     lab = getattr(strategy, "factor_lab", None)
     if lab is not None and review["factor_proposals"]:
         try:
-            panels = strategy._factor_panel(now)
-            if isinstance(panels, tuple):  # (close, volume) from older callers and test doubles.
-                panels = panels[0] if panels[0] is None else {"stocks": {"close": panels[0], "volume": panels[1]},
-                                                              "etfs": {"close": panels[0], "volume": panels[1]}}
+            from .factors import as_panels
+            panels = as_panels(strategy._factor_panel(now))
             if not panels:
                 raise RiskError("Factor history unavailable")
             testable = [p for p in review["factor_proposals"] if (p.get("universe") or "stocks") in panels]

@@ -81,6 +81,13 @@ def real_cash(account):
     return number(account.cash) - number(account.cash_equivalent_value)
 
 
+def funding_needed(account, order, limits, sweep):
+    """Cash the purchase still lacks after the buffer; 0 when real cash already funds it."""
+    need = (order.quantity * number(order.limit) * (1 + limits.fee_buffer)
+            + sweep.keep_cash * number(account.equity) - real_cash(account))
+    return max(Decimal("0"), need)
+
+
 def funding_sell(account, order, quote, limits, sweep):
     """Sell enough of the sweep for `order` (a purchase) plus the cash buffer; None when cash suffices."""
     need = (order.quantity * number(order.limit) * (1 + limits.fee_buffer)

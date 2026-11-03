@@ -80,6 +80,30 @@ def finnhub_dates(symbol, today, key, get):
     return sorted({_day(row["date"]).isoformat() for row in rows if row.get("date")})
 
 
+def bounded(function, seconds):
+    """function() with a time limit; the Yahoo calendar call takes no timeout of its own.
+
+    A daemon thread, so a hung request can never keep the process alive; it is
+    abandoned and the symbol's date is reported unavailable.
+    """
+    import threading
+    outcome = {}
+
+    def target():
+        try:
+            outcome["value"] = function()
+        except Exception as exc:  # Reported to the caller below.
+            outcome["error"] = exc
+    worker = threading.Thread(target=target, name="earnings-calendar", daemon=True)
+    worker.start()
+    worker.join(seconds)
+    if worker.is_alive():
+        raise TimeoutError(f"calendar request exceeded {seconds} seconds")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["value"]
+
+
 def within(event_day, today, window_days):
     """True when the event is today or within `window_days` business days after today."""
     event_day, today = _day(event_day), _day(today)
@@ -90,9 +114,9 @@ def within(event_day, today, window_days):
 
 
 class EarningsCalendar:
-    def __init__(self, journal, settings, environ=None, get=None, yahoo=None):
+    def __init__(self, journal, settings, environ=None, get=None, yahoo=None, timeout_seconds=10):
         import requests
-        self.journal, self.settings = journal, settings
+        self.journal, self.settings, self.timeout_seconds = journal, settings, timeout_seconds
         self.environ = os.environ if environ is None else environ
         self.get, self.yahoo = get or requests.get, yahoo or yahoo_dates
         with journal.connection() as db:
@@ -121,7 +145,7 @@ class EarningsCalendar:
                 try:
                     source = self.source()
                     dates = (finnhub_dates(symbol, today, self.environ["FINNHUB_API_KEY"], self.get)
-                             if source == "finnhub" else self.yahoo(symbol))
+                             if source == "finnhub" else bounded(lambda: self.yahoo(symbol), self.timeout_seconds))
                 except Exception as exc:
                     error = str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__
                 with self.journal.connection() as db:
