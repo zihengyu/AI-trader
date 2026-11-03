@@ -1444,7 +1444,9 @@ for local runs without model calls or orders; ``FUND_AUTO_RESUME`` to let the
 independent monitor lift a STOP written by a service restart or a liveness fault
 after continuous health, never an operator's stop), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
 ``FUND_CRITIC``, ``FUND_CRITIC_MODEL``, ``FUND_REASONING_EFFORT``, ``FUND_MAX_AGENT_RUNS_PER_DAY``,
-``FUND_MIN_REVIEW_MINUTES``, ``FUND_MODEL_PRICES_JSON``), user limits
+``FUND_MIN_REVIEW_MINUTES``, ``FUND_SKIP_QUIET_REVIEWS`` to skip a scheduled
+manager review when nothing changed since its allocation completed,
+``FUND_MAX_QUIET_MINUTES`` for the longest such quiet stretch, ``FUND_MODEL_PRICES_JSON``), user limits
 (``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
 ``FUND_MAX_POSITION``, ``FUND_MAX_EXPOSURE``, ``FUND_MAX_DRAWDOWN``,
 ``FUND_DAILY_ORDERS``, ``FUND_DAILY_LOSS_LIMIT``, ``FUND_TARGET_VOL``,

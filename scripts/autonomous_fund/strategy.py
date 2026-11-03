@@ -59,6 +59,9 @@ RESEARCHER_PROMPT = (
     "evidence, and carry useful selection/timing lessons into current research. "
     "operator_mandate instructions come from the human operator and bound what may be proposed. "
     "Use scorecards (scored predictions and allocation excess returns) to weigh past ideas. "
+    "market_snapshot already gives every eligible symbol's returns, volatility, beta, trend and liquidity from "
+    "completed daily closes: use it instead of recomputing them with tools, and spend tool calls on news, filings "
+    "and evidence it cannot contain. "
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
     "of time; an unfinished run returns nothing."
@@ -98,6 +101,8 @@ MANAGER_PROMPT = (
     "caps, sector/group caps, the drawdown exposure budget, the daily loss stop and liquidity. "
     "Use the supplied risk context (volatility estimates, name caps, groups, budgets, stress) to "
     "propose a portfolio that already fits; scaled weights are reported back in risk_overlay. "
+    "market_snapshot gives each symbol's returns, volatility, beta, trend and liquidity from completed daily "
+    "closes; use it rather than recomputing them with tools. "
     "Sales execute automatically. Purchases run automatically inside a daily risk-increase "
     "envelope; purchases beyond it, or during market stress, wait for one operator approval "
     "of the whole plan. Choose next_review_at no earlier than min_review_minutes. "
@@ -107,6 +112,9 @@ MANAGER_PROMPT = (
     "take_profit_weight, and with price alerts: a deterministic watcher checks them every minute without "
     "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
     "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
+    "A review you scheduled is skipped without calling you while nothing has changed (no trigger, fill, holding "
+    "change or new research since your allocation completed); you are still called at least every "
+    "model_budget.max_quiet_minutes, so set alerts and news_watch for anything that should wake you sooner. "
     "Calibrate confidence with scorecards and abandon ideas whose scored record is persistently weak; "
     "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
@@ -239,11 +247,18 @@ class Mandate:
 
 @dataclass(frozen=True)
 class ModelBudget:
-    """Bounded inference: per-day run budget, review floor and failure backoff."""
+    """Bounded inference: per-day run budget, review floor, failure backoff and quiet-review skips.
+
+    skip_quiet_reviews: a review the manager scheduled is skipped (no model call)
+    when nothing it decided on has changed: see AutonomousFund._quiet_review. The
+    manager is still called at least every max_quiet_minutes during a session.
+    """
     max_agent_runs_per_day: int = 60
     reserved_review_runs: int = 4
     min_review_minutes: int = 15
     failure_backoff_minutes: tuple = (5, 15, 60)
+    skip_quiet_reviews: bool = True
+    max_quiet_minutes: int = 120
 
     def __post_init__(self):
         object.__setattr__(self, "failure_backoff_minutes", tuple(self.failure_backoff_minutes))
@@ -255,6 +270,10 @@ class ModelBudget:
             raise RiskError("min_review_minutes must be 1..1440")
         if not self.failure_backoff_minutes or any(type(m) is not int or not 1 <= m <= 1440 for m in self.failure_backoff_minutes):
             raise RiskError("failure_backoff_minutes must be a non-empty list of 1..1440 minute delays")
+        if type(self.skip_quiet_reviews) is not bool:
+            raise RiskError("skip_quiet_reviews must be true or false")
+        if type(self.max_quiet_minutes) is not int or not self.min_review_minutes <= self.max_quiet_minutes <= 1440:
+            raise RiskError("max_quiet_minutes must be min_review_minutes..1440")
 
     @classmethod
     def from_config(cls, section):
@@ -816,6 +835,7 @@ class AutonomousFund(Strategy):
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
+                       "market_snapshot": self._market_snapshot(now),
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
@@ -1125,6 +1145,9 @@ class AutonomousFund(Strategy):
             if self.next_review and now < self.next_review:
                 self._warm_optional(now)
                 return
+            if self._quiet_review(account, now, paused):
+                self._warm_optional(now)
+                return
             self._decide(account, now, paused)
         except Exception as exc:
             from .execution import ApprovalPending
@@ -1231,6 +1254,7 @@ class AutonomousFund(Strategy):
                    "strategy_followup": self._strategy_evaluations(),
                    "risk_increase_paused": paused,
                    "risk": self._risk_context(account, now),
+                   "market_snapshot": self._market_snapshot(now),
                    "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
@@ -1245,7 +1269,9 @@ class AutonomousFund(Strategy):
                        "alerts": "wake you for an early review when a price crosses above/below a level",
                        "news_watch": "search phrases; a new matching headline wakes you for an early review"},
                    "model_budget": {"min_review_minutes": budget.min_review_minutes,
-                                    "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day}}
+                                    "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day,
+                                    "skip_quiet_reviews": budget.skip_quiet_reviews,
+                                    "max_quiet_minutes": budget.max_quiet_minutes}}
         champion = self._champion()
         failure_role = "manager" if live else "researcher"
         try:
@@ -1271,6 +1297,9 @@ class AutonomousFund(Strategy):
             validate_decision(decision, now, self.universe, self.limits)
             minimum = timedelta(minutes=budget.min_review_minutes)
             self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
+            # What this decision saw: a later scheduled review with nothing new can skip the model call.
+            self.journal.set_meta("last_model_decision", {"at": now.isoformat(), "day": trading_day(now),
+                                                          "research": self._research_key()})
         except Exception:
             self._decision_failed(budget, role=failure_role)
             raise
@@ -1290,18 +1319,73 @@ class AutonomousFund(Strategy):
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow(context, champion, decision, now, budget)
 
+    def _holdings_key(self, account):
+        """The AI-managed holdings as comparable text (the cash sweep is cash, not a holding)."""
+        sweep = getattr(getattr(self, "cash_sweep", None), "symbol", None)
+        return {symbol: str(number(quantity)) for symbol, quantity in sorted(account.positions.items())
+                if number(quantity) != 0 and symbol != sweep}
+
+    def _research_key(self):
+        """Which saved research the manager saw: its completion time, or None."""
+        packet = getattr(self, "premarket_research", None)
+        return packet.get("completed_at") if isinstance(packet, dict) else None
+
+    def _quiet_review(self, account, now, paused=False):
+        """True when a scheduled review has nothing new for the manager: the model call is skipped.
+
+        All must hold: skipping is enabled; no watcher trigger (alert, large move,
+        market stress, news match) is waiting; purchases are not paused; the last
+        model decision was made this trading day less than max_quiet_minutes ago;
+        its allocation completed and the holdings are exactly what it left (no stop,
+        take-profit or other fill since); and the saved research is the one it saw.
+        Levels and alerts stay armed meanwhile, and the next check is one review
+        floor later. Anything else calls the manager as before.
+        """
+        budget = getattr(self, "model_budget", None) or ModelBudget()
+        if not budget.skip_quiet_reviews or paused or getattr(self, "_triggers", None):
+            return False
+        last = self.journal.get_meta("last_model_decision") or {}
+        done = self.journal.get_meta("allocation_complete") or {}
+        try:
+            made = instant(last["at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        latest = self.execution.latest(now)
+        if (last.get("day") != trading_day(now) or now - made >= timedelta(minutes=budget.max_quiet_minutes)
+                or latest is None or latest["state"] != "complete" or done.get("decision_id") != latest["id"]
+                or done.get("positions") != self._holdings_key(account)
+                or last.get("research") != self._research_key()):
+            return False
+        self.next_review = now + timedelta(minutes=budget.min_review_minutes)
+        self.journal.event(now, "review_skipped", {
+            "reason": "nothing changed since the last decision", "decision_id": latest["id"],
+            "decided_at": last["at"], "next_check": self.next_review.isoformat(),
+            "manager_due_by": (made + timedelta(minutes=budget.max_quiet_minutes)).isoformat()})
+        return True
+
     def _critique(self, context, research, budget, now):
         """The devil's advocate's critique, or None (disabled, no budget, or failed: never blocks a decision)."""
         settings = getattr(self, "critic", None)
         if settings is None or not settings.enabled or not getattr(self, "_critic_ready", False):
             return None
+        # The critique argues against the research and the holdings. While both (and the session, and
+        # any wake-up reason) are unchanged, a new call would argue the same case again: reuse it.
+        key = hashlib.sha256(json.dumps(
+            [trading_day(now), research, (context.get("account") or {}).get("positions"),
+             context.get("watch_triggers")], sort_keys=True, default=str).encode()).hexdigest()
+        saved = self.journal.get_meta("critique_cache") or {}
+        if saved.get("key") == key and saved.get("critique") is not None:
+            self.journal.event(now, "critic_reused", {"critique_at": saved.get("at")})
+            return saved["critique"]
         if self.journal.counter("agent_runs", now) + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
             self.journal.event(now, "critic_skipped", {"reason": "model_budget"})
             return None
         try:
-            return self._record_agent("critic", self._agent_call("critic",
+            critique = self._record_agent("critic", self._agent_call("critic",
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
                 context={**context, "research": research}), phase="critique")
+            self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
+            return critique
         except Exception as exc:
             self.journal.event(self.get_datetime(), "critic_unavailable",
                                {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
@@ -1871,6 +1955,38 @@ class AutonomousFund(Strategy):
         window = rows[-(self.quant.es_lookback_days + 5):]
         return [(d, close) for d, close, _ in self._completed(window, now)]
 
+    def _market_snapshot(self, now):
+        """Returns, volatility, beta, trend and liquidity per tradable symbol, once per trading day.
+
+        Computed from the completed daily bars the risk engine already reads (or the
+        day's prefetched store), so the agents need not spend tool calls on them.
+        Symbols not read yet wait for a later iteration once the preparation budget
+        is spent; such a partial snapshot lists them under `deferred` and is not cached.
+        """
+        if getattr(self, "quant", None) is None:
+            return None
+        day = trading_day(now)
+        cached = getattr(self, "_market_snapshot_cache", None)
+        if cached and cached[0] == day:
+            return cached[1]
+        from .snapshot import snapshot
+        benchmark = self.quant.stress_benchmark
+        histories, deferred = {}, []
+        for symbol in sorted(set(self.universe) | {benchmark}):
+            if (day, symbol) not in (getattr(self, "_bars", None) or {}) and not self._may_prepare():
+                deferred.append(symbol)
+                continue
+            rows, _ = self._daily_bars(symbol, now)
+            histories[symbol] = self._completed(rows, now)
+        try:
+            result = snapshot(histories, benchmark)
+        except Exception as exc:  # Context for the AI: never costs the iteration.
+            return {"unavailable": type(exc).__name__}
+        if deferred:
+            return {**result, "deferred": deferred}
+        self._market_snapshot_cache = (day, result)
+        return result
+
     def _risk_estimate(self, symbols, now):
         from .quant import RiskEstimate
         key = (trading_day(now), frozenset(symbols))
@@ -1967,7 +2083,7 @@ class AutonomousFund(Strategy):
         """Advance optional data preparation with what is left of this iteration's budget."""
         if getattr(self, "mode", None) not in {"paper", "local"}:
             return
-        for step in (self._factor_context, self._earnings_caps, self._macro_context):
+        for step in (self._market_snapshot, self._factor_context, self._earnings_caps, self._macro_context):
             if not self._may_prepare():
                 return
             try:
@@ -2252,6 +2368,8 @@ class AutonomousFund(Strategy):
             raise ApprovalPending("Purchase beyond the automatic risk envelope waits for plan approval")
         elif result["complete"]:
             self.execution.complete(active["id"], now)
+            self.journal.set_meta("allocation_complete", {"decision_id": active["id"],
+                                                          "positions": self._holdings_key(account)})
             if sweep is not None:
                 # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
                 # Parking is optional: a failure is recorded, never raised past a completed allocation.

@@ -93,6 +93,8 @@ SETTINGS = {
     "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
+    "FUND_SKIP_QUIET_REVIEWS": (("model_budget", "skip_quiet_reviews"), _bool, False, "模型", "到点复核时若无任何变化（无提醒、无成交、持仓和研究不变）则跳过本次模型调用"),
+    "FUND_MAX_QUIET_MINUTES": (("model_budget", "max_quiet_minutes"), _int, False, "模型", "连续跳过复核的最长时间（分钟），到时一定调用基金经理"),
     "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
     # ----- User constraints (the operator's mandate and hard limits)
     "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),

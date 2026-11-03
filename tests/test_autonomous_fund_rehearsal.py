@@ -133,3 +133,20 @@ def test_model_call_durations_are_reported_and_a_call_past_the_monitor_limit_fai
     assert calls[0] == {"name": "researcher", "seconds": 950.0} and calls[1]["unfinished"]
     report = _finish(tmp_path / "out", Stages(), tmp_path, 5, extra={"agent_calls": calls})
     assert report["verdict"] == "fail" and "researcher 950.0 秒" in text(report)
+
+
+def test_each_model_call_reports_its_tokens_or_a_cache_hit(tmp_path):
+    from datetime import datetime, timedelta, timezone
+    from scripts.autonomous_fund.rehearsal import agent_calls, text
+    journal = Journal(tmp_path / "copy", "synthetic-tokens")
+    start = datetime(2026, 11, 3, 2, tzinfo=timezone.utc)
+    for key, name, usage, hit in (("a", "researcher", {"prompt_tokens": 1200, "completion_tokens": 300}, False),
+                                  ("b", "critic", None, True)):
+        journal.event(start, "agent_call_started", {"id": key, "name": name})
+        journal.event(start + timedelta(seconds=40), "agent_call_finished", {"id": key, "name": name})
+        journal.event(start + timedelta(seconds=40), "agent", {"name": name, "usage": usage, "cache_hit": hit})
+    calls = agent_calls(journal)
+    assert calls[0] == {"name": "researcher", "seconds": 40.0, "input_tokens": 1200, "output_tokens": 300}
+    assert calls[1]["cache_hit"] is True
+    shown = text({"verdict": "ready", "copy": "c", "stages": [], "agent_calls": calls})
+    assert "输入 1200 / 输出 300 tokens" in shown and "critic 40.0 秒（缓存命中）" in shown

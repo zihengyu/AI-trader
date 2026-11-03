@@ -84,10 +84,23 @@ def _context_judge(value):
     return "ok", ""
 
 
+def _snapshot_judge(value):
+    verdict, detail = _context_judge(value)
+    if verdict == "ok" and isinstance(value, dict):
+        missing = value.get("no_history") or []
+        detail = f"{len(value.get('symbols') or {})} symbols" + (f", no history: {', '.join(missing)}" if missing else "")
+    return verdict, detail
+
+
 def agent_calls(journal):
-    """Each model call's duration from the copy's own agent_call_started/finished events."""
+    """Each model call's duration, and its tokens when the provider reported them, from the copy's events.
+
+    The `agent` event recorded right after a finished call carries its usage; a
+    reused cached answer used no tokens and is marked cache_hit.
+    """
+    from .report import token_counts
     from .risk import instant
-    started, calls = {}, []
+    started, calls, awaiting = {}, [], {}
     for row in journal.all_events():
         body = row["body"]
         if row["kind"] == "agent_call_started":
@@ -95,8 +108,26 @@ def agent_calls(journal):
         elif row["kind"] == "agent_call_finished" and body.get("id") in started:
             name, began = started.pop(body["id"])
             calls.append({"name": name, "seconds": round((instant(row["at"]) - began).total_seconds(), 1)})
+            awaiting.setdefault(name, []).append(calls[-1])
+        elif row["kind"] == "agent" and awaiting.get(body.get("name")):
+            call = awaiting[body["name"]].pop(0)
+            if body.get("cache_hit"):
+                call["cache_hit"] = True
+            elif body.get("usage"):
+                try:
+                    call.update({k: v for k, v in token_counts(body["usage"]).items() if k != "cached_input_tokens"})
+                except (TypeError, ValueError, AttributeError):
+                    pass  # An unfamiliar usage shape: the duration is still reported.
     calls += [{"name": name, "seconds": None, "unfinished": True} for name, _ in started.values()]
     return calls
+
+
+def _call_text(call):
+    if call.get("seconds") is None:
+        return f"{call['name']} 未结束"
+    tokens = (f"（输入 {call['input_tokens']} / 输出 {call['output_tokens']} tokens）"
+              if "input_tokens" in call else "（缓存命中）" if call.get("cache_hit") else "")
+    return f"{call['name']} {call['seconds']} 秒{tokens}"
 
 
 def latest(root=Path("artifacts/fund-rehearsal")):
@@ -187,6 +218,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         strategy._execute = lambda intent, now, account=None, prices=None: submitted.append(intent)
         strategy._executor._initialize()  # Startup, including the pre-open research.
         strategy.validation = None  # No shadow call: one decision is enough to rehearse.
+        strategy.journal.set_meta("critique_cache", None)  # Rehearse a real critic call, never a reused one.
         return strategy
     strategy = stages.run("start the strategy (startup and pre-open research)", build, kind="model")
     if strategy is None:
@@ -201,6 +233,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return _finish(scratch, stages, root, keep)
     stages.run("risk context (history, volatility, stress windows)", lambda: strategy._risk_context(account, at),
                kind="required", judge=_context_judge)
+    stages.run("market snapshot", lambda: strategy._market_snapshot(at), judge=_snapshot_judge)
     stages.run("factor research (history, research universe, SEC)", lambda: strategy._factor_context(at),
                judge=_context_judge)
     stages.run("earnings calendar", lambda: strategy._earnings_caps(at),
@@ -280,6 +313,7 @@ LABELS = {
     "start the strategy (startup and pre-open research)": "启动策略（含盘前研究，真实模型）",
     "account snapshot": "账户快照",
     "risk context (history, volatility, stress windows)": "风控数据（历史、波动率、危机情景）",
+    "market snapshot": "行情快照（收益、波动、beta、均线、成交额）",
     "factor research (history, research universe, SEC)": "因子研究数据（研究股票池、SEC 财报）",
     "earnings calendar": "财报日历",
     "FRED macro context": "FRED 宏观数据",
@@ -304,8 +338,7 @@ def text(report):
     calls = report.get("agent_calls") or []
     if calls:
         lines += ["", "每次模型调用耗时（监控在单次调用超过 900 秒时会停止交易）："
-                  + "、".join(f"{c['name']} {c['seconds']} 秒" if c.get("seconds") is not None else f"{c['name']} 未结束"
-                             for c in calls)]
+                  + "、".join(_call_text(c) for c in calls)]
     built = report.get("construction")
     if built:
         lines += ["", "AI 目标 → 风控后：" + json.dumps(built["targets"], ensure_ascii=False) + " → "
