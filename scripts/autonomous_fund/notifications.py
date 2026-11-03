@@ -384,3 +384,223 @@ def readable(kind, details, sequence=None):
     if text is None:
         return None
     return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")
+
+
+# ----- Weekly report (V2 3.6) ---------------------------------------------------------------------
+
+WEEKLY_KINDS = ("account", "benchmark", "benchmark_action", "fill", "fill_reconciled", "agent", "notification",
+                "postmarket_review", "learning_evaluation", "startup", "factor_negative_control")
+NO_DATA = "无数据"
+
+
+def week_of(day):
+    """(Monday, Sunday, "YYYY-Www") of the ISO week holding the New York session date `day`."""
+    from datetime import date, timedelta
+    session = date.fromisoformat(day)
+    monday = session - timedelta(days=session.weekday())
+    year, week, _ = session.isocalendar()
+    return monday.isoformat(), (monday + timedelta(days=6)).isoformat(), f"{year}-W{week:02d}"
+
+
+def _weekly_facts(events, monday, sunday, zone):
+    """Account, benchmark, trading and model-cost facts of one week, from the journal only."""
+    from .costs import scripted
+    from .performance import PerformanceSettings, benchmark_series
+    def local(at):
+        return instant(at).astimezone(zone).date().isoformat()
+    marks = {}
+    for at, kind, body in events:
+        if kind == "account":
+            marks[local(at)] = float(body["equity"])
+    before = [d for d in sorted(marks) if d < monday]
+    inside = [d for d in sorted(marks) if monday <= d <= sunday]
+    facts = {"start_day": before[-1] if before else (inside[0] if inside else None),
+             "end_day": inside[-1] if inside else None, "start_from_previous_week": bool(before)}
+    days = ([facts["start_day"]] if before else []) + inside
+    facts["daily"] = [(b, marks[b] / marks[a] - 1) for a, b in zip(days, days[1:]) if marks[a] > 0]
+    if facts["start_day"] and facts["end_day"] and marks[facts["start_day"]] > 0:
+        facts["week_return"] = marks[facts["end_day"]] / marks[facts["start_day"]] - 1
+        facts["start_equity"], facts["end_equity"] = marks[facts["start_day"]], marks[facts["end_day"]]
+    level, peak, worst = 1.0, 1.0, 0.0
+    for _, r in facts["daily"]:
+        level *= 1 + r
+        peak = max(peak, level)
+        worst = max(worst, 1 - level / peak)
+    facts["max_drawdown"] = worst if facts["daily"] else None
+    prices, actions = {}, {}
+    for at, kind, body in events:
+        if kind == "benchmark":
+            for symbol, value in body.items():
+                try:
+                    if float(value) > 0:
+                        prices.setdefault(symbol, {})[local(at)] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        elif kind == "benchmark_action":
+            actions.setdefault(body["symbol"], []).append(body)
+    configured = [b.get("performance") for _, k, b in events if k == "startup" and b.get("performance")]
+    definitions = configured[-1]["benchmarks"] if configured else PerformanceSettings().definitions()
+    facts["benchmarks"] = {}
+    if facts.get("week_return") is not None:
+        pairs = list(zip(days, days[1:]))
+        for definition in definitions:
+            series = benchmark_series(definition, pairs, prices, actions)
+            growth = 1.0
+            for value in series:
+                growth = growth * (1 + value) if value is not None and growth is not None else None
+            facts["benchmarks"][definition["id"]] = growth - 1 if growth is not None else None
+    orders = {}
+    for at, kind, body in events:
+        if kind in {"fill", "fill_reconciled"} and monday <= local(at) <= sunday:
+            orders.setdefault(str(body.get("broker_id")), {}).setdefault(kind, []).append(body)
+    fills = [b for kinds in orders.values() for b in (kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds
+                                                      else kinds["fill"])]
+    fees = [b.get("trade_cost") for b in fills]
+    facts["trades"] = {"fills": len(fills),
+                       "notional": sum(float(b["quantity"]) * float(b["price"]) for b in fills),
+                       "fees": sum(float(f) for f in fees if f is not None),
+                       "fees_unknown": sum(f is None for f in fees)}
+    calls = [b for at, kind, b in events if kind == "agent" and monday <= local(at) <= sunday
+             and not scripted(b) and not b.get("cache_hit")]
+    by_role = {}
+    for body in calls:
+        if body.get("cost_usd") is not None:
+            by_role[body.get("name") or "unknown"] = by_role.get(body.get("name") or "unknown", 0.0) + float(body["cost_usd"])
+    facts["model"] = {"calls": len(calls), "usd": sum(by_role.values()), "by_role": by_role,
+                      "unpriced": sum(b.get("cost_usd") is None and bool(b.get("usage")) for b in calls)}
+    facts["health"] = Counter(b.get("kind") for at, kind, b in events if kind == "notification"
+                              and b.get("kind") in HEALTH_KINDS and monday <= local(at) <= sunday)
+    return facts
+
+
+def weekly_document(root, sequence):
+    """The week's report ending with one completed post-market review: (filename, markdown).
+
+    Facts come from the journal and code; statistical inferences say their sample;
+    model judgments are the AI's own words; hypotheses are untested. A section
+    without data says so instead of being left out or filled in.
+    """
+    zone = ZoneInfo("America/New_York")
+    with operator_connection(root) as db:
+        row = db.execute("SELECT body FROM events WHERE sequence=? AND kind='postmarket_review'", (sequence,)).fetchone()
+        if not row:
+            raise RiskError("Weekly report has no matching completed review")
+        packet = json.loads(row[0])
+        cutoff, day = instant(packet["completed_at"]), packet["session_date"]
+        monday, sunday, label = week_of(day)
+        events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)),
+            WEEKLY_KINDS) if instant(at) <= cutoff]
+        # Written just after each review, so selected by session date like the daily report.
+        related = [(kind, json.loads(body)) for kind, body in db.execute(
+            "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
+            "json_extract(body,'$.session_date') BETWEEN ? AND ? ORDER BY sequence", (monday, day))]
+    facts = _weekly_facts(events, monday, sunday, zone)
+    reviews = [b for _, k, b in events if k == "postmarket_review" and monday <= b["session_date"] <= sunday]
+    lines = [f"# {label} 模拟账户周报（{monday} 至 {sunday}）", "",
+             f"报告截止：{cutoff.isoformat()}（最后一次复盘：{day}）。", "",
+             "本报告区分四类内容：【事实】账本记录和代码计算；【统计推断】带样本量的检验，样本少时不稳定；"
+             "【模型判断】AI 自己的复盘文字；【待验证假设】尚未被数据证实的想法。", "",
+             "## 一、本周收益与风险【事实】", ""]
+    if facts.get("week_return") is None:
+        lines.append(NO_DATA)
+    else:
+        origin = "上周最后一次估值" if facts["start_from_previous_week"] else "本周第一次估值（没有上周估值）"
+        lines.append(f"- 净值 {facts['start_equity']:.2f} → {facts['end_equity']:.2f}，本周收益 "
+                     f"{_percent(facts['week_return'])}（起点：{origin}，{facts['start_day']}）")
+        lines.append("- 每日：" + ("；".join(f"{d} {_percent(r)}" for d, r in facts["daily"]) or NO_DATA))
+        lines.append(f"- 本周最大回撤（按每日估值）：{_percent(facts['max_drawdown'])}")
+        for benchmark, value in facts["benchmarks"].items():
+            excess = facts["week_return"] - value if value is not None else None
+            lines.append(f"- 基准 {benchmark}：{_percent(value)}，超额 {_percent(excess)}" if value is not None else
+                         f"- 基准 {benchmark}：{NO_DATA}（缺价格记录）")
+    trades, model = facts["trades"], facts["model"]
+    lines += ["", "## 二、交易成本和模型费用【事实】", "",
+              f"- 成交 {trades['fills']} 笔，金额 {trades['notional']:.2f} 美元，已记录费用 {trades['fees']:.2f} 美元"
+              + (f"，{trades['fees_unknown']} 笔费用未知（不按 0 计）" if trades["fees_unknown"] else ""),
+              (f"- 模型调用 {model['calls']} 次，估算费用 {model['usd']:.4f} 美元"
+               + (f"（另有 {model['unpriced']} 次未定价，不按 0 计）" if model["unpriced"] else "")
+               + ("；按角色：" + "、".join(f"{r} {v:.4f}" for r, v in sorted(model["by_role"].items()))
+                  if model["by_role"] else "")) if model["calls"] else f"- 模型调用：{NO_DATA}"]
+    lines += ["", "## 三、本周归因合计【事实，代码按收盘价计算】", ""]
+    usable = [r.get("attribution") for r in reviews if (r.get("attribution") or {}).get("status") in {"complete", "partial"}]
+    if usable:
+        totals = {}
+        for item in usable:
+            for key, value in item["components"].items():
+                totals[key] = totals.get(key, 0.0) + value
+        lines += [f"- {ATTRIBUTION_LABELS[key]}：{_percent(value)}" for key, value in totals.items()]
+        lines.append(f"- 未解释：{_percent(sum(i['unexplained'] for i in usable))}（{len(usable)} 个交易日相加，"
+                     f"其中不完整 {sum(i['status'] == 'partial' for i in usable)} 天）")
+    else:
+        lines.append(NO_DATA)
+    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
+    lines += ["", "## 四、预测与研究想法打分【统计推断】", ""]
+    if card:
+        predictions = card.get("predictions") or {}
+        lines.append(f"- 复盘预测：共 {predictions.get('total', 0)} 条，已打分 {predictions.get('scored', 0)}，"
+                     f"命中率 {_percent(predictions.get('hit_rate'))}")
+        ideas = card.get("ideas")
+        text = idea_text(ideas)
+        lines.append(f"- {text}" if text else f"- 研究想法：{NO_DATA}")
+        for bucket, value in ((ideas or {}).get("by_confidence") or {}).items():
+            if value["scored"]:
+                lines.append(f"  - 把握 {bucket}：{value['scored']} 条，命中率 {_percent(value['hit_rate'])}，"
+                             f"平均把握 {_percent(value['mean_confidence'])}")
+    else:
+        lines.append(NO_DATA)
+    tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
+    control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
+    lines += ["", "## 五、因子实验进展【统计推断】", ""]
+    if tests:
+        counts = Counter(FACTOR_STATUS.get(r.get("status"), r.get("status")) for r in tests)
+        lines.append("- 本周检验：" + "、".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        lines += [f"  - 通过：{r.get('name')} `{r.get('expression')}`" for r in tests if r.get("status") == "validated"]
+    else:
+        lines.append(f"- 本周检验：{NO_DATA}")
+    lines.append(f"- 随机因子负对照（{control['as_of']}）：样本内通过率 {_percent(control.get('in_sample_pass_rate'))}，"
+                 f"最终通过率 {_percent(control.get('validated_rate'))}，显著性 {_percent(control.get('significance'))}"
+                 if control else f"- 随机因子负对照：{NO_DATA}")
+    learning = next((b for _, k, b in reversed(events) if k == "learning_evaluation"), None)
+    construction = (card or {}).get("construction")
+    lines += ["", "## 六、对照实验状态【统计推断】", ""]
+    if construction:
+        test = construction.get("test") or {}
+        lines.append(f"- 组合构建对照：当前 {construction.get('champion')}，配对 {test.get('pairs')} 个交易日，"
+                     f"t = {test.get('t_stat')}")
+    else:
+        lines.append(f"- 组合构建对照：{NO_DATA}")
+    if learning:
+        stats = learning.get("memo_minus_baseline_1d_excess") or {}
+        lines.append(f"- 学习对照（影子 A/B）：当前 {learning.get('champion')}，配对 {stats.get('pairs')} 个交易日，"
+                     f"t = {stats.get('t_stat')}")
+    else:
+        lines.append(f"- 学习对照（影子 A/B）：{NO_DATA}")
+    lines += ["", "## 七、异常和缺失数据【事实】", ""]
+    health = facts["health"]
+    lines.append("- 运行异常：" + ("；".join(f"{k} × {v}" for k, v in sorted(health.items())) if health else "本周没有记录"))
+    gaps = []
+    for r in reviews:
+        item = r.get("attribution") or {}
+        if item.get("status") in {"unavailable", "partial", None}:
+            detail = item.get("reason") or "、".join(item.get("unavailable", []) + item.get("fees_unknown", []))
+            gaps.append(f"{r['session_date']}：{detail or '这次复盘没有归因'}")
+    lines.append("- 归因缺数据：" + ("；".join(gaps) if gaps else "无"))
+    data_gaps = [g for r in reviews for g in (r.get("review") or {}).get("data_gaps", [])]
+    lines.append("- 复盘指出的数据缺项：" + ("；".join(data_gaps[:10]) if data_gaps else "无"))
+    lines.append(f"- 本周完成复盘 {len(reviews)} 次")
+    lines += ["", "## 八、AI 本周复盘要点【模型判断】", ""]
+    lines += [f"- {r['session_date']}（置信度 {(r.get('review') or {}).get('confidence')}）："
+              f"{((r.get('review') or {}).get('summary') or '')[:600]}" for r in reviews] or [NO_DATA]
+    lines += ["", "## 九、下周关注的假设【待验证假设】", ""]
+    last = (reviews[-1].get("review") if reviews else None) or {}
+    hypotheses = [c for key in ("selection_adjustments", "timing_adjustments") for c in last.get(key, [])]
+    lines += [f"- {c['hypothesis']}（验证条件：{c['validation']}；失效条件：{c['invalidated_when']}）"
+              for c in hypotheses] or [f"- 调整：{NO_DATA}"]
+    pending = last.get("predictions") or []
+    lines += ([f"- 待打分预测 {len(pending)} 条：" + "；".join(
+        f"{p['symbol']} {DIRECTIONS.get(p['direction'], p['direction'])} {p['horizon_sessions']} 日" for p in pending[:10])]
+        if pending else [])
+    if last.get("strategy_memo"):
+        lines += ["", "最新策略备忘（AI 撰写，供下周参考）：", "", last["strategy_memo"][:3000]]
+    return f"weekly-{label}.md", "\n".join(lines) + "\n"

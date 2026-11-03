@@ -289,6 +289,7 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
                     "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
                     "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
+            self._queue_weekly(db, reviews, now)
             # Drop stale first-start alerts; retain recent requests and failures.
             # A durable cursor bounds each poll to new notifications. It never
             # advances past one stamped in the future, which is revisited later.
@@ -310,7 +311,8 @@ class Monitor:
                     if previous["body"] == row["body"] and abs((instant(row["at"]) - instant(previous["at"])).total_seconds()) < 1800:
                         duplicate = True
                         break
-                stale = body.get("kind") != "postmarket_report" and now - instant(row["at"]) > timedelta(hours=1)
+                stale = (body.get("kind") not in {"postmarket_report", "weekly_report"} and
+                         now - instant(row["at"]) > timedelta(hours=1))
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
             self._note_desk(db, now)
@@ -332,6 +334,43 @@ class Monitor:
         except Exception:  # Metrics are a convenience; they never affect supervision.
             pass
         return status
+
+    def _week_ends(self, day):
+        """True when `day` is the last NYSE session of its ISO week (cached; holidays and early weeks included)."""
+        cache = self.__dict__.setdefault("_week_end_cache", {})
+        if day not in cache:
+            import pandas_market_calendars as mcal
+            from datetime import date
+            session = date.fromisoformat(day)
+            schedule = mcal.get_calendar("NYSE").schedule(start_date=session + timedelta(days=1),
+                                                          end_date=session + timedelta(days=10))
+            following = schedule.index[0].date() if len(schedule) else None
+            cache[day] = following is None or following.isocalendar()[:2] != session.isocalendar()[:2]
+        return cache[day]
+
+    def _queue_weekly(self, db, reviews, now):
+        """One weekly report per ISO week, after the review of the week's last session (recent reviews only)."""
+        from .notifications import week_of
+        sent = {row[0] for row in db.execute(
+            "SELECT json_extract(body,'$.details.week') FROM events WHERE kind='notification' "
+            "AND json_extract(body,'$.kind')='weekly_report'")}
+        for review in reviews[-7:]:
+            packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
+            completed = instant(packet["completed_at"])
+            if completed > now or now - completed > timedelta(days=7):
+                continue
+            week = week_of(packet["session_date"])[2]
+            if week in sent:
+                continue
+            try:
+                last = self._week_ends(packet["session_date"])
+            except Exception:
+                continue  # Without the calendar the week's end is unknown: no guessed report.
+            if last:
+                sent.add(week)
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
+                    "kind": "weekly_report", "details": {"review_sequence": review["sequence"], "week": week,
+                                                         "session_date": packet["session_date"]}})))
 
     def _note_decision_drought(self, db, now):
         """Alert once a day when the session runs without a valid decision and nothing explains it.
@@ -443,6 +482,12 @@ class Monitor:
                     filename, document = daily_document(self.root, body["details"]["review_sequence"])
                     result = self.transport.send_document(
                         f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
+                        filename, document)
+                elif body.get("kind") == "weekly_report":
+                    from .notifications import weekly_document
+                    filename, document = weekly_document(self.root, body["details"]["review_sequence"])
+                    result = self.transport.send_document(
+                        f"LumiBot 模拟账户 · {body['details']['week']} 周报（{body['details']['session_date']} 收盘后）",
                         filename, document)
                 elif body.get("kind") == "approval_required" and (
                         "side" in body.get("details", {}) or "buys" in body.get("details", {})):
