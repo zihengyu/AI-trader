@@ -92,14 +92,93 @@ class Intent:
     limit: Decimal
 
 
+def bounded_text(limit, min_length=0):
+    """A model text field asked to stay within `limit` characters; a longer answer is cut and marked, never rejected.
+
+    A strict maximum would throw away a whole paid answer for a few extra words
+    (2026-11-03: a critique summary of 1,600 characters). The schema still shows
+    the model the limit.
+    """
+    from typing import Annotated
+    from pydantic import BeforeValidator, Field
+
+    def cut(value):
+        if isinstance(value, str) and len(value) > limit:
+            return value[:limit - 14].rstrip() + " …[truncated]"
+        return value
+    return Annotated[str, BeforeValidator(cut), Field(min_length=min_length, max_length=limit)]
+
+
+def bounded_list(item, limit, min_length=0):
+    """A model list asked to hold at most `limit` items; extra items are dropped, never a rejected answer."""
+    from typing import Annotated
+    from pydantic import BeforeValidator, Field
+    return Annotated[list[item], BeforeValidator(lambda v: v[:limit] if isinstance(v, list) else v),
+                     Field(min_length=min_length, max_length=limit)]
+
+
+def evidence_time(value):
+    """One aware timestamp from what a model wrote, or None.
+
+    Models sometimes give a span ("A ~ B", "A to B", "A - B"); the LATEST time of
+    the span is used, which is the conservative reading for any cutoff check.
+    """
+    import re
+    if value is None:
+        return None
+    try:
+        return instant(value)
+    except (TypeError, ValueError, RiskError):
+        pass
+    times = []
+    for part in re.split(r"\s*(?:~|\u2013|\u2014|\bto\b|\s-\s)\s*", str(value)):
+        try:
+            times.append(instant(part.strip()))
+        except (TypeError, ValueError, RiskError):
+            continue
+    return max(times) if times else None
+
+
 def validate_evidence(evidence, now, historical):
+    """Check research evidence times; live runs repair what can be repaired instead of losing the research.
+
+    Historical runs stay strict: every item needs readable available_at and
+    observed_at (the latest time of a span), none after the simulated time. Live
+    runs have no publication-date rule: a span is replaced by its latest time and
+    an unreadable observation time by the validation time, disclosed in
+    estimate_reason, so one badly formatted field never discards a paid answer.
+    """
     if not evidence:
         raise RiskError("No dated research evidence")
+
+    def plain(value):
+        try:
+            instant(value)
+            return True
+        except (TypeError, ValueError, RiskError):
+            return False
     for source in evidence:
-        observed = instant(source["observed_at"])
+        observed = evidence_time(source.get("observed_at"))
         if not historical:
+            notes = []
+            if observed is None:
+                notes.append(f"observed_at {source.get('observed_at')!r} was unreadable; set to the validation time")
+                source["observed_at"] = instant(now).isoformat()
+            elif not plain(source.get("observed_at")):
+                notes.append(f"observed_at span {source.get('observed_at')!r} reduced to its end")
+                source["observed_at"] = observed.isoformat()
+            available = source.get("available_at")
+            if available is not None and not plain(available):
+                parsed = evidence_time(available)
+                notes.append(f"available_at {available!r} " + ("reduced to its end" if parsed else "was unreadable"))
+                source["available_at"] = parsed.isoformat() if parsed else None
+            if notes:
+                source["estimated"] = True
+                source["estimate_reason"] = f"{(source.get('estimate_reason') or '').strip()} ({'; '.join(notes)})".strip()
             continue
-        published = instant(source["available_at"])
+        published = evidence_time(source.get("available_at"))
+        if published is None or observed is None:
+            raise RiskError("Historical evidence needs readable available_at and observed_at times")
         if published > now or observed > now:
             raise RiskError("Research evidence is after the simulated cutoff")
         if source.get("estimated") and not source.get("estimate_reason", "").strip():

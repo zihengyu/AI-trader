@@ -70,10 +70,18 @@ GLOBAL_MARKETS = {
     "GC=F": "gold futures", "^N225": "Nikkei 225 (Tokyo)", "^HSI": "Hang Seng (Hong Kong)",
     "^STOXX50E": "Euro Stoxx 50"}
 # FRED release names (lower case, matched as substrings) of the scheduled US releases that move markets.
+# FOMC meetings come from the Federal Reserve's own calendar: FRED's "FOMC Press Release" is listed
+# every day (2026-11-03 rehearsal), which is a data feed, not the meeting schedule.
 MAJOR_RELEASES = ("consumer price index", "employment situation", "gross domestic product",
                   "personal income and outlays", "producer price index", "monthly sales for retail",
                   "unemployment insurance weekly claims", "job openings and labor turnover", "industrial production",
-                  "fomc", "surveys of consumers", "new residential construction")
+                  "surveys of consumers", "new residential construction")
+MAX_RELEASE_DATES = 6  # A release dated more often than this in the window is a daily feed, not an event.
+FOMC_CALENDAR = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+MONTHS = {name: number for number, name in enumerate(
+    ("january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november",
+     "december"), start=1)}
+MONTHS.update({name[:3]: number for name, number in list(MONTHS.items())})  # "Apr/May"
 CALENDAR_DAYS = 21
 FRED_RELEASE_DATES = "https://api.stlouisfed.org/fred/releases/dates"
 SUSPECT_MOVE = 0.25  # A gap this large versus the previous close is more likely a split or bad data.
@@ -350,19 +358,61 @@ def premarket_moves(frames, previous_closes, now, gauges=GAUGES):
 
 
 def major_releases(rows, today, days=CALENDAR_DAYS):
-    """The market-moving scheduled releases from FRED's release dates, soonest first."""
+    """The market-moving scheduled releases from FRED's release dates, soonest first.
+
+    A release dated more than MAX_RELEASE_DATES times in the window is a daily
+    data feed, not a scheduled event, and is left out whatever its name.
+    """
     end = (today + timedelta(days=days)).isoformat()
-    seen, major, other = set(), [], 0
+    dates = {}
     for row in rows:
         name, day = str(row.get("release_name") or ""), str(row.get("date") or "")
-        if not name or not today.isoformat() <= day <= end or (day, name) in seen:
+        if name and today.isoformat() <= day <= end:
+            dates.setdefault(name, {})[day] = row.get("release_id")
+    major, other = [], 0
+    for name, days_ in dates.items():
+        if len(days_) > MAX_RELEASE_DATES or not any(key in name.lower() for key in MAJOR_RELEASES):
+            other += len(days_)
             continue
-        seen.add((day, name))
-        if any(key in name.lower() for key in MAJOR_RELEASES):
-            major.append({"date": day, "release": name, "release_id": row.get("release_id")})
-        else:
-            other += 1
+        major += [{"date": day, "release": name, "release_id": key} for day, key in days_.items()]
     return sorted(major, key=lambda r: (r["date"], r["release"])), other
+
+
+def fomc_meetings(html, today, days=CALENDAR_DAYS):
+    """Scheduled FOMC decision days within `days` from the Federal Reserve's calendar page.
+
+    The page lists each year's meetings as a month ("January", "Apr/May") and a
+    day span ("27-28", "30-1", "16-17*" with an asterisk for a projections
+    meeting). The decision is on the last day. Notation votes and unscheduled
+    meetings are left out. Raises RiskError when the page has no readable year.
+    """
+    import re
+    end = today + timedelta(days=days)
+    sections = re.split(r"(\d{4}) FOMC Meetings", html)
+    meetings = []
+    for index in range(1, len(sections) - 1, 2):
+        year, body = int(sections[index]), sections[index + 1]
+        pairs = re.findall(r"fomc-meeting__month[^>]*>\s*(?:<[^>]+>\s*)*([A-Za-z/]+)\s*(?:<[^>]+>\s*)*</div>\s*"
+                           r"<div[^>]*fomc-meeting__date[^>]*>\s*([^<]+)<", body)
+        for month_text, day_text in pairs:
+            if "notation" in day_text.lower() or "unscheduled" in day_text.lower():
+                continue
+            days_ = [int(d) for d in re.findall(r"\d+", day_text)]
+            months = [MONTHS[m.lower()[:3]] for m in month_text.split("/") if m.lower()[:3] in MONTHS]
+            if not days_ or not months:
+                continue
+            month = months[-1]  # "Apr/May 30-1": the decision is on the last day, in the last month.
+            try:
+                decision = datetime(year, month, days_[-1]).date()
+            except ValueError:
+                continue
+            if today <= decision <= end:
+                meetings.append({"date": decision.isoformat(), "release": "FOMC meeting decision"
+                                 + (" with economic projections" if "*" in day_text else ""),
+                                 "source": "federalreserve.gov FOMC calendar"})
+    if len(sections) < 3:
+        raise RiskError("the Federal Reserve's FOMC calendar page had no readable meeting year")
+    return meetings
 
 
 class DataDesk:
@@ -669,12 +719,21 @@ class DataDesk:
             if len(batch) < 1000:
                 break
         major, other = major_releases(rows, today)
+        unavailable = None
+        try:  # FOMC decision days from the Fed itself; a failure is disclosed, never guessed.
+            page = get(FOMC_CALENDAR, timeout=20, headers={"User-Agent": "LumiBot-AutonomousFund/1.0"})
+            page.raise_for_status()
+            fomc = fomc_meetings(page.text, today)
+        except Exception as exc:
+            fomc, unavailable = [], str(exc)[:120] if isinstance(exc, RiskError) else type(exc).__name__
+        releases = sorted(major + fomc, key=lambda r: (r["date"], r["release"]))
         self.store.put(trading_day(now), "econ_calendar", {
-            "as_of": instant(now).isoformat(), "window_days": CALENDAR_DAYS, "releases": major,
-            "other_releases": other, "source": "FRED release calendar (St. Louis Fed)",
+            "as_of": instant(now).isoformat(), "window_days": CALENDAR_DAYS, "releases": releases,
+            "other_releases": other, "fomc_unavailable": unavailable,
+            "source": "FRED release calendar (St. Louis Fed); FOMC meetings from federalreserve.gov",
             "note": "Dates only. Most US data releases come out at 08:30 New York time and FOMC statements at "
                     "14:00; check the agency's own calendar for the exact time."})
-        return {"major": len(major), "other": other}
+        return {"major": len(major), "fomc": len(fomc), "other": other, "fomc_unavailable": unavailable}
 
     def _job_macro(self, now):
         from .macro import MacroWatch
@@ -717,7 +776,8 @@ class DataDesk:
             rows = self.store.bars(day, symbol, 1) or []
             histories[symbol] = [(str(d), c, v) for d, c, v, *_ in rows if c == c and c > 0]
         if not histories.get(benchmark):
-            raise Idle(f"no daily bars for {benchmark} in today's store yet")
+            raise Idle("waiting for the day's daily bars (stored after 06:00 New York); until then the trading "
+                       "process computes the snapshot itself")
         result = snapshot(histories, benchmark)
         if self.store.get(day, "market_snapshot") != json.loads(json.dumps(result, default=str)):
             self.store.put(day, "market_snapshot", result)  # Rewritten only when something changed.

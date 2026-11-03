@@ -33,6 +33,7 @@ def rehearsal(tmp_path, monkeypatch):
     clock = Clock()
 
     def run(account, **kw):
+        kw.setdefault("live_data", False)  # Offline: the scripted AI must not bring live data sources.
         source = YahooRealtimeData(now=clock, fetch=clock.fetch)
         return rehearse(account, CONFIG, runtime=ScriptedRuntime(), source=source, root=tmp_path / "rehearsal", **kw)
     return run
@@ -48,7 +49,7 @@ def test_a_full_decision_is_rehearsed_on_a_copy_and_no_order_is_sent(tmp_path, r
     report = rehearsal(account)
     assert report["verdict"] == "ready", json.dumps(report["stages"], indent=2, default=str)
     names = [row["stage"] for row in report["stages"]]
-    assert names[0] == "memory directory writable" and "critic and manager decision (real models)" in names
+    assert names[0] == "memory directory writable" and "critic and manager decision (scripted AI)" in names
     assert report["construction"]["constructed"] and report["decision"]["targets"]
     assert report["orders_intercepted"]  # The plan was computed; nothing was submitted.
     assert (account / "state.sqlite3").read_bytes() == before  # The real account is untouched...
@@ -150,3 +151,25 @@ def test_each_model_call_reports_its_tokens_or_a_cache_hit(tmp_path):
     assert calls[1]["cache_hit"] is True
     shown = text({"verdict": "ready", "copy": "c", "stages": [], "agent_calls": calls})
     assert "输入 1200 / 输出 300 tokens" in shown and "critic 40.0 秒（缓存命中）" in shown
+
+
+def test_the_default_rehearsal_is_free_and_real_models_are_opt_in():
+    from scripts.autonomous_fund.run import ScriptedRuntime, rehearsal_options
+    models, runtime = rehearsal_options()
+    assert models and isinstance(runtime, ScriptedRuntime)  # No inference, no model cost.
+    assert rehearsal_options(real_models=True) == (True, None)
+    assert rehearsal_options(no_models=True) == (False, None)
+
+
+def test_a_scripted_rehearsal_still_uses_live_data_and_says_how_it_ran(tmp_path, rehearsal, monkeypatch):
+    from scripts.autonomous_fund import events, macro
+    from scripts.autonomous_fund.rehearsal import text
+    fred = []
+    monkeypatch.setattr(macro.MacroWatch, "_fetch", lambda self, name, today: fred.append(name) or [("2026-10-30", 4.0)])
+    monkeypatch.setattr(events.EarningsCalendar, "fetch", lambda self, symbol, today: ("yahoo", [], None))
+    report = rehearsal(tmp_path / "account", live_data=True)
+    stage = {row["stage"]: row for row in report["stages"]}
+    assert report["ai"] == "scripted" and fred  # The scripted AI ran on real (here: stubbed) FRED data.
+    assert stage["FRED macro context"]["detail"] != "disabled"
+    assert stage["critic and manager decision (scripted AI)"]["status"] == "ok"
+    assert "模拟 AI：完整流程、真实数据、不调用模型、0 模型费用" in text(report)

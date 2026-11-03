@@ -9,16 +9,16 @@ import pandas_market_calendars as mcal
 from pydantic import BaseModel, ConfigDict, Field
 
 from .journal import encode
-from .risk import RiskError, instant, validate_evidence
+from .risk import RiskError, bounded_list, bounded_text, instant, validate_evidence
 
 
 class Adjustment(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    hypothesis: str = Field(min_length=1, max_length=1200)
-    rationale: str = Field(min_length=1, max_length=1500)
-    evidence_refs: list[str] = Field(min_length=1, max_length=12)
-    validation: str = Field(min_length=1, max_length=1200)
-    invalidated_when: str = Field(min_length=1, max_length=1200)
+    hypothesis: bounded_text(1200, 1)
+    rationale: bounded_text(1500, 1)
+    evidence_refs: bounded_list(str, 12, 1)
+    validation: bounded_text(1200, 1)
+    invalidated_when: bounded_text(1200, 1)
 
 
 class Prediction(BaseModel):
@@ -28,7 +28,7 @@ class Prediction(BaseModel):
     direction: Literal["up", "down", "outperform", "underperform"]
     horizon_sessions: int = Field(ge=1, le=20)
     benchmark: str = Field(default="SPY", min_length=1, max_length=12)
-    hypothesis_ref: str = Field(default="", max_length=200)
+    hypothesis_ref: bounded_text(200) = ""
 
 
 class FactorProposal(BaseModel):
@@ -37,7 +37,7 @@ class FactorProposal(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     expression: str = Field(min_length=1, max_length=300)
     horizon_sessions: int = Field(ge=1, le=20)
-    hypothesis: str = Field(min_length=1, max_length=600)
+    hypothesis: bounded_text(600, 1)
     # Which cross-section ranks it: stocks (tradable plus research universe) or ETFs, never both.
     universe: Literal["stocks", "etfs"] = "stocks"
 
@@ -46,17 +46,17 @@ class PostmarketReview(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     session_date: str
     as_of: str
-    summary: str = Field(min_length=1, max_length=4000)
-    selection_adjustments: list[Adjustment] = Field(max_length=8)
-    timing_adjustments: list[Adjustment] = Field(max_length=8)
-    retained_lessons: list[str] = Field(max_length=12)
-    retired_hypotheses: list[str] = Field(max_length=12)
-    data_gaps: list[str] = Field(max_length=12)
+    summary: bounded_text(4000, 1)
+    selection_adjustments: bounded_list(Adjustment, 8)
+    timing_adjustments: bounded_list(Adjustment, 8)
+    retained_lessons: bounded_list(bounded_text(600), 12)
+    retired_hypotheses: bounded_list(bounded_text(600), 12)
+    data_gaps: bounded_list(bounded_text(600), 12)
     confidence: Literal["low", "medium", "high"]
-    strategy_memo: str = Field(min_length=1, max_length=6000)
-    predictions: list[Prediction] = Field(default_factory=list, max_length=10)
-    mandate_compliance: str = Field(default="", max_length=2000)
-    factor_proposals: list[FactorProposal] = Field(default_factory=list, max_length=5)
+    strategy_memo: bounded_text(6000, 1)
+    predictions: bounded_list(Prediction, 10) = Field(default_factory=list)
+    mandate_compliance: bounded_text(2000) = ""
+    factor_proposals: bounded_list(FactorProposal, 5) = Field(default_factory=list)
 
 
 def _events(journal, now, kinds=None):

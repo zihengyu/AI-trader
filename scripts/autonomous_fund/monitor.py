@@ -171,10 +171,23 @@ class Monitor:
         if (self.root / "STOP").exists() and state == "healthy":
             state = "stopped"
         old = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health'").fetchone()
+        quiet = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health_quiet'").fetchone()
         if not old or old[0] != state:
-            if state not in {"healthy", "stopped"}:
+            from . import stops
+            record = stops.read(self.root) or {}
+            planned = state == "runner_exited" and record.get("class") == "operator"
+            if state not in {"healthy", "stopped"} and planned:
+                # A stop or restart by the operator ends the runner on purpose: recorded, not alerted
+                # (the operator STOP already holds trading; a crash under no operator STOP still alerts).
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "watchdog_noted", encode({
+                    "reason": state, "stop": record.get("reason")})))
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health_quiet','1')")
+            elif state not in {"healthy", "stopped"}:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_stop", "details": {"reason": state, "action": "STOP written; inspect broker orders and resume explicitly"}})))
+                db.execute("DELETE FROM fund_monitor_meta WHERE key='health_quiet'")
+            elif old and old[0] not in {"healthy", "stopped"} and quiet:
+                db.execute("DELETE FROM fund_monitor_meta WHERE key='health_quiet'")  # The planned stop is over.
             elif old and old[0] not in {"healthy", "stopped"}:
                 from . import stops
                 policy = self.resume_policy

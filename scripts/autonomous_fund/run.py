@@ -46,6 +46,15 @@ class ScriptedRuntime:
                               usage={"input_tokens": 0, "output_tokens": 0})
 
 
+def rehearsal_options(no_models=False, real_models=False):
+    """(models, runtime) for `rehearse`. Free by default: a scripted AI answers every model call while
+    the data, sandbox, account copy, validation and risk construction are all real; real models only
+    when asked for (they cost money)."""
+    if no_models:
+        return False, None
+    return True, None if real_models else ScriptedRuntime()
+
+
 def paper_config():
     missing = [name for name in ("ALPACA_API_KEY", "ALPACA_API_SECRET") if not os.environ.get(name)]
     if missing:
@@ -302,6 +311,8 @@ def main(argv=None):
     parser.add_argument("--latest", action="store_true", help="rehearse: print the newest saved report, run nothing")
     parser.add_argument("--no-models", action="store_true",
                         help="rehearse: data stages only, no model calls (no model cost)")
+    parser.add_argument("--real-models", action="store_true",
+                        help="rehearse: call the real models (costs money); default is a free scripted AI")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
     parser.add_argument("--require-monitor", action="store_true", help="Block local/paper orders unless an independent Telegram monitor is fresh")
     parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
@@ -509,9 +520,10 @@ def main(argv=None):
         from .settings import configured_mode
         if configured_mode(os.environ) != "local":
             raise RiskError("rehearse supports local mode; for paper use check and notify-test")
-        if not args.no_models:
+        if args.real_models:
             models_ready(args, config)
-        result = rehearse(args.run_dir, config, models=not args.no_models)
+        models, runtime = rehearsal_options(args.no_models, args.real_models)
+        result = rehearse(args.run_dir, config, models=models, runtime=runtime)
         print(text(result))
         if result["verdict"] != "ready":
             raise SystemExit(1)

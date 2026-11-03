@@ -93,7 +93,7 @@ DESK_LABELS = {"news": "资讯", "intraday": "盘中行情", "premarket": "盘�
 NOTE_LABELS = (("needs FRED_API_KEY", "需要在 .env 填 FRED_API_KEY，免费申请"),
                ("Yahoo is failing for the trading process", "交易进程的 Yahoo 请求出错，暂时让路"),
                ("no pre-market trades yet", "暂无盘前成交"), ("no account journal yet", "账本尚未创建"),
-               ("no daily bars", "等待日线"))
+               ("waiting for the day's daily bars", "等美东 06:00 后的当天日线；期间交易进程自己计算"))
 
 
 def _note(text):
@@ -118,6 +118,10 @@ def desk_line(root, now):
         note = f"（出错：{item['error']}）" if item.get("error") else (f"（{_note(item['note'])}）" if item.get("note") else "")
         parts.append(text + note)
     state = "运行中" if view["running"] else "已停止（交易进程自己拉取数据，交易不受影响）"
+    from .datastore import bars_settled
+    if "bars" not in view["datasets"] and (DeskStatus(root).read() or {}).get("mode") == "local" \
+            and not bars_settled(now):
+        parts.insert(0, "日线 美东 06:00 后拉取")
     busy = view.get("busy_with") or {}
     doing = f"，正在处理 {DESK_LABELS.get(busy.get('job'), busy.get('job'))}" if busy.get("job") else ""
     return f"数据员：{state}{doing}；" + ("、".join(parts) or "还没有完成的数据")
@@ -183,6 +187,9 @@ def summary(root, mode, now=None):
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")
     with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         failure = db.execute("SELECT at,body FROM events WHERE kind='operation_error' ORDER BY sequence DESC LIMIT 1").fetchone()
+        age = _age(failure[0], now) if failure else None
+        if age is not None and age > 86400:
+            failure = None  # Only the last 24 hours: an old, fixed error is not a current problem.
         retries = {key: json.loads(value) for key, value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
@@ -202,7 +209,8 @@ def summary(root, mode, now=None):
                          if frame.get("module", "").split(".")[0] not in sys.stdlib_module_names),
                         frames[-1] if frames else {})
         code = f" errno={origin['errno']} ({origin.get('errno_name', '')})" if "errno" in origin else ""
-        lines.append(f"最近业务异常：{failure[0]} {detail.get('phase')} {detail.get('error')}{code}；"
+        ago = f"{int(age // 3600)} 小时前" if age >= 3600 else f"{int(age // 60)} 分钟前"
+        lines.append(f"最近业务异常（{ago}）：{failure[0]} {detail.get('phase')} {detail.get('error')}{code}；"
                      f"位置 {location.get('module', '?')}.{location.get('function', '?')}:{location.get('line', '?')}")
     if rows:
         lines.append("最近通知：")

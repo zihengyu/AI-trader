@@ -458,11 +458,51 @@ def test_global_markets_report_the_move_since_the_previous_day_and_keep_the_last
     assert DailyStore(tmp_path / "cache" / "daily").get(DAY, "global_markets")["markets"]  # Not replaced by nothing.
 
 
+FED_PAGE = """
+<div class="panel"><h4><a>2026 FOMC Meetings</a></h4>
+<div class="row fomc-meeting"><div class="fomc-meeting__month col-xs-5"><strong>Apr/May</strong></div>
+<div class="fomc-meeting__date col-xs-4">28-29</div></div>
+<div class="row fomc-meeting"><div class="fomc-meeting__month col-xs-5"><strong>November</strong></div>
+<div class="fomc-meeting__date col-xs-4">16-17*</div></div>
+<div class="row fomc-meeting"><div class="fomc-meeting__month col-xs-5"><strong>November</strong></div>
+<div class="fomc-meeting__date col-xs-4">20 (notation vote)</div></div>
+<div class="row fomc-meeting"><div class="fomc-meeting__month col-xs-5"><strong>December</strong></div>
+<div class="fomc-meeting__date col-xs-4">8-9</div></div></div>
+<div class="panel"><h4><a>2027 FOMC Meetings</a></h4>
+<div class="row fomc-meeting"><div class="fomc-meeting__month col-xs-5"><strong>Jan</strong></div>
+<div class="fomc-meeting__date col-xs-4">26-27</div></div></div>
+"""
+
+
+def test_fomc_decision_days_come_from_the_feds_own_calendar():
+    from scripts.autonomous_fund.datadesk import fomc_meetings
+    from datetime import date
+    assert fomc_meetings(FED_PAGE, date(2026, 11, 3)) == [
+        {"date": "2026-11-17", "release": "FOMC meeting decision with economic projections",
+         "source": "federalreserve.gov FOMC calendar"}]  # The notation vote is not a meeting.
+    assert [m["date"] for m in fomc_meetings(FED_PAGE, date(2026, 12, 1), days=60)] == ["2026-12-09", "2027-01-27"]
+    spanning = FED_PAGE.replace("Apr/May", "Apr/May").replace("28-29", "30-1")
+    assert fomc_meetings(spanning, date(2026, 4, 25))[0]["date"] == "2026-05-01"
+    with pytest.raises(RiskError):
+        fomc_meetings("<html>maintenance</html>", date(2026, 11, 3))
+
+
+def test_a_release_dated_every_day_is_a_data_feed_not_an_event():
+    from scripts.autonomous_fund.datadesk import major_releases
+    from datetime import date
+    rows = [{"release_id": 1, "release_name": "Consumer Price Index Daily Snapshot", "date": f"2026-11-{d:02d}"}
+            for d in range(3, 20)] + [{"release_id": 10, "release_name": "Consumer Price Index", "date": "2026-11-10"}]
+    major, other = major_releases(rows, date(2026, 11, 3))
+    assert [r["release"] for r in major] == ["Consumer Price Index"] and other == 17
+
+
 def test_the_economic_calendar_keeps_the_market_moving_releases_and_needs_a_fred_key(tmp_path):
     from scripts.autonomous_fund.datadesk import Idle
     pages = []
 
-    def get(url, params=None, timeout=None):
+    def get(url, params=None, timeout=None, headers=None):
+        if "federalreserve.gov" in url:
+            return SimpleNamespace(raise_for_status=lambda: None, text=FED_PAGE)
         pages.append(params["offset"])
         rows = [{"release_id": i, "release_name": "Some Regional Survey", "date": "2026-11-05"} for i in range(1000)]
         if params["offset"]:
@@ -475,9 +515,11 @@ def test_the_economic_calendar_keeps_the_market_moving_releases_and_needs_a_fred
     with pytest.raises(Idle, match="FRED_API_KEY"):
         desk._job_calendar(NOW)
     desk.environ = {"FRED_API_KEY": "synthetic"}
-    assert desk._job_calendar(NOW) == {"major": 2, "other": 1} and pages == [0, 1000]
+    assert desk._job_calendar(NOW) == {"major": 2, "fomc": 1, "other": 1, "fomc_unavailable": None}
+    assert pages == [0, 1000]
     calendar = DailyStore(tmp_path / "cache" / "daily").get(DAY, "econ_calendar")
-    assert [r["release"] for r in calendar["releases"]] == ["Employment Situation", "Consumer Price Index"]
+    assert [r["release"] for r in calendar["releases"]] == [
+        "Employment Situation", "Consumer Price Index", "FOMC meeting decision with economic projections"]
 
 
 def test_the_context_carries_premarket_before_and_early_in_the_session_and_upcoming_releases(tmp_path):
@@ -520,3 +562,94 @@ def test_the_desk_service_yields_cpu_io_and_memory_to_trading():
     from scripts.autonomous_fund.deploy import generate
     desk = generate("/srv/fund", None, "/srv/fund/.env", "fundbot", None)["lumibot-fund-desk.service"]
     assert all(line in desk.splitlines() for line in ("Nice=10", "CPUWeight=20", "IOWeight=20", "OOMScoreAdjust=500"))
+
+
+# ----- Findings from the 2026-11-03 server rehearsal ------------------------------------------------------
+
+def test_a_live_evidence_time_span_is_repaired_and_a_historical_one_is_read_conservatively():
+    from scripts.autonomous_fund.risk import validate_evidence
+    live = [{"source": "s", "available_at": None, "estimated": False, "estimate_reason": "computed",
+             "observed_at": "2026-11-03T02:10:22-05:00 ~ 2026-11-03T02:11:45-05:00"},
+            {"source": "t", "available_at": "around midday", "observed_at": "yesterday", "estimated": False,
+             "estimate_reason": ""}]
+    validate_evidence(live, NOW, False)  # Raised ValueError and lost the whole post-market review before.
+    assert live[0]["observed_at"] == "2026-11-03T02:11:45-05:00" and live[0]["estimated"]
+    assert "reduced to its end" in live[0]["estimate_reason"]
+    assert live[1]["observed_at"] == NOW.isoformat() and live[1]["available_at"] is None
+    assert "unreadable" in live[1]["estimate_reason"]
+    cutoff = datetime(2026, 11, 3, 7, 11, tzinfo=timezone.utc)  # Between the two ends of the span.
+    historical = [{"source": "s", "available_at": "2026-11-02T16:00:00-05:00", "estimated": False,
+                   "estimate_reason": "", "observed_at": "2026-11-03T02:10:22-05:00 ~ 2026-11-03T02:11:45-05:00"}]
+    with pytest.raises(RiskError, match="after the simulated cutoff"):
+        validate_evidence(historical, cutoff, True)  # The span's end is after the cutoff.
+    with pytest.raises(RiskError, match="readable"):
+        validate_evidence([{**historical[0], "observed_at": "yesterday"}], cutoff, True)
+
+
+def test_an_over_long_answer_is_trimmed_instead_of_thrown_away():
+    from scripts.autonomous_fund.review import PostmarketReview
+    from scripts.autonomous_fund.strategy import Critique, Decision
+    critique = Critique.model_validate({"summary": "x" * 3200, "concerns": [
+        {"symbol": "", "concern": "c" * 900, "evidence": "e"}] * 12})  # Rejected outright before (1,500 cap).
+    assert len(critique.summary) <= 3000 and critique.summary.endswith("…[truncated]") and len(critique.concerns) == 10
+    assert Critique.model_json_schema()["properties"]["summary"]["maxLength"] == 3000  # The model still sees it.
+    decision = Decision.model_validate({"as_of": "a", "expires_at": "b", "next_review_at": "c", "rationale": "r",
+                                        "targets": [], "news_watch": [{"query": "jobs report", "reason": "r" * 500}]})
+    assert len(decision.news_watch[0].reason) <= 200
+    with pytest.raises(Exception):
+        Critique.model_validate({"summary": ""})  # Required content is still required.
+    assert PostmarketReview.model_json_schema()["properties"]["summary"]["maxLength"] == 4000
+
+
+def test_an_empty_desk_section_says_why(tmp_path):
+    strategy = runner(tmp_path)
+    answer = strategy.desk_latest("premarket")
+    assert answer["data"] is None and "04:00 New York" in answer["unavailable"]
+    assert "news watch is not running" in strategy.desk_latest("news")["unavailable"]
+
+
+def test_the_rehearsal_reports_only_its_own_calls_and_every_lost_answer(tmp_path):
+    from scripts.autonomous_fund.rehearsal import _last_sequence, agent_calls, answer_problems
+    journal = Journal(tmp_path, "synthetic-rehearsal")
+    journal.event(NOW, "agent_call_started", {"id": "old", "name": "critic"})  # The account's history.
+    journal.event(NOW, "agent", {"name": "researcher", "parse_error": "OSError"})
+    start = _last_sequence(tmp_path)
+    journal.event(NOW, "agent_call_started", {"id": "a", "name": "critic"})
+    journal.event(NOW + timedelta(seconds=117), "agent_call_finished", {"id": "a", "name": "critic"})
+    journal.event(NOW, "agent", {"name": "critic", "parse_error": "String should have at most 1500 characters",
+                                 "usage": {"prompt_tokens": 448884, "completion_tokens": 20623}})
+    journal.event(NOW, "critic_unavailable", {"error": "Invalid structured agent answer"})
+    journal.event(NOW, "operation_error", {"notification": "postmarket_review_error", "error": "ValueError",
+                                           "frames": [{"module": "scripts.autonomous_fund.risk",
+                                                       "function": "validate_evidence", "line": 99}]})
+    journal.event(NOW, "notification", {"kind": "postmarket_review_error", "details": "ValueError"})
+    calls = agent_calls(journal, after=start)
+    assert calls == [{"name": "critic", "seconds": 117.0, "input_tokens": 448884, "output_tokens": 20623}]
+    problems = answer_problems(journal, after=start)
+    assert len(problems) == 3 and "at most 1500 characters" in problems[0]
+    assert problems[2] == "postmarket_review_error: ValueError at scripts.autonomous_fund.risk.validate_evidence:99"
+
+
+def test_status_hides_errors_older_than_a_day_and_dates_recent_ones(tmp_path):
+    from scripts.autonomous_fund.status import summary
+    from tests.test_autonomous_fund_monitor import setup
+    journal = setup(tmp_path)
+    journal.event(NOW - timedelta(hours=30), "operation_error", {"phase": "trading_iteration", "error": "OSError"})
+    assert "最近业务异常" not in summary(tmp_path, "local", now=NOW)
+    journal.event(NOW - timedelta(hours=2), "operation_error", {"phase": "premarket_research", "error": "ValueError"})
+    assert "最近业务异常（2 小时前）" in summary(tmp_path, "local", now=NOW)
+
+
+def test_a_planned_restart_is_not_alerted_but_a_crash_is(tmp_path):
+    from scripts.autonomous_fund import stops
+    from scripts.autonomous_fund.monitor import Monitor
+    from tests.test_autonomous_fund_monitor import NOW as MONITOR_NOW, setup
+    journal = setup(tmp_path)
+    monitor = Monitor(tmp_path)
+    monitor.poll(MONITOR_NOW + timedelta(seconds=5))
+    stops.write(tmp_path, "operator", "stopped_by_operator", MONITOR_NOW + timedelta(seconds=6))
+    (tmp_path / "status.json").write_text(encode({"heartbeat_at": (MONITOR_NOW + timedelta(seconds=6)).isoformat(),
+                                                  "runner_state": "exited"}), encoding="utf-8")
+    monitor.poll(MONITOR_NOW + timedelta(seconds=10))
+    kinds = [r["body"].get("kind") for r in journal.all_events() if r["kind"] == "notification"]
+    assert "watchdog_stop" not in kinds and any(r["kind"] == "watchdog_noted" for r in journal.all_events())
