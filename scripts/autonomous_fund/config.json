@@ -104,6 +104,10 @@
     "auto_resume_after_seconds": 180,
     "max_auto_resumes_per_day": 3
   },
+  "performance": {
+    "benchmarks": {"spy": {"SPY": "1"}, "risk_matched": {"SPY": "0.6", "SGOV": "0.4"}},
+    "data_costs_usd_per_month": "0"
+  },
   "factor_lab": {
     "enabled": true,
     "history_days": 504,

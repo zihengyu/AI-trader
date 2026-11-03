@@ -777,10 +777,27 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
   `configurations_breakdown` 里分别列出：交易过的提示词版本数 × 风控配置数，加上测试过的因子表达式数（包括未通过的），
   加上组合构建对照（运行过就加 1）和学习对照组（影子 A/B 运行过就加 1），不会少于原来的算法；
 - 最短记录期 MinTRL：按目前的夏普比，要多少个交易日才能有 95% 的把握说它大于 0；
-- 相对 SPY 的回归：beta、年化 alpha 和 alpha 的 t 值。
+- 相对 SPY 的回归：beta、年化 alpha 和 alpha 的 t 值，以及用 **Newey-West**（Bartlett 核，滞后
+  `floor(4·(n/100)^(2/9))`）稳健标准误算出的 alpha t 值，收益有自相关时它更小；
+- 年化收益和波动、最大回撤、Sortino（只用下行波动）、**按自相关修正的夏普**（Lo 2002：用到 Newey-West 滞后阶数为止的自相关，
+  更高阶记为 0；正自相关会降低夏普），每项都注明交易日数。
+
+**事先定义的基准**（`config.json` 的 `performance.benchmarks`）：默认 `spy`（100% SPY）和 `risk_matched`
+（60% SPY + 40% SGOV，每个交易日再平衡）。每个基准的 id 是名称加定义的哈希（如 `risk_matched-1a2b3c4d`），
+写在启动记录里；改了定义就是新 id，旧定义的结果继续列在报告里（标为“旧定义”），不会被新定义追溯替换，
+不能事后挑最容易战胜的基准。基准收益用账本里每个交易日最后的价格记录计算，再加上为基准证券记录的分红和拆股
+（`benchmark_action`；本地模式每个交易日从 Yahoo 查一次最近 40 天的公司行为），所以是总收益：SGOV 的收益几乎全是月度分红，
+只看价格会让基准过于容易战胜。数据源不提供公司行为时（如 Alpaca paper），报告写明“分红未计入”。
+每个基准给出年化超额收益、跟踪误差、信息比率和 alpha（普通与 Newey-West t 值）。
+
+**两种净收益口径**：
+- 账户净收益：账户净值的变化，已经包含成交费用和相对成交价的滑点；
+- 系统净收益：再扣掉区间内的模型费用（每次调用记录的 `cost_usd`）和数据订阅费（`performance.data_costs_usd_per_month`，
+  `FUND_DATA_COSTS_USD_PER_MONTH`，默认 0，按每月 21 个交易日分摊）。任何一个区间有未定价的模型调用，或数据费用设为未知（null），
+  系统净收益就显示“未知”，不当作 0。
 
 **分阶段资金就绪度**（`capital_stage`）：只有在运行验收通过、至少 60 个交易日且不少于 MinTRL、PSR ≥ 0.95、DSR ≥ 0.90、
-alpha t ≥ 1.65（单边 95%）、且没有触发回撤上限时，才给出 `eligible_stage_1`（最多投入计划资金的 10%）；否则为 `paper_only`
+alpha t ≥ 1.65（单边 95%，普通 t 值和 Newey-West t 值取较小者）、且没有触发回撤上限时，才给出 `eligible_stage_1`（最多投入计划资金的 10%）；否则为 `paper_only`
 并列出每一条不满足的原因。25% 和 50% 两个阶段需要实盘记录满足同样的检验。**这只是报告**：本应用没有实盘模式，
 任何真金白银的一步都需要你明确授权和单独审核的执行路径。
 

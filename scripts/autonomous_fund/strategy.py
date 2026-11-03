@@ -464,6 +464,8 @@ def configuration(path, environ=None):
     CriticSettings.from_config(result.get("critic"))
     from .datadesk import DeskSettings
     DeskSettings.from_config(result.get("data_desk"))
+    from .performance import PerformanceSettings
+    PerformanceSettings.from_config(result.get("performance"))
     budget = ModelBudget.from_config(result.get("model_budget"))
     if budget.max_daily_cost_usd is not None:
         from .costs import rate_for
@@ -609,6 +611,8 @@ class AutonomousFund(Strategy):
         from .validation import ValidationSettings
         self.validation = ValidationSettings.from_config(config.get("validation"))
         from .factors import FactorLab, FactorSettings
+        from .performance import PerformanceSettings
+        self.performance = PerformanceSettings.from_config(config.get("performance"))
         factor_settings = FactorSettings.from_config(config.get("factor_lab"))
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
         self.sec = None
@@ -726,6 +730,8 @@ class AutonomousFund(Strategy):
                            "observe_only": observe_only, "execution_revision": EXECUTION_REVISION,
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "prompt_version": self.prompt_version,
+                           "performance": {"benchmarks": self.performance.definitions(),
+                                           "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
                            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
                            "mandate": asdict(self.mandate),
@@ -1149,10 +1155,53 @@ class AutonomousFund(Strategy):
         try:
             benchmarks = {symbol: str(self.get_last_price(Asset(symbol, asset_type="stock"))) for symbol in ("SPY", "QQQ")}
             if all(number(value) > 0 for value in benchmarks.values()):
+                # The predefined benchmarks' other components (SGOV for risk_matched) when priced.
+                for symbol in getattr(getattr(self, "performance", None), "symbols", lambda: [])():
+                    if symbol not in benchmarks:
+                        try:
+                            value = self.get_last_price(Asset(symbol, asset_type="stock"))
+                        except Exception:
+                            value = None
+                        if value is not None and number(value) > 0:
+                            benchmarks[symbol] = str(value)
                 self.journal.event(start, "benchmark", benchmarks)
         except Exception:
             self.journal.event(start, "benchmark_unavailable", {})
+        self._record_benchmark_actions(start)
         return account
+
+    def _record_benchmark_actions(self, now):
+        """Once a trading day: the benchmarks' recent dividends and splits, so they are total returns.
+
+        Only where the data source reports corporate actions (the local Yahoo source);
+        elsewhere the benchmarks stay price returns and the report says so. Never
+        blocks the iteration.
+        """
+        settings = getattr(self, "performance", None)
+        source = getattr(getattr(self, "broker", None), "data_source", None)
+        fetch = getattr(source, "corporate_actions", None)
+        day = trading_day(now)
+        if settings is None or fetch is None or getattr(self, "_benchmark_actions_day", None) == day:
+            return
+        self._benchmark_actions_day = day
+        seen, checked = set(self.journal.get_meta("benchmark_actions_seen") or []), []
+        for symbol in settings.symbols():
+            try:
+                actions = fetch(Asset(symbol, asset_type="stock"), since=instant(now) - timedelta(days=40))
+            except Exception:
+                continue
+            checked.append(symbol)
+            for action in actions:
+                for kind in ("dividend", "split"):
+                    amount = action.get(kind)
+                    key = f"{symbol}:{action.get('date')}:{kind}"
+                    if amount and float(amount) > 0 and key not in seen:
+                        seen.add(key)
+                        self.journal.event(now, "benchmark_action", {"symbol": symbol, "date": str(action["date"]),
+                                                                     kind: str(amount)})
+        if checked:
+            self.journal.event(now, "benchmark_actions_checked", {"symbols": checked})
+            self.journal.set_meta("benchmark_actions_seen", sorted(seen)[-500:])
 
     def _price(self, symbol, record=True):
         asset, now = Asset(symbol, asset_type="stock"), self.get_datetime()

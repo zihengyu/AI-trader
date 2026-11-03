@@ -1467,6 +1467,7 @@ envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER`
 parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
 ``FUND_NEWS_QUERIES``, ``FUND_NEWS_RSS_FEEDS``, ``FUND_SHADOW_AB``, ``FUND_FACTOR_LAB``,
+``FUND_DATA_COSTS_USD_PER_MONTH`` (paid data subscriptions in USD per month, default 0, charged to the system net return beside the model costs),
 ``FUND_MODEL_KNOWLEDGE_CUTOFF_JSON`` (JSON ``{model: "YYYY-MM-DD"}``: training-data cutoffs the operator
 looked up; factor-test dates after the proposing models' latest cutoff are reported as clean out-of-sample,
 and without one every historical factor test is flagged as possibly memorized),
