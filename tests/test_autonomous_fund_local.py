@@ -428,3 +428,35 @@ def test_local_mode_runs_through_native_strategy_executor_with_scripted_model(tm
     restored.do_polling()
     observed = restored._pull_order(journal.pending()[0]["broker_id"], strategy.name)
     assert observed.status == "fill"
+
+
+def test_exchange_hours_are_built_once_a_day_not_three_times_a_second():
+    """2026-11-03: LumiBot's live loop asks for the open and close every second; each call rebuilt the exchange
+    calendar and kept a CPU core busy around the clock. The cached answer must equal the uncached one."""
+    from datetime import datetime, timezone
+    from lumibot.brokers import Broker
+    from scripts.autonomous_fund.local_broker import LocalPaperBroker
+    from scripts.autonomous_fund.market_data import CachedMarketHours
+
+    class Counting:  # LumiBot's own market_hours, without an abstract broker around it.
+        def __init__(self):
+            self.market, self.extended_trading_minutes, self.calls = "NYSE", 0, 0
+
+        def market_hours(self, market="NASDAQ", close=True, next=False, date=None):
+            self.calls += 1
+            return Broker.market_hours(self, market, close, next, date)
+
+    class Cached(CachedMarketHours, Counting):
+        pass
+
+    plain, cached = Counting(), Cached()
+    day = datetime(2026, 11, 3, 15, tzinfo=timezone.utc)
+    for _ in range(50):
+        assert cached.market_hours(close=True, date=day) == plain.market_hours(close=True, date=day)
+        cached.market_hours(close=False, date=day)
+    assert cached.calls == 2 and plain.calls == 50  # One build per (open/close, day).
+    assert cached.market_hours(close=True, date=day.replace(hour=23)) == cached.market_hours(close=True, date=day)
+    later = cached.market_hours(close=True, date=datetime(2026, 11, 4, 15, tzinfo=timezone.utc))
+    assert later > cached.market_hours(close=True, date=day) and cached.calls == 3  # A new day is built afresh.
+    assert cached.market_hours(close=True) is not None  # Today, with no date given.
+    assert issubclass(LocalPaperBroker, CachedMarketHours)

@@ -172,9 +172,13 @@ def run_paper(args, config):
     from lumibot.brokers import Alpaca
     from lumibot.traders import Trader
     from .strategy import AutonomousFund, assert_paper
+    from .market_data import CachedMarketHours
+
+    class FundAlpaca(CachedMarketHours, Alpaca):
+        """LumiBot's Alpaca broker with the exchange calendar built once a day (see CachedMarketHours)."""
     credentials = paper_config()
     models_ready(args, config)
-    broker = Alpaca(credentials)
+    broker = FundAlpaca(credentials)
     assert_paper(broker)
     binding = hashlib.sha256(credentials["API_KEY"].encode()).hexdigest()
     strategy = AutonomousFund(broker=broker, name="AutonomousPaperFund", parameters={

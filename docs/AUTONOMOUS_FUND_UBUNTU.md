@@ -362,6 +362,18 @@ sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service lum
 SQLite 审计账本不会自动删除；监控发现运行分区剩余不足 200 MB 时会写 STOP 并通知。
 定期检查磁盘、内存、模型账单、通知队列、时间同步和服务重启次数；长期内存稳定性需实际观察。
 
+**CPU 一直满载**：2026-11-03 之前的版本里，交易进程每秒查 3 次开盘／收盘时间，每次都重新计算一遍交易所日历（含节假日规则），空闲时也会占满一个 CPU 核心。现在每天只算一次（`CachedMarketHours`），同样条件下从约 32% 降到 1% 以下。更新后仍然很高时，用下面的命令看是哪个进程：
+
+```bash
+ps -eo pid,user,pcpu,pmem,etime,args --sort=-pcpu | head -12
+```
+
+```bash
+systemctl status lumibot-fund-runner lumibot-fund-desk lumibot-fund-monitor --no-pager | grep -E "●|CPU:|Memory:"
+```
+
+如果占用最高的不是 `scripts.autonomous_fund` 的进程，而是不认识的程序，应按服务器安全事件处理（检查登录记录、计划任务和对外连接），不要只重启了事。
+
 ## 行情轮询与可靠性的边界
 
 本地撮合轮询每 5 秒，默认策略调度每 30 秒（可配置）；AI 按自己的复核时间运行，并非每次轮询都收费推理。
