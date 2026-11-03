@@ -84,6 +84,16 @@ def backup(root, destination):
     stops.write(destination, "operator", "restored_backup")
 
 
+SANDBOX_KEYS = ("WorkingDirectory", "Environment", "UMask", "NoNewPrivileges", "PrivateTmp", "ProtectSystem",
+                "ProtectHome", "ReadWritePaths")
+
+
+def sandbox_properties(repo, run_dir, env_file, user):
+    """The runner unit's filesystem and privilege settings, for running a one-off command identically."""
+    unit = generate(repo, run_dir, env_file, user, None)["lumibot-fund-runner.service"]
+    return [line for line in unit.splitlines() if line.split("=", 1)[0] in SANDBOX_KEYS]
+
+
 BACKUP_NAME = re.compile(r"\d{8}-\d{6}")
 
 
@@ -126,6 +136,9 @@ def main(argv=None):
     copy = sub.add_parser("backup")
     copy.add_argument("--run-dir", type=Path, required=True)
     copy.add_argument("--output-dir", type=Path, required=True)
+    jail = sub.add_parser("sandbox", help="Print the runner's sandbox properties (used by fund-rehearse.sh)")
+    jail.add_argument("--user", required=True)
+    jail.add_argument("--env-file", type=Path, default=Path(".env"))
     daily = sub.add_parser("rotate-backup", help="Timestamped snapshot of the configured account, keeping the newest N")
     daily.add_argument("--env-file", type=Path, default=Path(".env"))
     daily.add_argument("--run-dir", type=Path)
@@ -148,6 +161,9 @@ def main(argv=None):
         raise RiskError("Generate service paths on the target Linux host, not Windows")
     args.env_file = args.env_file.resolve()
     repo = Path(__file__).resolve().parents[2]
+    if args.action == "sandbox":
+        print("\n".join(sandbox_properties(repo, None, args.env_file, args.user)))
+        return
     if args.action == "units":
         # Regenerating the units never changes trading state.
         args.output_dir.mkdir(parents=True, exist_ok=True)

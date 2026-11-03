@@ -282,7 +282,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -295,6 +295,8 @@ def main(argv=None):
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
     parser.add_argument("--once", action="store_true", help="One local scheduler iteration or monitor poll, then exit")
+    parser.add_argument("--no-models", action="store_true",
+                        help="rehearse: data stages only, no model calls (no model cost)")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
     parser.add_argument("--require-monitor", action="store_true", help="Block local/paper orders unless an independent Telegram monitor is fresh")
     parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
@@ -394,7 +396,7 @@ def main(argv=None):
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
-    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check"} else "true"
+    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse"} else "true"
     if args.mode == "serve":
         from .service import serve
         if not args.env_file:
@@ -461,6 +463,18 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "rehearse":
+        from .rehearsal import rehearse, text
+        from .settings import configured_mode
+        if configured_mode(os.environ) != "local":
+            raise RiskError("rehearse supports local mode; for paper use check and notify-test")
+        if not args.no_models:
+            models_ready(args, config)
+        result = rehearse(args.run_dir, config, models=not args.no_models)
+        print(text(result))
+        if result["verdict"] != "ready":
+            raise SystemExit(1)
         return
     if args.mode == "schwab-check":
         from .schwab import schwab_check
