@@ -80,6 +80,23 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "model_cost_budget_exhausted", "decision_drought"}
 
 
+DIRECTIONS = {"up": "看涨", "down": "看跌", "outperform": "跑赢基准", "underperform": "跑输基准"}
+VERDICTS = {"informative": "有预测信息", "not_informative": "未优于朴素基准", "insufficient_sample": "样本不足"}
+
+
+def idea_text(ideas):
+    """One line on the research ideas' scored record, or None without any."""
+    if not ideas or not ideas.get("total"):
+        return None
+    coin, up = ideas["baselines"]["coin"], ideas["baselines"]["always_up"]
+    brier = "暂无" if ideas.get("brier") is None else f"{ideas['brier']:.3f}"
+    return (f"研究想法：共 {ideas['total']} 条，已打分 {ideas['scored']}，命中率 {_percent(ideas.get('hit_rate'))}"
+            f"（总是看涨 {_percent(up.get('hit_rate'))}，抛硬币 50%），Brier {brier}（抛硬币 0.25），"
+            f"剔除大盘后的选股命中率 {_percent(ideas['selection'].get('hit_rate'))}；"
+            f"结论：{VERDICTS.get(ideas.get('verdict'), ideas.get('verdict'))}（至少 {ideas.get('minimum_sample')} 条才下结论）；"
+            f"待验证 {ideas['pending']}")
+
+
 def _percent(value):
     return "暂无" if value is None else f"{value * 100:.2f}%"
 
@@ -142,6 +159,9 @@ def daily_document(root, sequence):
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
                   "决策超额收益（1/5/20 个交易日；已扣除组合 beta 对应的市场涨跌，net 再扣交易成本）："
                   + json.dumps(decisions, ensure_ascii=False)]
+        line = idea_text(card.get("ideas"))
+        if line:
+            lines.append(line)
         timing = card.get("timing")
         if timing:
             stop, profit = timing["protective_exits"]["stop_loss"], timing["protective_exits"]["take_profit"]
@@ -229,6 +249,14 @@ def readable(kind, details, sequence=None):
         if evidence:
             lines += ["", f"证据 {details.get('evidence_count', len(evidence))} 条："]
             lines += [f"• {e.get('source')}（{_when(e.get('available_at') or e.get('observed_at'))}）" for e in evidence]
+        ideas = details.get("ideas")
+        if ideas:
+            lines += ["", f"投资想法 {len(ideas)} 条（已登记为预测，之后按收盘价打分）："]
+            lines += [f"• {i.get('symbol')} {DIRECTIONS.get(i.get('direction'), i.get('direction'))}，"
+                      f"{i.get('horizon_sessions')} 个交易日，把握 {_percent(i.get('confidence'))}：{(i.get('thesis') or '')[:120]}"
+                      for i in ideas]
+        elif "ideas" in details:
+            lines += ["", "投资想法：今天没有足够把握的机会（允许为空）。"]
         lines += ["", "这只是研究：开盘后由 AI 决策，并经过风控后才会下单。"]
         text = "\n".join(lines)
     elif kind == "session_open":

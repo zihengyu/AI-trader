@@ -48,7 +48,8 @@ def test_saved_research_keeps_its_original_times_and_session(tmp_path, previous_
     strategy.premarket_research = packet
     strategy._decide(account(), NOW, False)
     context = calls[0][1]
-    assert context["research"] == research
+    assert context["research"] == {**research, "ideas": []}  # Research saved before ideas existed still validates.
+    assert context["research_ideas"] == []
     assert context["research_status"]["state"] == ("previous_session" if previous_session else "available")
     assert context["research_status"]["completed_at"] == made.isoformat()
     assert context["premarket_research"] == packet
