@@ -1,17 +1,17 @@
-"""Scheduled prefetch: fetch each trading day's research data before anyone needs it.
+"""One pass of the daily research downloads, by hand: `run prefetch`.
 
-Run by the `lumibot-fund-prefetch.timer` (07:15 New York on weekdays, before
-the pre-open research) or by hand with `run prefetch`. It fills the account's
-daily store (datastore.py) and the SEC cache:
+The data desk (datadesk.py, `lumibot-fund-desk.service`) runs these steps
+continuously; this command runs the daily ones once, for example on a server
+without the desk or to check every source before the open. It fills the
+account's daily store (datastore.py) and the SEC cache:
 
 - local mode: completed daily bars for the tradable universe, the research
   universe and the benchmarks (the same source and length the runner uses;
   paper mode keeps the broker's own data and skips this part);
 - FRED series, the earnings calendar, SEC company-facts extracts.
 
-The runner reads these first and fetches only what is missing, so research and
-trading no longer wait for downloads and a restart never repeats them. It never
-calls a model, places an order or touches STOP, approvals or the journal.
+The runner reads these first and fetches only what is missing. It never calls
+a model, places an order or touches STOP, approvals or the journal.
 """
 import os
 import time
@@ -20,17 +20,54 @@ from datetime import datetime, timezone
 from .risk import RiskError, trading_day
 
 
+def fetch_bars(store, day, symbols, length, data):
+    """Completed daily bars for every symbol not yet stored today: {"fetched", "already_stored", "failed"}."""
+    from lumibot.entities import Asset
+    from .strategy import daily_rows
+    bars = {"fetched": 0, "already_stored": 0, "failed": {}}
+    for symbol in symbols:
+        if store.bars(day, symbol, length) is not None:
+            bars["already_stored"] += 1
+            continue
+        try:
+            rows = daily_rows(data.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day"))
+            if not rows:
+                raise RiskError("no completed daily bars")
+            store.save_bars(day, symbol, length, rows)
+            bars["fetched"] += 1
+        except Exception as exc:
+            bars["failed"][symbol] = str(exc)[:120] if isinstance(exc, RiskError) else type(exc).__name__
+    return bars
+
+
+def refresh_earnings(store, day, calendar, stocks, refresh=False):
+    """Earnings dates per stock into the store; refresh=True fetches every stock again.
+
+    A failed fetch never replaces dates fetched earlier: the earlier answer is kept.
+    """
+    today = datetime.fromisoformat(str(day)).date()
+    saved = store.get(day, "earnings") or {}
+    for symbol in stocks:
+        if symbol in saved and not saved[symbol].get("error") and not refresh:
+            continue
+        source_name, dates, error = calendar.fetch(symbol, today)
+        if error and symbol in saved and not saved[symbol].get("error"):
+            continue
+        saved[symbol] = {"source": source_name, "dates": dates, "error": error}
+    store.put(day, "earnings", saved)
+    return {"symbols": len(saved), "failed": sorted(s for s, v in saved.items() if v["error"])}
+
+
 def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, clock=time.monotonic,
              earnings_get=None, earnings_yahoo=None, macro_get=None, sec_get=None):
     from pathlib import Path
     import pandas as pd
-    from lumibot.entities import Asset
     from .datastore import DailyStore
     from .events import EarningsCalendar, EventSettings
     from .factors import FactorSettings
     from .macro import MacroSettings, MacroWatch
     from .risk import Limits
-    from .strategy import daily_rows, history_length, risk_settings
+    from .strategy import history_length, risk_settings
     environ = os.environ if environ is None else environ
     run_dir = Path(run_dir)
     now = now or datetime.now(timezone.utc)
@@ -45,23 +82,9 @@ def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, cloc
 
     if mode == "local":
         from .market_data import YahooRealtimeData
-        data = source or YahooRealtimeData(tape=None)
         length = history_length(quant, lab if lab.enabled else None)
         symbols = sorted(set(universe) | set(stocks) | {quant.stress_benchmark, "SPY", "QQQ"})
-        bars = {"fetched": 0, "already_stored": 0, "failed": {}}
-        for symbol in symbols:
-            if store.bars(day, symbol, length) is not None:
-                bars["already_stored"] += 1
-                continue
-            try:
-                rows = daily_rows(data.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day"))
-                if not rows:
-                    raise RiskError("no completed daily bars")
-                store.save_bars(day, symbol, length, rows)
-                bars["fetched"] += 1
-            except Exception as exc:
-                bars["failed"][symbol] = str(exc)[:120] if isinstance(exc, RiskError) else type(exc).__name__
-        report["bars"] = bars
+        report["bars"] = fetch_bars(store, day, symbols, length, source or YahooRealtimeData(tape=None))
     else:
         report["bars"] = "skipped: paper mode keeps the broker's own daily data"
 
@@ -73,15 +96,8 @@ def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, cloc
     events = EventSettings.from_config(config.get("events"))
     if events.enabled:
         calendar = EarningsCalendar(None, events, environ=environ, get=earnings_get, yahoo=earnings_yahoo)
-        today = datetime.fromisoformat(day).date()
-        saved = store.get(day, "earnings") or {}
-        for symbol in sorted(s for s, kind in universe.items() if kind == "stock"):
-            if symbol in saved and not saved[symbol].get("error"):
-                continue
-            source_name, dates, error = calendar.fetch(symbol, today)
-            saved[symbol] = {"source": source_name, "dates": dates, "error": error}
-        store.put(day, "earnings", saved)
-        report["earnings"] = {"symbols": len(saved), "failed": sorted(s for s, v in saved.items() if v["error"])}
+        report["earnings"] = refresh_earnings(store, day, calendar,
+                                              sorted(s for s, kind in universe.items() if kind == "stock"))
     agent = str(environ.get("FUND_SEC_USER_AGENT", "")).strip()
     if lab.enabled and agent:
         from .fundamentals import SecFundamentals

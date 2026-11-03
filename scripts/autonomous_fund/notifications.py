@@ -299,6 +299,9 @@ def readable(kind, details, sequence=None):
     elif kind == "model_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型调用预算已用完（{details.get('runs')}/{details.get('limit')}）："
                 "已有目标继续执行，止损照常，明天恢复研究。")
+    elif kind == "data_desk_stale" and isinstance(details, dict):
+        text = (f"ℹ️ 数据员已 {details.get('heartbeat_minutes_ago')} 分钟没有更新：交易进程改为自己拉取行情、资讯和宏观数据，"
+                "交易不受影响。查看：bash scripts/fund-logs.sh errors；重启：bash scripts/fund-restart.sh -y")
     elif kind == "drawdown_pause":
         text = "🚨 回撤触及上限，暂停增加仓位；卖出和止损照常。确认后由人工复位（reset-drawdown）。"
     elif kind == "construction_switched" and isinstance(details, dict):

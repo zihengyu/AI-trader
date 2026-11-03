@@ -96,6 +96,7 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
 | 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
 | 模型 | `FUND_SKIP_QUIET_REVIEWS`、`FUND_MAX_QUIET_MINUTES` | 到点复核时无任何变化就跳过模型调用、连续跳过的最长分钟数（见[模型调用预算](#模型调用预算与失败退避)） |
+| 外部 | `FUND_DATA_DESK`、`FUND_DESK_INTRADAY_SECONDS` | 数据员（常驻服务，持续拉取整理资讯、盘中行情、宏观、财报）开关、盘中行情刷新间隔 |
 | 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
 | 约束 | `FUND_MAX_POSITION`、`FUND_MAX_EXPOSURE`、`FUND_MAX_DRAWDOWN`、`FUND_DAILY_ORDERS` | 单只上限、总敞口、回撤硬锁、每日提交次数 |
 | 约束 | `FUND_DAILY_LOSS_LIMIT`、`FUND_TARGET_VOL`、`FUND_MAX_ES` | 单日亏损闸门、波动率目标、尾部损失上限 |
@@ -777,8 +778,12 @@ alpha t ≥ 1.65（单边 95%）、且没有触发回撤上限时，才给出 `e
   相对压力基准（默认 SPY）的 60 日 beta 和相关性、相对 50/200 日均线的位置、距 252 日最高收盘的回撤和 20 日日均成交额，
   放进盘前研究和盘中决策的上下文，研究员和基金经理不必再用工具重复计算。只用已完成的交易日（历史回放同样不看未来），
   缺数据为 `null`，从不填补；预算用完时尚未读取的标的列在 `deferred`，下一轮补齐。
-- **研究数据预取**：每个工作日美东 07:15 的定时任务（`run prefetch`）把当天的日线、FRED、财报日历和 SEC 基本面先存到
-  `<账户目录>/cache/daily/<交易日>/`；交易进程先读这里，缺的才联网补并写回。见 [Ubuntu 部署](AUTONOMOUS_FUND_UBUNTU.md)。
+- **数据员**（`data_desk` 段，`FUND_DATA_DESK`，常驻服务 `lumibot-fund-desk`）：一个不调用模型、不下单的进程持续拉取整理
+  资讯（开盘时每 5 分钟）、盘中行情（每 `FUND_DESK_INTRADAY_SECONDS`，默认 5 分钟）、FRED（工作时段每小时）、财报日历
+  （每 6 小时）、日线、行情快照和 SEC 财报，存到 `<账户目录>/cache/daily/<交易日>/` 和账本的资讯表。交易进程先读这些，缺的或
+  过期的才自己联网补；盘前研究和盘中决策的输入里有 `data_desk`（各数据的新鲜度、盘中行情、上次决策以来新增的资讯条数），
+  三个 AI 角色在实盘模式下都有 `desk_latest` 工具，可在思考过程中随时读到那一刻最新的数据（历史回放没有这个工具，不会看到未来）。
+  数据员停了交易照常，交易进程自己拉数据。见 [Ubuntu 部署](AUTONOMOUS_FUND_UBUNTU.md#数据员常驻的数据整理服务)。
 
 ## 停止、恢复与异常通知
 
@@ -829,8 +834,8 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 
 **进程退出后的自动重启与自动恢复**：
 
-- Ubuntu：两个 systemd 服务（交易、监控）退出后 30 秒自动重启；
-- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易和监控两个进程，任一退出 30 秒后重启：
+- Ubuntu：三个 systemd 服务（交易、监控、数据员）退出后 30 秒自动重启；
+- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易、监控和数据员三个进程，任一退出 30 秒后重启：
 
   ```powershell
   .\scripts\run_autonomous_fund.ps1 -Mode serve

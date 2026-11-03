@@ -1,6 +1,7 @@
 """Real-time information watch: headlines, filings and macro releases for the AI.
 
-A background thread polls free public sources, stores each item once with its
+A background thread polls free public sources (the data desk process does it
+instead while it runs; this thread then stands by), stores each item once with its
 source publication time and observation time, and flags a few deterministic
 "material" events that should bring the next AI review forward. It never
 trades and never interprets content: the AI reads the items as UNTRUSTED data
@@ -125,8 +126,11 @@ def yahoo_items(symbol, fetch=None):
 class NewsWatch:
     """Background poller; the strategy thread reads results from the journal."""
 
-    def __init__(self, journal, settings, *, clock=None, is_open=None, get=None, yahoo=None, environ=None):
+    def __init__(self, journal, settings, *, clock=None, is_open=None, get=None, yahoo=None, environ=None,
+                 standby=None):
         self.journal, self.settings = journal, settings
+        # standby(): True while another process (the data desk) polls into the same journal table.
+        self.standby = standby
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.is_open = is_open or (lambda: True)
         self.get = get or requests.get
@@ -161,7 +165,8 @@ class NewsWatch:
     def _run(self):
         while not self._stop.is_set():
             try:
-                self.poll_once()
+                if self.standby is None or not self.standby():
+                    self.poll_once()
             except Exception as exc:  # A poll failure never reaches trading.
                 self.stats["errors"]["poll"] = type(exc).__name__
             interval = self.settings.poll_seconds * (1 if self.is_open() else 4)

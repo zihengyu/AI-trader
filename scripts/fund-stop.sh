@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Manual shutdown of the AI paper fund: stop trading first (an operator STOP that
 # is never lifted automatically; the runner cancels this application's open
-# orders), give it time to do so, then stop both services.
+# orders), give it time to do so, then stop the runner, monitor and data desk.
 # Usage: bash scripts/fund-stop.sh [--now] [--disable]
 #   --now      do not wait for the runner to cancel orders (default: wait 60 s)
 #   --disable  also stop the services from starting at boot
@@ -10,7 +10,7 @@ repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$repo"
 py="${AI_FUND_PYTHON:-$repo/.venv/bin/python}"
 env_file="${AI_FUND_ENV:-$repo/.env}"
-units=(lumibot-fund-runner.service lumibot-fund-monitor.service)
+units=(lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service)
 wait_seconds=60
 disable=0
 for arg in "$@"; do
@@ -35,7 +35,7 @@ fi
 echo "3/3 停止服务……"
 run sudo systemctl stop "${units[@]}"
 if (( disable )); then
-  run sudo systemctl disable --now "${units[@]}" lumibot-fund-backup.timer lumibot-fund-prefetch.timer
+  run sudo systemctl disable --now "${units[@]}" lumibot-fund-backup.timer
   echo "    已取消开机自启（含每日备份定时器）。"
 fi
 echo

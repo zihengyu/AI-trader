@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
@@ -22,7 +23,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, decision_levels, d
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
-                   "construction", "critic")
+                   "construction", "critic", "data_desk")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -62,6 +63,9 @@ RESEARCHER_PROMPT = (
     "market_snapshot already gives every eligible symbol's returns, volatility, beta, trend and liquidity from "
     "completed daily closes: use it instead of recomputing them with tools, and spend tool calls on news, filings "
     "and evidence it cannot contain. "
+    "In live runs a data desk (数据员) process collects news, intraday prices, FRED and earnings continuously: "
+    "data_desk shows its freshness, the session so far and what is new since the last decision, and the "
+    "desk_latest tool returns the newest version of any section at the moment you call it. "
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
     "of time; an unfinished run returns nothing."
@@ -103,6 +107,8 @@ MANAGER_PROMPT = (
     "propose a portfolio that already fits; scaled weights are reported back in risk_overlay. "
     "market_snapshot gives each symbol's returns, volatility, beta, trend and liquidity from completed daily "
     "closes; use it rather than recomputing them with tools. "
+    "In live runs data_desk and the desk_latest tool give the data desk's continuously updated intraday prices, "
+    "news, macro and earnings; check desk_latest before acting on minutes-old context. "
     "Sales execute automatically. Purchases run automatically inside a daily risk-increase "
     "envelope; purchases beyond it, or during market stress, wait for one operator approval "
     "of the whole plan. Choose next_review_at no earlier than min_review_minutes. "
@@ -390,6 +396,8 @@ def configuration(path, environ=None):
     from .construction import ConstructionSettings
     ConstructionSettings.from_config(result.get("construction"))
     CriticSettings.from_config(result.get("critic"))
+    from .datadesk import DeskSettings
+    DeskSettings.from_config(result.get("data_desk"))
     return result
 
 
@@ -532,15 +540,20 @@ class AutonomousFund(Strategy):
             except RiskError as exc:
                 self.journal.event(self.get_datetime(), "fundamentals_unavailable", {"error": str(exc)})
         self._factor_cache = None
+        # Live runs read the data desk's prepared data first (datadesk.py) and fetch only what it lacks.
+        from .datadesk import DeskStatus
+        from .datastore import DailyStore
+        live = mode in {"paper", "local"}
+        self.daily_store = DailyStore(self.run_dir / "cache" / "daily") if live else None
+        self.desk_status = DeskStatus(self.run_dir) if live else None
         self.news = None
         from .news import NewsSettings, NewsWatch
         news = NewsSettings.from_config(config.get("news"))
-        if mode in {"paper", "local"} and news.enabled and runtime is None:
-            # Live information only; historical runs use the researcher's dated tools.
-            self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open)
-        # Live runs share each trading day's research data with the scheduled prefetch job.
-        from .datastore import DailyStore
-        self.daily_store = DailyStore(self.run_dir / "cache" / "daily") if mode in {"paper", "local"} else None
+        if live and news.enabled and runtime is None:
+            # Live information only; historical runs use the researcher's dated tools. While the
+            # data desk is collecting news, this thread stands by and only reads what it stored.
+            self.news = NewsWatch(self.journal, news, clock=self.get_datetime, is_open=self.broker.is_market_open,
+                                  standby=self._desk_collects_news)
         from .events import EarningsCalendar, EventSettings
         events = EventSettings.from_config(config.get("events"))
         # Live only: a historical run would need the earnings calendar as it was known then.
@@ -590,7 +603,9 @@ class AutonomousFund(Strategy):
         isolate_research(self, self.run_dir / "cache", config.get("research_network"))
         common = dict(allow_trading=False, allow_network=True,
                       reasoning_effort=config.get("reasoning_effort"), _runtime=runtime,
-                      model_request_timeout_seconds=120)
+                      model_request_timeout_seconds=120,
+                      # Live data only: a historical run must never read today's prepared data.
+                      tools=[self.desk_latest] if mode in {"paper", "local"} else None)
         # Both roles are read-only by the user's explicit structured-target contract.
         # Native permissions remove every tool marked as mutating trading state.
         self.agents.create(
@@ -835,7 +850,7 @@ class AutonomousFund(Strategy):
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
-                       "market_snapshot": self._market_snapshot(now),
+                       "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
@@ -1255,6 +1270,7 @@ class AutonomousFund(Strategy):
                    "risk_increase_paused": paused,
                    "risk": self._risk_context(account, now),
                    "market_snapshot": self._market_snapshot(now),
+                   "data_desk": self._desk_context(now),
                    "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
@@ -1955,6 +1971,67 @@ class AutonomousFund(Strategy):
         window = rows[-(self.quant.es_lookback_days + 5):]
         return [(d, close) for d, close, _ in self._completed(window, now)]
 
+    def _desk_collects_news(self):
+        """True while the data desk polls news into this journal (the runner's thread then stands by)."""
+        status, news = getattr(self, "desk_status", None), getattr(self, "news", None)
+        if status is None or news is None:
+            return False
+        from .market_data import SessionClock
+        is_open = SessionClock(now=self.get_datetime).status()["open"]
+        # Three missed polls and the runner polls again itself.
+        return status.fresh("news", 3 * news.settings.poll_seconds * (1 if is_open else 4), self.get_datetime())
+
+    def _desk_version(self, now, *names):
+        """Store versions of datasets the desk rewrites during the day: a changed one invalidates a cache."""
+        store = getattr(self, "daily_store", None)
+        return tuple(store.version(trading_day(now), name) for name in names) if store is not None else ()
+
+    @agent_tool(name="desk_latest",
+                description="Newest data the data desk (数据员) prepared, read at the moment of the call (live only).")
+    def desk_latest(self, section: str = "intraday") -> dict:
+        """Read the data desk's newest version of one section, for example mid-run after minutes of research.
+
+        Args:
+            section: intraday (session so far: last, change, day range and volume, movers, breadth),
+                snapshot (daily returns, volatility, beta, trend, liquidity), macro (FRED regime),
+                earnings (upcoming dates and caps), news (recent headlines, filings, releases)
+                or status (which datasets are fresh and when they were updated)
+        """
+        return self._desk_section(str(section).strip().lower(), self.get_datetime())
+
+    def _desk_section(self, section, now):
+        readers = {"intraday": lambda: self._intraday(now), "snapshot": lambda: self._market_snapshot(now),
+                   "macro": lambda: self._macro_context(now), "earnings": lambda: self._earnings_caps(now),
+                   "news": lambda: self._news_context(None, now),
+                   "status": lambda: self.desk_status.summary(now) if getattr(self, "desk_status", None) else None}
+        if section not in readers:
+            return {"error": f"unknown section {section!r}", "sections": sorted(readers)}
+        try:
+            return {"section": section, "read_at": instant(now).isoformat(), "data": readers[section]()}
+        except Exception as exc:  # A tool answer, never an exception inside the model run.
+            return {"section": section, "unavailable": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__}
+
+    def _intraday(self, now):
+        """The desk's newest intraday pulse of today's session, or None."""
+        store = getattr(self, "daily_store", None)
+        return store.get(trading_day(now), "intraday") if store is not None else None
+
+    def _desk_context(self, now):
+        """What the data desk prepared: its freshness, the intraday pulse and what is new since the last decision."""
+        status = getattr(self, "desk_status", None)
+        if status is None:
+            return None
+        since = (self.journal.get_meta("last_model_decision") or {}).get("at")
+        new = None
+        if since and getattr(self, "news", None) is not None:
+            with self.journal.connection() as db:
+                row = db.execute("SELECT count(*), sum(material IS NOT NULL) FROM fund_news WHERE observed_at>? "
+                                 "AND baseline=0", (instant(since).astimezone(ZoneInfo("UTC")).isoformat(),)).fetchone()
+            new = {"since": since, "items": row[0] or 0, "material": row[1] or 0}
+        return {"desk": status.summary(now), "intraday": self._intraday(now), "news_since_last_decision": new,
+                "tool": "desk_latest(section) returns the newest intraday, snapshot, macro, earnings, news or status "
+                        "at the moment you call it"}
+
     def _market_snapshot(self, now):
         """Returns, volatility, beta, trend and liquidity per tradable symbol, once per trading day.
 
@@ -1965,12 +2042,20 @@ class AutonomousFund(Strategy):
         """
         if getattr(self, "quant", None) is None:
             return None
-        day = trading_day(now)
+        day, version = trading_day(now), self._desk_version(now, "market_snapshot")
         cached = getattr(self, "_market_snapshot_cache", None)
-        if cached and cached[0] == day:
+        if cached and cached[0] == (day, version):
             return cached[1]
         from .snapshot import snapshot
         benchmark = self.quant.stress_benchmark
+        prepared = self.daily_store.get(day, "market_snapshot") if getattr(self, "daily_store", None) else None
+        wanted = set(self.universe) | {benchmark}
+        if prepared and wanted <= set(prepared.get("symbols") or {}) | set(prepared.get("no_history") or []):
+            # Prepared by the data desk from the same completed bars: no computation here.
+            result = {**prepared, "symbols": {s: v for s, v in prepared["symbols"].items() if s in wanted},
+                      "no_history": [s for s in prepared.get("no_history") or [] if s in wanted]}
+            self._market_snapshot_cache = ((day, version), result)
+            return result
         histories, deferred = {}, []
         for symbol in sorted(set(self.universe) | {benchmark}):
             if (day, symbol) not in (getattr(self, "_bars", None) or {}) and not self._may_prepare():
@@ -1984,7 +2069,7 @@ class AutonomousFund(Strategy):
             return {"unavailable": type(exc).__name__}
         if deferred:
             return {**result, "deferred": deferred}
-        self._market_snapshot_cache = (day, result)
+        self._market_snapshot_cache = ((day, version), result)
         return result
 
     def _risk_estimate(self, symbols, now):
@@ -2097,7 +2182,7 @@ class AutonomousFund(Strategy):
         calendar = getattr(self, "earnings", None)
         if calendar is None or self.mode not in {"paper", "local"}:
             return empty
-        day = trading_day(now)
+        day = (trading_day(now), self._desk_version(now, "earnings"))  # The desk refreshes the calendar.
         cached = getattr(self, "_earnings_cache", None)
         if cached and cached[0] == day:
             return cached[1]
@@ -2121,16 +2206,18 @@ class AutonomousFund(Strategy):
         watch = getattr(self, "macro", None)
         if watch is None:
             return None
+        from .macro import SERIES
         day = trading_day(now)
+        key = (day, self._desk_version(now, *(f"fred_{name}" for name in SERIES)))  # Desk refreshes hourly.
         cached = getattr(self, "_macro_cache", None)
-        if cached and cached[0] == day:
+        if cached and cached[0] == key:
             return cached[1]
         try:
             result = watch.context(day, may_fetch=self._may_prepare)
         except Exception as exc:
             result = {"unavailable": type(exc).__name__}
         if not result.get("deferred"):  # Series not fetched yet are fetched in a later iteration.
-            self._macro_cache = (day, result)
+            self._macro_cache = (key, result)
         return result
 
     def _stress(self, now):

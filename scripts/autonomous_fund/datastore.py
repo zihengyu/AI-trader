@@ -1,11 +1,12 @@
 """Each New York trading day's research data, fetched once and kept on disk.
 
-The scheduled prefetch job (`run prefetch`, systemd timer before the pre-open
-research) and the runner share this store under `<run-dir>/cache/daily/<day>/`:
+The data desk (datadesk.py, always on), the one-shot `run prefetch` and the
+runner share this store under `<run-dir>/cache/daily/<day>/`:
 
 - `bars/<SYMBOL>.json`: completed daily bars (date, close, volume, open, high,
   low) as the data source returned them, sessions BEFORE that day only;
-- `<name>.json`: other daily data (FRED series, earnings dates).
+- `<name>.json`: other data (FRED series, earnings dates, the market snapshot and
+  the intraday pulse), rewritten by the desk whenever it refreshes them.
 
 The runner reads the store first and uses the network only for what is missing,
 writing what it fetched back. A restart therefore never repeats the day's
@@ -56,6 +57,14 @@ class DailyStore:
 
     def put(self, day, name, value):
         self._write(self.root / str(day) / f"{name}.json", value)
+
+    def version(self, day, name):
+        """Changes whenever `name` is rewritten (the data desk refreshes during the day); None when absent."""
+        try:
+            stat = (self.root / str(day) / f"{name}.json").stat()
+        except OSError:
+            return None
+        return stat.st_ino, stat.st_mtime_ns  # Every atomic rewrite is a new file (new inode).
 
     def prune(self, today, keep=KEEP_DAYS):
         """Remove days older than the newest `keep` (this store's own day directories only)."""

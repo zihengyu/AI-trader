@@ -84,6 +84,15 @@ def _context_judge(value):
     return "ok", ""
 
 
+def _desk_judge(view):
+    """Running with fresh data is ok; a stopped desk is a warning (the runner then fetches its own data)."""
+    if not view.get("running"):
+        return "warn", "disabled" if view.get("disabled") else "desk not running"
+    ages = [f"{name} {item['updated_minutes_ago']:g} min" + (" (error)" if item.get("error") else "")
+            for name, item in sorted(view["datasets"].items()) if item.get("updated_minutes_ago") is not None]
+    return "ok", "running; " + (", ".join(ages) or "no dataset finished yet")
+
+
 def _snapshot_judge(value):
     verdict, detail = _context_judge(value)
     if verdict == "ok" and isinstance(value, dict):
@@ -189,9 +198,10 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         root.mkdir(parents=True, exist_ok=True)
         if (account_dir / "state.sqlite3").is_file():
             deploy.backup(account_dir, book)
-            sec = account_dir / "cache" / "sec"
-            if sec.is_dir():
-                shutil.copytree(sec, book / "cache" / "sec")
+            # The SEC cache and what the data desk prepared, so the copy reads them like the runner.
+            for name in ("sec", "daily", "desk"):
+                if (account_dir / "cache" / name).is_dir():
+                    shutil.copytree(account_dir / "cache" / name, book / "cache" / name)
             stops.clear(book)  # The copy's own STOP; orders are intercepted below.
             return "copied"
         book.mkdir(parents=True)
@@ -199,6 +209,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     origin = stages.run("copy the account", copy, kind="required", judge=lambda v: ("ok", v or ""))
     if origin is None:
         return _finish(scratch, stages, root, keep)
+    from .datadesk import DeskStatus
+    stages.run("data desk", lambda: DeskStatus(account_dir).summary(), judge=_desk_judge)
     # The copy's own native memory, so the rehearsal never writes into the real one.
     os.environ["LUMIBOT_MEMORY_DIR"] = str((scratch / "memory").resolve())
     rehearsal_config = {**config, "news": {**(config.get("news") or {}), "enabled": False}}
@@ -313,6 +325,7 @@ LABELS = {
     "start the strategy (startup and pre-open research)": "启动策略（含盘前研究，真实模型）",
     "account snapshot": "账户快照",
     "risk context (history, volatility, stress windows)": "风控数据（历史、波动率、危机情景）",
+    "data desk": "数据员（常驻数据服务）",
     "market snapshot": "行情快照（收益、波动、beta、均线、成交额）",
     "factor research (history, research universe, SEC)": "因子研究数据（研究股票池、SEC 财报）",
     "earnings calendar": "财报日历",
@@ -323,12 +336,13 @@ LABELS = {
     "risk construction of the targets": "目标组合的量化风控",
 }
 DETAILS = {"copied": "已复制真实账本", "fresh": "没有账本，用新账户", "disabled": "未启用",
+           "desk not running": "没有运行：交易进程会自己拉数据，但盘中更慢；运行 bash scripts/fund-restart.sh -y 启动它",
            "pre-open research not run": "盘前研究未运行（已运行过或在开盘前一小时窗口外）",
            "--no-models": "--no-models，未调用模型"}
 
 
 def text(report):
-    marks = {"ok": "通过", "fail": "失败", "skipped": "跳过"}
+    marks = {"ok": "通过", "fail": "失败", "skipped": "跳过", "warn": "注意"}
     lines = [f"盘前彩排：{'全部通过' if report['verdict'] == 'ready' else '有失败项'}（账本副本：{report['copy']}）", ""]
     for row in report["stages"]:
         where = f"；位置 {row['where']}" if row.get("where") else ""

@@ -174,10 +174,11 @@ def test_supervisor_keeps_runner_and_monitor_alive_with_a_restart_delay(tmp_path
                   install_signals=False)
     assert stops.read(tmp_path)["class"] == "operator"  # Ctrl+C on serve is a manual stop.
     roles = [child.role for child in started]
-    assert roles[:2] == ["runner", "monitor"] and roles.count("runner") == 2  # Restarted once, not in a loop.
-    assert sorted(stopped) == ["monitor", "runner"]  # Every live child is stopped on exit.
-    restart_at = next(i for i, c in enumerate(started) if i > 1 and c.role == "runner")
-    assert restart_at == 2 and at[restart_at] - at[0] >= service.RESTART_SECONDS  # No tight crash loop.
+    # The data desk runs beside them (directly: it never trades, so no STOP supervision).
+    assert roles[:3] == ["runner", "monitor", "datadesk"] and roles.count("runner") == 2  # Restarted once, not in a loop.
+    assert sorted(stopped) == ["datadesk", "monitor", "runner"]  # Every live child is stopped on exit.
+    restart_at = next(i for i, c in enumerate(started) if i > 2 and c.role == "runner")
+    assert restart_at == 3 and at[restart_at] - at[0] >= service.RESTART_SECONDS  # No tight crash loop.
 
 
 def test_supervisor_refuses_to_run_unattended_without_notifications(tmp_path, monkeypatch):

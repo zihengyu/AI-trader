@@ -159,8 +159,9 @@ class EarningsCalendar:
         prefetched = (self.store.get(today.isoformat(), "earnings") if self.store is not None else None) or {}
         for symbol in sorted(symbols):
             row = stored.get(symbol)
-            if row is None and symbol in prefetched:  # Fetched ahead by the scheduled prefetch.
-                item = prefetched[symbol]
+            item = prefetched.get(symbol)
+            if item is not None and (row is None or not item.get("error")):
+                # Kept current by the data desk (or a prefetch): newer than this process's own fetch.
                 row = {"source": item.get("source"), "error": item.get("error"),
                        "dates": json.dumps(item["dates"]) if item.get("dates") is not None else None}
             if row is None and may_fetch is not None and not may_fetch():

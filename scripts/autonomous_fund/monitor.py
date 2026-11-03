@@ -295,6 +295,7 @@ class Monitor:
                 stale = body.get("kind") != "postmarket_report" and now - instant(row["at"]) > timedelta(hours=1)
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
+            self._note_desk(db, now)
         if self.transport is not None:
             self._deliver(now)
             if getattr(self.transport, "replies_enabled", False):
@@ -312,6 +313,25 @@ class Monitor:
         except Exception:  # Metrics are a convenience; they never affect supervision.
             pass
         return status
+
+    def _note_desk(self, db, now):
+        """Tell the operator once per six hours when the data desk stopped updating (trading is unaffected)."""
+        from .datadesk import DeskStatus
+        state = DeskStatus(self.root).read()
+        if state is None or state.get("disabled"):
+            return  # Never ran (an older installation) or switched off: nothing to report.
+        try:
+            age = (now - instant(state["heartbeat_at"])).total_seconds()
+        except (KeyError, TypeError, ValueError):
+            return
+        if age < 600:
+            return
+        noted = db.execute("SELECT value FROM fund_monitor_meta WHERE key='desk_stale_noted_at'").fetchone()
+        if noted and (now - instant(noted[0])).total_seconds() < 6 * 3600:
+            return
+        db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('desk_stale_noted_at',?)", (now.isoformat(),))
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
+            "kind": "data_desk_stale", "details": {"heartbeat_minutes_ago": round(age / 60)}})))
 
     def _deliver(self, now, only=None):
         with operator_connection(self.root) as db:
@@ -504,6 +524,15 @@ def metrics_text(root, status):
              "# TYPE fund_notifications gauge"]
     lines += [f'fund_notifications{{state="{state}"}} {count}'
               for state, count in sorted((status.get("delivery_counts") or {}).items())]
+    from .datadesk import DeskStatus
+    desk = DeskStatus(root).read()
+    if desk and desk.get("heartbeat_at"):
+        lines += ["# HELP fund_desk_heartbeat_timestamp_seconds When the data desk last wrote its heartbeat.",
+                  "# TYPE fund_desk_heartbeat_timestamp_seconds gauge",
+                  f"fund_desk_heartbeat_timestamp_seconds {instant(desk['heartbeat_at']).timestamp():.0f}",
+                  "# TYPE fund_desk_dataset_timestamp_seconds gauge"]
+        lines += [f'fund_desk_dataset_timestamp_seconds{{dataset="{name}"}} {instant(job["ok_at"]).timestamp():.0f}'
+                  for name, job in sorted((desk.get("jobs") or {}).items()) if job.get("ok_at")]
     book = root / "state.sqlite3"
     if book.is_file():
         with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
