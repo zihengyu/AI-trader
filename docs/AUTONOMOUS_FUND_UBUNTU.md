@@ -21,13 +21,14 @@
 
 ## 一键脚本（日常使用）
 
-装好 Python 依赖（见下一节）之后，日常只需要四个脚本，都在仓库目录里**以普通用户运行**（不要加 sudo，需要时脚本会自己调用）。
+装好 Python 依赖（见下一节）之后，日常只需要五个脚本，都在仓库目录里**以普通用户运行**（不要加 sudo，需要时脚本会自己调用）。
 服务以运行脚本的用户身份运行，例如 `ubuntu`：
 
 | 脚本 | 作用 |
 |---|---|
 | `bash scripts/fund-start.sh` | 启动：检查 `.env` → 安装或更新两个 systemd 服务 → 启动 → 等独立监控就绪（最多 3 分钟）→ 处于人工停止时询问是否恢复交易（`-y` 直接恢复） |
 | `bash scripts/fund-restart.sh` | **更新代码后用这个**：重新安装有变化的服务文件 → 真正重启两个服务（加载新代码）→ 等到重启后的独立监控写出新状态 → 询问是否恢复交易（`-y` 直接恢复）。`--update` 先 `git pull --ff-only`（只快进，不覆盖本地修改）并按锁定版本重装依赖。`fund-start.sh` 对已经在运行的服务不会重启，所以更新后单独运行它看起来“没反应” |
+| `bash scripts/fund-rehearse.sh` | **盘前彩排**：在交易服务完全相同的文件沙箱里，用账户副本、真实行情和真实模型完整走一遍决策（盘前研究 → 风控数据 → 因子研究 → 财报日历 → FRED → 反方审查 → 基金经理 → 决策校验 → 量化风控），在下单前停下，逐段报告耗时和结果。不碰真实账户、STOP、审批和 Telegram；`--no-models` 只检查数据环节、不花模型费用 |
 | `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、账户、待审批、最近通知）；`logs` 实时日志，`errors` 最近 24 小时的警告和错误，`report` 账户报告，`approvals` 待审批 |
 | `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止两个服务；`--disable` 同时取消开机自启 |
 
@@ -39,6 +40,24 @@
 ```bash
 bash scripts/fund-restart.sh --update -y
 ```
+
+**开盘前检查清单**（美股开盘 = 北京时间 22:30，夏令时 21:30；在那之前一两个小时做完）：
+
+```bash
+bash scripts/fund-logs.sh
+```
+```bash
+bash scripts/run_autonomous_fund.sh check
+```
+```bash
+bash scripts/fund-rehearse.sh
+```
+
+1. `fund-logs.sh`：两个服务 active，独立监控“新鲜”，“交易”一行是运行中（或会自动恢复），没有新的业务异常；
+2. `check`：`connectivity_summary.blocking` 为空（Yahoo、Telegram、模型 API 都能连上）；
+3. `fund-rehearse.sh`：全部“通过”。任何“失败”都带位置和原因，开盘前就能修；数据环节超过 45 秒的会注明在交易时段会分几轮完成，
+   必需环节（账户快照、风控数据）超过 120 秒、单次模型调用超过 900 秒会直接判失败，因为开盘后监控会因此停止交易。
+   一次彩排大约调用 2–3 次模型（盘前研究若当天已做过则不再调用）。
 
 监控停止（例如“迭代卡住”）在 24 小时内最多自动恢复 3 次。次数用完后状态会写明“自动恢复次数已用完”，
 `fund-start.sh` 和 `fund-restart.sh` 会像人工停止一样询问是否恢复：先用 `bash scripts/fund-logs.sh errors` 看原因。
