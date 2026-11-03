@@ -46,11 +46,43 @@ def stop_class(root):
     return record["class"] if record else "none"
 
 
-def monitor_ready(root, now=None):
-    """The independent monitor wrote a fresh, healthy (or deliberately stopped) state."""
+def resumes_exhausted(root, record):
+    """The monitor gave up resuming this STOP: an auto_resume_exhausted notice at or after it was written."""
+    book = Path(root) / "state.sqlite3"
+    if not record or not book.is_file():
+        return False
+    since = instant(record["at"]) if record.get("at") else None
+    with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        rows = db.execute("SELECT at, body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200")
+        for at, body in rows:
+            if json.loads(body).get("kind") == "auto_resume_exhausted" and (since is None or instant(at) >= since):
+                return True
+    return False
+
+
+def needs_operator(root):
+    """Only a person can lift this STOP: operator stops, faults needing a person, or exhausted automatic resumes."""
+    record = stops.read(root) if Path(root).is_dir() else None
+    if record is None:
+        return False
+    return record["class"] == "operator" or not stops.resumable(record) or resumes_exhausted(root, record)
+
+
+def monitor_ready(root, now=None, after=None):
+    """The independent monitor wrote a fresh, healthy (or deliberately stopped) state.
+
+    after: a Unix time the state must be newer than (a restart must not be
+    confirmed by the previous monitor's last write).
+    """
     now = now or datetime.now(timezone.utc)
     state = _read(Path(root) / "monitor.json") or {}
     age = _age(state.get("at"), now)
+    if after is not None:
+        try:
+            if instant(state.get("at")).timestamp() <= after:
+                return False
+        except (TypeError, ValueError):
+            return False
     return age is not None and 0 <= age <= MONITOR_FRESH_SECONDS and state.get("health") in {"healthy", "stopped"}
 
 
@@ -66,6 +98,9 @@ def summary(root, mode, now=None):
         since = f"，自 {record['at']}" if record.get("at") else ""
         if record["class"] == "operator":
             hint = "需要运行 bash scripts/fund-start.sh 确认恢复"
+        elif stops.resumable(record) and resumes_exhausted(root, record):
+            hint = ("24 小时内自动恢复次数已用完，不会再自动恢复；查看 bash scripts/fund-logs.sh errors 确认原因后，"
+                    "运行 bash scripts/fund-start.sh -y 恢复")
         elif stops.resumable(record):
             hint = "交易进程健康 3 分钟、没有不明订单后会自动恢复"
         else:

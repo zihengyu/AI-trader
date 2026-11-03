@@ -146,3 +146,23 @@ def test_snapshot_reports_the_sweep_as_cash_and_keeps_it_out_of_the_ai_universe(
     assert account.cash_equivalents == {"BILLS": 80} and "BILLS" not in strategy.universe
     session = strategy.journal.session(NOW)
     assert session["start_exposure"] == number("0.1")  # The sweep never counts as risk exposure.
+
+
+def test_a_stale_sweep_quote_never_blocks_a_purchase_cash_already_funds(tmp_path):
+    strategy = strategy_with_sweep(tmp_path)
+
+    def stale(symbol, record=True):
+        if symbol == "BILLS":
+            raise RiskError("Stale, future, crossed or excessively wide quote")
+        return quote()
+    strategy._price = stale
+    funded = view(10000)
+    strategy.journal.observe_session(NOW, funded)
+    strategy._continue_allocation(accept(strategy, [("ALFA", .09)]), funded)
+    (intent, kind), = strategy.submitted
+    assert kind == "allocation" and intent.symbol == "ALFA"  # No sweep quote was needed.
+    strategy.submitted.clear()
+    done = view(9100, positions={"ALFA": 9}, equity=10000)
+    strategy._continue_allocation(accept(strategy, [("ALFA", .09)]), done)  # Parking fails quietly.
+    assert strategy.submitted == []
+    assert any(r["kind"] == "cash_sweep_unavailable" for r in strategy.journal.all_events())

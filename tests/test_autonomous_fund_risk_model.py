@@ -151,3 +151,27 @@ def test_strategy_fetches_each_scenario_history_once_and_never_uses_an_unfinishe
     assert again == first and sorted(calls) == ["ALFA", "SPY"]  # Persisted: one fetch per symbol.
     estimate = strategy._risk_estimate({"ALFA"}, now)
     assert estimate.metrics({"ALFA": .1})["scenario_losses"]["covid_2020"] > 0
+
+
+def test_an_empty_read_is_retried_and_a_stored_gap_is_rechecked_after_a_month(tmp_path):
+    from datetime import timedelta
+    from tests.test_autonomous_fund_quant import harness
+    quant = {"stress_scenarios": {"covid_2020": ["2020-02-19", "2020-03-23"]}}
+    strategy = harness(tmp_path, frames={}, quant=quant)
+    calls = []
+    strategy.get_historical_prices = lambda asset, length, timestep="day": calls.append(asset.symbol) or None
+    now = datetime(2026, 11, 2, 15, tzinfo=timezone.utc)
+    first = strategy._scenario_returns({"ALFA"}, now)
+    assert first["covid_2020"]["returns"]["ALFA"] is None  # Unknown today...
+    with strategy.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_scenario_returns").fetchone()[0] == 0  # ...but not stored.
+    days = pd.bdate_range("2020-03-02", "2020-06-30", tz="America/New_York")  # Listed after the crash began.
+    late = pd.DataFrame({"close": np.linspace(50, 60, len(days))}, index=days)
+    strategy.get_historical_prices = lambda asset, length, timestep="day": calls.append(asset.symbol) or SimpleNamespace(df=late)
+    strategy._scenario_failed = set()
+    strategy._scenario_returns({"ALFA"}, now + timedelta(days=1))
+    count = len(calls)
+    strategy._scenario_returns({"ALFA"}, now + timedelta(days=2))
+    assert len(calls) == count  # A real gap is stored...
+    strategy._scenario_returns({"ALFA"}, now + timedelta(days=35))
+    assert len(calls) > count  # ...and rechecked after a month.

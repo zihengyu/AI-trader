@@ -207,7 +207,7 @@ def test_strategy_builds_separate_stock_and_etf_panels_with_research_names_and_o
     strategy._factor_cache = None
     strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=frame)
     seen = {}
-    strategy.sec = SimpleNamespace(errors={}, panels=lambda symbols, index: seen.setdefault("symbols", symbols) and {
+    strategy.sec = SimpleNamespace(errors={}, deferred=[], panels=lambda symbols, index, may_download=None: seen.setdefault("symbols", symbols) and {
         "earnings": pd.DataFrame(5.0, index=index, columns=sorted(symbols))})
     panels = strategy._factor_panel(days[-1].to_pydatetime())
     assert list(panels["stocks"]["close"].columns) == ["ALFA", "WIDE"]  # Research names widen the stocks.
@@ -217,3 +217,30 @@ def test_strategy_builds_separate_stock_and_etf_panels_with_research_names_and_o
     strategy._factor_context_cache = None
     context = strategy._factor_context(days[-1].to_pydatetime())
     assert context["fundamentals"]["source"].startswith("SEC")
+
+
+def test_a_missing_cross_section_never_hides_the_other_or_aborts_a_batch(tmp_path):
+    lab = FactorLab(Journal(tmp_path, "synthetic-missing-panel"), SETTINGS)
+    panels = mixed()
+    lab.test([proposal("rank(ret(60))"), {**proposal("-vol(20)", name="calm"), "universe": "etfs"}],
+             NOW, "2026-11-02", panels)
+    trials = lab.trials()
+    only_stocks = {"stocks": panels["stocks"]}  # Every ETF download failed today.
+    results = lab.test([{**proposal("rank(ret(20))", name="etf-mom"), "universe": "etfs"},
+                        proposal("-rank(ret(5))", name="reversal")], NOW, "2026-11-03", only_stocks)
+    assert results[0]["status"] == "unavailable" and results[1]["status"] != "unavailable"
+    assert lab.trials() == trials + 1  # The unavailable one is not a trial.
+    context = lab.context(NOW, only_stocks)
+    assert any(row["universe"] == "stocks" for row in context["validated"])
+
+
+def test_redundancy_is_judged_on_in_sample_dates_only():
+    close, volume = panel(seed=1)
+    outcome = evaluate("rank(ret(60))", 5, close, volume, SETTINGS, trials=1)
+    assert outcome["first_date"] <= outcome["in_sample_last_date"] < outcome["last_date"]
+
+
+def test_share_counts_filed_together_with_an_ambiguous_entry_do_not_break_alignment():
+    index = pd.bdate_range("2026-03-02", "2026-03-06")
+    aligned = as_of([("2026-03-02", None), ("2026-03-02", 1e9), ("2026-03-04", 2e9)], index)
+    assert np.isnan(aligned.iloc[0]) and aligned.iloc[-1] == 2e9

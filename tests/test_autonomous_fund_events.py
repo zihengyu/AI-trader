@@ -136,6 +136,28 @@ def test_strategy_exposes_macro_context_once_per_day(tmp_path):
     from tests.test_autonomous_fund_quant import NOW, harness
     strategy = harness(tmp_path)
     calls = []
-    strategy.macro = SimpleNamespace(context=lambda day: calls.append(day) or {"regime": {}, "as_of_day": day})
+    strategy.macro = SimpleNamespace(context=lambda day, may_fetch=None: calls.append(day) or {"regime": {}, "as_of_day": day})
     first = strategy._macro_context(NOW)
     assert first["as_of_day"] == "2026-11-02" and strategy._macro_context(NOW) is first and len(calls) == 1
+
+
+def test_a_hung_calendar_request_is_bounded_and_reported_unknown(tmp_path):
+    import threading
+    release = threading.Event()
+    book = EarningsCalendar(Journal(tmp_path, "synthetic-hang"), EventSettings(), environ={},
+                            yahoo=lambda symbol: release.wait(30) or [], timeout_seconds=0.2)
+    caps, upcoming, unknown = book.caps({"ALFA"}, FRIDAY)
+    release.set()
+    assert caps == {} and unknown == ["ALFA"]
+
+
+def test_the_earnings_calendar_is_fetched_once_per_day_and_reused(tmp_path):
+    from tests.test_autonomous_fund_quant import NOW, harness
+    strategy = harness(tmp_path, mode="local")
+    strategy.config = {"universe": {"ALFA": "stock"}}
+    strategy.universe = frozenset({"ALFA"})
+    calls = []
+    strategy.earnings = EarningsCalendar(strategy.journal, EventSettings(), environ={},
+                                         yahoo=lambda s: calls.append(s) or [NOW.date().isoformat()])
+    first = strategy._earnings_caps(NOW)
+    assert first["caps"] == {"ALFA": number("0.05")} and strategy._earnings_caps(NOW) is first and calls == ["ALFA"]

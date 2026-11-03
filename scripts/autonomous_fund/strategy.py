@@ -5,6 +5,7 @@ import os
 from dataclasses import asdict, dataclass
 from datetime import timedelta
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -26,6 +27,11 @@ NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
+# Optional data work (factor research history and SEC filings, the earnings calendar, FRED and
+# stress-window histories) may use at most this much of a live trading iteration and continues in
+# the next one. The independent monitor treats 180 seconds without an iteration or model-call
+# event during the session as a stalled runner; required risk data stays synchronous.
+PREPARATION_BUDGET_SECONDS = 45
 
 
 # System prompts are module constants so their digest (prompt_version) identifies
@@ -758,6 +764,8 @@ class AutonomousFund(Strategy):
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
+                       # Warms today's earnings calendar before the open, off the trading path.
+                       "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -1000,6 +1008,7 @@ class AutonomousFund(Strategy):
         self.log_message(f"FUND {kind}: {details}", color="yellow")
 
     def on_trading_iteration(self):
+        self._begin_preparation()
         try:
             self.journal.event(self.get_datetime(), "iteration_started", {})
             if self.mode == "paper":
@@ -1029,6 +1038,7 @@ class AutonomousFund(Strategy):
                 # flapping watchdog reason must not turn into a stream of alerts.
                 self.notify("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
                                             "orders": "no new orders"})
+                self._warm_optional(now)  # Ready when trading resumes; never an order.
                 return
             if self.mode not in {"local", "paper"}:
                 # Native Pandas daily replay advances date rows without close
@@ -1058,8 +1068,10 @@ class AutonomousFund(Strategy):
             active = self.execution.active(now, self.universe, self.limits)
             if active and (self.next_review is None or now < self.next_review):
                 self._continue_allocation(active, account)
+                self._warm_optional(now)
                 return
             if self.next_review and now < self.next_review:
+                self._warm_optional(now)
                 return
             self._decide(account, now, paused)
         except Exception as exc:
@@ -1072,6 +1084,7 @@ class AutonomousFund(Strategy):
             # Third-party exceptions may contain authenticated URLs or headers.
             self._disclose_failure("blocked", exc, phase="trading_iteration")
         finally:
+            self._end_preparation()
             steps = [lambda: self.journal.event(self.get_datetime(), "iteration_finished", {}), self.journal.export]
             if self.mode == "local":
                 steps.append(self._report_if_due)
@@ -1648,22 +1661,36 @@ class AutonomousFund(Strategy):
         research = set(lab.settings.research_universe) if lab is not None else set()
         groups = {"stocks": sorted({s for s in self.universe if kinds.get(s, "stock") == "stock"} | research),
                   "etfs": sorted(s for s in self.universe if kinds.get(s) == "unlevered_etf")}
-        panels, missing = {}, []
+        panels, missing, pending = {}, [], []
+        fetched = getattr(self, "_bars", None) or {}
         for name, symbols in groups.items():
             history = {}
             for symbol in symbols:
+                if (day, symbol) not in fetched and not self._may_prepare():
+                    pending.append(symbol)  # Downloaded in a later iteration; progress is kept in _bars.
+                    continue
                 rows, error = self._daily_bars(symbol, now)
+                fetched = self._bars
                 if error or not rows:
                     missing.append(symbol)
                     continue
                 history[symbol] = [(d, close, shares) for d, close, shares in self._completed(rows, now)]
             if not history:
                 continue
+            if pending:
+                continue  # An incomplete cross-section would bias every IC: wait for all of it.
             close, volume = panel_from_rows(history)
             data = {"close": close, "volume": volume, **self._ohlc_panels(close, now)}
             if name == "stocks":
-                data.update(self._fundamental_panels(close))
+                fundamentals, complete = self._fundamental_panels(close)
+                if not complete:
+                    pending.append("SEC filings")
+                    continue
+                data.update(fundamentals)
             panels[name] = data
+        self._factor_warming = len(pending)
+        if pending:
+            return None  # Not cached: the next iteration continues where this one stopped.
         if missing:
             self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
         result = panels or None
@@ -1686,15 +1713,16 @@ class AutonomousFund(Strategy):
         return frames
 
     def _fundamental_panels(self, close):
-        """SEC point-in-time fields for the stock cross-section, or nothing when unavailable."""
+        """(SEC point-in-time fields, complete). Nothing when unavailable; incomplete while still downloading."""
         sec = getattr(self, "sec", None)
         if sec is None:
-            return {}
+            return {}, True
         try:
-            return sec.panels(set(close.columns), close.index)
+            panels = sec.panels(set(close.columns), close.index, may_download=self._may_prepare)
+            return panels, not getattr(sec, "deferred", None)
         except Exception as exc:
             self.journal.event(self.get_datetime(), "fundamentals_unavailable", {"error": type(exc).__name__})
-            return {}
+            return {}, True
 
     def _factor_context(self, now):
         """Once per trading day (warmed before the open): intraday decisions only reuse it.
@@ -1710,11 +1738,15 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == day:
             return cached[1]
         try:
+            from .factors import as_panels
             panels = self._factor_panel(now)
-            if isinstance(panels, tuple):  # Older test doubles return (close, volume).
-                panels = panels[0] if panels[0] is None else {"stocks": {"close": panels[0], "volume": panels[1]},
-                                                              "etfs": {"close": panels[0], "volume": panels[1]}}
-            context = lab.context(now, panels, tradable=set(self.universe))
+            if panels is None and getattr(self, "_factor_warming", 0):
+                # Still downloading in the background of later iterations: show what is known, uncached.
+                context = lab.context(now, None)
+                context["warming"] = {"pending": self._factor_warming,
+                                      "meaning": "factor history is still being prepared; ranks follow shortly"}
+                return context
+            context = lab.context(now, as_panels(panels), tradable=set(self.universe))
             sec = getattr(self, "sec", None)
             context["fundamentals"] = ({"source": "SEC EDGAR company facts (point in time)",
                                         "errors": dict(list(sec.errors.items())[:10])} if sec is not None else
@@ -1795,8 +1827,12 @@ class AutonomousFund(Strategy):
             self._estimates = {k: v for k, v in self._estimates.items() if k[0] == key[0]}
             # The benchmark's own history gives every name an ex-ante beta for stress proxies.
             names = set(symbols) | {self.quant.stress_benchmark}
-            self._estimates[key] = RiskEstimate({s: self._daily_closes(s, now) for s in names}, self.quant,
-                                                scenarios=self._scenario_returns(names, now))
+            scenarios = self._scenario_returns(names, now)
+            estimate = RiskEstimate({s: self._daily_closes(s, now) for s in names}, self.quant, scenarios=scenarios)
+            if getattr(self, "_scenario_deferred", None):
+                # Names still downloading are proxied pessimistically meanwhile; not cached.
+                return estimate
+            self._estimates[key] = estimate
         return self._estimates[key]
 
     def _scenario_returns(self, symbols, now):
@@ -1818,12 +1854,22 @@ class AutonomousFund(Strategy):
             db.execute("""CREATE TABLE IF NOT EXISTS fund_scenario_returns (symbol TEXT NOT NULL, scenario TEXT NOT NULL,
                 start TEXT NOT NULL, end TEXT NOT NULL, value REAL, recorded_at TEXT NOT NULL,
                 PRIMARY KEY (symbol, scenario, start, end))""")
-            stored = {(r["symbol"], r["scenario"], r["start"], r["end"]): r["value"]
-                      for r in db.execute("SELECT * FROM fund_scenario_returns")}
+            rows = list(db.execute("SELECT * FROM fund_scenario_returns"))
+        stored = {(r["symbol"], r["scenario"], r["start"], r["end"]): r["value"] for r in rows}
+        # A gap ("no history in this window") is rechecked monthly: a provider may have
+        # returned a shortened history; a found return is a historical fact and is kept.
+        recheck = {(r["symbol"], r["scenario"], r["start"], r["end"]) for r in rows if r["value"] is None and
+                   (instant(now) - instant(r["recorded_at"])).days >= 30}
         failed = self.__dict__.setdefault("_scenario_failed", set())
-        for symbol in sorted(wanted):
-            needed = [w for w in windows if (symbol, *w) not in stored]
+        benchmark = self.quant.stress_benchmark
+        self._scenario_deferred = []
+        # The benchmark first and regardless of the iteration budget: without it no window applies.
+        for symbol in sorted(wanted, key=lambda s: (s != benchmark, s)):
+            needed = [w for w in windows if (symbol, *w) not in stored or (symbol, *w) in recheck]
             if not needed or (today, symbol) in failed:
+                continue
+            if symbol != benchmark and not self._may_prepare():
+                self._scenario_deferred.append(symbol)
                 continue
             first = min(start for _, start, _ in needed)
             length = int((date.fromisoformat(today) - date.fromisoformat(first)).days * 252 / 365) + 30
@@ -1833,6 +1879,8 @@ class AutonomousFund(Strategy):
                 rows = [] if frame is None or "close" not in frame else [
                     (str(index.date()), _finite(close)) for index, close in zip(frame.index, frame["close"])]
                 rows = [(d, c) for d, c in rows if d < today and c == c and c > 0]
+                if not rows:  # Nothing came back: a failed read, not evidence that no history exists.
+                    raise RiskError("empty history")
             except Exception as exc:
                 failed.add((today, symbol))
                 self.journal.event(now, "scenario_history_unavailable", {"symbol": symbol, "error": type(exc).__name__})
@@ -1843,14 +1891,42 @@ class AutonomousFund(Strategy):
                     db.execute("INSERT OR REPLACE INTO fund_scenario_returns VALUES (?,?,?,?,?,?)",
                                (symbol, name, start, end, value, str(now)))
                     stored[(symbol, name, start, end)] = value
-        benchmark = self.quant.stress_benchmark
         return {name: {"window": [start, end], "benchmark": stored.get((benchmark, name, start, end)),
                        "returns": {s: stored.get((s, name, start, end)) for s in sorted(wanted)}}
                 for name, start, end in windows}
 
+    def _begin_preparation(self):
+        """Start this live iteration's optional-data budget (replays and hooks have none)."""
+        live = getattr(self, "mode", None) in {"paper", "local"}
+        self._preparation_until = monotonic() + PREPARATION_BUDGET_SECONDS if live else None
+
+    def _end_preparation(self):
+        self._preparation_until = None
+
+    def _preparation_left(self):
+        """Seconds of optional data work left in this iteration; None outside a live iteration (no limit)."""
+        until = getattr(self, "_preparation_until", None)
+        return None if until is None else until - monotonic()
+
+    def _may_prepare(self):
+        left = self._preparation_left()
+        return left is None or left > 0
+
+    def _warm_optional(self, now):
+        """Advance optional data preparation with what is left of this iteration's budget."""
+        if getattr(self, "mode", None) not in {"paper", "local"}:
+            return
+        for step in (self._factor_context, self._earnings_caps, self._macro_context):
+            if not self._may_prepare():
+                return
+            try:
+                step(now)
+            except Exception as exc:  # Preparation is optional: it never costs the iteration.
+                self.journal.event(now, "preparation_unavailable", {"step": step.__name__, "error": type(exc).__name__})
+
     def _earnings_caps(self, now):
         """Today's earnings caps for admitted stocks (live modes only); cached per trading day, never raises."""
-        empty = {"caps": {}, "upcoming": {}, "unknown": []}
+        empty = {"caps": {}, "upcoming": {}, "unknown": [], "deferred": []}
         calendar = getattr(self, "earnings", None)
         if calendar is None or self.mode not in {"paper", "local"}:
             return empty
@@ -1861,12 +1937,16 @@ class AutonomousFund(Strategy):
         kinds = (getattr(self, "config", None) or {}).get("universe") or {}
         stocks = {s for s in self.universe if kinds.get(s) == "stock"}
         try:
-            caps, upcoming, unknown = calendar.caps(stocks, instant(now).astimezone(ZoneInfo("America/New_York")).date())
-            result = {"caps": caps, "upcoming": upcoming, "unknown": unknown}
+            caps, upcoming, unknown = calendar.caps(stocks, instant(now).astimezone(ZoneInfo("America/New_York")).date(),
+                                                    may_fetch=self._may_prepare)
+            deferred = sorted(getattr(calendar, "deferred", ()))
+            result = {"caps": caps, "upcoming": upcoming, "unknown": sorted(set(unknown) - set(deferred)),
+                      "deferred": deferred}
         except Exception as exc:
             self.journal.event(now, "earnings_calendar_unavailable", {"error": type(exc).__name__})
             result = {**empty, "unknown": sorted(stocks)}
-        self._earnings_cache = (day, result)
+        if not result["deferred"]:  # A partly fetched calendar continues in the next iteration.
+            self._earnings_cache = (day, result)
         return result
 
     def _macro_context(self, now):
@@ -1879,10 +1959,11 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == day:
             return cached[1]
         try:
-            result = watch.context(day)
+            result = watch.context(day, may_fetch=self._may_prepare)
         except Exception as exc:
             result = {"unavailable": type(exc).__name__}
-        self._macro_cache = (day, result)
+        if not result.get("deferred"):  # Series not fetched yet are fetched in a later iteration.
+            self._macro_cache = (day, result)
         return result
 
     def _stress(self, now):
@@ -2102,12 +2183,18 @@ class AutonomousFund(Strategy):
         if result["orders"]:
             order = result["orders"][0]
             if sweep is not None and order.side == "buy":
-                from .cash import funding_sell
-                funding = funding_sell(account, order, self._sweep_quote(now), self.limits, sweep)
-                if funding is not None:
-                    # Fund the purchase first; it follows on a later iteration through the same checks.
-                    self._submit(funding, now, active["id"], kind="cash_sweep")
-                    return
+                from .cash import funding_needed, funding_sell
+                # The sweep quote is needed only when real cash cannot fund this purchase.
+                if funding_needed(account, order, self.limits, sweep) > 0:
+                    try:
+                        funding = funding_sell(account, order, self._sweep_quote(now), self.limits, sweep)
+                    except RiskError as exc:
+                        self.journal.event(now, "cash_sweep_unavailable", {"step": "funding", "error": str(exc)})
+                        return  # The purchase cannot be funded now; retried on a later iteration.
+                    if funding is not None:
+                        # Fund the purchase first; it follows on a later iteration through the same checks.
+                        self._submit(funding, now, active["id"], kind="cash_sweep")
+                        return
             self._execute(order, now, account, prices)
         elif result["request"]:
             from .execution import ApprovalPending
@@ -2116,11 +2203,15 @@ class AutonomousFund(Strategy):
             self.execution.complete(active["id"], now)
             if sweep is not None:
                 # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
+                # Parking is optional: a failure is recorded, never raised past a completed allocation.
                 from .cash import park_buy
-                park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
-                                min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
-                if park is not None:
-                    self._submit(park, now, active["id"], kind="cash_sweep")
+                try:
+                    park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
+                                    min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
+                    if park is not None:
+                        self._submit(park, now, active["id"], kind="cash_sweep")
+                except RiskError as exc:
+                    self.journal.event(now, "cash_sweep_unavailable", {"step": "park", "error": str(exc)})
 
     def _sweep_quote(self, now):
         quote = self._price(self.cash_sweep.symbol)

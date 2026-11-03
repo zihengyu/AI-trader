@@ -382,6 +382,7 @@ def evaluate(expression, horizon, close, volume, settings, trials, extra=None):
     net = (spread * direction - 4 * turnover * settings.cost_bps / 10_000
            if spread is not None and turnover is not None else None)
     result.update(decay=decay, rank_autocorrelation=rank_autocorrelation(factor, dates),
+                  in_sample_last_date=str(inside.index[-1].date()) if len(inside) else None,
                   quintile_turnover=round(turnover, 3) if turnover is not None else None,
                   net_spread=round(net, 5) if net is not None else None)
     if ins["t"] is None or abs(ins["t"]) < result["critical_t"]:
@@ -427,6 +428,8 @@ def as_panels(close, volume=None, extra=None):
     The strategy passes a dict of universes; a bare close panel (offline tools,
     older callers) serves as both cross-sections.
     """
+    if isinstance(close, tuple):  # (close, volume) from older callers and test doubles.
+        close, volume = close
     if isinstance(close, dict):
         return close
     if close is None:
@@ -498,8 +501,12 @@ class FactorLab:
                 results.append({"name": existing["name"], "expression": expression, "status": existing["status"],
                                 "reason": "already tested: " + (existing["reason"] or ""), "repeat": True})
                 continue
+            data = (panels or {}).get(universe)
+            if data is None:  # No history for this cross-section today: not a trial, retried later.
+                results.append({"name": name, "expression": expression, "universe": universe,
+                                "status": "unavailable", "reason": f"no {universe} history available"})
+                continue
             trials = self.trials() + (0 if existing else 1)
-            data = panels[universe]
             try:
                 close_, volume_, extra_ = _fields(data)
                 outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_)
@@ -527,8 +534,10 @@ class FactorLab:
         """A validated candidate that mostly re-ranks like an existing validated factor is not a discovery."""
         close, volume, extra = _fields(data)
         candidate = compute(expression, close, volume, extra)
-        dates = [pd.Timestamp(d) for d in pd.date_range(outcome["first_date"], outcome["last_date"])
-                 if pd.Timestamp(d) in candidate.index] if outcome.get("first_date") else []
+        # In-sample dates only: the holdout stays untouched by every test.
+        first, last = outcome.get("first_date"), outcome.get("in_sample_last_date")
+        dates = [d for d in candidate.index if first and last and
+                 pd.Timestamp(first) <= d <= pd.Timestamp(last)]
         dates = dates[::max(1, len(dates) // 60)]  # A sample of the in-sample period is enough.
         for row in self.rows("validated"):
             if (row.get("universe") or "stocks") != universe or row["expression"] == expression:
@@ -546,7 +555,9 @@ class FactorLab:
         active = []
         for row in self.rows("validated"):
             try:
-                data = panels[row.get("universe") or "stocks"]
+                data = (panels or {}).get(row.get("universe") or "stocks")
+                if data is None:
+                    raise RiskError(f"no {row.get('universe') or 'stocks'} history available")
                 c, v, x = _fields(data)
                 live = live_record(row["expression"], row["horizon"], row["direction"], row["validated_at"],
                                    c, v, self.settings, x, tradable)
