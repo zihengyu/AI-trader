@@ -1209,6 +1209,9 @@ FRED_API_KEY
   ``realtime_start`` and ``realtime_end`` for point-in-time backtests.
   Built-in FRED agent tools are not exposed during backtests without this key
   because LumiBot does not use revised public CSV fallbacks for macro data.
+- Autonomous paper fund: its data desk uses the key for the economic release
+  calendar (scheduled CPI, jobs, GDP, FOMC and similar release dates); without
+  it the calendar is unavailable and macro series use the public CSV download.
 
 LUMIBOT_FRED_CACHE_DIR
 ^^^^^^^^^^^^^^^^^^^^^^
@@ -1261,6 +1264,9 @@ LUMIBOT_AGENT_MAX_RUN_ATTEMPTS
 - Default: ``2`` in backtests, ``10`` in live trading.
 - Notes: Backtests default to a lower retry budget so a bad provider window does
   not multiply model spend across many simulated iterations.
+- Autonomous fund CLI: an unset value is configured as ``2`` so every agent
+  call (attempts x per-attempt run timeout) ends before the independent
+  monitor's 900-second agent limit; explicit values are preserved.
 
 Telegram notifications
 ----------------------
@@ -1441,7 +1447,12 @@ for local runs without model calls or orders; ``FUND_AUTO_RESUME`` to let the
 independent monitor lift a STOP written by a service restart or a liveness fault
 after continuous health, never an operator's stop), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
 ``FUND_CRITIC``, ``FUND_CRITIC_MODEL``, ``FUND_REASONING_EFFORT``, ``FUND_MAX_AGENT_RUNS_PER_DAY``,
-``FUND_MIN_REVIEW_MINUTES``, ``FUND_MODEL_PRICES_JSON``), user limits
+``FUND_MIN_REVIEW_MINUTES``, ``FUND_SKIP_QUIET_REVIEWS`` to skip a scheduled
+manager review when nothing changed since its allocation completed,
+``FUND_MAX_QUIET_MINUTES`` for the longest such quiet stretch, ``FUND_MODEL_PRICES_JSON``), the data
+desk (``FUND_DATA_DESK`` for the always-on service that keeps news, intraday prices, FRED,
+earnings dates and daily bars current for the agents, ``FUND_DESK_INTRADAY_SECONDS`` for its
+intraday refresh interval), user limits
 (``FUND_CAPITAL_USD``, ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
 ``FUND_MAX_POSITION``, ``FUND_MAX_EXPOSURE``, ``FUND_MAX_DRAWDOWN``,
 ``FUND_DAILY_ORDERS``, ``FUND_DAILY_LOSS_LIMIT``, ``FUND_TARGET_VOL``,

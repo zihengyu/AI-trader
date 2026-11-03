@@ -93,6 +93,8 @@ SETTINGS = {
     "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
+    "FUND_SKIP_QUIET_REVIEWS": (("model_budget", "skip_quiet_reviews"), _bool, False, "模型", "到点复核时若无任何变化（无提醒、无成交、持仓和研究不变）则跳过本次模型调用"),
+    "FUND_MAX_QUIET_MINUTES": (("model_budget", "max_quiet_minutes"), _int, False, "模型", "连续跳过复核的最长时间（分钟），到时一定调用基金经理"),
     "FUND_MODEL_PRICES_JSON": (("model_prices_per_million",), _json, False, "模型", "每百万 token 价格 JSON，用于费用估算"),
     # ----- User constraints (the operator's mandate and hard limits)
     "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),
@@ -125,12 +127,14 @@ SETTINGS = {
     "FUND_ITERATION_SECONDS": (("execution", "iteration_seconds"), _int, False, "外部", "盯盘迭代间隔（秒，15–300）"),
     "FUND_LIVE_STREAM": (("market_data", "live_stream"), _bool, False, "外部", "是否使用 Yahoo 实时推送报价"),
     "FUND_RESEARCH_RESOLVER": (("research_network", "resolver"), str, False, "外部", "研究网页解析方式 system/doh（Fake-IP 代理用 doh）"),
+    "FUND_DATA_DESK": (("data_desk", "enabled"), _bool, False, "外部", "数据员：常驻进程持续拉取整理资讯、盘中行情、宏观和财报，研究员和基金经理随时读最新数据"),
+    "FUND_DESK_INTRADAY_SECONDS": (("data_desk", "intraday_seconds"), _int, False, "外部", "数据员刷新盘中行情的间隔（秒，60–3600）"),
     "FUND_NEWS_ENABLED": (("news", "enabled"), _bool, False, "外部", "是否开启实时资讯监控"),
     "FUND_NEWS_POLL_SECONDS": (("news", "poll_seconds"), _int, False, "外部", "资讯轮询间隔（秒）"),
     "FUND_NEWS_QUERIES": (("news", "queries"), _list, False, "外部", "长期关注的新闻搜索词，多条用 | 分隔"),
     "FUND_NEWS_RSS_FEEDS": (("news", "rss_feeds"), _feeds, False, "外部", "自定义 RSS：名称=https://...，多条用 | 分隔"),
     "FUND_SEC_USER_AGENT": (None, None, False, "外部", "SEC 要求的联系人声明（姓名＋邮箱），用于读取 8-K 公告和按披露日的财报基本面"),
-    "FRED_API_KEY": (None, None, True, "外部", "FRED 宏观数据 Key（可选；不填用公开 CSV 下载）"),
+    "FRED_API_KEY": (None, None, True, "外部", "FRED Key（推荐，免费）：数据员的经济日历（CPI、非农、GDP、FOMC 公布日期）需要它；宏观数据不填时用公开 CSV"),
     "FUND_MACRO": (("macro", "enabled"), _bool, False, "外部", "是否给 AI 提供 FRED 宏观环境（美债收益率、利差、高收益债利差、VIX）"),
     "FINNHUB_API_KEY": (None, None, True, "外部", "Finnhub Key（可选）：更可靠的财报日历；不填用 Yahoo"),
     "FUND_SHADOW_AB": (("validation", "shadow_enabled"), _bool, False, "外部", "是否开启影子 A/B 验证 AI 的自我优化"),
@@ -153,9 +157,11 @@ MODES = {"local": "真实行情本地模拟盘：Yahoo 行情 + 本地虚拟资�
          "paper": "Alpaca 模拟账户：券商模拟撮合，不是真钱"}
 # Commands that act on one trading account's directory. Historical, offline and
 # preflight commands keep their own directory and never write into an account.
+# Commands that act on the FUND_MODE account. The rehearsal, the prefetch and the data desk
+# belong here too: otherwise they used the earlier default directory, not the running account.
 ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "stop", "resume", "attach-order", "reset-drawdown",
                               "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
-                              "notify-test", "status"})
+                              "notify-test", "status", "rehearse", "prefetch", "datadesk"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
 
 

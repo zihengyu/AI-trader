@@ -2,8 +2,8 @@
 # Restart the AI paper fund so updated code takes effect (fund-start.sh alone
 # leaves already-running services on their old code).
 # --update first pulls the current branch (fast-forward only) and reinstalls the
-# pinned dependencies. Then: reinstall changed service files, restart both
-# services, wait for a monitor heartbeat newer than the restart, and offer to
+# pinned dependencies. Then: reinstall changed service files, restart the runner,
+# monitor and data desk, wait for a monitor heartbeat newer than the restart, and offer to
 # resume trading (a restart stops trading by hand, exactly like fund-stop.sh).
 # Usage: bash scripts/fund-restart.sh [--update] [-y]   (-y: resume without asking)
 set -euo pipefail

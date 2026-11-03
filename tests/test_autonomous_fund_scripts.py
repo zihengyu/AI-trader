@@ -52,15 +52,20 @@ def test_scripts_are_valid_bash(name):
 
 def test_start_installs_starts_waits_for_the_monitor_and_resumes_a_manual_stop(tmp_path):
     book, env = account_book(tmp_path)
+    (tmp_path / "installed").mkdir()
+    (tmp_path / "installed" / "lumibot-fund-prefetch.timer").write_text("[Timer]\n")  # From an earlier version.
     result = script("fund-start.sh", tmp_path, env, "-y")
     assert result.returncode == 0, result.stdout + result.stderr
     assert "+ sudo install -m 644" in result.stdout and "+ sudo systemctl daemon-reload" in result.stdout
     assert ("+ sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service "
-            "lumibot-fund-backup.timer") in result.stdout
+            "lumibot-fund-desk.service lumibot-fund-backup.timer") in result.stdout
+    # The data desk replaced the daily prefetch timer: an installed one is disabled and removed.
+    assert "+ sudo systemctl disable --now lumibot-fund-prefetch.timer" in result.stdout
+    assert f"+ sudo rm -f {tmp_path / 'installed' / 'lumibot-fund-prefetch.timer'}" in result.stdout
     assert "已恢复交易" in result.stdout and not (book / "STOP").exists()
     assert sorted(p.name for p in (tmp_path / "build").iterdir()) == [
-        "lumibot-fund-backup.service", "lumibot-fund-backup.timer", "lumibot-fund-monitor.service",
-        "lumibot-fund-runner.service"]
+        "lumibot-fund-backup.service", "lumibot-fund-backup.timer", "lumibot-fund-desk.service",
+        "lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
     assert "+ sudo install -m 644" in result.stdout and "lumibot-fund-backup.timer" in result.stdout
     assert not (ROOT / "artifacts" / "autonomous-fund").exists()  # Checking the config leaves no stray directory.
 
@@ -91,7 +96,8 @@ def test_stop_writes_an_operator_stop_then_stops_the_services(tmp_path):
     result = script("fund-stop.sh", tmp_path, env, "--disable")
     assert result.returncode == 0, result.stdout + result.stderr
     assert stops.read(book)["class"] == "operator"  # Never lifted automatically.
-    assert "+ sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service" in result.stdout
+    assert ("+ sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service "
+            "lumibot-fund-desk.service") in result.stdout
     assert "+ sudo systemctl disable --now" in result.stdout and "lumibot-fund-backup.timer" in result.stdout
 
 
@@ -103,7 +109,8 @@ def test_logs_status_explains_the_state_in_one_screen(tmp_path):
                  "账户：净值 10000", "最近通知：", "stop_active"):
         assert text in result.stdout, result.stdout
     follow = script("fund-logs.sh", tmp_path, env, "logs")
-    assert "+ journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service -f" in follow.stdout
+    assert ("+ journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service "
+            "-u lumibot-fund-desk.service -f") in follow.stdout
     assert script("fund-logs.sh", tmp_path, env, "unknown").returncode == 2
 
 
@@ -130,7 +137,8 @@ def test_units_only_writes_the_unit_files(tmp_path):
     from scripts.autonomous_fund import deploy
     deploy.main(["units", "--user", "nobody", "--env-file", str(tmp_path / ".env"), "--output-dir", str(tmp_path)])
     assert sorted(p.name for p in tmp_path.iterdir()) == ["lumibot-fund-backup.service", "lumibot-fund-backup.timer",
-                                                          "lumibot-fund-monitor.service", "lumibot-fund-runner.service"]
+                                                          "lumibot-fund-desk.service", "lumibot-fund-monitor.service",
+                                                          "lumibot-fund-runner.service"]
 
 
 def test_rotating_backups_keep_the_newest_snapshots_only(tmp_path):
@@ -186,7 +194,7 @@ def test_restart_really_restarts_running_services_then_resumes(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     out = result.stdout
     assert out.index("+ sudo systemctl enable --now") < out.index(
-        "+ sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service")
+        "+ sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service")
     assert "已恢复交易" in out and not (book / "STOP").exists()
     plain = script("fund-start.sh", tmp_path, env)
     assert "systemctl restart" not in plain.stdout  # A plain start never restarts a running fund.

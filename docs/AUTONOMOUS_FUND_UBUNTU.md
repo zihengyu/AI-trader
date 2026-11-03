@@ -2,7 +2,7 @@
 
 本应用的显式秘密配置、无人值守进程管理、审批和日报运维说明。
 
-**Last Updated:** 2026-11-02
+**Last Updated:** 2026-11-03
 
 **Status:** 部署生成器与进程／通知回归已验证；目标 Ubuntu 安装和 Telegram 实际投递待验证
 
@@ -26,11 +26,11 @@
 
 | 脚本 | 作用 |
 |---|---|
-| `bash scripts/fund-start.sh` | 启动：检查 `.env` → 安装或更新两个 systemd 服务 → 启动 → 等独立监控就绪（最多 3 分钟）→ 处于人工停止时询问是否恢复交易（`-y` 直接恢复） |
-| `bash scripts/fund-restart.sh` | **更新代码后用这个**：重新安装有变化的服务文件 → 真正重启两个服务（加载新代码）→ 等到重启后的独立监控写出新状态 → 询问是否恢复交易（`-y` 直接恢复）。`--update` 先 `git pull --ff-only`（只快进，不覆盖本地修改）并按锁定版本重装依赖。`fund-start.sh` 对已经在运行的服务不会重启，所以更新后单独运行它看起来“没反应” |
-| `bash scripts/fund-rehearse.sh` | **盘前彩排**：在交易服务完全相同的文件沙箱里，用账户副本、真实行情和真实模型完整走一遍决策（盘前研究 → 风控数据 → 因子研究 → 财报日历 → FRED → 反方审查 → 基金经理 → 决策校验 → 量化风控），在下单前停下，逐段报告耗时和结果。不碰真实账户、STOP、审批和 Telegram；`--no-models` 只检查数据环节、不花模型费用 |
-| `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、账户、待审批、最近通知）；`logs` 实时日志，`errors` 最近 24 小时的警告和错误，`report` 账户报告，`approvals` 待审批 |
-| `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止两个服务；`--disable` 同时取消开机自启 |
+| `bash scripts/fund-start.sh` | 启动：检查 `.env` → 安装或更新三个 systemd 服务（交易、独立监控、数据员）和每日备份定时器 → 启动 → 等独立监控就绪（最多 3 分钟）→ 处于人工停止时询问是否恢复交易（`-y` 直接恢复）。旧版本装过的 `lumibot-fund-prefetch.timer` 会自动停用并删除（已被数据员取代） |
+| `bash scripts/fund-restart.sh` | **更新代码后用这个**：重新安装有变化的服务文件 → 真正重启三个服务（加载新代码）→ 等到重启后的独立监控写出新状态 → 询问是否恢复交易（`-y` 直接恢复）。`--update` 先 `git pull --ff-only`（只快进，不覆盖本地修改）并按锁定版本重装依赖。`fund-start.sh` 对已经在运行的服务不会重启，所以更新后单独运行它看起来“没反应” |
+| `bash scripts/fund-rehearse.sh` | **盘前彩排**：在交易服务完全相同的文件沙箱里，用 `FUND_MODE` 账户的副本（含数据员准备的数据）、真实行情和真实模型完整走一遍决策（数据员状态 → 盘前研究 → 风控数据 → 因子研究 → 财报日历 → FRED → 反方审查 → 基金经理 → 决策校验 → 量化风控），在下单前停下，逐段报告耗时、每次模型调用的耗时和结果。在后台临时服务里运行，断开 SSH 不会中断，重连后用 `--show` 看结果。不碰真实账户、STOP、审批和 Telegram；`--no-models` 只检查数据环节、不花模型费用 |
+| `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、数据员各类数据的更新时间、账户、待审批、最近通知）；`logs` 三个服务的实时日志，`errors` 最近 24 小时的警告和错误，`report` 账户报告，`approvals` 待审批 |
+| `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止三个服务；`--disable` 同时取消开机自启 |
 
 第一次运行 `fund-start.sh` 时如果还没有 `.env`，脚本会从模板创建一份并提示填写 Key 后再运行。
 服务器重启或程序崩溃后服务会自动拉起，交易在安全条件下自动恢复；用 `fund-stop.sh` 关停的，下次 `fund-start.sh` 时确认恢复。
@@ -53,11 +53,84 @@ bash scripts/run_autonomous_fund.sh check
 bash scripts/fund-rehearse.sh
 ```
 
-1. `fund-logs.sh`：两个服务 active，独立监控“新鲜”，“交易”一行是运行中（或会自动恢复），没有新的业务异常；
+1. `fund-logs.sh`：三个服务 active，独立监控“新鲜”，“交易”一行是运行中（或会自动恢复），“数据员”一行是运行中、
+   资讯和宏观几分钟到一小时内更新过，没有新的业务异常；
 2. `check`：`connectivity_summary.blocking` 为空（Yahoo、Telegram、模型 API 都能连上）；
 3. `fund-rehearse.sh`：全部“通过”。任何“失败”都带位置和原因，开盘前就能修；数据环节超过 45 秒的会注明在交易时段会分几轮完成，
    必需环节（账户快照、风控数据）超过 120 秒、单次模型调用超过 900 秒会直接判失败，因为开盘后监控会因此停止交易。
-   一次彩排大约调用 2–3 次模型（盘前研究若当天已做过则不再调用）。
+   一次彩排大约调用 2–3 次模型（盘前研究若当天已做过则不再调用）。断线后重新连上，运行 `bash scripts/fund-rehearse.sh --show` 查看结果。
+
+**模型调用的时间上限**：LumiBot 的 `run_timeout` 是每次尝试的上限，超时还会被当作临时错误重试，实盘默认最多 10 次，
+一次调用可能拖到将近一小时，而独立监控在单次调用超过 900 秒时就会停止交易。启动入口因此默认 `LUMIBOT_AGENT_MAX_RUN_ATTEMPTS=2`，
+研究员每次尝试 420 秒、反方审查和基金经理各 300 秒，最坏情况分别约 842 秒和 602 秒；研究员被要求控制在约 20 次工具调用内。
+如果你手动把重试次数调大到会超过 900 秒，启动时会记录 `agent_time_budget_exceeds_monitor` 并提示。
+
+## 数据员：常驻的数据整理服务
+
+研究员和基金经理不再在模型调用里现拉数据，新消息也不用等到某个固定时间。第三个服务 `lumibot-fund-desk`（数据员）
+一直在后台运行，只拉数据、整理数据、算好指标；它不调用模型、不下单，也不改 STOP、审批和决策：
+
+| 数据 | 内容 | 多久更新一次 |
+|---|---|---|
+| 资讯 | Yahoo 个股新闻、SEC 8-K 公告、美联储发布、自定义 RSS，以及 AI 设定的 `news_watch` 搜索词，写进账本的资讯表；跟踪的标的包括持仓、最新目标和价格提醒 | 开盘时每 `FUND_NEWS_POLL_SECONDS`（默认 5 分钟），休市时每 20 分钟 |
+| 盘中行情 | 每个可交易标的和 SPY/QQQ/IWM/DIA：最新已完成一分钟的价格、相对昨收的涨跌、开盘跳空、日内高低和成交量，领涨领跌和涨跌家数 | 开盘时每 `FUND_DESK_INTRADAY_SECONDS`（默认 5 分钟） |
+| 盘前行情 | 每个可交易标的和 SPY/QQQ/IWM/DIA 的盘前成交：最新价、相对昨收的涨跌、盘前成交量、领涨领跌 | 交易日美东 04:00 到开盘，每 15 分钟 |
+| 全球市场 | 标普、纳指、罗素股指期货，VIX，10 年期美债收益率，美元指数，欧元、日元，原油、黄金，日经、恒生、欧洲斯托克 50 | 工作日休市时每 15 分钟、盘中每 30 分钟、周末每 4 小时 |
+| 经济日历 | 未来三周 CPI、非农、GDP、PCE、PPI、零售销售、初请失业金、JOLTS、工业产出、FOMC 等公布日期（需要 `FRED_API_KEY`，免费） | 每 6 小时 |
+| 宏观 | FRED 美债收益率、期限利差、高收益债利差、VIX | 工作日 06:00–20:00（美东）每小时，其余时间每 4 小时 |
+| 财报日历 | 每只股票的下一次财报日期（日期变了，财报前的仓位上限当天就生效） | 每 6 小时 |
+| 日线 | 本地模式下交易范围、因子研究范围和基准的已完成日线（不含当天正在形成的 K 线；纸面账户模式用券商的数据） | 美东 06:00 以后才拉当天的（新一天的拆股、分红那时已计入），没拉全时每 15 分钟补一次，之后每小时检查 |
+| 行情快照 | 由日线算好的收益、波动、beta、均线位置、成交额 | 每 15 分钟检查，有变化才重写 |
+| SEC 财报 | 需要更新的公司基本面（需要 `FUND_SEC_USER_AGENT`） | 每 12 小时 |
+
+结果写在账户目录的 `cache/daily/<交易日>/`（保留最近 3 天）和账本的资讯表，状态和心跳写在 `cache/desk/status.json`。
+交易进程**先读数据员准备好的数据，只有缺的或过期的才自己联网补**；研究员和基金经理的输入里有 `data_desk`
+（各类数据多久前更新、盘中行情、上次决策以来新增的资讯条数），并且可以在思考过程中随时调用 `desk_latest` 工具，
+读到那一刻最新的盘中行情、快照、宏观、财报或资讯。重大资讯（AI 关注的搜索词命中、持仓公告、美联储发布、持仓新闻扎堆）
+照常提前唤醒基金经理。
+
+**交易优先**：两个进程从同一个服务器 IP 访问 Yahoo，所以数据员让着交易进程。它的盘中行情只下载当天的分钟线（交易进程下载 5 天），
+请求之间停 0.3 秒，一轮里连续 3 次失败就停下这一轮；交易进程自己的 Yahoo 请求一出错，就写下冷却时间
+（`cache/desk/yahoo_cooldown.json`），冷却期间数据员不再请求 Yahoo（资讯里只暂停 Yahoo 新闻，美联储、SEC、Google 新闻照常）。
+数据员服务的 CPU、磁盘优先级更低，内存紧张时系统先停它。
+
+**过期和可疑的数据会标出来**：超过 15 分钟没更新的盘中行情、超过 1 小时的盘前行情、超过 90 分钟的全球市场，在 AI 的输入里只显示
+“已过期”和更新时间，不当作当前数据。相对昨收跳空 25% 以上的标的标为“可疑（可能是拆股、特别分红或数据错误，需核实）”，
+不计入领涨领跌。资讯会把不同来源的同一条新闻合并成一条（注明几家报道），并按重要程度排序：重大事件、持仓、关注词、宏观、目标、公告，
+再按时间。
+
+数据员停了也不影响交易：交易进程发现它连续 3 次没更新资讯就自己接着轮询，其余数据缺了也会自己拉，只是慢一些。
+独立监控在数据员 10 分钟没有心跳时发一次 Telegram 提醒（6 小时内最多一次）；`fund-logs.sh` 的概况里有一行“数据员”，
+显示每类数据几分钟前更新、是否出错。查看它的日志：
+
+```bash
+journalctl -u lumibot-fund-desk -f -o cat
+```
+
+不想要数据员时在 `.env` 里写 `FUND_DATA_DESK=false`（交易进程恢复原来的自己拉取方式）。没有数据员的机器上，
+也可以手动把当天的日线、FRED、财报日历和 SEC 财报一次性拉好：
+
+```bash
+bash scripts/run_autonomous_fund.sh prefetch
+```
+
+**修正**：之前 `fund-rehearse.sh`、`prefetch` 没有使用 `FUND_MODE` 的账户目录，而是旧的默认目录 `artifacts/autonomous-fund`，
+所以彩排复制的是一个新账户、预取的数据交易进程也读不到。现在都用 `FUND_MODE`／`FUND_RUN_DIR` 指定的账户；
+更新后请重新彩排一次。
+
+**更少、更好的模型调用**（不降低风控，也不限制 AI 的研究工具）：
+
+- **行情快照 `market_snapshot`**：每个交易日由代码根据已完成日线算一次每个可交易标的的 1/5/20/60 日收益、20/60 日年化波动、
+  相对 SPY 的 60 日 beta 和相关性、相对 50/200 日均线的位置、距 252 日高点的回撤和 20 日日均成交额，放进盘前研究和基金经理的上下文。
+  提示词要求直接使用，不再用工具反复计算，把工具调用留给新闻、公告和证据。缺数据就是 `null`，从不填补。
+- **反方审查复用**：同一交易日内研究结果、持仓和唤醒原因都没变时，复用上一次的审查（日志 `critic_reused`），不再重复调用；
+  任何一项变化都会重新审查。
+- **跳过无变化的定时复核**（`FUND_SKIP_QUIET_REVIEWS`，默认开启）：基金经理自己定的复核时间到了，但没有任何提醒、大幅波动、
+  市场压力或新闻命中，上次决定的调仓已经完成且持仓完全没变（没有止损、止盈或其他成交），研究也还是那一份，就不调用模型，
+  日志记为 `review_skipped`，一个复核间隔（`FUND_MIN_REVIEW_MINUTES`）后再检查。止损、止盈和价格提醒始终有效，有变化立即唤醒；
+  同一交易时段内距上次模型决策满 `FUND_MAX_QUIET_MINUTES`（默认 120 分钟）必定调用一次，新的交易日第一次复核也必定调用。
+- **彩排报告每次模型调用的 token**：`fund-rehearse.sh` 的结果里每次调用写明耗时和输入／输出 token（复用的写“缓存命中”），
+  便于判断哪一步最费时、最费钱。
 
 监控停止（例如“迭代卡住”）在 24 小时内最多自动恢复 3 次。次数用完后状态会写明“自动恢复次数已用完”，
 `fund-start.sh` 和 `fund-restart.sh` 会像人工停止一样询问是否恢复：先用 `bash scripts/fund-logs.sh errors` 看原因。
@@ -92,7 +165,7 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh check
 请改用香港／新加坡等境外地域，或在 `.env` 设置 `HTTPS_PROXY`。设置了 Alpaca Key 时，local 模式在 Yahoo 拿不到日线时
 会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`）。
 
-`prepare` 只生成 `artifacts/fund-systemd/` 中的两个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
+`prepare` 只生成 `artifacts/fund-systemd/` 中的交易、监控、数据员三个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`
 （`local` 本地模拟盘或 `paper` Alpaca 模拟账户，没有实盘选项）和 `FUND_RUN_DIR`（留空为 `artifacts/fund-<模式>`，
 服务要求放在仓库 `artifacts/` 下），`prepare` 会打印服务将使用的模式和账户目录。它不覆盖已有 `.env`，也不安装或启动任何服务。
@@ -139,11 +212,11 @@ sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.run check \
 它还会报告 `research_network`：若研究站点解析为 Fake-IP（198.18.0.0/15）或私有地址，网页研究会被安全检查拒绝，
 按提示让服务器不走 Fake-IP，或在 `config.json` 设置 `"research_network": {"resolver": "doh"}`。
 如将来选择 Alpaca Paper，先在本地 `.env` 填写专用 Paper Key，把 `FUND_MODE` 改为 `paper`，为服务用户准备新账户目录，
-再一起重启两个服务；账本自动换到 `artifacts/fund-paper`，不会用 `fund-local` 的账本连接券商账户：
+再一起重启三个服务；账本自动换到 `artifacts/fund-paper`，不会用 `fund-local` 的账本连接券商账户：
 
 ```bash
 sudo install -d -o "<service-user>" -m 700 artifacts/fund-paper
-sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service
+sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
 ```
 
 重启后同样保持 STOP，核对后再 `resume`。也可用 `deploy prepare --mode paper --run-dir artifacts/fund-paper`
@@ -153,16 +226,17 @@ sudo systemctl restart lumibot-fund-runner.service lumibot-fund-monitor.service
 如果父目录不允许服务用户遍历，需由管理员调整目录权限；不要用放开所有文件读写的方式解决。
 可选浏览器的安装和外部数据订阅仍按 LumiBot 原有说明配置；缺少这些工具会影响研究覆盖面。
 
-## 审阅并启动两个服务
+## 审阅并启动服务
 
 ```bash
 systemd-analyze verify artifacts/fund-systemd/lumibot-fund-*.service
 sudo install -m 644 artifacts/fund-systemd/lumibot-fund-runner.service /etc/systemd/system/
 sudo install -m 644 artifacts/fund-systemd/lumibot-fund-monitor.service /etc/systemd/system/
+sudo install -m 644 artifacts/fund-systemd/lumibot-fund-desk.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service
-systemctl status lumibot-fund-runner.service lumibot-fund-monitor.service
-journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service -n 60 --no-pager
+sudo systemctl enable --now lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
+systemctl status lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
+journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service -u lumibot-fund-desk.service -n 60 --no-pager
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh notify-test --run-dir artifacts/fund-local
 ```
 
@@ -267,7 +341,7 @@ Telegram 接收确认丢失时重试可能重复，不保证恰好一次；同�
 ```bash
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh report --run-dir artifacts/fund-local
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh stop --run-dir artifacts/fund-local
-sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service
+sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
 ```
 
 `runtime.log` 按 20 MB 轮转，保留 5 个历史文件；journald 的磁盘额度由服务器管理员设置。

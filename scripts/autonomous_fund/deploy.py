@@ -60,6 +60,22 @@ def generate(repo, run_dir, env_file, user, mode):
         "UMask=0077", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict", "ProtectHome=read-only",
         "ReadWritePaths=" + " ".join(unit_quote(p) for p in sorted({repo / "artifacts", run_dir or repo / "artifacts"})),
         "StandardOutput=journal", "StandardError=journal", ""])
+    # The data desk (数据员): always on, collects and prepares research data; never trades.
+    desk_args = [python, "-m", "scripts.autonomous_fund.run", "datadesk", "--env-file", env_file]
+    desk_args += ["--run-dir", run_dir] if run_dir else []
+    units["lumibot-fund-desk.service"] = "\n".join([
+        "[Unit]", "Description=LumiBot paper fund data desk (news, prices, macro, earnings)",
+        "Wants=network-online.target", "After=network-online.target", "StartLimitIntervalSec=0", "",
+        "[Service]", "Type=exec", f"User={user}", f"WorkingDirectory={unit_path(repo)}",
+        "ExecStart=" + " ".join(unit_quote(arg) for arg in desk_args),
+        "Restart=always", "RestartSec=30", "KillSignal=SIGINT", "TimeoutStopSec=30",
+        # The trading process comes first: less CPU and I/O, and the first to go under memory pressure.
+        "Nice=10", "CPUWeight=20", "IOWeight=20", "OOMScoreAdjust=500",
+        "Environment=PYTHONUNBUFFERED=1 LUMIBOT_DISABLE_DOTENV=true",
+        "UMask=0077", "NoNewPrivileges=true", "PrivateTmp=true", "ProtectSystem=strict", "ProtectHome=read-only",
+        "ReadWritePaths=" + " ".join(unit_quote(p) for p in sorted({repo / "artifacts", run_dir or repo / "artifacts"})),
+        "StandardOutput=journal", "StandardError=journal", "",
+        "[Install]", "WantedBy=multi-user.target", ""])
     units["lumibot-fund-backup.timer"] = "\n".join([
         "[Unit]", "Description=Daily LumiBot paper fund journal backup", "",
         "[Timer]", "OnCalendar=*-*-* 17:45:00 America/New_York", "Persistent=true", "RandomizedDelaySec=300", "",

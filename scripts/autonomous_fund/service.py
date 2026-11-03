@@ -205,11 +205,12 @@ def main(argv=None):
 
 def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.monotonic, stop=None,
           install_signals=True):
-    """Keep the runner and monitor services alive where systemd is unavailable (e.g. Windows).
+    """Keep the runner, monitor and data desk alive where systemd is unavailable (e.g. Windows).
 
-    Equivalent to the two generated units: each role runs under this module's
-    supervision and is restarted RESTART_SECONDS after it last started when it
-    exits. Unattended running requires Telegram, like the server services.
+    Equivalent to the generated units: the runner and monitor run under this
+    module's supervision, the data desk directly (it never trades), and each is
+    restarted RESTART_SECONDS after it last started when it exits. Unattended
+    running requires Telegram, like the server services.
     """
     from .environment import load_environment
     load_environment(env_file)
@@ -224,7 +225,7 @@ def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.
     children, started, requested = {}, {}, False
     try:
         while True:
-            for role in ("runner", "monitor"):
+            for role in ("runner", "monitor", "desk"):
                 child = children.get(role)
                 if child is not None and child.poll() is None:
                     continue
@@ -232,7 +233,9 @@ def serve(env_file, config, run_dir=None, *, popen=subprocess.Popen, clock=time.
                     if clock() - started[role] < RESTART_SECONDS:
                         continue
                     print(f"{role} exited with code {child.poll()}; restarting", flush=True)
-                command = [sys.executable, "-m", "scripts.autonomous_fund.service", role, "--env-file", str(env_file),
+                module = (["scripts.autonomous_fund.run", "datadesk"] if role == "desk" else
+                          ["scripts.autonomous_fund.service", role])
+                command = [sys.executable, "-m", *module, "--env-file", str(env_file),
                            "--config", str(config)] + (["--run-dir", str(run_dir)] if run_dir else [])
                 children[role] = popen(command)
                 started[role] = clock()

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # One-step start of the AI paper fund on Ubuntu (systemd):
-# check .env -> install/update the two services -> start them -> wait for the
-# independent monitor -> offer to resume trading when it is stopped by hand.
+# check .env -> install/update the services (runner, monitor, data desk) -> start
+# them -> wait for the independent monitor -> offer to resume trading when it is
+# stopped by hand.
 # Usage: bash scripts/fund-start.sh [-y] [--restart]
 #   -y         resume without asking
 #   --restart  also restart running services so updated code takes effect
@@ -14,9 +15,12 @@ env_file="${AI_FUND_ENV:-$repo/.env}"
 unit_dir="${AI_FUND_UNIT_DIR:-/etc/systemd/system}"
 build_dir="${AI_FUND_UNIT_BUILD:-$repo/artifacts/fund-systemd}"
 user="${AI_FUND_USER:-$(id -un)}"
-units=(lumibot-fund-runner.service lumibot-fund-monitor.service)
+# Runner, independent monitor and the always-on data desk (数据员).
+units=(lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service)
 # Installed with the services; the timer takes a daily journal snapshot after the close.
 backup_units=(lumibot-fund-backup.service lumibot-fund-backup.timer)
+# Replaced by the data desk (2026-11-03): removed when an earlier version installed it.
+legacy_units=(lumibot-fund-prefetch.timer lumibot-fund-prefetch.service)
 yes=0
 restart=0
 for arg in "$@"; do
@@ -56,6 +60,13 @@ for unit in "${units[@]}" "${backup_units[@]}"; do
     changed=1
   fi
 done
+for unit in "${legacy_units[@]}"; do
+  if [[ -f "$unit_dir/$unit" ]]; then
+    run sudo systemctl disable --now "$unit" 2>/dev/null || true
+    run sudo rm -f "$unit_dir/$unit"
+    changed=1
+  fi
+done
 if (( changed )); then
   run sudo systemctl daemon-reload
   echo "    服务文件已安装／更新。"
@@ -69,7 +80,7 @@ if (( restart )); then
   # Stopping writes a manual STOP, so trading resumes only through the step below.
   [[ -z "${AI_FUND_DRY_RUN:-}" ]] && fresh=(--fresh-after "$(date +%s)")
   run sudo systemctl restart "${units[@]}"
-  echo "    已重启两个服务（加载新代码）。"
+  echo "    已重启交易、监控和数据员三个服务（加载新代码）。"
 fi
 
 echo "4/4 等待独立监控就绪（最多 3 分钟，第一次启动时监控可能先重启一次）……"

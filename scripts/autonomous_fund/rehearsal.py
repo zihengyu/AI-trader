@@ -84,6 +84,67 @@ def _context_judge(value):
     return "ok", ""
 
 
+def _desk_judge(view):
+    """Running with fresh data is ok; a stopped desk is a warning (the runner then fetches its own data)."""
+    if not view.get("running"):
+        return "warn", "disabled" if view.get("disabled") else "desk not running"
+    ages = [f"{name} {item['updated_minutes_ago']:g} min" + (" (error)" if item.get("error") else "")
+            for name, item in sorted(view["datasets"].items()) if item.get("updated_minutes_ago") is not None]
+    return "ok", "running; " + (", ".join(ages) or "no dataset finished yet")
+
+
+def _snapshot_judge(value):
+    verdict, detail = _context_judge(value)
+    if verdict == "ok" and isinstance(value, dict):
+        missing = value.get("no_history") or []
+        detail = f"{len(value.get('symbols') or {})} symbols" + (f", no history: {', '.join(missing)}" if missing else "")
+    return verdict, detail
+
+
+def agent_calls(journal):
+    """Each model call's duration, and its tokens when the provider reported them, from the copy's events.
+
+    The `agent` event recorded right after a finished call carries its usage; a
+    reused cached answer used no tokens and is marked cache_hit.
+    """
+    from .report import token_counts
+    from .risk import instant
+    started, calls, awaiting = {}, [], {}
+    for row in journal.all_events():
+        body = row["body"]
+        if row["kind"] == "agent_call_started":
+            started[body["id"]] = (body["name"], instant(row["at"]))
+        elif row["kind"] == "agent_call_finished" and body.get("id") in started:
+            name, began = started.pop(body["id"])
+            calls.append({"name": name, "seconds": round((instant(row["at"]) - began).total_seconds(), 1)})
+            awaiting.setdefault(name, []).append(calls[-1])
+        elif row["kind"] == "agent" and awaiting.get(body.get("name")):
+            call = awaiting[body["name"]].pop(0)
+            if body.get("cache_hit"):
+                call["cache_hit"] = True
+            elif body.get("usage"):
+                try:
+                    call.update({k: v for k, v in token_counts(body["usage"]).items() if k != "cached_input_tokens"})
+                except (TypeError, ValueError, AttributeError):
+                    pass  # An unfamiliar usage shape: the duration is still reported.
+    calls += [{"name": name, "seconds": None, "unfinished": True} for name, _ in started.values()]
+    return calls
+
+
+def _call_text(call):
+    if call.get("seconds") is None:
+        return f"{call['name']} 未结束"
+    tokens = (f"（输入 {call['input_tokens']} / 输出 {call['output_tokens']} tokens）"
+              if "input_tokens" in call else "（缓存命中）" if call.get("cache_hit") else "")
+    return f"{call['name']} {call['seconds']} 秒{tokens}"
+
+
+def latest(root=Path("artifacts/fund-rehearsal")):
+    """The newest saved report, or None."""
+    reports = sorted(Path(root).glob("*/rehearsal.json")) if Path(root).is_dir() else []
+    return json.loads(reports[-1].read_text(encoding="utf-8")) if reports else None
+
+
 def _prune(root, keep):
     runs = sorted(p for p in Path(root).iterdir() if p.is_dir() and len(p.name) == 15 and p.name[8] == "-")
     for old in runs[:-keep]:
@@ -137,9 +198,10 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         root.mkdir(parents=True, exist_ok=True)
         if (account_dir / "state.sqlite3").is_file():
             deploy.backup(account_dir, book)
-            sec = account_dir / "cache" / "sec"
-            if sec.is_dir():
-                shutil.copytree(sec, book / "cache" / "sec")
+            # The SEC cache and what the data desk prepared, so the copy reads them like the runner.
+            for name in ("sec", "daily", "desk"):
+                if (account_dir / "cache" / name).is_dir():
+                    shutil.copytree(account_dir / "cache" / name, book / "cache" / name)
             stops.clear(book)  # The copy's own STOP; orders are intercepted below.
             return "copied"
         book.mkdir(parents=True)
@@ -147,6 +209,8 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     origin = stages.run("copy the account", copy, kind="required", judge=lambda v: ("ok", v or ""))
     if origin is None:
         return _finish(scratch, stages, root, keep)
+    from .datadesk import DeskStatus
+    stages.run("data desk", lambda: DeskStatus(account_dir).summary(), judge=_desk_judge)
     # The copy's own native memory, so the rehearsal never writes into the real one.
     os.environ["LUMIBOT_MEMORY_DIR"] = str((scratch / "memory").resolve())
     rehearsal_config = {**config, "news": {**(config.get("news") or {}), "enabled": False}}
@@ -166,6 +230,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         strategy._execute = lambda intent, now, account=None, prices=None: submitted.append(intent)
         strategy._executor._initialize()  # Startup, including the pre-open research.
         strategy.validation = None  # No shadow call: one decision is enough to rehearse.
+        strategy.journal.set_meta("critique_cache", None)  # Rehearse a real critic call, never a reused one.
         return strategy
     strategy = stages.run("start the strategy (startup and pre-open research)", build, kind="model")
     if strategy is None:
@@ -180,6 +245,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
         return _finish(scratch, stages, root, keep)
     stages.run("risk context (history, volatility, stress windows)", lambda: strategy._risk_context(account, at),
                kind="required", judge=_context_judge)
+    stages.run("market snapshot", lambda: strategy._market_snapshot(at), judge=_snapshot_judge)
     stages.run("factor research (history, research universe, SEC)", lambda: strategy._factor_context(at),
                judge=_context_judge)
     stages.run("earnings calendar", lambda: strategy._earnings_caps(at),
@@ -228,13 +294,16 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     built = stages.run("risk construction of the targets", construction, kind="required",
                        judge=lambda v: ("ok", f"binding: {', '.join(v['binding']) or 'none'}"))
     report = _finish(scratch, stages, root, keep, extra={"decision": decision, "construction": built,
-                                                         "orders_intercepted": [str(i) for i in submitted]})
+                                                         "orders_intercepted": [str(i) for i in submitted],
+                                                         "agent_calls": agent_calls(strategy.journal)})
     return report
 
 
 def _finish(scratch, stages, root, keep, extra=None):
+    from .strategy import MONITOR_AGENT_SECONDS
     rows = stages.rows
-    verdict = "fail" if any(r["status"] == "fail" for r in rows) else "ready"
+    slow = [c for c in (extra or {}).get("agent_calls", []) if (c.get("seconds") or 0) >= MONITOR_AGENT_SECONDS]
+    verdict = "fail" if slow or any(r["status"] == "fail" for r in rows) else "ready"
     report = {"verdict": verdict, "at": datetime.now(timezone.utc).isoformat(), "copy": str(scratch),
               "stages": rows, **(extra or {}),
               "note": "A copy of the account; no order, STOP, approval or Telegram message of the real account "
@@ -256,6 +325,8 @@ LABELS = {
     "start the strategy (startup and pre-open research)": "启动策略（含盘前研究，真实模型）",
     "account snapshot": "账户快照",
     "risk context (history, volatility, stress windows)": "风控数据（历史、波动率、危机情景）",
+    "data desk": "数据员（常驻数据服务）",
+    "market snapshot": "行情快照（收益、波动、beta、均线、成交额）",
     "factor research (history, research universe, SEC)": "因子研究数据（研究股票池、SEC 财报）",
     "earnings calendar": "财报日历",
     "FRED macro context": "FRED 宏观数据",
@@ -265,18 +336,23 @@ LABELS = {
     "risk construction of the targets": "目标组合的量化风控",
 }
 DETAILS = {"copied": "已复制真实账本", "fresh": "没有账本，用新账户", "disabled": "未启用",
+           "desk not running": "没有运行：交易进程会自己拉数据，但盘中更慢；运行 bash scripts/fund-restart.sh -y 启动它",
            "pre-open research not run": "盘前研究未运行（已运行过或在开盘前一小时窗口外）",
            "--no-models": "--no-models，未调用模型"}
 
 
 def text(report):
-    marks = {"ok": "通过", "fail": "失败", "skipped": "跳过"}
+    marks = {"ok": "通过", "fail": "失败", "skipped": "跳过", "warn": "注意"}
     lines = [f"盘前彩排：{'全部通过' if report['verdict'] == 'ready' else '有失败项'}（账本副本：{report['copy']}）", ""]
     for row in report["stages"]:
         where = f"；位置 {row['where']}" if row.get("where") else ""
         detail = DETAILS.get(row.get("detail"), row.get("detail"))
         lines.append(f"[{marks.get(row['status'], row['status'])}] {LABELS.get(row['stage'], row['stage'])}："
                      f"{row['seconds']} 秒" + (f"；{detail}" if detail else "") + where)
+    calls = report.get("agent_calls") or []
+    if calls:
+        lines += ["", "每次模型调用耗时（监控在单次调用超过 900 秒时会停止交易）："
+                  + "、".join(_call_text(c) for c in calls)]
     built = report.get("construction")
     if built:
         lines += ["", "AI 目标 → 风控后：" + json.dumps(built["targets"], ensure_ascii=False) + " → "

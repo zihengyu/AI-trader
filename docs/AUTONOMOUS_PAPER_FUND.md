@@ -2,7 +2,7 @@
 
 基于原生 LumiBot Agent、Strategy、Broker 和 BacktestingBroker 的纸面账户应用。
 
-**Last Updated:** 2026-11-02
+**Last Updated:** 2026-11-03
 
 **Status:** 公开行情、本地虚拟账户及一次真实 DeepSeek 盘前研究已验证；量化风控、例外审批、授权资金分仓、盯盘、记分卡、Telegram 回复审批、实时推送报价与资讯监控已通过替身测试；Alpaca、真实推送和开盘交易待验证
 
@@ -95,6 +95,8 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 模型 | `DEEPSEEK_API_KEY`（及可选 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`） | 模型 Key |
 | 模型 | `FUND_RESEARCH_MODEL`、`FUND_DECISION_MODEL`、`FUND_REASONING_EFFORT` | 研究员／基金经理模型与推理强度（角色变量优先于 `AI_MODEL`） |
 | 模型 | `FUND_MAX_AGENT_RUNS_PER_DAY`、`FUND_MIN_REVIEW_MINUTES`、`FUND_MODEL_PRICES_JSON` | 每日调用上限、最短复核间隔、费用估算价格 |
+| 模型 | `FUND_SKIP_QUIET_REVIEWS`、`FUND_MAX_QUIET_MINUTES` | 到点复核时无任何变化就跳过模型调用、连续跳过的最长分钟数（见[模型调用预算](#模型调用预算与失败退避)） |
+| 外部 | `FUND_DATA_DESK`、`FUND_DESK_INTRADAY_SECONDS` | 数据员（常驻服务，持续拉取整理资讯、盘中行情、宏观、财报）开关、盘中行情刷新间隔 |
 | 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
 | 约束 | `FUND_MAX_POSITION`、`FUND_MAX_EXPOSURE`、`FUND_MAX_DRAWDOWN`、`FUND_DAILY_ORDERS` | 单只上限、总敞口、回撤硬锁、每日提交次数 |
 | 约束 | `FUND_DAILY_LOSS_LIMIT`、`FUND_TARGET_VOL`、`FUND_MAX_ES` | 单日亏损闸门、波动率目标、尾部损失上限 |
@@ -542,6 +544,7 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 观点之间的相关性、陈旧或无日期的证据。输出按证券列出的疑虑和缺失的证据（`critique`），基金经理必须在理由里回应重要疑虑。
 盘中评议使用已保存的预研及其可用性信息，不先重跑研究员；历史回放继续评议该轮已验证日期的研究。
 它不做决定、不下单。模型预算不够两次调用（反方＋基金经理）时跳过，调用失败只记录 `critic_unavailable`，都不会挡住决策。
+同一交易日内研究、持仓和唤醒原因（`watch_triggers`）都没变时复用上一次的审查（`critic_reused`），不重复调用；任何一项变化都重新审查。
 影子 A/B 的两组看到同一份反方审查。
 
 **组合构建 A/B**（`construction` 段，`FUND_CONSTRUCTION_MODE`）：专业基金通常把“选什么”和“各买多少”分开。
@@ -765,6 +768,25 @@ alpha t ≥ 1.65（单边 95%）、且没有触发回撤上限时，才给出 `e
   并发送一次 `model_budget_exhausted` 通知。
   盘中一次基础评估只需预留一次经理调用；盘前、盘后及可选评议／影子评估继续计入实际调用预算。
 - AI 指定的 `next_review_at` 不早于 `min_review_minutes`（默认 15 分钟）；目标执行窗口也按此下限计算。
+- **跳过无变化的定时复核**（`skip_quiet_reviews`，默认 `true`，`FUND_SKIP_QUIET_REVIEWS`）：到了 AI 自己定的复核时间，
+  只有同时满足以下条件才不调用模型（记录 `review_skipped`，`min_review_minutes` 后再检查）：没有待处理的盯盘唤醒
+  （提醒、大幅波动、市场压力、新闻命中）；没有暂停加仓；上次模型决策在同一纽约交易日、距今不到 `max_quiet_minutes`
+  （默认 120 分钟，`FUND_MAX_QUIET_MINUTES`，取值 `min_review_minutes`..1440）；该决策的调仓已完成（`allocation_complete`），
+  且持仓与完成时完全一致（现金管理 ETF 视为现金）；已保存的盘前研究仍是它看到的那一份。任何一条不满足就照常调用基金经理。
+  已设置的止损、止盈和价格提醒在跳过期间照常生效；提示词告诉基金经理这一规则，让它用提醒和 `news_watch` 安排需要更早唤醒的情况。
+- **行情快照**（`market_snapshot`）：每个交易日由代码从已完成日线计算一次可交易标的的 1/5/20/60 日收益、20/60 日年化波动、
+  相对压力基准（默认 SPY）的 60 日 beta 和相关性、相对 50/200 日均线的位置、距 252 日最高收盘的回撤和 20 日日均成交额，
+  放进盘前研究和盘中决策的上下文，研究员和基金经理不必再用工具重复计算。只用已完成的交易日（历史回放同样不看未来），
+  缺数据为 `null`，从不填补；预算用完时尚未读取的标的列在 `deferred`，下一轮补齐。
+- **数据员**（`data_desk` 段，`FUND_DATA_DESK`，常驻服务 `lumibot-fund-desk`）：一个不调用模型、不下单的进程持续拉取整理
+  资讯（开盘时每 5 分钟）、盘中行情（每 `FUND_DESK_INTRADAY_SECONDS`，默认 5 分钟）、FRED（工作时段每小时）、财报日历
+  （每 6 小时）、盘前行情（交易日 04:00 到开盘）、全球市场（股指期货、VIX、美债、美元、外汇、原油、黄金、亚太和欧洲指数）、
+  经济日历（需要 `FRED_API_KEY`）、日线（美东 06:00 以后）、行情快照和 SEC 财报，存到 `<账户目录>/cache/daily/<交易日>/`
+  和账本的资讯表。它让着交易进程使用 Yahoo（交易进程的请求出错时暂停），过期的数据标为过期，跳空 25% 以上的标为可疑；
+  资讯合并重复报道并按与持仓的相关度排序。交易进程先读这些，缺的或
+  过期的才自己联网补；盘前研究和盘中决策的输入里有 `data_desk`（各数据的新鲜度、盘中行情、上次决策以来新增的资讯条数），
+  三个 AI 角色在实盘模式下都有 `desk_latest` 工具，可在思考过程中随时读到那一刻最新的数据（历史回放没有这个工具，不会看到未来）。
+  数据员停了交易照常，交易进程自己拉数据。见 [Ubuntu 部署](AUTONOMOUS_FUND_UBUNTU.md#数据员常驻的数据整理服务)。
 
 ## 停止、恢复与异常通知
 
@@ -815,8 +837,8 @@ Ctrl+C 可以停止进程，但不能保证撤回已经被券商接受的订单�
 
 **进程退出后的自动重启与自动恢复**：
 
-- Ubuntu：两个 systemd 服务（交易、监控）退出后 30 秒自动重启；
-- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易和监控两个进程，任一退出 30 秒后重启：
+- Ubuntu：三个 systemd 服务（交易、监控、数据员）退出后 30 秒自动重启；
+- Windows 或没有 systemd 的机器：用 `serve` 代替直接运行，它同时管理交易、监控和数据员三个进程，任一退出 30 秒后重启：
 
   ```powershell
   .\scripts\run_autonomous_fund.ps1 -Mode serve

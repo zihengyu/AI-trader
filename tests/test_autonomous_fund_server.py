@@ -47,7 +47,10 @@ def test_linux_secret_permissions_fail_closed(tmp_path):
 def test_generated_units_quote_paths_and_have_independent_recovery():
     units = generate('/srv/fund checkout', '/srv/fund checkout/artifacts/book', '/srv/fund checkout/.env', 'fundbot', 'local')
     assert set(units) == {'lumibot-fund-runner.service', 'lumibot-fund-monitor.service', 'lumibot-fund-backup.service',
-                          'lumibot-fund-backup.timer'}
+                          'lumibot-fund-backup.timer', 'lumibot-fund-desk.service'}
+    desk = units['lumibot-fund-desk.service']  # Always on, same sandbox, never supervised as a trader.
+    assert '"scripts.autonomous_fund.run" "datadesk"' in desk and 'Restart=always' in desk
+    assert 'ProtectHome=read-only' in desk and 'ReadWritePaths=' in desk and 'KillSignal=SIGINT' in desk
     backup = units['lumibot-fund-backup.service']
     assert 'Type=oneshot' in backup and '"rotate-backup"' in backup and 'Restart=' not in backup
     assert '"--run-dir" "/srv/fund checkout/artifacts/book"' in backup and 'ProtectSystem=strict' in backup

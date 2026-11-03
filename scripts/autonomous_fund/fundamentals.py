@@ -168,6 +168,14 @@ def as_of(series, index):
     return pd.Series(values, index=index, dtype=float)
 
 
+def _atomic(path, text):
+    """The prefetch job and the runner share this cache: a reader never sees a partial file."""
+    import os
+    temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8")
+    temporary.replace(path)
+
+
 class SecFundamentals:
     def __init__(self, cache_dir, user_agent, get=None, sleep=time.sleep, today=None):
         import requests
@@ -191,7 +199,7 @@ class SecFundamentals:
         fresh = path.is_file() and (time.time() - path.stat().st_mtime) < 7 * 86400
         if not fresh:
             try:
-                path.write_text(json.dumps(self._download(TICKERS_URL)), encoding="utf-8")
+                _atomic(path, json.dumps(self._download(TICKERS_URL)))
             except Exception:
                 if not path.is_file():
                     raise
@@ -224,7 +232,7 @@ class SecFundamentals:
                 self.errors[symbol] = type(exc).__name__
                 return {k: [tuple(x) for x in v] for k, v in cached["fields"].items()}
             raise
-        path.write_text(json.dumps({"checked": today.isoformat(), "fields": fields}), encoding="utf-8")
+        _atomic(path, json.dumps({"checked": today.isoformat(), "fields": fields}))
         return fields
 
     def panels(self, symbols, index, may_download=None):

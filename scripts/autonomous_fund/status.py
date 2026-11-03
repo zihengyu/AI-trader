@@ -86,6 +86,43 @@ def monitor_ready(root, now=None, after=None):
     return age is not None and 0 <= age <= MONITOR_FRESH_SECONDS and state.get("health") in {"healthy", "stopped"}
 
 
+DESK_LABELS = {"news": "资讯", "intraday": "盘中行情", "premarket": "盘前行情", "global": "全球市场", "macro": "宏观",
+               "calendar": "经济日历", "earnings": "财报日历", "bars": "日线", "snapshot": "行情快照", "sec": "SEC 财报"}
+
+
+NOTE_LABELS = (("needs FRED_API_KEY", "需要在 .env 填 FRED_API_KEY，免费申请"),
+               ("Yahoo is failing for the trading process", "交易进程的 Yahoo 请求出错，暂时让路"),
+               ("no pre-market trades yet", "暂无盘前成交"), ("no account journal yet", "账本尚未创建"),
+               ("no daily bars", "等待日线"))
+
+
+def _note(text):
+    return next((label for prefix, label in NOTE_LABELS if str(text).startswith(prefix)), text)
+
+
+def desk_line(root, now):
+    """One line on the data desk (数据员): running or not, and how fresh each dataset is."""
+    from .datadesk import DeskStatus
+    view = DeskStatus(root).summary(now)
+    if view.get("disabled"):
+        return "数据员：已关闭（FUND_DATA_DESK=false，交易进程自己拉取数据）"
+    if "datasets" not in view:
+        return "数据员：还没有运行过（交易进程自己拉取数据）"
+    parts = []
+    for name, label in DESK_LABELS.items():
+        item = view["datasets"].get(name)
+        if not item:
+            continue
+        age = item.get("updated_minutes_ago")
+        text = f"{label} {age:g} 分钟前" if age is not None else f"{label} 尚无成功"
+        note = f"（出错：{item['error']}）" if item.get("error") else (f"（{_note(item['note'])}）" if item.get("note") else "")
+        parts.append(text + note)
+    state = "运行中" if view["running"] else "已停止（交易进程自己拉取数据，交易不受影响）"
+    busy = view.get("busy_with") or {}
+    doing = f"，正在处理 {DESK_LABELS.get(busy.get('job'), busy.get('job'))}" if busy.get("job") else ""
+    return f"数据员：{state}{doing}；" + ("、".join(parts) or "还没有完成的数据")
+
+
 def summary(root, mode, now=None):
     from .settings import MODES
     root, now = Path(root), now or datetime.now(timezone.utc)
@@ -121,6 +158,7 @@ def summary(root, mode, now=None):
         open_text = ("开盘中" if market.get("open") else f"休市，下次开盘 {market.get('next_open')}") if market else ""
         lines.append(f"交易进程：{beat.get('runner_state')}（心跳 {int(age) if age is not None else '?'} 秒前）"
                      + (f"；市场：{open_text}" if open_text else ""))
+    lines.append(desk_line(root, now))
     book = root / "state.sqlite3"
     if not book.is_file():
         lines.append("账本：尚未创建（交易进程第一次启动中）")

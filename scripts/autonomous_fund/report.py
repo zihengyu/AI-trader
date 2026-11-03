@@ -17,6 +17,16 @@ REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_val
                 "mandate_capital_changed", "operator_reserve_adjusted")
 
 
+
+def token_counts(raw):
+    """{input_tokens, output_tokens, cached_input_tokens} from one call's provider usage (several spellings)."""
+    return {
+        "input_tokens": int(raw.get("prompt_tokens", raw.get("input_tokens", raw.get("prompt_token_count", 0)))),
+        "output_tokens": int(raw.get("completion_tokens", raw.get("output_tokens", raw.get("candidates_token_count", 0)))),
+        "cached_input_tokens": int(raw.get("cache_read_input_tokens") or raw.get("cached_content_token_count") or
+                                   (raw.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
+    }
+
 def report(root, prices=None, write_files=True, *, as_of=None):
     if as_of is not None and write_files:
         raise ValueError("Historical report snapshots must not overwrite current reports")
@@ -137,13 +147,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
             totals["unknown_calls"] += 1
             counts["unknown_calls"] += 1
             continue
-        values = {
-            "input_tokens": int(raw.get("prompt_tokens", raw.get("input_tokens", raw.get("prompt_token_count", 0)))),
-            "output_tokens": int(raw.get("completion_tokens", raw.get("output_tokens", raw.get("candidates_token_count", 0)))),
-            "cached_input_tokens": int(raw.get("cache_read_input_tokens") or raw.get("cached_content_token_count") or
-                (raw.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
-        }
-        for key, value in values.items():
+        for key, value in token_counts(raw).items():
             totals[key] += value
             counts[key] += value
     estimate = None

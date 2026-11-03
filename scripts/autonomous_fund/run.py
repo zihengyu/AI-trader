@@ -255,7 +255,11 @@ def run_local(args, config):
     from .market_data import LiveTape, MarketDataSettings
     market = MarketDataSettings.from_config(config.get("market_data"))
     tape = LiveTape() if market.live_stream else None
-    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds), journal, Limits(**config["limits"]),
+    from .datadesk import yahoo_cooldown_writer
+    # Trading has priority on Yahoo: its failures pause the data desk's Yahoo requests (same server IP).
+    broker = LocalPaperBroker(YahooRealtimeData(tape=tape, live_seconds=market.live_seconds,
+                                                on_backoff=yahoo_cooldown_writer(args.run_dir)), journal,
+                              Limits(**config["limits"]),
                               matching_enabled=not args.observe_only, require_monitor=args.require_monitor,
                               starting_cash=Mandate.from_config(config.get("mandate")).local_account_usd)
     strategy = AutonomousFund(broker=broker, name="AutonomousLocalFund", parameters={
@@ -282,7 +286,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -295,6 +299,7 @@ def main(argv=None):
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
     parser.add_argument("--once", action="store_true", help="One local scheduler iteration or monitor poll, then exit")
+    parser.add_argument("--latest", action="store_true", help="rehearse: print the newest saved report, run nothing")
     parser.add_argument("--no-models", action="store_true",
                         help="rehearse: data stages only, no model calls (no model cost)")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
@@ -396,7 +401,7 @@ def main(argv=None):
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
-    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse"} else "true"
+    os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse", "prefetch", "datadesk"} else "true"
     if args.mode == "serve":
         from .service import serve
         if not args.env_file:
@@ -430,6 +435,11 @@ def main(argv=None):
                              ("LUMIBOT_TRADING_DAYS_CACHE_DIR", "trading-days")):
             if not os.environ.get(name):
                 os.environ[name] = str(args.run_dir.resolve() / "cache" / folder)
+        # LumiBot retries a timed-out agent run up to 10 times live; two attempts keep every
+        # call inside the monitor's agent limit (strategy.agent_worst_case_seconds).
+        if not os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS"):
+            from .strategy import AGENT_RUN_ATTEMPTS
+            os.environ["LUMIBOT_AGENT_MAX_RUN_ATTEMPTS"] = str(AGENT_RUN_ATTEMPTS)
         # The AI's own SEC tool identifies the operator, as SEC's fair-access policy asks.
         if os.environ.get("FUND_SEC_USER_AGENT") and not os.environ.get("LUMIBOT_SEC_USER_AGENT"):
             os.environ["LUMIBOT_SEC_USER_AGENT"] = os.environ["FUND_SEC_USER_AGENT"]
@@ -472,6 +482,27 @@ def main(argv=None):
         return
     if args.mode == "check":
         check_market(args, config)
+        return
+    if args.mode == "prefetch":
+        from .prefetch import prefetch
+        from .settings import configured_mode
+        print(json.dumps(prefetch(args.run_dir, config, configured_mode(os.environ) or "local"), indent=2,
+                         ensure_ascii=False))
+        return
+    if args.mode == "datadesk":
+        # The data desk (数据员): collects and prepares research data until stopped; never trades.
+        from .datadesk import run as run_desk
+        from .settings import configured_mode
+        args.run_dir.mkdir(parents=True, exist_ok=True)
+        raise SystemExit(run_desk(args.run_dir, config, configured_mode(os.environ) or "local"))
+    if args.mode == "rehearse" and args.latest:
+        from .rehearsal import latest, text
+        saved = latest()
+        if saved is None:
+            raise RiskError("No rehearsal report yet: run bash scripts/fund-rehearse.sh")
+        print(text(saved))
+        if saved["verdict"] != "ready":
+            raise SystemExit(1)
         return
     if args.mode == "rehearse":
         from .rehearsal import rehearse, text
