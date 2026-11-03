@@ -988,7 +988,9 @@ class AutonomousFund(Strategy):
         dropped and listed.
         """
         from .costs import scripted
-        ideas = research.get("ideas") or []
+        # A runtime may hand back a plain dict: validate here so every idea carries its defaults.
+        research = Research.model_validate(research).model_dump()
+        ideas = research["ideas"]
         if not ideas or scripted({"model": packet.get("model")}):
             return []  # A scripted test answer is not a prediction.
         day = trading_day(instant(packet["session_open"]))

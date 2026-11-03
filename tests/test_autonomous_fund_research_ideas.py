@@ -98,6 +98,13 @@ def test_ideas_are_registered_once_with_their_formation_time_and_never_revised(t
     assert rows[1]["symbol"] == "BETA" and rows[1]["benchmark"] == "SPY"
     assert [i["idea_id"] for i in strategy._session_ideas(PACKET["session_open"])] == [r["idea_id"] for r in rows]
     assert strategy._register_ideas(research(), PACKET) == []
+    raw = {"summary": "Raw dict answer", "evidence": EVIDENCE, "ideas": [  # No benchmark, catalyst or refs given.
+        idea("DELTA", "up", 1, 0.7)]}
+    [raw_id] = strategy._register_ideas(raw, PACKET)
+    stored = [r["body"] for r in strategy.journal.all_events() if r["kind"] == "research_idea"][-1]
+    assert raw_id == "2026-11-03#4" and stored["benchmark"] == "SPY" and stored["evidence_refs"] == []
+    with pytest.raises(ValidationError):  # The caller discloses idea_registration_error; the research is kept.
+        strategy._register_ideas({"summary": "x", "evidence": EVIDENCE, "ideas": [idea(confidence="sure")]}, PACKET)
     tomorrow = {**PACKET, "session_open": "2026-11-04T09:30:00-05:00", "completed_at": "2026-11-04T08:40:00-05:00"}
     assert strategy._register_ideas(first, tomorrow) == ["2026-11-04#1", "2026-11-04#2"]  # A new session's call.
 
