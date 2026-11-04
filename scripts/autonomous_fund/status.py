@@ -25,6 +25,7 @@ REASONS = {
     "independent_notifications_unconfigured": "未配置 Telegram", "monitor_child_stalled": "监控子进程卡住",
 }
 MONITOR_FRESH_SECONDS = 90
+RUNNER_FRESH_SECONDS = 180
 
 
 def _age(at, now):
@@ -36,7 +37,8 @@ def _age(at, now):
 
 def _read(path):
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        body = json.loads(Path(path).read_text(encoding="utf-8"))
+        return body if isinstance(body, dict) else None
     except (OSError, ValueError):
         return None
 
@@ -149,9 +151,20 @@ def summary(root, mode, now=None):
     from .settings import MODES
     root, now = Path(root), now or datetime.now(timezone.utc)
     lines = [f"模式：{mode}（{MODES.get(mode, mode)}）", f"账户目录：{root}"]
+    beat = _read(root / ("status.json" if mode == "local" else "runner_health.json"))
     record = stops.read(root) if root.is_dir() else None
     if record is None:
-        lines.append("交易：运行中（没有 STOP）")
+        age = _age(beat.get("heartbeat_at"), now) if beat else None
+        if not beat:
+            lines.append("交易：尚未确认运行（没有 STOP；尚无交易进程心跳）")
+        elif beat.get("runner_state") == "exited":
+            lines.append("交易：未运行（没有 STOP；交易进程已退出）")
+        elif age is None or not 0 <= age <= RUNNER_FRESH_SECONDS:
+            lines.append("交易：状态未知（没有 STOP；交易进程心跳过期或时间异常）")
+        elif beat.get("runner_state") != "running":
+            lines.append("交易：尚未确认运行（没有 STOP；交易进程尚未就绪）")
+        else:
+            lines.append("交易：运行中（没有 STOP）")
     else:
         why = REASONS.get(record["reason"], record["reason"])
         since = f"，自 {record['at']}" if record.get("at") else ""
@@ -173,7 +186,6 @@ def summary(root, mode, now=None):
                      f"Telegram：{'已配置' if monitor.get('telegram_configured') else '未配置'}")
     else:
         lines.append("独立监控：还没有状态文件（监控尚未运行）")
-    beat = _read(root / "status.json") or _read(root / "runner_health.json")
     if beat:
         age = _age(beat.get("heartbeat_at"), now)
         market = beat.get("market") or {}
@@ -183,7 +195,7 @@ def summary(root, mode, now=None):
     lines.append(desk_line(root, now))
     book = root / "state.sqlite3"
     if not book.is_file():
-        lines.append("账本：尚未创建（交易进程第一次启动中）")
+        lines.append("账本：尚未创建")
         return "\n".join(lines)
     from .report import report
     try:

@@ -30,6 +30,25 @@ monitoring and a cleared STOP indicate process liveness. An individual research
 or trading iteration may still fail. Identical short alerts are deduplicated for
 30 minutes, so the absence of a new alert does not establish business recovery.
 
+A missing STOP alone does not establish liveness. The status command reports
+trading as running only with a ``running`` runner heartbeat no older than 180
+seconds; absent, exited, stale and future-dated heartbeats are identified
+separately. Inspect the current decisions and errors to establish business
+progress.
+
+The monitor shares a 20-second work budget between Telegram notifications and
+commands, alternating which queue goes first. An already-started request retains
+its ten-second network timeout. Deferred commands remain unread at the durable
+cursor. A monitor restart, an observation gap over 45 seconds, a backward clock
+or a new runner startup restarts the continuous-health period before automatic
+resume. Operator stops, unresolved orders and the daily resume cap still apply.
+
+While waiting between iterations, the stall threshold is the greater of 180
+seconds and the runner's recorded iteration interval plus ten seconds. An
+iteration that has already started retains the original 180-second progress
+threshold; model-call liveness retains its separate threshold. This lets valid
+longer schedules wait for their next iteration without masking a stuck job.
+
 The maintenance status now displays the most recent ``operation_error`` with its
 timestamp, phase, module, function, line number and OS errno when available. It
 also shows the persisted AI failure count and retry time. Detailed safe records

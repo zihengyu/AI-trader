@@ -7,6 +7,7 @@ import threading
 import shutil
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
 
 import requests
 
@@ -18,6 +19,9 @@ from .risk import RiskError, instant
 DECISION_GRACE_MINUTES = 90  # After the open, the first valid decision is expected within this.
 DECISION_DROUGHT_HOURS = 3  # Later, a decision is expected within this after the manager's own next_review_at.
 LEGITIMATE_PAUSES = ("model_budget_exhausted", "model_cost_budget_exhausted")
+EXECUTION_MONITOR_MAX_AGE_SECONDS = 45
+POLL_SECONDS = 10
+NOTIFICATION_BUDGET_SECONDS = 20  # One in-flight ten-second request may finish after this budget.
 
 
 def require_monitor(root, now):
@@ -25,7 +29,7 @@ def require_monitor(root, now):
     try:
         body = json.loads((Path(root) / "monitor.json").read_text(encoding="utf-8"))
         age = (instant(now) - instant(body["at"])).total_seconds()
-        if (not 0 <= age <= 45 or body["health"] not in {"healthy", "stopped"} or
+        if (not 0 <= age <= EXECUTION_MONITOR_MAX_AGE_SECONDS or body["health"] not in {"healthy", "stopped"} or
                 not body.get("telegram_configured")):
             raise ValueError("Unhealthy independent monitor")
     except Exception:
@@ -103,6 +107,9 @@ class Telegram:
 class Monitor:
     def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900, resume_policy=None):
         self.root, self.transport = Path(root), transport
+        self.clock = time.monotonic
+        self._observer = uuid4().hex
+        self._commands_first = False
         self.resume_policy = resume_policy  # None: never resume automatically.
         if heartbeat_seconds < 30 or agent_seconds < 60:
             raise RiskError("Watchdog thresholds are too short")
@@ -155,15 +162,23 @@ class Monitor:
             state = "agent_call_stalled"
         if state == "healthy" and not (latest and latest[1] == "agent_call_started"):
             market = self._session_status(now)
-            iteration = db.execute("SELECT at FROM events WHERE sequence>? AND kind IN "
+            iteration = db.execute("SELECT at,kind FROM events WHERE sequence>? AND kind IN "
                 "('iteration_started','iteration_finished') ORDER BY sequence DESC LIMIT 1", (saved["sequence"],)).fetchone()
             observed_at = instant(iteration[0] if iteration else saved[0])
             if latest:
                 # A model call that just finished is progress too: a long but moving
                 # iteration (research, then manager) is not a stalled one.
                 observed_at = max(observed_at, instant(latest[0]))
+            timeout = self.heartbeat_seconds
+            if iteration is None or iteration["kind"] == "iteration_finished":
+                # A completed job may be waiting for its next scheduled slot.
+                # Started jobs retain the original progress limit.
+                execution = startup.get("execution")
+                interval = execution.get("iteration_seconds") if isinstance(execution, dict) else None
+                if type(interval) is int and 15 <= interval <= 300:
+                    timeout = max(timeout, interval + POLL_SECONDS)
             if (market["open"] and (now - instant(market["next_open"])).total_seconds() > 300 and
-                    (now - observed_at).total_seconds() > self.heartbeat_seconds):
+                    (now - observed_at).total_seconds() > timeout):
                 state = "iteration_stalled"
         if shutil.disk_usage(self.root).free < 200_000_000:
             state = "low_disk_space"
@@ -204,7 +219,7 @@ class Monitor:
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                     "kind": "watchdog_recovered", "details": text})))
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
-        if self._auto_resume(db, now, underlying):
+        if self._auto_resume(db, now, underlying, saved["sequence"]):
             state = "healthy"
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health',?)", (state,))
         return state
@@ -222,13 +237,29 @@ class Monitor:
         self._session_now = now
         return self._session_clock.status()
 
-    def _auto_resume(self, db, now, underlying):
+    def _auto_resume(self, db, now, underlying, startup_sequence):
         """Lift a STOP that a service restart or a liveness fault wrote, never an operator's.
 
         Requires continuous health for auto_resume_after_seconds after the stop,
         no unresolved order reservation, and at most max_auto_resumes_per_day.
         """
         from . import stops
+        previous = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health_observation'").fetchone()
+        continuous = False
+        if previous:
+            try:
+                observed = json.loads(previous[0])
+                continuous = (observed["observer"] == self._observer and
+                              observed["startup_sequence"] == startup_sequence and
+                              0 <= (now - instant(observed["at"])).total_seconds() <= EXECUTION_MONITOR_MAX_AGE_SECONDS)
+            except (KeyError, TypeError, ValueError):
+                pass
+        # Persist this with the health-period update: a rolled-back poll cannot
+        # accidentally reuse the older period after an observation gap.
+        db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('health_observation',?)", (encode({
+            "observer": self._observer, "startup_sequence": startup_sequence, "at": now.isoformat()}),))
+        if not continuous:
+            db.execute("DELETE FROM fund_monitor_meta WHERE key='healthy_since'")
         if underlying != "healthy":
             db.execute("DELETE FROM fund_monitor_meta WHERE key='healthy_since'")
             return False
@@ -271,6 +302,7 @@ class Monitor:
 
     def poll(self, now=None):
         now = instant(now or datetime.now(timezone.utc))
+        deadline = self.clock() + NOTIFICATION_BUDGET_SECONDS
         with operator_connection(self.root) as db:
             state = self._health(db, now)
             # Recover even if the trader exited between persisting the review
@@ -318,9 +350,15 @@ class Monitor:
             self._note_desk(db, now)
             self._note_decision_drought(db, now)
         if self.transport is not None:
-            self._deliver(now)
-            if getattr(self.transport, "replies_enabled", False):
-                self._commands(now)
+            replies = getattr(self.transport, "replies_enabled", False)
+            # Both queues share the deadline. Alternate first access so slow
+            # notifications cannot starve approvals, or vice versa.
+            if replies and self._commands_first:
+                self._commands(now, deadline=deadline)
+            self._deliver(now, deadline=deadline)
+            if replies and not self._commands_first:
+                self._commands(now, deadline=deadline)
+            self._commands_first = not self._commands_first
         with operator_connection(self.root) as db:
             counts = dict(db.execute("SELECT state,count(*) FROM fund_deliveries GROUP BY state"))
         status = {"at": now.isoformat(), "health": state, "telegram_configured": self.transport is not None,
@@ -452,7 +490,9 @@ class Monitor:
         db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
             "kind": "data_desk_stale", "details": {"heartbeat_minutes_ago": round(age / 60)}})))
 
-    def _deliver(self, now, only=None):
+    def _deliver(self, now, only=None, *, deadline=None):
+        if deadline is not None and self.clock() >= deadline:
+            return
         with operator_connection(self.root) as db:
             recipient = db.execute("SELECT value FROM fund_monitor_meta WHERE key='recipient'").fetchone()
             if not recipient or recipient[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
@@ -464,6 +504,8 @@ class Monitor:
         # Bound delivery work so the independent health gate stays fresh while
         # sending slow uploads; remaining durable messages wait for the next poll.
         for row in [r for r in rows if instant(r["next_at"]) <= now and (only is None or r["sequence"] == only)][:2]:
+            if deadline is not None and self.clock() >= deadline:
+                break
             body = json.loads(row["body"])
             text = f"LumiBot 模拟账户 · 事件 #{row['sequence']}\n{body.get('kind')}\n{encode(body.get('details'))}"
             with operator_connection(self.root) as db:
@@ -518,7 +560,7 @@ class Monitor:
                 break  # Respect rate limits and outages across the whole batch.
 
 
-    def _commands(self, now):
+    def _commands(self, now, *, deadline=None):
         """Telegram replies as an approval channel: authenticated, request-bound, auditable.
 
         Accepted only from the configured chat and an authorized approver, for a
@@ -527,6 +569,8 @@ class Monitor:
         Approval is the same digest-bound operator action as the CLI: it never
         relaxes a hard limit, cannot approve while STOP is active and expires.
         """
+        if deadline is not None and self.clock() >= deadline:
+            return
         with operator_connection(self.root) as db:
             row = db.execute("SELECT value FROM fund_monitor_meta WHERE key='telegram_offset'").fetchone()
         offset = int(row[0]) if row else 0
@@ -535,6 +579,8 @@ class Monitor:
             return
         try:
             for update in updates:
+                if deadline is not None and self.clock() >= deadline:
+                    break  # Leave the offset before this message; Telegram returns it next poll.
                 offset = max(offset, int(update.get("update_id", 0)) + 1)
                 try:
                     self._command(update, now)
@@ -758,4 +804,4 @@ def run_monitor(args):
             if args.once:
                 print(encode(status))
                 return
-            time.sleep(10)
+            time.sleep(POLL_SECONDS)
