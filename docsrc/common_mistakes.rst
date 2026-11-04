@@ -55,6 +55,36 @@ the final exception's OS errno before looking for an OS cause and identifies
 the nearest non-standard-library caller. Intermediate handled ``ENOENT``
 contexts from recursive directory creation no longer hide the final ``EROFS``.
 
+Autonomous Fund STOP After Repeated Restarts
+--------------------------------------------------------------------------------
+
+An ``active`` systemd service and fresh runner heartbeat can coexist with a
+watchdog STOP. After three automatic resumes in 24 hours, trading stays stopped
+until the operator investigates and explicitly resumes. The initial liveness
+fault and its time are now retained through the resulting supervised exit;
+a stronger fault or operator stop still takes priority.
+
+One reproduced cause is an AI call outlasting its scheduler interval.
+APScheduler normally skips the overlapping job, but a LiteLLM log filter raised
+``KeyError: 'litellm'`` while logging that warning and terminated the scheduler
+thread. The local/paper application now guards its scheduler logger: normal
+filters still run; a logging failure emits only a fixed diagnostic and exception
+type, withholding the original record, and scheduling continues. Job concurrency,
+trading gates and model errors retain their behavior. A normal monitor SIGINT
+also exits cleanly without clearing STOP.
+
+Run ``bash scripts/fund-logs.sh errors`` to see the last 80 warning/error records
+within 24 hours, including complete tracebacks. The previous line filter removed
+stack frames and included large successful research messages, obscuring the
+exception. Inspect runner and monitor logs separately when reading raw journal
+output. A process heartbeat alone does not establish that decisions recovered.
+
+The application's optional precomputed macro context also uses a separate
+attribute from native ``Strategy.macro``. This fixes ``MacroWatch`` missing-method
+errors from FRED tools without replacing the native client. Direct FRED tools
+still require ``FRED_API_KEY``; disabling the application's macro summary does
+not disable those tools. Restart the updated application to load the correction.
+
 Research Failures Delaying the Autonomous Fund Manager
 --------------------------------------------------------------------------------
 

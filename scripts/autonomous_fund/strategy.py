@@ -652,8 +652,10 @@ class AutonomousFund(Strategy):
             self.history_fallback = AlpacaDailyHistory(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"])
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
-        self.macro = (MacroWatch(macro, historical=mode not in {"paper", "local"}, store=self.daily_store)
-                      if macro.enabled and mode != "mock" and live_data else None)
+        # `macro` is the native FRED tool client. The app's precomputed regime
+        # context must never replace it (its public methods differ).
+        self.macro_watch = (MacroWatch(macro, historical=mode not in {"paper", "local"}, store=self.daily_store)
+                            if macro.enabled and mode != "mock" and live_data else None)
         self.sleeptime = "1M" if mode in {"paper", "local"} else "1D"
         if mode in {"paper", "local"} and self.execution_policy.iteration_seconds != 60:
             # Faster deterministic watching; AI reviews keep their own floor and budget.
@@ -2585,7 +2587,7 @@ class AutonomousFund(Strategy):
 
     def _macro_context(self, now):
         """FRED regime context, once per trading day; None when disabled."""
-        watch = getattr(self, "macro", None)
+        watch = getattr(self, "macro_watch", None)
         if watch is None:
             return None
         from .macro import SERIES

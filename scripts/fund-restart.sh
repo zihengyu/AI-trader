@@ -32,4 +32,5 @@ if (( update )); then
     -e "$repo" -r scripts/autonomous_fund/requirements.txt
   echo "当前代码：$(git -C "$repo" log --oneline -1)"
 fi
-exec bash "$repo/scripts/fund-start.sh" --restart "${pass[@]}"
+# Empty forwarded options must also work with Bash 3.2 and nounset.
+exec bash "$repo/scripts/fund-start.sh" --restart ${pass[@]+"${pass[@]}"}

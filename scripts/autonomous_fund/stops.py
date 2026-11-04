@@ -67,6 +67,12 @@ def write(root, kind, reason, now=None, detail=None):
             return current
         if current is not None and current["class"] == kind and current["reason"] == record["reason"]:
             return current  # Keep the original time: how long it has been stopped matters.
+        if (current is not None and kind == "watchdog" and current["class"] == kind and
+                resumable(current) and resumable(record)):
+            # The supervisor's consequent exit is not a new root cause. Keep
+            # the first liveness fault and its time until this STOP is cleared;
+            # non-resumable faults and operator stops still outrank it above.
+            return current
         temporary = root / "STOP.tmp"
         temporary.write_text(json.dumps(record), encoding="utf-8")
         temporary.replace(root / "STOP")

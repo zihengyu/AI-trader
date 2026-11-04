@@ -207,7 +207,8 @@ def test_macro_and_earnings_follow_the_desks_intraday_refreshes(tmp_path):
     store = strategy.daily_store
     for name in SERIES:
         store.put(DAY, f"fred_{name}", [["2026-10-30", 4.0]])
-    strategy.macro = MacroWatch(MacroSettings(), environ={}, get=offline, store=store)
+    # Desk context must not overwrite Strategy.macro, which owns the FRED tools.
+    strategy.macro_watch = MacroWatch(MacroSettings(), environ={}, get=offline, store=store)
     assert strategy._macro_context(NOW)["series"]["DGS10"]["latest"] == 4.0
     store.put(DAY, "fred_DGS10", [["2026-10-30", 4.0], ["2026-11-02", 4.25]])  # The desk's hourly refresh.
     assert strategy._macro_context(NOW)["series"]["DGS10"]["latest"] == 4.25

@@ -37,12 +37,12 @@ if [[ "$user" == "root" ]]; then
   echo "请用普通用户（例如 ubuntu）运行，不要加 sudo；脚本需要时会自己调用 sudo。" >&2; exit 1
 fi
 if [[ ! -x "$py" ]]; then
-  echo "没有找到 $py：先创建虚拟环境并安装依赖（见 docs/AUTONOMOUS_FUND_UBUNTU.md）。" >&2; exit 1
+  echo "没有找到 ${py}：先创建虚拟环境并安装依赖（见 docs/AUTONOMOUS_FUND_UBUNTU.md）。" >&2; exit 1
 fi
 if [[ ! -f "$env_file" ]]; then
   cp scripts/autonomous_fund/.env.example "$env_file"
   chmod 600 "$env_file"
-  echo "已创建 $env_file。先填写 DEEPSEEK_API_KEY、FUND_TELEGRAM_BOT_TOKEN、FUND_TELEGRAM_CHAT_ID，再重新运行本脚本："
+  echo "已创建 ${env_file}。先填写 DEEPSEEK_API_KEY、FUND_TELEGRAM_BOT_TOKEN、FUND_TELEGRAM_CHAT_ID，再重新运行本脚本："
   echo "  nano $env_file"
   exit 1
 fi
@@ -86,7 +86,8 @@ fi
 echo "4/4 等待独立监控就绪（最多 3 分钟，第一次启动时监控可能先重启一次）……"
 ready=0
 for _ in $(seq 1 36); do
-  if fund status --check-monitor "${fresh[@]}" >/dev/null 2>&1; then ready=1; break; fi
+  # Bash 3.2 treats an empty array as unset under nounset; omit absent options.
+  if fund status --check-monitor ${fresh[@]+"${fresh[@]}"} >/dev/null 2>&1; then ready=1; break; fi
   [[ -n "${AI_FUND_DRY_RUN:-}" ]] && break
   sleep 5
 done

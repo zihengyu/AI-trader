@@ -3,7 +3,7 @@
 # Usage: bash scripts/fund-logs.sh [status|logs|errors|report|approvals]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
-#   errors     warnings and errors from the last 24 hours
+#   errors     last 80 warning/error records in 24 hours, including complete tracebacks
 #   report     account report: return, drawdown, fills, model usage
 #   approvals  purchase plans waiting for approval
 set -euo pipefail
@@ -29,10 +29,10 @@ case "${1:-status}" in
     run journalctl -u "${units[0]}" -u "${units[1]}" -u "${units[2]}" -f -n 50 ;;
   errors)
     if [[ -n "${AI_FUND_DRY_RUN:-}" ]]; then
-      echo "+ journalctl -u ${units[0]} -u ${units[1]} -u ${units[2]} --since '24 hours ago'"
+      echo "+ journalctl -u ${units[0]} -u ${units[1]} -u ${units[2]} --since '24 hours ago' --output=json"
     else
-      journalctl -u "${units[0]}" -u "${units[1]}" -u "${units[2]}" --since "24 hours ago" --no-pager |
-        grep -E "WARNING|ERROR|CRITICAL|Traceback|Error:|RiskError|exited|failed|FUND " | tail -n 80 || true
+      journalctl -u "${units[0]}" -u "${units[1]}" -u "${units[2]}" --since "24 hours ago" --no-pager --output=json |
+        "$py" -m scripts.autonomous_fund.log_errors
     fi ;;
   report)
     fund report ;;

@@ -136,7 +136,8 @@ def test_strategy_exposes_macro_context_once_per_day(tmp_path):
     from tests.test_autonomous_fund_quant import NOW, harness
     strategy = harness(tmp_path)
     calls = []
-    strategy.macro = SimpleNamespace(context=lambda day, may_fetch=None: calls.append(day) or {"regime": {}, "as_of_day": day})
+    # The app context has its own owner; Strategy.macro remains the native tool client.
+    strategy.macro_watch = SimpleNamespace(context=lambda day, may_fetch=None: calls.append(day) or {"regime": {}, "as_of_day": day})
     first = strategy._macro_context(NOW)
     assert first["as_of_day"] == "2026-11-02" and strategy._macro_context(NOW) is first and len(calls) == 1
 

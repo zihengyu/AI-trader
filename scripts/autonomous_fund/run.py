@@ -185,6 +185,8 @@ def run_paper(args, config):
         "config": config, "run_dir": str(args.run_dir), "mode": "paper", "account_binding": binding,
         "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
         "require_monitor": args.require_monitor})
+    from .runtime_logging import configure_scheduler_logging
+    configure_scheduler_logging(strategy)
     trader = Trader()
     trader.add_strategy(strategy)
     try:
@@ -279,6 +281,9 @@ def run_local(args, config):
         "config": config, "run_dir": str(args.run_dir), "mode": "local", "account_binding": "local-virtual-account",
         "model": args.model, "research_model": args.research_model, "decision_model": args.decision_model,
         "observe_only": args.observe_only, "require_monitor": args.require_monitor})
+    if not args.once:
+        from .runtime_logging import configure_scheduler_logging
+        configure_scheduler_logging(strategy)
     broker.do_polling()
     print("Local virtual account active. No brokerage account is connected. Observe-only=" + str(args.observe_only))
     print("Market session: " + json.dumps(broker.data_source.session.status()))
@@ -482,7 +487,12 @@ def main(argv=None):
         return
     if args.mode == "monitor":
         from .monitor import run_monitor
-        run_monitor(args)
+        try:
+            run_monitor(args)
+        except KeyboardInterrupt:
+            # systemd sends SIGINT on an ordinary stop/restart. This is a clean
+            # monitor exit, not a traceback or an abnormal status-254 failure.
+            pass
         return
     if args.mode == "notify-test":
         from .monitor import send_test

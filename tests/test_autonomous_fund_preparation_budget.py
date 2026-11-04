@@ -112,7 +112,8 @@ def test_the_earnings_calendar_and_fred_defer_instead_of_blocking(tmp_path, cloc
     def fred(url, params=None, timeout=None, headers=None):
         clock.value += 20
         return SimpleNamespace(raise_for_status=lambda: None, text="observation_date,X\n2026-10-30,1.0\n")
-    strategy.macro = MacroWatch(MacroSettings(), environ={}, get=fred)
+    # Preparation belongs to the app context, independently of native FRED tools.
+    strategy.macro_watch = MacroWatch(MacroSettings(), environ={}, get=fred)
     strategy._begin_preparation()
     partial = strategy._macro_context(NOW)
     assert any(item.get("unavailable") == "deferred" for item in partial["series"].values())
