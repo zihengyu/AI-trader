@@ -44,7 +44,8 @@ def review_harness(tmp_path):
         calls.append(("manager", kwargs))
         context = kwargs["context"]
         adjustment = {"hypothesis": "复查相对强势的持续性后再考虑入场", "rationale": "仅有日内观测，暂不能推断持续性",
-                      "evidence_refs": ["Synthetic timestamped observation"],
+                      "evidence_refs": [f"event:{context['session']['events'][0]['sequence']}",
+                                        "Synthetic timestamped observation"],
                       "validation": "积累多个后续交易日样本并比较基准与费用", "invalidated_when": "反证表明优势无法覆盖费用"}
         return answer(PostmarketReview(session_date=context["session"]["session_date"], as_of=context["as_of"],
             summary="选股与择时均需后续样本验证。", selection_adjustments=[adjustment], timing_adjustments=[],
@@ -68,6 +69,12 @@ def test_after_close_review_produces_auditable_feedback_without_orders(tmp_path)
     assert calls[-1][1]["output_schema"] is PostmarketReview
     assert all(call["context"]["orders_enabled"] is False for _, call in calls)
     packet = events(strategy, "postmarket_review")[0]
+    # The model can copy exact references for both kinds of evidence from one list.
+    assert calls[-1][1]["context"]["allowed_evidence_refs"] == [
+        *[f"event:{row['sequence']}" for row in packet["session"]["events"]],
+        "Synthetic timestamped observation",
+    ]
+    assert "allowed_evidence_refs" in calls[-1][1]["task_prompt"]
     assert packet["version"] == 1 and packet["previous_version"] is None
     assert packet["session"]["observed_pnl_usd"] == 20
     assert any(r["kind"] == "operator_approval" and r["body"]["state"] == "rejected" for r in packet["session"]["events"])
@@ -174,7 +181,9 @@ def test_untrusted_review_cannot_inject_executable_or_untraceable_output(tmp_pat
         if bad == "targets":
             body["targets"] = [{"symbol": "OUTSIDE", "weight": 1.0}]
         elif bad == "invalid_reference":
-            body["selection_adjustments"][0]["evidence_refs"] = ["event:99999"]
+            valid = body["selection_adjustments"][0]
+            body["timing_adjustments"] = [{**valid, "evidence_refs": ["event:99999"]}]
+            valid["evidence_refs"] += ["research:Synthetic timestamped observation", "untrusted model text"]
         elif bad == "future_as_of":
             body["as_of"] = (CLOSE + timedelta(days=1)).isoformat()
         else:
@@ -186,7 +195,15 @@ def test_untrusted_review_cannot_inject_executable_or_untraceable_output(tmp_pat
     strategy.after_market_closes()
     assert not events(strategy, "postmarket_review")
     assert not strategy.journal.pending()
-    assert events(strategy, "notification")[-1]["kind"] == "postmarket_review_error"
+    notice = events(strategy, "notification")[-1]
+    assert notice["kind"] == "postmarket_review_error"
+    if bad == "invalid_reference":
+        # Identify every bad position while keeping untrusted model text out of alerts.
+        assert "2026-11-02" in notice["details"]
+        assert "selection_adjustments[0].evidence_refs[2,3]" in notice["details"]
+        assert "timing_adjustments[0].evidence_refs[0]" in notice["details"]
+        assert "untrusted model text" not in notice["details"]
+        assert [name for name, _ in calls] == ["researcher", "manager"]
 
 
 def test_prior_memo_is_reassessed_and_new_versions_are_persisted(tmp_path):

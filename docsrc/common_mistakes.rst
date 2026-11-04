@@ -126,6 +126,18 @@ Historical replays retain their dated research and evidence validation before a
 manager decision. Pre-open and post-close research remain read-only lifecycle
 work; this change does not introduce background research workers.
 
+Evidence References Rejected in an Autonomous Fund Postmarket Review
+--------------------------------------------------------------------------------
+
+The optional autonomous fund supplies an ``allowed_evidence_refs`` list for each
+postmarket review. The manager copies entries exactly when citing a journal event
+or a source from the saved research. An unmatched reference rejects the review
+and leaves the last valid strategy memo in effect.
+
+The ``postmarket_review_error`` notice identifies the review date and the invalid
+positions using zero-based indices. Look up those positions in the manager call's
+``trace=`` file to compare the submitted references with the supplied list.
+
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------
 

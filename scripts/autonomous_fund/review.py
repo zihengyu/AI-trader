@@ -260,13 +260,18 @@ def review_after_close(strategy):
     now = instant(strategy.get_datetime())
     if strategy.halt_path.exists():
         return
+    # Use the same snapshot for the copyable list and the exact-match check.
+    refs = [f"event:{row['sequence']}" for row in saved["context"]["session"]["events"]]
+    refs.extend(item["source"] for item in saved["research"]["evidence"])
+    allowed_refs = set(refs)
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
-               "research_completed_at": saved["completed_at"]}
+               "research_completed_at": saved["completed_at"], "allowed_evidence_refs": list(dict.fromkeys(refs))}
     result = _run_stage(strategy, "manager",
         task_prompt="这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
                     "自主改进选股与择时的判断方法，分别列出可检验的调整、依据、验证条件和失效条件；"
-                    "证据不足时可以不调整。evidence_refs 只引用 session 中的 event:<sequence> 或 research.evidence 的 source。"
+                    "evidence_refs 必须逐字复制 context.allowed_evidence_refs 中的值，保持原有大小写和标点。"
+                    "不要自行添加前缀或改写来源名称。清单中没有支持某条调整的证据时，省略该条调整。"
                     "给出保留教训、撤回假设、数据缺项及下一交易日完整 strategy_memo，继承仍有效的经验。"
                     "不因单日盈亏宣称策略有效，不追涨杀跌式过拟合，说明样本不足和置信度。"
                     "备忘仅供下一次 AI 研究和完整目标持仓决策参考，不能修改风险上限、投资范围、权限或代码。"
@@ -289,11 +294,16 @@ def review_after_close(strategy):
     review = PostmarketReview.model_validate(strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()
     if review["session_date"] != day or instant(review["as_of"]) != now:
         raise RiskError("Postmarket review session/as_of mismatch")
-    refs = {f"event:{r['sequence']}" for r in saved["context"]["session"]["events"]}
-    refs.update(e["source"] for e in saved["research"]["evidence"])
-    if any(ref not in refs for change in review["selection_adjustments"] + review["timing_adjustments"]
-           for ref in change["evidence_refs"]):
-        raise RiskError("Postmarket adjustment refers to evidence outside the supplied review")
+    invalid = []
+    for group in ("selection_adjustments", "timing_adjustments"):
+        for index, change in enumerate(review[group]):
+            unmatched = [str(i) for i, ref in enumerate(change["evidence_refs"]) if ref not in allowed_refs]
+            if unmatched:
+                invalid.append(f"{group}[{index}].evidence_refs[{','.join(unmatched)}]")
+    if invalid:
+        # This message also goes to Telegram. Keep model text in the agent trace.
+        raise RiskError(f"Postmarket adjustment refers to evidence outside the supplied review for {day} "
+                        f"({', '.join(invalid)})")
     packet = {**session, "version": (memory["version"] if memory else 0) + 1,
               "previous_version": memory["version"] if memory else None,
               "input_as_of": saved["context"]["as_of"], "completed_at": strategy.get_datetime().isoformat(),
