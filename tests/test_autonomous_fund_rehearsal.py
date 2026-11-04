@@ -104,6 +104,8 @@ def test_the_script_runs_the_rehearsal_inside_the_service_sandbox(tmp_path):
         assert "--uid=nobody" in result.stdout and "rehearse" in result.stdout and "--no-models" in result.stdout
         # A background unit, not tied to the terminal: a dropped SSH session cannot stop it.
         assert "--unit=lumibot-fund-rehearsal" in result.stdout and "--pipe" not in result.stdout
+        # A stuck rehearsal is stopped after 30 minutes and never outranks the trading process for CPU.
+        assert "-p RuntimeMaxSec=1800 -p Nice=10 -p CPUWeight=20" in result.stdout
     assert subprocess.run(["bash", str(ROOT / "scripts" / "fund-rehearse.sh"), "--live"], capture_output=True,
                           env=variables).returncode == 2
 
