@@ -96,6 +96,8 @@ class Account:
     # The cash sweep holding (see cash.py): already counted in `cash`, never in `positions`.
     cash_equivalents: dict = field(default_factory=dict)
     cash_equivalent_value: Decimal = Decimal("0")
+    # Observed position cost only, for operator display; never substitute a target or quote.
+    position_average_prices: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

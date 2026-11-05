@@ -175,7 +175,7 @@ MODES = {"local": "真实行情本地模拟盘：Yahoo 行情 + 本地虚拟资�
 # belong here too: otherwise they used the earlier default directory, not the running account.
 ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "stop", "resume", "attach-order", "reset-drawdown",
                               "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
-                              "notify-test", "status", "rehearse", "prefetch", "datadesk"})
+                              "notify-test", "status", "decisions", "rehearse", "prefetch", "datadesk"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
 
 

@@ -10,7 +10,7 @@ the AI must never trade them, because a sale in a shared position would let the
 broker's tax-lot method (often first-in-first-out) sell the operator's lots and
 would make attribution ambiguous. They are removed from the tradable universe.
 """
-from .risk import RiskError, number
+from .risk import RiskError, instant, number
 
 
 def market_value(position):
@@ -18,6 +18,46 @@ def market_value(position):
     if isinstance(payload, dict) and payload.get("marketValue") is not None:
         return number(payload["marketValue"])
     return None
+
+
+def average_prices(positions, holdings):
+    """Observed weighted entry prices for fully attributed sleeve positions only."""
+    quantities, costs = {}, {}
+    for position in positions:
+        symbol = position.asset.symbol
+        if symbol not in holdings or str(position.asset.asset_type) != "stock":
+            continue
+        try:
+            quantity = number(position.quantity)
+            price = number(getattr(position, "avg_fill_price", None))
+        except RiskError:
+            continue
+        if quantity > 0 and price > 0:
+            quantities[symbol] = quantities.get(symbol, number(0)) + quantity
+            costs[symbol] = costs.get(symbol, number(0)) + quantity * price
+    # A missing lot price must not silently become a partial, misleading average.
+    return {symbol: costs[symbol] / quantity for symbol, quantity in quantities.items()
+            if quantity == number(holdings[symbol])}
+
+
+def recent_trades(events, as_of, limit=6):
+    """Confirmed fills visible at the account snapshot, without double-counting reconciliation."""
+    cutoff = instant(as_of)
+    callbacks, reconciled = [], {}
+    for index, (at, kind, body) in enumerate(events):
+        if kind not in {"fill", "fill_reconciled"} or instant(at) > cutoff:
+            continue
+        row = {**body, "at": at, "evidence_kind": (
+            "broker_cumulative_observation" if kind == "fill_reconciled" else
+            body.get("evidence_kind", "native_fill_callback"))}
+        if kind == "fill_reconciled":
+            reconciled[str(body["broker_id"])] = (index, row)
+        else:
+            callbacks.append((index, row))
+    chosen = [(index, row) for index, row in callbacks if str(row["broker_id"]) not in reconciled]
+    chosen += list(reconciled.values())
+    chosen.sort(key=lambda item: (instant(item[1]["at"]), item[0]))
+    return [row for _, row in chosen[-limit:]]
 
 
 def split_holdings(positions, universe, *, quote_asset=None, allow_external=False, baseline=None,

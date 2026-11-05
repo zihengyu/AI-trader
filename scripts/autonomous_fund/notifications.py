@@ -296,8 +296,8 @@ def readable(kind, details, sequence=None):
         lines.append(f"模式：{mode}（{MODES.get(mode, mode)}）")
         account = details.get("account")
         if account:
-            held = "、".join(f"{s}×{q}" for s, q in (account.get("positions") or {}).items()) or "无"
-            lines.append(f"账户：净值 {account.get('equity')}，现金 {account.get('cash')}，持仓 {held}")
+            from .status import account_lines
+            lines += ["", *account_lines(account, details.get("recent_trades")), ""]
         if details.get("research_summary"):
             lines.append(f"今日盘前研究要点：{details['research_summary']}")
         if details.get("close"):
@@ -315,6 +315,8 @@ def readable(kind, details, sequence=None):
             return f"（{'，'.join(parts)}）" if parts else ""
         changes = details.get("changes") or []
         header = ("🧭 今日首次复核：维持目标组合" if details.get("first_today") else "🧭 AI 调整目标组合")
+        if details.get("level_changes") and details.get("weight_changed") is False:
+            header = "🧭 AI 更新交易价位"
         lines = [f"{header}（{_when(details.get('at'))}）"]
         for label, rows in (("买入／加仓", [r for r in changes if float(r["to"]) > float(r["from"])]),
                             ("卖出／减仓", [r for r in changes if float(r["to"]) < float(r["from"])]),
@@ -324,7 +326,21 @@ def readable(kind, details, sequence=None):
                     lines.append(f"不变：{row['symbol']} {percent(row['to'])}{levels(row)}")
                 else:
                     lines.append(f"{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
-        lines.append(f"现金约 {percent(details.get('cash_weight') or 0)}")
+        for change in details.get("level_changes") or []:
+            before, after = change["before"], change["after"]
+            parts = []
+            for key, label in (("entry_limit", "入场上限"), ("stop_loss", "止损"),
+                               ("take_profit", "止盈"), ("take_profit_weight", "止盈后保留权重")):
+                if before.get(key) == after.get(key):
+                    continue
+                show = percent if key == "take_profit_weight" else str
+                left = show(before[key]) if key in before else "未设置"
+                right = show(after[key]) if key in after else "已撤销"
+                parts.append(f"{label} {left}→{right}")
+            lines.append(f"价位调整：{change['symbol']}（{'，'.join(parts)}）")
+        lines.append(f"目标现金约 {percent(details.get('cash_weight') or 0)}")
+        from .status import account_lines
+        lines += ["", *account_lines(details.get("account"), details.get("recent_trades"))]
         if details.get("rationale"):
             lines += ["", f"理由：{details['rationale']}"]
         if details.get("next_review_at"):

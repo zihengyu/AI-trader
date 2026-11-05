@@ -69,11 +69,12 @@ def test_after_close_review_produces_auditable_feedback_without_orders(tmp_path)
     assert calls[-1][1]["output_schema"] is PostmarketReview
     assert all(call["context"]["orders_enabled"] is False for _, call in calls)
     packet = events(strategy, "postmarket_review")[0]
-    # The model can copy exact references for both kinds of evidence from one list.
-    assert calls[-1][1]["context"]["allowed_evidence_refs"] == [
-        *[f"event:{row['sequence']}" for row in packet["session"]["events"]],
-        "Synthetic timestamped observation",
-    ]
+    # Stable IDs avoid copying long source prose; exact legacy names remain traceable.
+    allowed = calls[-1][1]["context"]["allowed_evidence_refs"]
+    event_refs = [f"event:{row['sequence']}" for row in packet["session"]["events"]]
+    assert allowed[:len(event_refs)] == event_refs
+    assert {"research:1", "Synthetic timestamped observation", "context:session"} <= set(allowed)
+    assert "context:factor_lab" not in allowed  # Absent input is never advertised as evidence.
     assert "allowed_evidence_refs" in calls[-1][1]["task_prompt"]
     assert packet["version"] == 1 and packet["previous_version"] is None
     assert packet["session"]["observed_pnl_usd"] == 20
@@ -203,7 +204,8 @@ def test_untrusted_review_cannot_inject_executable_or_untraceable_output(tmp_pat
         assert "selection_adjustments[0].evidence_refs[2,3]" in notice["details"]
         assert "timing_adjustments[0].evidence_refs[0]" in notice["details"]
         assert "untrusted model text" not in notice["details"]
-        assert [name for name, _ in calls] == ["researcher", "manager"]
+        # One bounded correction is attempted; the still-forged references remain rejected.
+        assert [name for name, _ in calls] == ["researcher", "manager", "manager"]
 
 
 def test_prior_memo_is_reassessed_and_new_versions_are_persisted(tmp_path):
@@ -239,3 +241,89 @@ def test_report_can_rebuild_review_files_without_model_calls(tmp_path):
     assert len(calls) == 2
     assert (tmp_path / "postmarket_review.md").exists()
     assert (tmp_path / "strategy_memory.json").exists()
+
+
+def test_a_misquoted_long_source_gets_one_correction_with_stable_refs(tmp_path):
+    strategy, calls = review_harness(tmp_path)
+    source = "Synthetic SQL exploration (24 assets, 180 sessions; candidate-return rank correlation; exploratory only)"
+    researcher, manager = strategy.agents["researcher"].run, strategy.agents["manager"].run
+    strategy._factor_context = lambda now: {"validated": [], "trials": 0, "next_critical_t": 2.1}
+
+    def research(**kwargs):
+        result = researcher(**kwargs)
+        body = result.parsed.model_copy(deep=True)
+        body.evidence[0].source = source
+        return answer(body, result.model)
+
+    def correctable(**kwargs):
+        result = manager(**kwargs)
+        body = result.parsed.model_copy(deep=True)
+        correction = kwargs["context"].get("reference_correction")
+        body.selection_adjustments[0].evidence_refs = (
+            ["research:1", "context:factor_lab"] if correction else ["Paraphrased synthetic SQL exploration"])
+        return answer(body, result.model)
+
+    strategy.agents["researcher"].run, strategy.agents["manager"].run = research, correctable
+    strategy.after_market_closes()
+    assert [name for name, _ in calls] == ["researcher", "manager", "manager"]
+    [packet] = events(strategy, "postmarket_review")
+    assert packet["research"]["evidence"][0]["source"] == source
+    assert packet["review"]["selection_adjustments"][0]["evidence_refs"] == ["research:1", "context:factor_lab"]
+    catalog = {row["ref"]: row for row in packet["evidence_catalog"]}
+    assert catalog["research:1"]["source"] == source
+    assert catalog["research:1"]["observed_at"] == CLOSE.isoformat()
+    assert catalog["context:factor_lab"]["context_path"] == "factor_lab"
+    assert strategy_memory(strategy.journal, CLOSE)["evidence_catalog"] == packet["evidence_catalog"]
+    correction = calls[-1][1]["context"]["reference_correction"]
+    assert correction["invalid_paths"] == ["selection_adjustments[0].evidence_refs[0]"]
+    assert calls[-1][1]["context"]["research"] == calls[-2][1]["context"]["research"]
+    assert len(events(strategy, "postmarket_reference_retry")) == 1
+    assert len(events(strategy, "agent")) == 3 and not strategy.journal.pending()
+    strategy.after_market_closes()
+    assert len(calls) == 3  # Successful correction is durable; it never repeats the researcher.
+
+
+@pytest.mark.parametrize("blocked", ["stop", "cost", "runs"])
+def test_reference_correction_respects_stop_and_existing_model_budgets(tmp_path, blocked):
+    strategy, calls = review_harness(tmp_path)
+    manager = strategy.agents["manager"].run
+    strategy.model_budget = SimpleNamespace(max_agent_runs_per_day=2 if blocked == "runs" else 60,
+                                            max_daily_cost_usd=None)
+    strategy._cost_exhausted = lambda now, step: blocked == "cost"
+
+    def invalid(**kwargs):
+        result = manager(**kwargs)
+        body = result.parsed.model_copy(deep=True)
+        body.selection_adjustments[0].evidence_refs = ["context:unprovided_results"]
+        if blocked == "stop":
+            strategy.halt_path.touch()
+        return answer(body, result.model)
+
+    strategy.agents["manager"].run = invalid
+    strategy.after_market_closes()
+    assert [name for name, _ in calls] == ["researcher", "manager"]
+    assert not events(strategy, "postmarket_review") and not events(strategy, "postmarket_reference_retry")
+
+
+def test_resuming_research_does_not_advertise_new_context_as_saved_evidence(tmp_path):
+    strategy, calls = review_harness(tmp_path)
+    strategy._factor_context = lambda now: None
+    manager = strategy.agents["manager"].run
+    strategy.agents["manager"].run = lambda **kwargs: (_ for _ in ()).throw(ConnectionError("fixture"))
+    strategy.after_market_closes()
+    assert len(events(strategy, "postmarket_research")) == 1
+    strategy._factor_context = lambda now: {"validated": ["newer synthetic observation"]}
+
+    def invalid(**kwargs):
+        assert "context:factor_lab" not in kwargs["context"]["allowed_evidence_refs"]
+        assert kwargs["context"]["factor_lab"] is None
+        result = manager(**kwargs)
+        body = result.parsed.model_copy(deep=True)
+        body.selection_adjustments[0].evidence_refs = ["context:factor_lab"]
+        return answer(body, result.model)
+
+    strategy.agents["manager"].run = invalid
+    strategy.after_market_closes()
+    assert [name for name, _ in calls] == ["researcher", "manager", "manager"]
+    assert not events(strategy, "postmarket_review")
+    assert "Postmarket adjustment refers" in events(strategy, "notification")[-1]["details"]

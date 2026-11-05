@@ -95,4 +95,5 @@ def test_status_shows_todays_decisions(tmp_path):
     journal.event(OPEN - timedelta(hours=20), "decision_validated", {"targets": []})
     journal.event(OPEN + timedelta(minutes=45), "decision_validated", {"targets": []})
     text = summary(tmp_path, "local", OPEN + timedelta(hours=2))
-    assert "决策：今天 1 次有效决策，最近一次 10:15（纽约）；累计 2 次" in text
+    # Clarify that a validated assessment is distinct from order submission or execution.
+    assert "决策：今天 1 次有效决策（通过校验的复核，不代表下单或成交），最近一次 10:15（纽约）；累计 2 次" in text

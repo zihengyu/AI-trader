@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Maintenance and logs for the AI paper fund on Ubuntu.
-# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|approvals]
+# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|approvals|decisions [YYYY-MM-DD]]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
 #   errors     last 80 warning/error records in 24 hours, including complete tracebacks
 #   report     account report: return, drawdown, fills, model usage
 #   approvals  purchase plans waiting for approval
+#   decisions [YYYY-MM-DD]  read-only decision/execution/Telegram timeline for a New York date
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$repo"
@@ -38,6 +39,13 @@ case "${1:-status}" in
     fund report ;;
   approvals)
     fund approvals ;;
+  decisions)
+    args=(decisions)
+    if [[ $# -gt 2 ]]; then
+      echo "用法：bash scripts/fund-logs.sh decisions [YYYY-MM-DD]" >&2; exit 2
+    fi
+    if [[ $# -eq 2 ]]; then args+=(--session-date "$2"); fi
+    fund "${args[@]}" ;;
   *)
-    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|approvals]" >&2; exit 2 ;;
+    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|approvals|decisions [YYYY-MM-DD]]" >&2; exit 2 ;;
 esac

@@ -4,6 +4,8 @@ Synthetic journals and an in-memory Telegram double; nothing is sent.
 """
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from scripts.autonomous_fund import stops
 from scripts.autonomous_fund.monitor import Monitor
 from .test_autonomous_fund_monitor import NOW, FakeTelegram, setup
@@ -101,7 +103,8 @@ def test_the_session_open_message_says_whether_today_trades(tmp_path):
         "stop": None, "account": {"equity": "10000", "cash": "9000", "positions": {"SPY": "2"}},
         "research_summary": "关注大盘科技股。"})
     [text] = bot.messages
-    assert text.startswith("🔔 美股开盘") and "交易：运行中" in text and "SPY×2" in text and "关注大盘科技股" in text
+    # Actual holdings now have their own readable rows, shared with maintenance status.
+    assert text.startswith("🔔 美股开盘") and "交易：运行中" in text and "SPY：2 股" in text and "关注大盘科技股" in text
     stopped = delivered(tmp_path / "stopped", "session_open", {
         "session_date": "2026-11-02", "mode": "local", "close": None,
         "stop": {"class": "operator", "reason": "operator_stop"}, "account": None, "research_summary": None})
@@ -160,6 +163,66 @@ def test_historical_runs_do_not_announce_decisions(tmp_path):
     strategy.mode = "mock"
     strategy._announce_decision(decision([{"symbol": "SPY", "weight": 0.10}]), NOW)
     assert notices(strategy.journal, "decision_changed") == []
+
+
+@pytest.mark.parametrize("field, before, after", [
+    ("entry_limit", 100, 102), ("stop_loss", 90, 91), ("take_profit", 120, 125),
+    ("take_profit_weight", .04, .02),
+])
+def test_execution_level_changes_are_announced_even_when_weights_do_not_change(tmp_path, field, before, after):
+    strategy = deciding(tmp_path)
+    target = {"symbol": "ALFA", "weight": .1, "entry_limit": 100, "stop_loss": 90,
+              "take_profit": 120, "take_profit_weight": .04}
+    strategy._announce_decision(decision([{**target, field: before}]), NOW)
+    strategy._announce_decision(decision([{**target, field: after}]), NOW + timedelta(minutes=20))
+    changed = notices(strategy.journal, "decision_changed")
+    assert len(changed) == 2
+    assert changed[-1]["level_changes"][0]["symbol"] == "ALFA"
+    from scripts.autonomous_fund.notifications import readable
+    text = readable("decision_changed", changed[-1])
+    assert "价位调整" in text
+
+
+def test_removing_a_level_is_announced_but_equivalent_numbers_and_new_reasons_are_quiet(tmp_path):
+    strategy = deciding(tmp_path)
+    target = {"symbol": "ALFA", "weight": .1, "entry_limit": 100, "stop_loss": 90}
+    strategy._announce_decision(decision([target]), NOW)
+    strategy._announce_decision(decision([{**target, "entry_limit": 100.0}], "不同的理由"), NOW + timedelta(minutes=20))
+    assert len(notices(strategy.journal, "decision_changed")) == 1
+    strategy._announce_decision(decision([{"symbol": "ALFA", "weight": .1}]), NOW + timedelta(minutes=40))
+    assert len(notices(strategy.journal, "decision_changed")) == 2
+    from scripts.autonomous_fund.notifications import readable
+    assert "已撤销" in readable("decision_changed", notices(strategy.journal, "decision_changed")[-1])
+
+
+@pytest.mark.parametrize("failure", ["notification", "baseline"])
+def test_failed_announcement_does_not_advance_its_durable_baseline(tmp_path, failure):
+    strategy = deciding(tmp_path)
+    with strategy.journal.connection() as db:
+        condition = ("ON events WHEN NEW.kind='notification'" if failure == "notification" else
+                     "ON meta WHEN NEW.key='notified_targets_day'")
+        db.execute(f"CREATE TRIGGER synthetic_notice_failure BEFORE INSERT {condition} "
+                   "BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END")
+    body = decision([{"symbol": "ALFA", "weight": .1}])
+    strategy._announce_decision(body, NOW)
+    assert strategy.journal.get_meta("notified_targets") is None
+    assert strategy.journal.get_meta("notified_targets_day") is None
+    assert notices(strategy.journal, "decision_changed") == []
+    with strategy.journal.connection() as db:
+        db.execute("DROP TRIGGER synthetic_notice_failure")
+    strategy._announce_decision(body, NOW + timedelta(minutes=1))
+    assert len(notices(strategy.journal, "decision_changed")) == 1
+
+
+def test_an_unavailable_logger_cannot_break_a_durably_queued_announcement(tmp_path):
+    strategy = deciding(tmp_path)
+    def unavailable(*args, **kwargs):
+        raise OSError("synthetic logger failure")
+    strategy.log_message = unavailable
+    strategy._announce_decision(decision([{"symbol": "BETA", "weight": .05}]), NOW)
+    assert len(notices(strategy.journal, "decision_changed")) == 1
+    strategy._announce_decision(decision([{"symbol": "BETA", "weight": .05}]), NOW + timedelta(minutes=15))
+    assert len(notices(strategy.journal, "decision_changed")) == 1
 
 
 def test_a_portfolio_change_reads_as_buys_sales_and_reasons(tmp_path):

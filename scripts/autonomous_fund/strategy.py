@@ -865,7 +865,7 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
-    def _announce_decision(self, decision, now):
+    def _announce_decision(self, decision, now, account=None, decision_id=None):
         """Tell the operator when the AI changes the target portfolio, and its first plan
         each day; an unchanged review (within one weight point) sends nothing."""
         if self.mode not in {"local", "paper"}:
@@ -876,23 +876,39 @@ class AutonomousFund(Strategy):
             day = trading_day(now)
             first_today = self.journal.get_meta("notified_targets_day") != day
             changed = set(new) != set(old) or any(abs(new[s] - old[s]) >= number("0.01") for s in new)
-            if not (changed or first_today):
+            levels = {s: row for s, row in decision_levels(decision).items() if s in new}
+            previous_levels = self.journal.get_meta("notified_levels") or {}
+            level_changes = []
+            for symbol in sorted(set(old) & set(new)):
+                before = {key: number(value) for key, value in (previous_levels.get(symbol) or {}).items()}
+                after = {key: number(value) for key, value in (levels.get(symbol) or {}).items()}
+                if before != after:
+                    level_changes.append({"symbol": symbol, "before": {k: str(v) for k, v in before.items()},
+                                          "after": {k: str(v) for k, v in after.items()}})
+            if not (changed or level_changes or first_today):
                 return
-            levels = decision_levels(decision)
             changes = []
             for symbol in sorted(set(new) | set(old)):
                 row = {"symbol": symbol, "from": str(old.get(symbol, number(0))), "to": str(new.get(symbol, number(0)))}
                 row.update({k: v for k, v in (levels.get(symbol) or {}).items()
                             if k in {"entry_limit", "stop_loss", "take_profit"}})
                 changes.append(row)
-            self.journal.set_meta("notified_targets", {s: str(w) for s, w in new.items()})
-            self.journal.set_meta("notified_targets_day", day)
-            self._disclose("decision_changed", {
-                "at": str(now), "first_today": first_today and not changed, "changes": changes,
+            details = {
+                "at": str(now), "first_today": first_today and not changed and not level_changes, "changes": changes,
+                "weight_changed": changed, "level_changes": level_changes, "decision_id": decision_id,
                 "cash_weight": str(max(number(0), 1 - sum(new.values(), number(0)))),
-                "rationale": str(decision.get("rationale") or "")[:1500], "next_review_at": decision.get("next_review_at")})
+                "account": asdict(account) if account is not None else None,
+                "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
+                "rationale": str(decision.get("rationale") or ""), "next_review_at": decision.get("next_review_at")}
+            self.journal.notification_with_meta(now, "decision_changed", details, {
+                "notified_targets": {s: str(w) for s, w in new.items()}, "notified_targets_day": day,
+                "notified_levels": levels})
+            self.log_message(f"FUND decision_changed: {details}", color="yellow")
         except Exception as exc:  # An announcement must never cost the decision.
-            self.log_message(f"Decision announcement skipped: {type(exc).__name__}", color="yellow")
+            try:
+                self.log_message(f"Decision announcement skipped: {type(exc).__name__}", color="yellow")
+            except Exception:
+                pass
 
     def _announce_session_open(self, now, account=None):
         """Once per trading day, at the first iteration of the regular session: trading
@@ -914,8 +930,8 @@ class AutonomousFund(Strategy):
             self._disclose("session_open", {
                 "session_date": day, "mode": self.mode, "close": close,
                 "stop": {"class": record["class"], "reason": record["reason"]} if record else None,
-                "account": {"equity": str(account.equity), "cash": str(account.cash),
-                            "positions": {s: str(q) for s, q in account.positions.items()}} if account else None,
+                "account": asdict(account) if account is not None else None,
+                "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
                 "research_summary": (research.get("summary") or "")[:600] or None})
         except Exception as exc:  # An announcement must never cost the iteration.
             self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
@@ -1132,7 +1148,7 @@ class AutonomousFund(Strategy):
             # mistake that for "no holdings" (it would invite duplicate purchases).
             raise RiskError("Positions unavailable or only partially refreshed")
         mandate = getattr(self, "mandate", None) or Mandate()
-        from .holdings import split_holdings
+        from .holdings import average_prices, split_holdings
         configured = getattr(self, "_configured_universe", None) or self.universe
         baseline = self.journal.get_meta("mandate_external") if mandate.capital_usd is not None else None
         holdings, external, external_value, shared = split_holdings(
@@ -1165,7 +1181,7 @@ class AutonomousFund(Strategy):
                 self.journal.event(start, "shared_symbols_readmitted", {"symbols": readmitted})
         # The account the AI and every risk rule see is the operator's capital sleeve.
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
-                          open_orders, receivables)
+                          open_orders, receivables, position_average_prices=average_prices(positions, holdings))
         if account.cash < 0:
             raise RiskError("Sleeve cash is negative: reserved cash or margin would be used; review the account")
         if self.mode == "local":
@@ -1563,7 +1579,7 @@ class AutonomousFund(Strategy):
             now = self.get_datetime()
             validate_decision(decision, now, self.universe, self.limits)
             minimum = timedelta(minutes=budget.min_review_minutes)
-            self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
+            accepted_id = self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
             # What this decision saw: a later scheduled review with nothing new can skip the model call.
             self.journal.set_meta("last_model_decision", {"at": now.isoformat(), "day": trading_day(now),
                                                           "research": self._research_key()})
@@ -1574,12 +1590,13 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_failures", 0)
             self.journal.set_meta("decision_retry_at", None)
             self.journal.set_meta("decision_failure_role", None)
-        self.journal.event(now, "decision_validated", {**decision, "prompt_version": getattr(self, "prompt_version", None)})
+        self.journal.event(now, "decision_validated", {
+            **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None)})
         self._record_construction_variant(decision, now)
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
-        self._announce_decision(decision, now)
+        self._announce_decision(decision, now, account=account, decision_id=accepted_id)
         try:
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:
@@ -1637,7 +1654,8 @@ class AutonomousFund(Strategy):
                 or done.get("positions") != self._holdings_key(account)
                 or last.get("research") != self._research_key()):
             return False
-        self.next_review = now + timedelta(minutes=budget.min_review_minutes)
+        self.next_review = min(now + timedelta(minutes=budget.min_review_minutes),
+                               made + timedelta(minutes=budget.max_quiet_minutes))
         self.journal.event(now, "review_skipped", {
             "reason": "nothing changed since the last decision", "decision_id": latest["id"],
             "decided_at": last["at"], "next_check": self.next_review.isoformat(),

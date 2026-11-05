@@ -105,8 +105,9 @@ def test_logs_status_explains_the_state_in_one_screen(tmp_path):
     book, env = account_book(tmp_path)
     result = script("fund-logs.sh", tmp_path, env)
     assert result.returncode == 0, result.stdout + result.stderr
+    # Account amounts use dollars, grouping and cents in the separate holdings block.
     for text in ("模式：local", "交易：已停止（人工停止：新账户首次启动", "fund-start.sh", "独立监控：stopped",
-                 "账户：净值 10000", "最近通知：", "stop_active"):
+                 "账户：净值 $10,000.00", "📌 当前实际持仓", "最近通知：", "stop_active"):
         assert text in result.stdout, result.stdout
     follow = script("fund-logs.sh", tmp_path, env, "logs")
     assert ("+ journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service "

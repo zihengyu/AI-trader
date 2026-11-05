@@ -82,6 +82,14 @@ def test_a_scheduled_review_with_nothing_new_skips_the_model_call(tmp_path):
     assert any(r["kind"] == "review_skipped" for r in strategy.journal.all_events())
 
 
+def test_a_quiet_checkpoint_never_schedules_the_manager_past_the_maximum_quiet_interval(tmp_path):
+    strategy, held = quiet_strategy(tmp_path)
+    due = NOW + timedelta(minutes=strategy.model_budget.max_quiet_minutes)
+    assert strategy._quiet_review(held, due - timedelta(minutes=5)) is True
+    assert strategy.next_review == due
+    assert strategy._quiet_review(held, due) is False
+
+
 @pytest.mark.parametrize("change", ["trigger", "positions", "too_long", "new_day", "incomplete", "disabled"])
 def test_any_change_still_calls_the_manager(tmp_path, change):
     from scripts.autonomous_fund.strategy import ModelBudget

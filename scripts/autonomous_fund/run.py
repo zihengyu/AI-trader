@@ -304,7 +304,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -313,6 +313,7 @@ def main(argv=None):
     parser.add_argument("--start", default="2025-01-06")
     parser.add_argument("--end", default="2025-02-14")
     parser.add_argument("--data-dir", type=Path)
+    parser.add_argument("--session-date", help="decisions: New York date YYYY-MM-DD (default: today in New York)")
     parser.add_argument("--scripted", action="store_true", help="Historical mechanical tests only; never paper")
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
@@ -427,6 +428,10 @@ def main(argv=None):
         if not args.env_file:
             raise RiskError("serve needs the .env file (the launchers select the checkout .env)")
         serve(args.env_file, args.config, args.run_dir if explicit_run_dir else None)
+        return
+    if args.mode == "decisions":
+        from .decision_activity import activity, lines
+        print("\n".join(lines(activity(args.run_dir, args.session_date), timeline=True)))
         return
     if args.mode == "status":
         # Read-only: never creates an account directory or journal.

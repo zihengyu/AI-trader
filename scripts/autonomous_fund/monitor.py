@@ -543,7 +543,10 @@ class Monitor:
                     if len(message) <= LONG_MESSAGE:
                         result = self.transport.send(message)
                     else:  # A long research text arrives whole, as a document.
-                        result = self.transport.send_document(message.split("\n", 1)[0] + "\n内容较长，见附件。",
+                        # Keep holdings visible; the attachment retains the complete rationale.
+                        caption = (message.split("\n理由：", 1)[0] if body.get("kind") == "decision_changed" else
+                                   message.split("\n", 1)[0])
+                        result = self.transport.send_document(caption[:900] + "\n内容较长，完整内容见附件。",
                                                               f"{body.get('kind')}-{row['sequence']}.txt", message)
             except Exception:
                 # Never persist third-party exceptions (may contain credentials).

@@ -92,6 +92,7 @@ def strategy_memory(journal, now):
     return {"version": packet["version"], "session_date": packet["session_date"],
             "available_at": packet["completed_at"], "model": packet["models"]["manager"],
             "mock": packet["mock"], "review": packet["review"],
+            "evidence_catalog": packet.get("evidence_catalog") or [],
             "account_observation_gaps": packet["session"]["account_observation_gaps"],
             "recent_reviews": [{"version": p["version"], "session_date": p["session_date"],
                                 "summary": p["review"]["summary"]} for p in reviews[-3:]]}
@@ -202,6 +203,37 @@ def _run_stage(strategy, name, **kwargs):
         raise
 
 
+def _evidence_catalog(saved):
+    """Short references bound to one saved input snapshot; source text and times stay intact."""
+    refs, catalog = [], []
+    original = saved["context"]
+    for index, row in enumerate(original["session"]["events"]):
+        ref = f"event:{row['sequence']}"
+        refs.append(ref)
+        catalog.append({"ref": ref, "context_path": f"session.events[{index}]"})
+    for index, evidence in enumerate(saved["research"]["evidence"], 1):
+        ref = f"research:{index}"
+        refs.extend((ref, evidence["source"]))  # Exact original names remain valid for older callers.
+        catalog.append({"ref": ref, "context_path": f"research.evidence[{index - 1}]", **evidence})
+    for key in ("session", "factor_lab", "scorecards", "attribution", "strategy_memory", "strategy_followup",
+                "operator_mandate", "limits", "eligible_universe"):
+        if original.get(key) is not None:
+            ref = f"context:{key}"
+            refs.append(ref)
+            catalog.append({"ref": ref, "context_path": key, "input_as_of": original["as_of"]})
+    return list(dict.fromkeys(refs)), catalog
+
+
+def _invalid_refs(review, allowed):
+    invalid = []
+    for group in ("selection_adjustments", "timing_adjustments"):
+        for index, change in enumerate(review[group]):
+            unmatched = [str(i) for i, ref in enumerate(change["evidence_refs"]) if ref not in allowed]
+            if unmatched:
+                invalid.append(f"{group}[{index}].evidence_refs[{','.join(unmatched)}]")
+    return invalid
+
+
 def review_after_close(strategy):
     """Two existing read-only roles; no execution or writable configuration tools."""
     if strategy.observe_only or strategy.halt_path.exists():
@@ -261,16 +293,21 @@ def review_after_close(strategy):
     if strategy.halt_path.exists():
         return
     # Use the same snapshot for the copyable list and the exact-match check.
-    refs = [f"event:{row['sequence']}" for row in saved["context"]["session"]["events"]]
-    refs.extend(item["source"] for item in saved["research"]["evidence"])
+    refs, catalog = _evidence_catalog(saved)
     allowed_refs = set(refs)
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
-               "research_completed_at": saved["completed_at"], "allowed_evidence_refs": list(dict.fromkeys(refs))}
-    result = _run_stage(strategy, "manager",
-        task_prompt="这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
+               "research_completed_at": saved["completed_at"], "allowed_evidence_refs": refs,
+               "evidence_catalog": catalog}
+    manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
                     "自主改进选股与择时的判断方法，分别列出可检验的调整、依据、验证条件和失效条件；"
                     "evidence_refs 必须逐字复制 context.allowed_evidence_refs 中的值，保持原有大小写和标点。"
+                    "优先使用 evidence_catalog 中的短编号（event:序号、research:序号、context:字段名），"
+                    "编号指向原始证据及其时间；不要把计算结果、指标说明或长段转述填进 evidence_refs。"
+                    "编号只属于本轮清单，不能把旧备忘中的同名编号当成本轮新证据；引用旧备忘可用 context:strategy_memory。"
+                    "如果 context.reference_correction 存在，这是一次引用修正：核对列出的 invalid_paths，"
+                    "在同一份原始证据内修正 previous_review 的引用及依赖它的断言，返回完整复盘；"
+                    "不得编造对应关系，没有证据支持的调整应撤回。"
                     "不要自行添加前缀或改写来源名称。清单中没有支持某条调整的证据时，省略该条调整。"
                     "给出保留教训、撤回假设、数据缺项及下一交易日完整 strategy_memo，继承仍有效的经验。"
                     "不因单日盈亏宣称策略有效，不追涨杀跌式过拟合，说明样本不足和置信度。"
@@ -289,26 +326,40 @@ def review_after_close(strategy):
                     "要求扣除换手成本后多空收益仍为正、且与已验证因子不高度相关，每多试一个表达式门槛都会提高，"
                     "结果在下一次决策和复盘中提供。"
                     "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
-                    "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。", context=context,
-        output_schema=PostmarketReview)
-    review = PostmarketReview.model_validate(strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()
-    if review["session_date"] != day or instant(review["as_of"]) != now:
-        raise RiskError("Postmarket review session/as_of mismatch")
-    invalid = []
-    for group in ("selection_adjustments", "timing_adjustments"):
-        for index, change in enumerate(review[group]):
-            unmatched = [str(i) for i, ref in enumerate(change["evidence_refs"]) if ref not in allowed_refs]
-            if unmatched:
-                invalid.append(f"{group}[{index}].evidence_refs[{','.join(unmatched)}]")
-    if invalid:
-        # This message also goes to Telegram. Keep model text in the agent trace.
-        raise RiskError(f"Postmarket adjustment refers to evidence outside the supplied review for {day} "
-                        f"({', '.join(invalid)})")
+                    "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。")
+    for attempt in range(2):
+        now = instant(strategy.get_datetime())
+        context = {**context, "as_of": now.isoformat()}
+        result = _run_stage(strategy, "manager", task_prompt=manager_prompt, context=context,
+                            output_schema=PostmarketReview)
+        review = PostmarketReview.model_validate(
+            strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()
+        if review["session_date"] != day or instant(review["as_of"]) != now:
+            raise RiskError("Postmarket review session/as_of mismatch")
+        invalid = _invalid_refs(review, allowed_refs)
+        if not invalid:
+            break
+        error = (f"Postmarket adjustment refers to evidence outside the supplied review for {day} "
+                 f"({', '.join(invalid)})")
+        if strategy.halt_path.exists():
+            return
+        # Correct a copying mistake once, under the existing budgets. Never accept
+        # a fuzzy match, promote model text to evidence, or repeat successful research.
+        budget = getattr(strategy, "model_budget", None)
+        exhausted = budget is not None and strategy.journal.counter(
+            "agent_runs", strategy.get_datetime()) >= budget.max_agent_runs_per_day
+        if attempt or exhausted or (hasattr(strategy, "_cost_exhausted") and
+                strategy._cost_exhausted(strategy.get_datetime(), "postmarket_reference_correction")):
+            raise RiskError(error)
+        strategy.journal.event(strategy.get_datetime(), "postmarket_reference_retry", {
+            "session_date": day, "invalid_paths": invalid, "research_completed_at": saved["completed_at"]})
+        context = {**context, "reference_correction": {"invalid_paths": invalid, "previous_review": review}}
     packet = {**session, "version": (memory["version"] if memory else 0) + 1,
               "previous_version": memory["version"] if memory else None,
               "input_as_of": saved["context"]["as_of"], "completed_at": strategy.get_datetime().isoformat(),
               "models": {"researcher": saved["model"], "manager": result.model},
               "attribution": saved["context"].get("attribution"),
+              "evidence_catalog": catalog, "reference_correction_attempts": attempt,
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)

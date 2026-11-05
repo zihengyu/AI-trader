@@ -66,6 +66,15 @@ class Journal:
         with self.connection() as db:
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(at), kind, encode(body)))
 
+    def notification_with_meta(self, at, kind, details, metadata):
+        """Publish the durable outbox entry and its deduplication baseline together."""
+        with self.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)",
+                       (str(at), "notification", encode({"kind": kind, "details": details})))
+            db.executemany("INSERT OR REPLACE INTO meta VALUES(?,?)",
+                           [(key, encode(value)) for key, value in metadata.items()])
+
     @staticmethod
     def blocked(db, intent, now, cap):
         """True when an unresolved intent exists or the side's daily budget is spent.
@@ -297,3 +306,10 @@ class Journal:
         for row in rows:
             row["body"] = json.loads(row["body"])
         return rows
+
+    def recent_trades(self, as_of):
+        from .holdings import recent_trades
+        with self.connection() as db:
+            rows = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+                "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")]
+        return recent_trades(rows, as_of)

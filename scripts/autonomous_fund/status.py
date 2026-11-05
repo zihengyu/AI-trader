@@ -147,6 +147,59 @@ def cost_line(costs):
     return text
 
 
+def account_lines(account, recent_trades=None):
+    """Separate observed holdings from AI targets, retaining the snapshot's own time."""
+    from zoneinfo import ZoneInfo
+    from .risk import number
+
+    def money(value):
+        try:
+            return f"${number(value):,.2f}"
+        except (TypeError, ValueError):
+            return "暂无"
+
+    def shares(value):
+        text = format(number(value), 'f')
+        return text.rstrip('0').rstrip('.') if '.' in text else text
+
+    def when(value):
+        try:
+            moment = instant(value)
+            return (f"美东 {moment.astimezone(ZoneInfo('America/New_York')):%m-%d %H:%M}"
+                    f" · 本地 {moment.astimezone():%m-%d %H:%M}")
+        except (TypeError, ValueError):
+            return "时间未知"
+
+    if not account or account.get("unavailable"):
+        return ["📌 当前实际持仓：暂无可用账户快照"]
+    at = account.get("as_of") or account.get("at")
+    lines = [f"📌 当前实际持仓（快照：{when(at)}）",
+             f"账户：净值 {money(account.get('equity'))} ｜ 现金 {money(account.get('cash'))}"]
+    prices = account.get("position_average_prices") or {}
+    positions = account.get("positions") or {}
+    for symbol, quantity in sorted(positions.items()):
+        if number(quantity) == 0:
+            continue
+        lines.append(f"• {symbol}：{shares(quantity)} 股 ｜ 买入均价 {money(prices.get(symbol))}")
+    if not any(number(quantity) != 0 for quantity in positions.values()):
+        lines.append("• 暂无证券持仓")
+    swept = account.get("cash_equivalents") or {}
+    if swept:
+        lines.append(f"现金中含短债 ETF {money(account.get('cash_equivalent_value'))}：")
+        lines += [f"• {symbol}：{shares(quantity)} 股 ｜ 买入均价 {money(prices.get(symbol))}"
+                  for symbol, quantity in sorted(swept.items())]
+    if recent_trades:
+        lines.append("🧾 最近成交（最近 6 笔，时间为成交观测时间）：")
+        for trade in recent_trades:
+            side = {"buy": "买入", "sell": "卖出"}.get(trade.get("side"), trade.get("side"))
+            label = "累计成交均价" if trade.get("evidence_kind") == "broker_cumulative_observation" else "成交价"
+            lines.append(f"• {side} {trade['symbol']}：{shares(trade['quantity'])} 股 ｜ {label} {money(trade.get('price'))}"
+                         f"（{when(trade.get('at'))}）")
+    elif recent_trades is not None:
+        lines.append("最近成交：暂无已确认的买卖成交")
+    return lines
+
+
 def summary(root, mode, now=None):
     from .settings import MODES
     root, now = Path(root), now or datetime.now(timezone.utc)
@@ -205,13 +258,7 @@ def summary(root, mode, now=None):
         return "\n".join(lines)
     account = data.get("latest_account") or {}
     if account:
-        positions = account.get("positions") or {}
-        held = "、".join(f"{s}×{q}" for s, q in positions.items()) or "无"
-        swept = account.get("cash_equivalents") or {}
-        parked = (f"（其中 {account.get('cash_equivalent_value')} 停在短债 ETF：" +
-                  "、".join(f"{s}×{q}" for s, q in swept.items()) + "）") if swept else ""
-        lines.append(f"账户：净值 {account.get('equity')}，现金 {account.get('cash')}{parked}，持仓 {held}"
-                     f"（{account.get('as_of') or account.get('at') or ''}）")
+        lines += ["", *account_lines(account, data.get("recent_trades")), ""]
     if data.get("return") is not None:
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")
@@ -226,15 +273,15 @@ def summary(root, mode, now=None):
         retries = {key: json.loads(value) for key, value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
-        decisions = [r[0] for r in db.execute("SELECT at FROM events WHERE kind='decision_validated' "
-                                              "ORDER BY sequence DESC LIMIT 200")]
     from zoneinfo import ZoneInfo
+    from .decision_activity import activity, lines as activity_lines
+    audit = activity(root, now=now)
     zone = ZoneInfo("America/New_York")
-    today = now.astimezone(zone).date()
-    todays = [instant(at) for at in decisions if instant(at).astimezone(zone).date() == today]
-    lines.append(f"决策：今天 {len(todays)} 次有效决策" + (
+    todays = [instant(item["at"]) for item in audit["decisions"]]
+    lines.append(f"决策：今天 {audit['validated']} 次有效决策（通过校验的复核，不代表下单或成交）" + (
         f"，最近一次 {max(todays).astimezone(zone):%H:%M}（纽约）" if todays else "") + (
-        f"；累计 {len(decisions)}{'+' if len(decisions) == 200 else ''} 次" if decisions else "；还没有过有效决策"))
+        f"；累计 {audit['cumulative_validated']} 次" if audit["cumulative_validated"] else "；还没有过有效决策"))
+    lines += activity_lines(audit)[1:]
     if retries.get("decision_failures") and retries.get("decision_retry_at"):
         label = "基金经理失败退避" if retries.get("decision_failure_role") == "manager" else "AI 失败退避"
         lines.append(f"{label}：连续失败 {retries['decision_failures']} 次；"

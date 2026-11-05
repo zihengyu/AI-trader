@@ -126,17 +126,79 @@ Historical replays retain their dated research and evidence validation before a
 manager decision. Pre-open and post-close research remain read-only lifecycle
 work; this change does not introduce background research workers.
 
+Many Fund Assessments but Few Telegram Notifications
+--------------------------------------------------------------------------------
+
+An autonomous-fund ``decision_validated`` event records a portfolio assessment
+that passed schema, freshness and mandate checks. Holding the same targets is
+also an assessment; it does not imply an order, fill or demonstrated investment
+skill. Research, critique and shadow calls also use the model-call budget and
+must not be counted as portfolio assessments.
+
+Telegram announces the first daily assessment, security additions/removals,
+weight changes of at least one percentage point, and changes to entry, stop,
+take-profit or take-profit retention levels. Removing a level is announced too;
+equivalent numeric formatting or a new rationale alone does not create another
+alert. The outbox entry and its deduplication baseline commit together so a
+failed database write cannot silently consume an announcement.
+
+``fund-logs.sh`` separates assessment types, orders, fills and delivery states.
+Use ``bash scripts/fund-logs.sh decisions YYYY-MM-DD`` to inspect a New York date
+in the configured account. It is read-only and never creates a journal. New
+events carry an explicit plan ID; legacy plans are linked only by an exact
+decision match. Delivery states describe the query time. A missing fill alone
+does not establish why a plan did not trade.
+
+Quiet checkpoints stay within the configured maximum quiet interval; they do
+not move the manager's deadline later by another review interval.
+
+Actual Holdings and Target Weights in the Autonomous Fund
+--------------------------------------------------------------------------------
+
+Telegram opening and portfolio-change messages and ``fund-logs.sh`` status show
+actual holdings in a separate block before the AI rationale. Each security has
+its observed share count and average purchase price, alongside account equity,
+cash and the original snapshot time. Target weights, target cash percentages
+and entry limits describe a plan; they do not establish that an order filled.
+
+Average purchase prices come from the local book or broker position response
+and cover only the AI capital sleeve. Older snapshots without a recorded cost
+show it as unavailable until the next account observation. Quotes and target
+prices are never used to reconstruct a missing purchase price. Cash-equivalent
+ETF holdings are listed separately and their value is already included in cash.
+
+The same block lists up to six confirmed buy/sell fills observed by the snapshot
+time, with quantities, prices and observation times. A recovered cumulative fill
+replaces that order's callbacks; other partial fills remain separate. Order
+limits are never presented as execution prices. The complete decision rationale
+is retained. Longer notices arrive as complete text attachments with holdings
+visible in the caption.
+
 Evidence References Rejected in an Autonomous Fund Postmarket Review
 --------------------------------------------------------------------------------
 
 The optional autonomous fund supplies an ``allowed_evidence_refs`` list for each
-postmarket review. The manager copies entries exactly when citing a journal event
-or a source from the saved research. An unmatched reference rejects the review
-and leaves the last valid strategy memo in effect.
+postmarket review. The manager preferentially copies short IDs from
+``evidence_catalog``: ``event:<sequence>``, ``research:n`` for a saved research
+item, or ``context:<field>`` for input actually present in that snapshot.
+Original source text and timestamps stay intact; exact original source names
+remain valid. The catalog is retained with the review and strategy memory.
+IDs belong to that review's snapshot and cannot be carried into another review
+as new evidence.
+
+A reference mismatch allows at most one additional manager correction per
+attempt, using the same saved research and allowed references. It counts against
+the existing call and cost budgets and respects STOP. The application never
+fuzzy-matches a citation or automatically promotes model prose to evidence.
+If the correction still fails, the review is rejected and the last valid
+strategy memo stays in effect. Successful research is reused across retries.
 
 The ``postmarket_review_error`` notice identifies the review date and the invalid
 positions using zero-based indices. Look up those positions in the manager call's
 ``trace=`` file to compare the submitted references with the supplied list.
+"Outside the supplied review" refers to a citation missing from that list, not
+to an investment-universe or position-limit violation. The error positions alone
+do not reveal which references the model submitted.
 
 Choosing an Intraday Order Duration
 --------------------------------------------------------------------------------

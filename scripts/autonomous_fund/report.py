@@ -66,7 +66,11 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     for at, kind, body in events:
         if kind == "account":
             accounts.append({"at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
-                             "positions": body["positions"], "receivables": float(body.get("receivables", 0))})
+                             "as_of": body.get("as_of") or at, "positions": body["positions"],
+                             "position_average_prices": body.get("position_average_prices") or {},
+                             "cash_equivalents": body.get("cash_equivalents") or {},
+                             "cash_equivalent_value": body.get("cash_equivalent_value", 0),
+                             "receivables": float(body.get("receivables", 0))})
         elif kind == "benchmark":
             benchmarks[at[:10]] = body
         elif kind == "fill":
@@ -155,6 +159,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
             # Cached prompt tokens at the operator's cached_input rate (ordinary input when not given).
             estimates_by_model = {model: call_cost(counts, rates[model]) for model, counts in by_model.items()}
             estimate = sum(estimates_by_model.values())
+    from .holdings import recent_trades
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
         "models": startup.get("models"),
@@ -195,6 +200,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "unfinished_model_calls": list(unfinished.values()),
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
         "latest_account": accounts[-1] if accounts else None,
+        "recent_trades": recent_trades(events, accounts[-1]["as_of"]) if accounts else [],
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
                         "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."
     }
