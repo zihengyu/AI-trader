@@ -37,14 +37,18 @@ WEIGHT_STEP = Decimal("0.000001")
 # Operator-reviewed defaults for the shipped universe. A symbol may belong to
 # several groups; each group limits the combined target weight of its members.
 DEFAULT_GROUPS = {
-    "technology": ("0.30", ["AAPL", "MSFT", "NVDA", "XLK"]),
-    "communication": ("0.20", ["GOOGL", "META"]),
-    "consumer_discretionary": ("0.20", ["AMZN", "HD"]),
-    "financials": ("0.30", ["BRK.B", "JPM", "V", "MA", "XLF"]),
-    "health_care": ("0.25", ["UNH", "JNJ", "XLV"]),
-    "energy": ("0.15", ["XOM", "XLE"]),
-    "consumer_staples": ("0.25", ["COST", "PG", "XLP"]),
-    "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]),
+    "technology": ("0.30", ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "XLK"]),
+    "communication": ("0.20", ["GOOGL", "META", "NFLX", "DIS", "T", "VZ", "XLC"]),
+    "consumer_discretionary": ("0.20", ["AMZN", "HD", "TSLA", "MCD", "LOW", "BKNG", "XLY"]),
+    "financials": ("0.30", ["BRK.B", "JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "AXP", "XLF"]),
+    "health_care": ("0.25", ["UNH", "JNJ", "LLY", "MRK", "ABBV", "PFE", "TMO", "XLV"]),
+    "energy": ("0.15", ["XOM", "CVX", "COP", "XLE"]),
+    "consumer_staples": ("0.25", ["COST", "PG", "WMT", "KO", "PEP", "PM", "XLP"]),
+    "industrials": ("0.25", ["CAT", "HON", "GE", "UNP", "RTX", "XLI"]),
+    "materials": ("0.15", ["LIN", "XLB"]),
+    "utilities": ("0.15", ["NEE", "XLU"]),
+    "real_estate": ("0.15", ["PLD", "XLRE"]),
+    "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "TSLA", "QQQ", "XLK"]),
     "us_broad_index": ("0.40", ["SPY", "VTI", "DIA", "IWM", "QQQ"]),
     "treasury_duration": ("0.30", ["IEF", "TLT"]),
 }

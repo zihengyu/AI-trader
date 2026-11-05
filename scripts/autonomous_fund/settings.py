@@ -16,7 +16,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .risk import RiskError
+from .risk import LEVERAGED_OR_INVERSE, RiskError
 
 SEPARATOR = "|"
 
@@ -105,6 +105,9 @@ SETTINGS = {
     "FUND_LOCAL_ACCOUNT_USD": (("mandate", "local_account_usd"), _decimal, False, "约束", "本地虚拟账户初始资金（仅新账本生效）"),
     "FUND_INSTRUCTIONS": (("mandate", "instructions"), _list, False, "约束", "给 AI 的文字约束，多条用 | 分隔"),
     "FUND_EXCLUDE_SYMBOLS": (None, None, False, "约束", "禁止交易的代码，逗号分隔（从投资范围和分组中移除）"),
+    "FUND_EXTRA_STOCKS": (None, None, False, "约束", "加入投资范围的股票，逗号分隔；写成 代码:分组（例如 SHOP:technology）会计入该行业上限"),
+    "FUND_EXTRA_ETFS": (None, None, False, "约束", "加入投资范围的非杠杆 ETF，格式同上；杠杆、反向和波动率产品会被拒绝"),
+    "FUND_RESEARCH_SYMBOLS": (None, None, False, "外部", "只供因子研究、不交易的额外股票，逗号分隔"),
     "FUND_MAX_POSITION": (("limits", "max_position"), _decimal, False, "约束", "单只证券最大权重，例如 0.10"),
     "FUND_MAX_EXPOSURE": (("limits", "max_exposure"), _decimal, False, "约束", "证券总敞口上限，例如 0.70"),
     "FUND_MAX_DRAWDOWN": (("limits", "drawdown"), _decimal, False, "约束", "回撤硬锁阈值，例如 0.08"),
@@ -267,6 +270,57 @@ def validate_env_file(path):
     validate_names(dotenv_values(path).keys(), f"{path}")
 
 
+def _symbol_items(raw, name, grouped=True):
+    """[(SYMBOL, group or None)] from "AMD, SHOP:technology"; duplicates are dropped."""
+    import re
+    items, seen = [], set()
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        symbol, _, group = part.partition(":")
+        symbol, group = symbol.strip().upper(), group.strip().lower() or None
+        if not re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", symbol):
+            raise RiskError(f"{name}: {part!r} is not a ticker symbol")
+        if group is not None and (not grouped or not re.fullmatch(r"[a-z_]{1,40}", group)):
+            raise RiskError(f"{name}: {part!r}: " + ("a research symbol takes no group" if not grouped
+                                                     else "group names are lower-case letters and _"))
+        if symbol in LEVERAGED_OR_INVERSE:
+            raise RiskError(f"{name}: {symbol} is a leveraged, inverse or volatility product and cannot be admitted")
+        if symbol not in seen:
+            seen.add(symbol)
+            items.append((symbol, group))
+    return items
+
+
+def _add_symbols(result, environ, audit):
+    """FUND_EXTRA_STOCKS / FUND_EXTRA_ETFS widen the tradable universe; FUND_RESEARCH_SYMBOLS the factor lab's."""
+    groups = (result.get("quant_risk") or {}).get("groups")
+    for name, kind in (("FUND_EXTRA_STOCKS", "stock"), ("FUND_EXTRA_ETFS", "unlevered_etf")):
+        items = _symbol_items(environ.get(name), name)
+        for symbol, group in items:
+            current = result["universe"].get(symbol)
+            if current is not None and current != kind:
+                raise RiskError(f"{name}: {symbol} is already admitted as {current}")
+            result["universe"][symbol] = kind
+            if group is None:
+                continue
+            if not groups or group not in groups:
+                raise RiskError(f"{name}: unknown group {group}; groups: " + ", ".join(sorted(groups or {})))
+            if symbol not in groups[group]["members"]:
+                groups[group]["members"].append(symbol)
+        if items:
+            audit.append({"variable": name, "path": "universe",
+                          "value": [f"{s}:{g}" if g else s for s, g in items]})
+    research = _symbol_items(environ.get("FUND_RESEARCH_SYMBOLS"), "FUND_RESEARCH_SYMBOLS", grouped=False)
+    if research:
+        lab = result.setdefault("factor_lab", {})
+        existing = list(lab.get("research_universe") or [])
+        lab["research_universe"] = existing + [s for s, _ in research if s not in existing]
+        audit.append({"variable": "FUND_RESEARCH_SYMBOLS", "path": "factor_lab.research_universe",
+                      "value": [s for s, _ in research]})
+
+
 def apply_environment(config, environ):
     """Return (effective config, audit rows). Raises with the variable name on any bad value."""
     result, audit = copy.deepcopy(config), []
@@ -280,6 +334,7 @@ def apply_environment(config, environ):
             raise RiskError(f"{name}: {exc}") from None
         _set(result, path, value)
         audit.append({"variable": name, "path": ".".join(path), "value": value})
+    _add_symbols(result, environ, audit)
     excluded = [s.strip().upper() for s in str(environ.get("FUND_EXCLUDE_SYMBOLS", "")).split(",") if s.strip()]
     if excluded:
         missing = sorted(set(excluded) - set(result["universe"]))

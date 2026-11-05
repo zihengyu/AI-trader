@@ -4,6 +4,16 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from zoneinfo import ZoneInfo
 
+# A safety net, not a complete list: common US-listed leveraged, inverse and volatility products
+# (index, sector, commodity and single-stock). The operator still reviews every admitted symbol.
+LEVERAGED_OR_INVERSE = frozenset("""
+TQQQ SQQQ QLD QID PSQ UPRO SPXU SPXL SPXS SSO SDS SH UDOW SDOW DDM DXD DOG TNA TZA UWM TWM RWM URTY SRTY
+SOXL SOXS USD SSG TECL TECS ROM REW FAS FAZ UYG SKF DPST LABU LABD CURE RXL HIBL HIBS WEBL WEBS FNGU FNGD
+BULZ BERZ MVV MZZ SAA SDD TMF TMV TBT TBF UBT TTT PST NUGT DUST JNUG JDST GUSH DRIP ERX ERY BOIL KOLD
+UCO SCO AGQ ZSL UGL GLL UVXY SVXY VXX VIXY VIXM UVIX SVIX YINN YANG EDC EDZ EET EEV XPP FXP CWEB KORU
+TSLL TSLQ TSLZ TSLT NVDL NVDU NVDD NVDS NVDX CONL MSTU MSTX MSTZ AMZU AAPU AAPD METU GGLL BITX SBIT
+""".split())
+
 
 class RiskError(ValueError):
     pass

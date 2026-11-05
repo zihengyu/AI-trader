@@ -106,7 +106,9 @@ MANAGER_PROMPT = (
     "Missing research is not a reason to wait for the researcher, nor permission to invent evidence. "
     "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
     "Omitted positions are to be liquidated, an empty list means all cash. "
-    "Respect supplied limits: no debt, shorts, derivatives, inverse or leveraged funds. "
+    "Respect supplied limits: no debt, no short selling (selling borrowed shares), derivatives, inverse or "
+    "leveraged funds. Selling what you hold is ordinary and never restricted: reduce, exit, take profits or cut "
+    "losses whenever your analysis says so; sales execute automatically without approval. "
     "Choose cash freely: idle cash is swept automatically into the operator's cash-equivalent ETF (account "
     "cash_equivalents) and already counts as cash in account.cash; never target that symbol. "
     "Write rationale in Chinese: explain each proposed buy, reduction, "
@@ -439,6 +441,10 @@ def configuration(path, environ=None):
     if not result["universe"] or any(v not in {"stock", "unlevered_etf", "cash_equivalent"}
                                      for v in result["universe"].values()):
         raise RiskError("Only operator-reviewed stocks, unlevered ETFs and one cash-equivalent ETF may be admitted")
+    from .risk import LEVERAGED_OR_INVERSE
+    refused = sorted(set(result["universe"]) & LEVERAGED_OR_INVERSE)
+    if refused:
+        raise RiskError("Leveraged, inverse or volatility products cannot be admitted: " + ", ".join(refused))
     from .cash import CashSweep
     CashSweep.from_config(result.get("cash_sweep"), result["universe"])
     risk_settings(result, set(result["universe"]), limits)
