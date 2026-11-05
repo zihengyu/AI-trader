@@ -87,7 +87,7 @@ def test_excluded_symbols_leave_the_universe_and_every_group():
     assert "NVDA" not in config["universe"] and "XOM" not in config["universe"]
     assert all("NVDA" not in spec["members"] for spec in config["quant_risk"]["groups"].values())
     with pytest.raises(RiskError, match="not in the eligible universe"):
-        effective({"FUND_EXCLUDE_SYMBOLS": "TSLA"})
+        effective({"FUND_EXCLUDE_SYMBOLS": "SHOP"})  # Not admitted by default (TSLA joined the universe).
 
 
 def test_shipped_template_lists_every_setting_and_changes_no_default():
