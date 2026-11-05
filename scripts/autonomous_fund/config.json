@@ -57,6 +57,8 @@
     "max_scenario_loss": "0.35",
     "max_portfolio_beta": "1.0",
     "max_style_exposure": "0.75",
+    "max_leveraged_total": "0.15",
+    "max_leveraged_position": "0.05",
     "stress_scenarios": {"gfc_2008": ["2008-09-01", "2009-03-09"], "covid_2020": ["2020-02-19", "2020-03-23"],
                          "rates_2022": ["2022-01-03", "2022-10-12"]},
     "groups": {
@@ -88,7 +90,7 @@
     "local_account_usd": "10000",
     "instructions": [
       "只用授权资金交易，账户中其余现金和持仓不属于你，不得动用。",
-      "不使用杠杆、融资、融券卖空（借股票卖出）、期权、期货或杠杆/反向 ETF；卖出、减仓、清仓自己持有的证券不受限制。"
+      "不借钱买入（融资）、不借股票卖出（融券卖空）、不用期权或期货；杠杆、反向和波动率 ETF 只能用投资范围中列出的，并受其仓位上限约束；卖出、减仓、清仓自己持有的证券不受限制。"
     ]
   },
   "research_network": {"resolver": "system"},

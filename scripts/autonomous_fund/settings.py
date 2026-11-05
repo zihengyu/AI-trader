@@ -16,7 +16,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from .risk import LEVERAGED_OR_INVERSE, RiskError
+from .risk import LEVERAGED_KIND, LEVERAGED_OR_INVERSE, RiskError
 
 SEPARATOR = "|"
 
@@ -106,7 +106,10 @@ SETTINGS = {
     "FUND_INSTRUCTIONS": (("mandate", "instructions"), _list, False, "约束", "给 AI 的文字约束，多条用 | 分隔"),
     "FUND_EXCLUDE_SYMBOLS": (None, None, False, "约束", "禁止交易的代码，逗号分隔（从投资范围和分组中移除）"),
     "FUND_EXTRA_STOCKS": (None, None, False, "约束", "加入投资范围的股票，逗号分隔；写成 代码:分组（例如 SHOP:technology）会计入该行业上限"),
-    "FUND_EXTRA_ETFS": (None, None, False, "约束", "加入投资范围的非杠杆 ETF，格式同上；杠杆、反向和波动率产品会被拒绝"),
+    "FUND_EXTRA_ETFS": (None, None, False, "约束", "加入投资范围的非杠杆 ETF，格式同上；杠杆、反向和波动率产品请用下一项"),
+    "FUND_EXTRA_LEVERAGED_ETFS": (None, None, False, "约束", "加入投资范围的杠杆、反向或波动率 ETF（如 SH、SDS、UVXY），格式同上；受下面两个上限约束"),
+    "FUND_MAX_LEVERAGED_TOTAL": (("quant_risk", "max_leveraged_total"), _decimal, False, "约束", "杠杆、反向和波动率 ETF 合计最大权重，例如 0.15"),
+    "FUND_MAX_LEVERAGED_POSITION": (("quant_risk", "max_leveraged_position"), _decimal, False, "约束", "单只杠杆、反向或波动率 ETF 最大权重，例如 0.05"),
     "FUND_RESEARCH_SYMBOLS": (None, None, False, "外部", "只供因子研究、不交易的额外股票，逗号分隔"),
     "FUND_MAX_POSITION": (("limits", "max_position"), _decimal, False, "约束", "单只证券最大权重，例如 0.10"),
     "FUND_MAX_EXPOSURE": (("limits", "max_exposure"), _decimal, False, "约束", "证券总敞口上限，例如 0.70"),
@@ -270,7 +273,7 @@ def validate_env_file(path):
     validate_names(dotenv_values(path).keys(), f"{path}")
 
 
-def _symbol_items(raw, name, grouped=True):
+def _symbol_items(raw, name, grouped=True, leveraged=False):
     """[(SYMBOL, group or None)] from "AMD, SHOP:technology"; duplicates are dropped."""
     import re
     items, seen = [], set()
@@ -285,8 +288,9 @@ def _symbol_items(raw, name, grouped=True):
         if group is not None and (not grouped or not re.fullmatch(r"[a-z_]{1,40}", group)):
             raise RiskError(f"{name}: {part!r}: " + ("a research symbol takes no group" if not grouped
                                                      else "group names are lower-case letters and _"))
-        if symbol in LEVERAGED_OR_INVERSE:
-            raise RiskError(f"{name}: {symbol} is a leveraged, inverse or volatility product and cannot be admitted")
+        if symbol in LEVERAGED_OR_INVERSE and not leveraged:
+            raise RiskError(f"{name}: {symbol} is a leveraged, inverse or volatility product; "
+                            "admit it with FUND_EXTRA_LEVERAGED_ETFS, under its own caps")
         if symbol not in seen:
             seen.add(symbol)
             items.append((symbol, group))
@@ -296,8 +300,9 @@ def _symbol_items(raw, name, grouped=True):
 def _add_symbols(result, environ, audit):
     """FUND_EXTRA_STOCKS / FUND_EXTRA_ETFS widen the tradable universe; FUND_RESEARCH_SYMBOLS the factor lab's."""
     groups = (result.get("quant_risk") or {}).get("groups")
-    for name, kind in (("FUND_EXTRA_STOCKS", "stock"), ("FUND_EXTRA_ETFS", "unlevered_etf")):
-        items = _symbol_items(environ.get(name), name)
+    for name, kind in (("FUND_EXTRA_STOCKS", "stock"), ("FUND_EXTRA_ETFS", "unlevered_etf"),
+                       ("FUND_EXTRA_LEVERAGED_ETFS", LEVERAGED_KIND)):
+        items = _symbol_items(environ.get(name), name, leveraged=kind == LEVERAGED_KIND)
         for symbol, group in items:
             current = result["universe"].get(symbol)
             if current is not None and current != kind:

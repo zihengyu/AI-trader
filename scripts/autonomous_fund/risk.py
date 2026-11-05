@@ -4,7 +4,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_FLOOR, ROUND_CEILING
 from zoneinfo import ZoneInfo
 
-# A safety net, not a complete list: common US-listed leveraged, inverse and volatility products
+# The universe kind for leveraged, inverse and volatility ETFs: admitted only when the operator declares
+# them so, and capped separately (quant_risk.max_leveraged_total / max_leveraged_position).
+LEVERAGED_KIND = "leveraged_etf"
+# Not a complete list: common US-listed leveraged, inverse and volatility products. These may be admitted
+# only as LEVERAGED_KIND, so one can never pass as an ordinary stock or ETF by mistake.
 # (index, sector, commodity and single-stock). The operator still reviews every admitted symbol.
 LEVERAGED_OR_INVERSE = frozenset("""
 TQQQ SQQQ QLD QID PSQ UPRO SPXU SPXL SPXS SSO SDS SH UDOW SDOW DDM DXD DOG TNA TZA UWM TWM RWM URTY SRTY

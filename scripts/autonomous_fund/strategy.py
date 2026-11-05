@@ -48,7 +48,8 @@ MONITOR_AGENT_SECONDS = 900
 # System prompts are module constants so their digest (prompt_version) identifies
 # which instructions produced each decision; scorecards are grouped by it.
 RESEARCHER_PROMPT = (
-    "Research US stocks and nonleveraged ETFs in the supplied eligible universe. "
+    "Research the US stocks and ETFs in the supplied eligible universe; leveraged_etfs (when present) lists "
+    "leveraged, inverse or volatility ETFs the operator admitted as hedging or tactical tools. "
     "Use native market/history, technical analysis, fundamentals and news/web tools. "
     "Find opportunities autonomously, assess contradictory evidence and portfolio risk. "
     "Return a concise summary and evidence with source, timezone-aware available_at "
@@ -106,9 +107,11 @@ MANAGER_PROMPT = (
     "Missing research is not a reason to wait for the researcher, nor permission to invent evidence. "
     "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
     "Omitted positions are to be liquidated, an empty list means all cash. "
-    "Respect supplied limits: no debt, no short selling (selling borrowed shares), derivatives, inverse or "
-    "leveraged funds. Selling what you hold is ordinary and never restricted: reduce, exit, take profits or cut "
-    "losses whenever your analysis says so; sales execute automatically without approval. "
+    "Respect supplied limits: no borrowing to buy (margin), no short selling (selling borrowed shares), no options "
+    "or futures. Leveraged, inverse and volatility ETFs only when listed in leveraged_etfs, within its caps: they "
+    "reset daily and decay when held, so use them as short-term hedges or tactical complements with a stated exit. "
+    "Selling what you hold is ordinary and never restricted: reduce, exit, take profits or cut losses whenever your "
+    "analysis says so; sales execute automatically without approval. "
     "Choose cash freely: idle cash is swept automatically into the operator's cash-equivalent ETF (account "
     "cash_equivalents) and already counts as cash in account.cash; never target that symbol. "
     "Write rationale in Chinese: explain each proposed buy, reduction, "
@@ -438,13 +441,15 @@ def configuration(path, environ=None):
         result["_environment_overrides"] = overrides
     limits = Limits(**result["limits"])
     model_selection(result)
-    if not result["universe"] or any(v not in {"stock", "unlevered_etf", "cash_equivalent"}
+    from .risk import LEVERAGED_KIND, LEVERAGED_OR_INVERSE
+    if not result["universe"] or any(v not in {"stock", "unlevered_etf", LEVERAGED_KIND, "cash_equivalent"}
                                      for v in result["universe"].values()):
-        raise RiskError("Only operator-reviewed stocks, unlevered ETFs and one cash-equivalent ETF may be admitted")
-    from .risk import LEVERAGED_OR_INVERSE
-    refused = sorted(set(result["universe"]) & LEVERAGED_OR_INVERSE)
+        raise RiskError("Only operator-reviewed stocks, unlevered ETFs, declared leveraged/inverse ETFs and one "
+                        "cash-equivalent ETF may be admitted")
+    refused = sorted(s for s, kind in result["universe"].items() if s in LEVERAGED_OR_INVERSE and kind != LEVERAGED_KIND)
     if refused:
-        raise RiskError("Leveraged, inverse or volatility products cannot be admitted: " + ", ".join(refused))
+        raise RiskError("Leveraged, inverse or volatility products can be admitted only as leveraged_etf "
+                        "(FUND_EXTRA_LEVERAGED_ETFS), never as an ordinary stock or ETF: " + ", ".join(refused))
     from .cash import CashSweep
     CashSweep.from_config(result.get("cash_sweep"), result["universe"])
     risk_settings(result, set(result["universe"]), limits)
@@ -942,6 +947,7 @@ class AutonomousFund(Strategy):
                        "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
+                       "leveraged_etfs": self._leveraged_context(),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
@@ -982,6 +988,22 @@ class AutonomousFund(Strategy):
             from . import report as reports
             self._bookkeeping(self.journal.export,
                               lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
+
+    def _leveraged_context(self):
+        """The admitted leveraged, inverse and volatility ETFs and their caps; None when none is admitted."""
+        from .risk import LEVERAGED_KIND
+        kinds = (getattr(self, "config", None) or {}).get("universe") or {}
+        symbols = sorted(s for s in self.universe if kinds.get(s) == LEVERAGED_KIND)
+        quant = getattr(self, "quant", None)
+        if not symbols or quant is None:
+            return None
+        return {"symbols": symbols, "max_total_weight": str(quant.max_leveraged_total),
+                "max_weight_each": str(quant.max_leveraged_position),
+                "meaning": "Leveraged, inverse and volatility ETFs the operator admitted. They reset daily, so held "
+                           "for weeks they drift from their multiple and decay in choppy markets; volatility products "
+                           "also lose value to futures roll. Use them mainly as short-term hedges or tactical "
+                           "complements, state the purpose and the exit condition, and remember an inverse ETF is "
+                           "still a long position in this account. The combined and per-symbol caps are enforced."}
 
     def _register_ideas(self, research, packet):
         """Register each new pre-open idea once, as an immutable research prediction; returns their ids.
@@ -1486,6 +1508,7 @@ class AutonomousFund(Strategy):
             return
         context = {"as_of": now.isoformat(), "historical": self.mode not in {"paper", "local"},
                    "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
+                       "leveraged_etfs": self._leveraged_context(),
                    "account": asdict(account), "previous_decision": self.last_decision,
                    "premarket_research": getattr(self, "premarket_research", None),
                    "strategy_memory": self._strategy_memory(),
