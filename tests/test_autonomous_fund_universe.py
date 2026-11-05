@@ -130,3 +130,28 @@ def test_only_borrowed_share_short_selling_is_banned_never_ordinary_selling():
     assert "卖出、减仓、清仓自己持有的证券不受限制" in rule and "杠杆、反向和波动率 ETF 只能用投资范围中列出的" in rule
     example = (ROOT / "scripts" / "autonomous_fund" / ".env.example").read_text(encoding="utf-8")
     assert rule in example and "FUND_EXTRA_LEVERAGED_ETFS" in example
+
+
+def test_the_operator_sets_group_caps_and_the_risk_policy_enforces_them():
+    from scripts.autonomous_fund.quant import QuantPolicy
+    from scripts.autonomous_fund.risk import Limits
+    config = configuration(CONFIG, environ={"FUND_GROUP_LIMITS": " Technology:0.40, energy:.1 ",
+                                            "FUND_EXTRA_STOCKS": "SMCI:technology"})
+    groups = config["quant_risk"]["groups"]
+    assert groups["technology"]["limit"] == "0.4" and groups["energy"]["limit"] == "0.1"
+    assert groups["financials"]["limit"] == "0.30"  # Untouched groups keep their defaults.
+    policy = QuantPolicy.from_config(config["quant_risk"], config["universe"], Limits(**config["limits"]))
+    caps = {name: limit for name, limit, _ in policy.groups}
+    assert caps["technology"] == "0.4" and caps["energy"] == "0.1"
+    audit = {row["variable"]: row["value"] for row in config["_environment_overrides"]}
+    assert audit["FUND_GROUP_LIMITS"] == ["technology:0.4", "energy:0.1"]
+
+
+@pytest.mark.parametrize("value, message", [
+    ("tech:0.4", "unknown group 'tech'"), ("technology", "needs a limit"), ("technology:abc", "needs a limit"),
+    ("technology:0", "above 0 and at most 1"), ("technology:1.5", "above 0 and at most 1"),
+    ("leveraged_inverse_volatility:0.2", "unknown group"),  # Those caps have their own settings.
+])
+def test_group_caps_are_validated(value, message):
+    with pytest.raises(RiskError, match=message):
+        configuration(CONFIG, environ={"FUND_GROUP_LIMITS": value})

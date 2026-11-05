@@ -1466,6 +1466,8 @@ volatility products may enter only through ``FUND_EXTRA_LEVERAGED_ETFS``), ``FUN
 (more leveraged, inverse or volatility ETFs as hedging or tactical tools; eight are admitted by default) with
 ``FUND_MAX_LEVERAGED_TOTAL`` and ``FUND_MAX_LEVERAGED_POSITION`` (combined and per-symbol weight caps,
 default 0.15 and 0.05), ``FUND_RESEARCH_SYMBOLS`` (research-only stocks for the factor lab),
+``FUND_GROUP_LIMITS`` (``group:limit`` pairs, for example ``technology:0.40``, changing existing groups'
+combined weight caps; each above 0 and at most 1),
 ``FUND_EXCLUDE_SYMBOLS``,
 ``FUND_INSTRUCTIONS``), the approval
 envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER``,
