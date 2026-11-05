@@ -166,6 +166,9 @@ def suspect(item, key):
                            "bad data; verify before use")
 
 
+INTRADAY_SECONDS_PER_SYMBOL = 5  # About 12 Yahoo requests a minute for the pulse.
+
+
 class Idle(Exception):
     """A job with nothing to do yet (for example no account journal): neither a success nor an error."""
 
@@ -492,7 +495,10 @@ class DataDesk:
         if name == "news":
             return self.news_settings.poll_seconds * (1 if is_open else 4)
         if name == "intraday":
-            return self.settings.intraday_seconds
+            # One minute-bar request per symbol: a wide universe stretches the pulse instead of
+            # raising the Yahoo request rate (about one request every INTRADAY_SECONDS_PER_SYMBOL s).
+            symbols = len(set(getattr(self, "tradable", ())) | set(GAUGES))
+            return max(self.settings.intraday_seconds, round(symbols * INTRADAY_SECONDS_PER_SYMBOL))
         if name == "macro":
             return self.settings.macro_minutes * 60 * (1 if working else 4)
         if name == "earnings":

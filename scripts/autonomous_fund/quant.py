@@ -27,7 +27,7 @@ from decimal import Decimal, ROUND_FLOOR
 
 import numpy as np
 
-from .risk import RiskError, number
+from .risk import LEVERAGED_KIND, RiskError, number
 
 TRADING_DAYS = 252
 # Normal-distribution expected shortfall at 97.5%: phi(z) / (1 - 0.975), z = 1.959964.
@@ -37,16 +37,22 @@ WEIGHT_STEP = Decimal("0.000001")
 # Operator-reviewed defaults for the shipped universe. A symbol may belong to
 # several groups; each group limits the combined target weight of its members.
 DEFAULT_GROUPS = {
-    "technology": ("0.30", ["AAPL", "MSFT", "NVDA", "XLK"]),
-    "communication": ("0.20", ["GOOGL", "META"]),
-    "consumer_discretionary": ("0.20", ["AMZN", "HD"]),
-    "financials": ("0.30", ["BRK.B", "JPM", "V", "MA", "XLF"]),
-    "health_care": ("0.25", ["UNH", "JNJ", "XLV"]),
-    "energy": ("0.15", ["XOM", "XLE"]),
-    "consumer_staples": ("0.25", ["COST", "PG", "XLP"]),
-    "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "QQQ", "XLK"]),
+    "technology": ("0.30", ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "XLK"]),
+    "communication": ("0.20", ["GOOGL", "META", "NFLX", "DIS", "T", "VZ", "XLC"]),
+    "consumer_discretionary": ("0.20", ["AMZN", "HD", "TSLA", "MCD", "LOW", "BKNG", "XLY"]),
+    "financials": ("0.30", ["BRK.B", "JPM", "V", "MA", "BAC", "WFC", "GS", "MS", "AXP", "XLF"]),
+    "health_care": ("0.25", ["UNH", "JNJ", "LLY", "MRK", "ABBV", "PFE", "TMO", "XLV"]),
+    "energy": ("0.15", ["XOM", "CVX", "COP", "XLE"]),
+    "consumer_staples": ("0.25", ["COST", "PG", "WMT", "KO", "PEP", "PM", "XLP"]),
+    "industrials": ("0.25", ["CAT", "HON", "GE", "UNP", "RTX", "XLI"]),
+    "materials": ("0.15", ["LIN", "XLB"]),
+    "utilities": ("0.15", ["NEE", "XLU"]),
+    "real_estate": ("0.15", ["PLD", "XLRE"]),
+    "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "TSLA", "QQQ", "XLK"]),
     "us_broad_index": ("0.40", ["SPY", "VTI", "DIA", "IWM", "QQQ"]),
-    "treasury_duration": ("0.30", ["IEF", "TLT"]),
+    "treasury_duration": ("0.30", ["IEF", "TLT", "TIP"]),
+    "us_factor": ("0.30", ["MTUM", "QUAL", "USMV", "VLUE"]),
+    "alternatives": ("0.20", ["BTAL", "DBMF", "TAIL", "UUP"]),
 }
 
 # Historical stress windows (peak to trough of the benchmark, approximately).
@@ -140,6 +146,10 @@ class QuantPolicy:
     # down pro rata, like a group cap; the AI sees every exposure in its risk context.
     max_portfolio_beta: Decimal = Decimal("1.0")
     max_style_exposure: Decimal = Decimal("0.75")
+    # Leveraged, inverse and volatility ETFs (universe kind "leveraged_etf"), admitted only by the operator:
+    # their combined weight and each one's weight are capped, on top of every other limit.
+    max_leveraged_total: Decimal = Decimal("0.15")
+    max_leveraged_position: Decimal = Decimal("0.05")
     stress_scenarios: tuple = tuple((name, start, end) for name, (start, end) in sorted(DEFAULT_SCENARIOS.items()))
     groups: tuple = ()
     etf_symbols: tuple = ()
@@ -164,7 +174,17 @@ class QuantPolicy:
                 raise RiskError(f"Risk group {name} contains symbols outside the eligible universe")
             if members:
                 groups.append((name, str(_fraction(spec["limit"], f"groups.{name}.limit")), tuple(sorted(members))))
-        # The operator's universe classification (stock / unlevered_etf) selects the name budget.
+        # Leveraged, inverse and volatility ETFs: a combined cap and a cap per symbol, as risk groups.
+        leveraged = sorted(s for s, kind in universe.items() if kind == LEVERAGED_KIND) if isinstance(universe, dict) else []
+        if leveraged:
+            total = section.get("max_leveraged_total", cls.max_leveraged_total)
+            single = section.get("max_leveraged_position", cls.max_leveraged_position)
+            groups.append(("leveraged_inverse_volatility", str(_fraction(total, "max_leveraged_total", inclusive_low=True)),
+                           tuple(leveraged)))
+            groups += [(f"leveraged:{s}", str(_fraction(single, "max_leveraged_position", inclusive_low=True)), (s,))
+                       for s in leveraged]
+        # The operator's universe classification (stock / unlevered_etf) selects the name budget; leveraged
+        # products get the stricter stock budget.
         etfs = tuple(sorted(s for s, kind in universe.items() if kind == "unlevered_etf")) if isinstance(universe, dict) else ()
         policy = cls(**{**section, "groups": tuple(groups), "etf_symbols": etfs})
         policy.validate(limits)
@@ -190,6 +210,10 @@ class QuantPolicy:
         _fraction(self.max_scenario_loss, "max_scenario_loss")
         _fraction(self.max_portfolio_beta, "max_portfolio_beta", Decimal("0.1"), Decimal("3"))
         _fraction(self.max_style_exposure, "max_style_exposure", Decimal("0.1"), Decimal("5"))
+        _fraction(self.max_leveraged_total, "max_leveraged_total", inclusive_low=True)
+        _fraction(self.max_leveraged_position, "max_leveraged_position", inclusive_low=True)
+        if self.max_leveraged_position > self.max_leveraged_total:
+            raise RiskError("max_leveraged_position cannot exceed max_leveraged_total")
         _scenarios({name: (start, end) for name, start, end in self.stress_scenarios})
         for key in ("min_annual_vol", "unknown_annual_vol", "target_portfolio_vol", "max_portfolio_es",
                     "max_name_risk", "max_etf_name_risk", "max_adv_participation", "drawdown_soft", "daily_loss_limit",

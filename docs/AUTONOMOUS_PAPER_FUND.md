@@ -100,7 +100,8 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 约束 | `FUND_CAPITAL_USD`、`FUND_ALLOW_EXTERNAL_HOLDINGS`、`FUND_LOCAL_ACCOUNT_USD` | 授权资金（如账户 5 万只给 AI 1 万）、是否有你自己的持仓、本地虚拟账户资金 |
 | 约束 | `FUND_MAX_POSITION`、`FUND_MAX_EXPOSURE`、`FUND_MAX_DRAWDOWN`、`FUND_DAILY_ORDERS` | 单只上限、总敞口、回撤硬锁、每日提交次数 |
 | 约束 | `FUND_DAILY_LOSS_LIMIT`、`FUND_TARGET_VOL`、`FUND_MAX_ES` | 单日亏损闸门、波动率目标、尾部损失上限 |
-| 约束 | `FUND_EXCLUDE_SYMBOLS`、`FUND_INSTRUCTIONS` | 禁止交易的代码（逗号分隔）、给 AI 的文字约束（`|` 分隔） |
+| 约束 | `FUND_EXTRA_STOCKS`、`FUND_EXTRA_ETFS`、`FUND_EXCLUDE_SYMBOLS`、`FUND_INSTRUCTIONS` | 加入投资范围的股票和非杠杆 ETF（`代码:分组` 计入该行业上限）、禁止交易的代码（逗号分隔）、给 AI 的文字约束（`|` 分隔） |
+| 外部 | `FUND_RESEARCH_SYMBOLS` | 只供因子研究、不交易的额外股票 |
 | 审批 | `FUND_AUTO_DAILY_EXPOSURE_INCREASE`、`FUND_AUTO_DAILY_BUY_TURNOVER`、`FUND_STRESS_REQUIRES_APPROVAL`、`FUND_APPROVAL_VALID_MINUTES` | 自动执行额度（设 0 则所有买入都审批）、压力下是否审批、有效期 |
 | 通知 | `FUND_TELEGRAM_BOT_TOKEN`、`FUND_TELEGRAM_CHAT_ID`、`FUND_TELEGRAM_APPROVER_IDS`、`FUND_TELEGRAM_APPROVALS` | Telegram 通知与回复审批 |
 | 外部 | `FUND_ITERATION_SECONDS`、`FUND_LIVE_STREAM`、`FUND_RESEARCH_RESOLVER` | 盯盘间隔、实时推送报价、研究网页解析（Fake-IP 用 `doh`） |
@@ -504,6 +505,47 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 这些记分卡进入盘后复盘、研究和决策的上下文，复盘被要求据此保留、修正或撤回假设，结果写入日报和 `report.json` 的 `latest_scorecard`。
 这是客观反馈而不是自动改参数：风险参数、投资范围和权限仍只能由你修改。样本少时结论不稳定，重叠期限之间相关。
 
+## 投资范围
+
+默认 93 个代码，研究员、基金经理和数据员都覆盖整个范围，你只需要加入自己希望研究和交易的股票：
+
+| 类别 | 代码 |
+|---|---|
+| 美股大盘股（56 只，覆盖 11 个行业） | AAPL、MSFT、NVDA、AVGO、AMZN、TSLA、JPM、LLY、XOM、CAT 等 |
+| 大盘指数和行业 ETF | SPY、QQQ、IWM、DIA、VTI，XLK、XLF、XLV、XLE、XLP、XLI、XLY、XLC、XLU、XLB、XLRE |
+| 国债、通胀保值债和黄金 | IEF、TLT、TIP、GLD |
+| 因子 ETF（风格对冲和补充） | MTUM 动量、QUAL 质量、USMV 低波动、VLUE 价值 |
+| 另类和对冲（非杠杆） | BTAL 市场中性（做多低 beta、做空高 beta）、DBMF 管理期货、TAIL 尾部风险（国债＋看跌期权）、UUP 美元 |
+| 反向和波动率（`leveraged_etf`） | SH 反向标普、PSQ 反向纳指、DOG 反向道指、RWM 反向罗素 2000、SDS 两倍反向标普、QID 两倍反向纳指、TBF 反向长债、VIXY 波动率 |
+| 现金停放 | SGOV（不是 AI 的投资对象） |
+
+每只个股和普通 ETF 都属于一个分组，分组有合计仓位上限（科技 30%、金融 30%、医疗 25%、必需消费 25%、工业 25%、通信 20%、
+可选消费 20%、能源 15%、材料 15%、公用事业 15%、房地产 15%，另有大型成长股 35%、宽基指数 40%、国债久期 30%、
+因子 ETF 30%、另类 20%）。黄金和 SGOV 只受单只上限约束。反向和波动率工具另有自己的上限，见下文。
+
+在 `.env` 里调整，不需要改 `config.json`：
+
+- `FUND_EXTRA_STOCKS`、`FUND_EXTRA_ETFS`：加入投资范围，逗号分隔。写成 `代码:分组`（如 `SHOP:technology`）就计入该行业上限；
+  不写分组只受单只上限约束。分组名写错、把 ETF 写进股票（或反过来）、代码格式不对都会在启动时报错。
+- `FUND_RESEARCH_SYMBOLS`：只供因子研究、不交易的股票。
+- `FUND_EXCLUDE_SYMBOLS`：移除，也可以移除上面加入的代码。
+
+**杠杆、反向和波动率 ETF** 作为对冲或战术补充：默认加入上表中的 8 只，更多的（如 SQQQ、UVXY）只能用
+`FUND_EXTRA_LEVERAGED_ETFS` 加入（类型 `leveraged_etf`，同样支持 `代码:分组`），不想用的用 `FUND_EXCLUDE_SYMBOLS` 移除。
+买入反向 ETF 不借钱也不借股票，最多亏掉投入的本金，但经济效果是做空：标的下跌时它上涨，风控按它与大盘的负相关把它当作对冲。它们另有两个上限：合计不超过
+`FUND_MAX_LEVERAGED_TOTAL`（默认 15%），单只不超过 `FUND_MAX_LEVERAGED_POSITION`（默认 5%），由量化风控作为分组上限执行，
+同时仍受单只上限、波动率目标、尾部损失、beta 和压力测试等全部限制；风险预算按个股（更严）计算。
+AI 会在上下文 `leveraged_etfs` 里看到它们和上限，并被要求说明用途和退出条件：这类产品每天重置倍数，持有越久偏离越大，
+波动率产品还有期货展期损耗。代码里内置了一份常见杠杆、反向和波动率产品名单（TQQQ、SQQQ、SOXL、UVXY、TSLL 等），
+名单上的代码只能按 `leveraged_etf` 加入，写进 `FUND_EXTRA_STOCKS`／`FUND_EXTRA_ETFS` 或在 `config.json` 里标成普通 ETF 都会报错；
+名单不是完整的，加入的每个代码仍需你自己确认类型。
+范围越大，每次 AI 调用的输入越长（行情快照、风格暴露按代码列出），数据员每轮拉取越久：日内脉搏每个代码约 5 秒，
+范围大时拉取间隔自动拉长，而不是提高对 Yahoo 的请求频率。改变投资范围会改变风控指纹，重启后基金经理会重新决策一次。
+
+**只禁止借钱和借股票**：不借钱买入（融资）、不借股票卖出（融券卖空），代码都会拦截：买入数量以账户里的真实现金为上限
+（扣除费用缓冲），现金为负会停止交易；卖出数量不能超过持有数量，出现空头持仓也会停止交易。卖出、减仓、清仓、止损、止盈随时可以，
+卖出不需要审批，也不占买入额度。买入反向 ETF 是普通的买入（多头持仓），不是卖空。
+
 ## 因子实验室：AI 挖掘因子，代码客观检验
 
 因子挖掘只在盘后做：复盘的研究阶段结合以往检验结果研究可能的新规律，基金经理阶段把它写成最多 5 个因子表达式（`factor_proposals`），
@@ -513,7 +555,7 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
 结果在之后的每次决策和复盘中交给 AI。闭环是：**AI 发现规律 → 写成因子 → 代码检验 → 通过的因子及其实盘表现回到 AI → AI 修正或提出新因子**。
 
 **两个横截面，不混排**：每个因子只在一个横截面里排名（`factor_proposals[].universe`）：
-`stocks` 是可交易个股加上**不可交易的研究股票池**（`factor_lab.research_universe`，默认 40 只大盘股，只用来增加横截面宽度，
+`stocks` 是可交易个股加上**不可交易的研究股票池**（`factor_lab.research_universe`，默认另外 40 只大盘股，`FUND_RESEARCH_SYMBOLS` 可再加；只用来增加横截面宽度，
 从不作为投资建议出现）；`etfs` 是可交易的普通 ETF（不含现金停放用的 SGOV）。个股和 ETF 混在一起排名时，
 低波动之类的因子主要是在区分“ETF 比个股稳”，测到的是资产类型而不是选股能力。升级前在混合横截面上验证的因子会自动退役
 （理由写明，仍计入尝试次数），需要按新横截面重新提出。注意研究股票池是今天的大盘股，有幸存者偏差。
@@ -572,7 +614,7 @@ AI 仍决定完整目标组合，量化风控和审批规则不变。影子 A/B 
 Linux 用 `--expression=...` 形式（表达式以 `-` 开头时必须如此），例如 `--expression=-vol(20)`。
 **实测**：仓库自带的 2019 年 5 只 ETF 日线上，`rank(ret(20))`、`-rank(ret(5))`、`-vol(20)`、`rank(ret(60))` 全部被拒绝
 （样本内 |t| 0.11–1.21，低于 1.96）。5 只证券、一年数据远不足以证明任何因子，这正是检验应有的结论；
-运行中的基金个股横截面为 16 只可交易个股加 40 只研究股票，ETF 横截面为 14 只 ETF，两年日线。合成数据测试中，真实存在的动量规律在所有种子下都通过，纯噪声在所有种子下都被拒绝。
+2026-11-05 起默认个股横截面为 56 只可交易个股加 40 只研究股票，ETF 横截面为 19 只 ETF，两年日线（此前是 16 只个股加 40 只研究股票、14 只 ETF）。合成数据测试中，真实存在的动量规律在所有种子下都通过，纯噪声在所有种子下都被拒绝。
 
 ## 实时行情：Yahoo 推送报价
 
