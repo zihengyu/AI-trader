@@ -529,6 +529,7 @@ AI 不需要每分钟被调用。基金经理在每次复核时为每个目标�
   不写分组只受单只上限约束。分组名写错、把 ETF 写进股票（或反过来）、代码格式不对都会在启动时报错。
 - `FUND_RESEARCH_SYMBOLS`：只供因子研究、不交易的股票。
 - `FUND_EXCLUDE_SYMBOLS`：移除，也可以移除上面加入的代码。
+- `FUND_GROUP_LIMITS`：调整已有分组的合计上限，例如 `technology:0.40,energy:0.10`（0 到 1 之间；分组名写错会列出可用的分组）。上限只由你设定，AI 只能在上限内决定实际配多少；反向和波动率工具的上限用下文的两个专门设置调整。
 
 **杠杆、反向和波动率 ETF** 作为对冲或战术补充：默认加入上表中的 8 只，更多的（如 SQQQ、UVXY）只能用
 `FUND_EXTRA_LEVERAGED_ETFS` 加入（类型 `leveraged_etf`，同样支持 `代码:分组`），不想用的用 `FUND_EXCLUDE_SYMBOLS` 移除。

@@ -111,6 +111,7 @@ SETTINGS = {
     "FUND_MAX_LEVERAGED_TOTAL": (("quant_risk", "max_leveraged_total"), _decimal, False, "约束", "杠杆、反向和波动率 ETF 合计最大权重，例如 0.15"),
     "FUND_MAX_LEVERAGED_POSITION": (("quant_risk", "max_leveraged_position"), _decimal, False, "约束", "单只杠杆、反向或波动率 ETF 最大权重，例如 0.05"),
     "FUND_RESEARCH_SYMBOLS": (None, None, False, "外部", "只供因子研究、不交易的额外股票，逗号分隔"),
+    "FUND_GROUP_LIMITS": (None, None, False, "约束", "调整分组合计仓位上限，例如 technology:0.40,energy:0.10（只能改已有分组，0 到 1 之间）"),
     "FUND_MAX_POSITION": (("limits", "max_position"), _decimal, False, "约束", "单只证券最大权重，例如 0.10"),
     "FUND_MAX_EXPOSURE": (("limits", "max_exposure"), _decimal, False, "约束", "证券总敞口上限，例如 0.70"),
     "FUND_MAX_DRAWDOWN": (("limits", "drawdown"), _decimal, False, "约束", "回撤硬锁阈值，例如 0.08"),
@@ -326,6 +327,39 @@ def _add_symbols(result, environ, audit):
                       "value": [s for s, _ in research]})
 
 
+def _group_limits(result, environ, audit):
+    """FUND_GROUP_LIMITS: the operator's combined weight caps for existing groups, e.g. "technology:0.40".
+
+    Only the operator sets them; the AI decides weights within them. A group that
+    does not exist, or a limit outside (0, 1], is refused with the valid choices.
+    """
+    from decimal import Decimal, InvalidOperation
+    raw = str(environ.get("FUND_GROUP_LIMITS") or "").strip()
+    if not raw:
+        return
+    groups = (result.get("quant_risk") or {}).get("groups") or {}
+    changed = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, value = part.partition(":")
+        name = name.strip().lower()
+        if name not in groups:
+            raise RiskError(f"FUND_GROUP_LIMITS: unknown group {name or part!r}; groups: " + ", ".join(sorted(groups)))
+        try:
+            limit = Decimal(value.strip())
+        except InvalidOperation:
+            raise RiskError(f"FUND_GROUP_LIMITS: {part!r} needs a limit such as {name}:0.30") from None
+        if not limit.is_finite() or not 0 < limit <= 1:
+            raise RiskError(f"FUND_GROUP_LIMITS: {name} limit must be above 0 and at most 1 (a share of equity)")
+        groups[name]["limit"] = format(limit.normalize(), "f")
+        changed[name] = groups[name]["limit"]
+    if changed:
+        audit.append({"variable": "FUND_GROUP_LIMITS", "path": "quant_risk.groups",
+                      "value": [f"{n}:{v}" for n, v in changed.items()]})
+
+
 def apply_environment(config, environ):
     """Return (effective config, audit rows). Raises with the variable name on any bad value."""
     result, audit = copy.deepcopy(config), []
@@ -340,6 +374,7 @@ def apply_environment(config, environ):
         _set(result, path, value)
         audit.append({"variable": name, "path": ".".join(path), "value": value})
     _add_symbols(result, environ, audit)
+    _group_limits(result, environ, audit)
     excluded = [s.strip().upper() for s in str(environ.get("FUND_EXCLUDE_SYMBOLS", "")).split(",") if s.strip()]
     if excluded:
         missing = sorted(set(excluded) - set(result["universe"]))
