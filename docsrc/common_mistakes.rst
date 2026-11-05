@@ -136,6 +136,13 @@ prefetched file and strategy cache refresh at the close so a morning response
 cannot suppress an available closing price. Missing source closes remain
 disclosed; a current quote is never substituted for a close.
 
+In local and paper modes, an exception or empty daily-history response is
+cached for 60 seconds before another attempt. Dependent risk estimates, styles,
+factor views, snapshots and scorecards are refreshed when that failure expires;
+successful symbol histories remain reusable. The source's own backoff still
+applies, and missing-history risk controls remain active until data recovers.
+Historical replays retain deterministic caching independent of wall-clock time.
+
 Scorecards refresh when a relevant visible research, decision, review or
 execution event is appended, at the close, and on the next New York date.
 Unrelated heartbeats retain the cache. Future-dated events remain excluded
@@ -148,6 +155,13 @@ old report's authorization; missing historical mandate evidence stays unknown.
 The rolling model-cost summary uses one window for call counts, tokens,
 unpriced calls and costs. An empty recent window does not turn old priced
 calls into a missing-price warning.
+
+Account reports group daily marks by New York date and select them by observation
+time, so a late backfill cannot replace a newer account mark. Benchmark price
+returns use the account's exact first and last observation instants; a missing
+endpoint stays unknown. A zero-equity account remains reportable. Returns with
+a nonpositive denominator and drawdowns without a positive high-water mark
+stay unknown, and an undefined daily return prevents a daily Sharpe estimate.
 
 Many Fund Assessments but Few Telegram Notifications
 --------------------------------------------------------------------------------

@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 
-from .risk import instant
+from .risk import instant, trading_day
 
 
 REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_validated", "fill_details_unavailable",
@@ -118,7 +118,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                              "cash_equivalent_value": body.get("cash_equivalent_value", 0),
                              "receivables": float(body.get("receivables", 0))})
         elif kind == "benchmark":
-            benchmarks[at[:10]] = body
+            benchmarks[instant(at)] = body
         elif kind == "fill":
             fills.append({"at": at, **body, "evidence_kind": body.get("evidence_kind", "native_fill_callback")})
         elif kind == "fill_reconciled":
@@ -134,32 +134,46 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     # A recovered cumulative broker fill replaces callbacks for that order.
     # Its timestamp is observation time, not an invented execution timestamp.
     fills = [row for row in fills if row["broker_id"] not in reconciled] + list(reconciled.values())
+    accounts.sort(key=lambda row: instant(row["at"]))
     daily = {}
     for row in accounts:
-        daily[row["at"][:10]] = row
+        daily[trading_day(instant(row["at"]))] = row
     curve = list(daily.values())
     peak, max_drawdown, previous = 0, 0, None
     for row in curve:
         peak = max(peak, row["equity"])
-        max_drawdown = max(max_drawdown, 1 - row["equity"] / peak)
-        row["daily_return"] = row["equity"] / previous - 1 if previous else 0
+        if peak > 0:
+            max_drawdown = max(max_drawdown, 1 - row["equity"] / peak)
+        if previous is None:
+            row["daily_return"] = 0 if row["equity"] > 0 else None
+        else:
+            row["daily_return"] = row["equity"] / previous - 1 if previous > 0 else None
         previous = row["equity"]
     initial = accounts[0]["equity"] if accounts else None
     observed_peak, observed_drawdown = 0, 0
     for row in accounts:
         observed_peak = max(observed_peak, row["equity"])
-        observed_drawdown = max(observed_drawdown, 1 - row["equity"] / observed_peak)
+        if observed_peak > 0:
+            observed_drawdown = max(observed_drawdown, 1 - row["equity"] / observed_peak)
     returns = [row["daily_return"] for row in curve[1:]]
     sharpe = None
-    if len(returns) > 1:
+    if len(returns) > 1 and all(value is not None for value in returns):
         mean = sum(returns) / len(returns)
         variance = sum((x - mean) ** 2 for x in returns) / (len(returns) - 1)
         sharpe = mean / math.sqrt(variance) * math.sqrt(252) if variance > 0 else None
     comparison = {}
     for symbol in ("SPY", "QQQ"):
-        observations = [float(benchmarks[row["at"][:10]][symbol]) for row in curve
-                        if symbol in benchmarks.get(row["at"][:10], {})]
-        comparison[symbol] = observations[-1] / observations[0] - 1 if len(observations) == len(curve) and len(curve) > 1 else None
+        # Compare the same first/last instants as the account's total return. A mark earlier
+        # that day cannot stand in for a missing endpoint after a source failure.
+        anchors = [accounts[0], accounts[-1]] if accounts else []
+        endpoints = [benchmarks.get(instant(row["at"]), {}).get(symbol) for row in anchors]
+        try:
+            benchmark_prices = [float(value) for value in endpoints]
+        except (TypeError, ValueError):
+            benchmark_prices = []
+        comparison[symbol] = (benchmark_prices[-1] / benchmark_prices[0] - 1
+                              if len(accounts) > 1 and len(benchmark_prices) == 2 and
+                              all(math.isfinite(value) and value > 0 for value in benchmark_prices) else None)
     # A partially filled order's trade_cost may be cumulative. Never sum repeated
     # cumulative observations. Missing broker fees remain unknown, not zero.
     fee_by_order = {}
@@ -234,8 +248,9 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "decision_backoffs": backoffs,
         "observations": len(curve), "starting_equity": initial,
         "ending_equity": curve[-1]["equity"] if curve else None,
-        "return": curve[-1]["equity"] / initial - 1 if initial and curve else None,
-        "max_observed_drawdown": observed_drawdown, "max_daily_drawdown": max_drawdown,
+        "return": curve[-1]["equity"] / initial - 1 if initial is not None and initial > 0 and curve else None,
+        "max_observed_drawdown": observed_drawdown if observed_peak > 0 else None,
+        "max_daily_drawdown": max_drawdown if peak > 0 else None,
         "daily_sharpe_zero_risk_free": sharpe,
         "benchmark_price_returns": comparison, "fills_observed": len(fills),
         "observed_fees": local_fees + sum(fee_by_order.values()) if not unknown_fee else None,

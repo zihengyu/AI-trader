@@ -36,6 +36,8 @@ CANCEL_RETRY_SECONDS = 240
 # the next one. The independent monitor treats 180 seconds without an iteration or model-call
 # event during the session as a stalled runner; required risk data stays synchronous.
 PREPARATION_BUDGET_SECONDS = 45
+# Live source failures are retryable; successful histories still last for the completed-session cutoff.
+DAILY_HISTORY_RETRY_SECONDS = 60
 # One agent call lasts up to attempts x run timeout + LumiBot's retry backoff: the run timeout
 # is per ATTEMPT and a timeout is retried. The independent monitor stops a runner after
 # MONITOR_AGENT_SECONDS in one call (agent_call_stalled), so every role must end before it.
@@ -1950,6 +1952,7 @@ class AutonomousFund(Strategy):
         """Cache objective scores until visible evidence or the completed-session cutoff changes."""
         if getattr(self, "quant", None) is None:
             return None
+        self._expire_history_failures(now)
         from .market_data import completed_daily_cutoff
         kinds = ("postmarket_review", "decision_validated", "protective_trigger", "entry_waiting",
                  "order_submitted", "construction_variant", "research_idea")
@@ -2155,6 +2158,7 @@ class AutonomousFund(Strategy):
         absent) or None. Stocks are the tradable stocks plus the non-tradable
         research universe; ETFs are the tradable unlevered ETFs. Cached per day.
         """
+        self._expire_history_failures(now)
         day = trading_day(now)
         if self._factor_cache and self._factor_cache[0] == day:
             return self._factor_cache[1]
@@ -2236,6 +2240,8 @@ class AutonomousFund(Strategy):
         lab = getattr(self, "factor_lab", None)
         if lab is None:
             return None
+        if getattr(self, "_history_retry_at", None):
+            self._expire_history_failures(now)
         day = trading_day(now)
         cached = getattr(self, "_factor_context_cache", None)
         if cached and cached[0] == day:
@@ -2260,6 +2266,25 @@ class AutonomousFund(Strategy):
         return context
 
     # ----- Quantitative risk view -------------------------------------------------
+    def _expire_history_failures(self, now):
+        """Retry live failures after bounded backoff, including views built from the missing history."""
+        retries = getattr(self, "_history_retry_at", None)
+        if not retries or getattr(self, "mode", None) not in {"local", "paper"}:
+            return
+        day, tick = trading_day(now), monotonic()
+        expired = {key for key, until in retries.items() if key[0] != day or tick >= until}
+        if not expired:
+            return
+        for key in expired:
+            retries.pop(key, None)
+            (getattr(self, "_bars", None) or {}).pop(key, None)
+            (getattr(self, "_ohlc", None) or {}).pop(key, None)
+        # Cached missing-history estimates must not prevent the next read from reaching the source.
+        self._estimates, self._stress_cache = {}, {}
+        for name in ("_style_cache", "_factor_cache", "_factor_context_cache", "_market_snapshot_cache",
+                     "_scorecard_cache"):
+            setattr(self, name, None)
+
     def _daily_bars(self, symbol, now):
         """One history read per symbol and completed-session cutoff, shared by risk and research.
 
@@ -2267,6 +2292,7 @@ class AutonomousFund(Strategy):
         (filled ahead by the scheduled prefetch) is read first; only a missing
         symbol is fetched, and what was fetched is written back for restarts.
         """
+        self._expire_history_failures(now)
         from .market_data import completed_daily_cutoff
         cutoff = completed_daily_cutoff(now)
         day, key = trading_day(now), (trading_day(now), symbol)
@@ -2296,6 +2322,12 @@ class AutonomousFund(Strategy):
             self._ohlc = {k: v for k, v in (getattr(self, "_ohlc", None) or {}).items() if k[0] == day}
             self._ohlc[key] = {str(d): (o, h, l) for d, _, _, o, h, l in full or [] if d < cutoff}
             self._bars[key] = (rows, error)
+            if getattr(self, "mode", None) in {"local", "paper"}:
+                retries = self.__dict__.setdefault("_history_retry_at", {})
+                if error or not rows:
+                    retries[key] = monotonic() + DAILY_HISTORY_RETRY_SECONDS
+                else:
+                    retries.pop(key, None)
         return self._bars[key]
 
     def _fetch_daily_bars(self, symbol, length, now):
@@ -2459,6 +2491,7 @@ class AutonomousFund(Strategy):
         """
         if getattr(self, "quant", None) is None:
             return None
+        self._expire_history_failures(now)
         day, version = trading_day(now), self._desk_version(now, "market_snapshot")
         cached = getattr(self, "_market_snapshot_cache", None)
         if cached and cached[0] == (day, version):
@@ -2490,6 +2523,7 @@ class AutonomousFund(Strategy):
         return result
 
     def _risk_estimate(self, symbols, now):
+        self._expire_history_failures(now)
         from .quant import RiskEstimate
         key = (trading_day(now), frozenset(symbols))
         if key not in self._estimates:
@@ -2514,6 +2548,7 @@ class AutonomousFund(Strategy):
         cached: z-scores over part of the universe would be wrong, so only the
         beta limit applies until the next iteration completes them.
         """
+        self._expire_history_failures(now)
         from .quant import style_values, style_zscores
         day = trading_day(now)
         cached = getattr(self, "_style_cache", None)
