@@ -460,6 +460,7 @@ def test_configured_policy_sections_validate_and_ship_with_documented_defaults()
     assert budget.min_review_minutes == 15 and Limits(**config["limits"]).daily_orders == 20
     groups = {name: set(members) for name, _, members in quant.groups}
     assert {"AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "TSLA", "QQQ", "XLK"} == groups["us_growth_megacap"]
+    assert groups["leveraged_inverse_volatility"] == {"SH", "PSQ", "DOG", "RWM", "SDS", "QID", "TBF", "VIXY"}
     bad = json.loads(path.read_text(encoding="utf-8"))
     bad["approval"]["price_collar"] = "0.5"
     with pytest.raises(RiskError):

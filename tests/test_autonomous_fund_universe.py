@@ -19,14 +19,18 @@ def test_the_default_universe_is_wide_sector_capped_and_free_of_leveraged_produc
     config = configuration(CONFIG, environ={})
     universe = config["universe"]
     kinds = [kind for kind in universe.values()]
-    assert (len(universe), kinds.count("stock"), kinds.count("unlevered_etf"), kinds.count("cash_equivalent")) == \
-        (76, 56, 19, 1)
+    assert (len(universe), kinds.count("stock"), kinds.count("unlevered_etf"), kinds.count("leveraged_etf"),
+            kinds.count("cash_equivalent")) == (93, 56, 28, 8, 1)
+    hedges = {s for s, kind in universe.items() if kind == "leveraged_etf"}
+    assert hedges == {"SH", "PSQ", "DOG", "RWM", "SDS", "QID", "TBF", "VIXY"}
     members = {m for group in config["quant_risk"]["groups"].values() for m in group["members"]}
-    # Every stock and sector ETF counts against a sector cap; only gold and the cash sweep stand alone.
-    assert sorted(set(universe) - members) == ["GLD", "SGOV"]
+    # Every stock and other ETF counts against a group cap; the hedges have their own caps (risk policy).
+    assert sorted(set(universe) - members - hedges) == ["GLD", "SGOV"]
     research = config["factor_lab"]["research_universe"]
     assert len(research) == 40 and not set(research) & set(universe)
-    assert not set(universe) & LEVERAGED_OR_INVERSE and not set(research) & LEVERAGED_OR_INVERSE
+    # A known leveraged, inverse or volatility product is admitted only as that kind.
+    assert all(universe[s] == "leveraged_etf" for s in set(universe) & LEVERAGED_OR_INVERSE)
+    assert not set(research) & LEVERAGED_OR_INVERSE
 
 
 def test_env_adds_tradable_and_research_symbols_with_optional_sector_groups():
@@ -72,17 +76,22 @@ def test_a_known_leveraged_product_never_passes_as_an_ordinary_stock_or_etf(tmp_
 def test_admitted_leveraged_products_get_a_combined_and_a_per_symbol_cap():
     from scripts.autonomous_fund.quant import QuantPolicy
     from scripts.autonomous_fund.risk import Limits
-    config = configuration(CONFIG, environ={"FUND_EXTRA_LEVERAGED_ETFS": "SH, SDS:us_broad_index, UVXY",
+    config = configuration(CONFIG, environ={"FUND_EXTRA_LEVERAGED_ETFS": "SQQQ, SDS:us_broad_index, UVXY",
                                             "FUND_MAX_LEVERAGED_TOTAL": "0.12", "FUND_MAX_LEVERAGED_POSITION": "0.04"})
-    assert [config["universe"][s] for s in ("SH", "SDS", "UVXY")] == ["leveraged_etf"] * 3
+    assert [config["universe"][s] for s in ("SQQQ", "SDS", "UVXY")] == ["leveraged_etf"] * 3
     policy = QuantPolicy.from_config(config["quant_risk"], config["universe"], Limits(**config["limits"]))
     groups = {name: (limit, set(members)) for name, limit, members in policy.groups}
-    assert groups["leveraged_inverse_volatility"] == ("0.12", {"SDS", "SH", "UVXY"})
+    limit, members = groups["leveraged_inverse_volatility"]
+    assert limit == "0.12" and {"SQQQ", "SDS", "UVXY", "SH", "VIXY"} <= members
     assert groups["leveraged:UVXY"] == ("0.04", {"UVXY"}) and "SDS" in groups["us_broad_index"][1]
     assert "SH" not in policy.etf_symbols  # The stricter single-stock risk budget applies.
-    plain = QuantPolicy.from_config(configuration(CONFIG, environ={})["quant_risk"],
-                                    configuration(CONFIG, environ={})["universe"], Limits())
-    assert not any(name.startswith("leveraged") for name, _, _ in plain.groups)  # Off unless admitted.
+    defaults = configuration(CONFIG, environ={})
+    plain = QuantPolicy.from_config(defaults["quant_risk"], defaults["universe"], Limits())
+    shipped = {name: limit for name, limit, _ in plain.groups if name.startswith("leveraged")}
+    assert shipped["leveraged_inverse_volatility"] == "0.15" and shipped["leveraged:SH"] == "0.05"
+    without = configuration(CONFIG, environ={"FUND_EXCLUDE_SYMBOLS": "SH,PSQ,DOG,RWM,SDS,QID,TBF,VIXY"})
+    bare = QuantPolicy.from_config(without["quant_risk"], without["universe"], Limits())
+    assert not any(name.startswith("leveraged") for name, _, _ in bare.groups)  # Excluding them all removes the caps.
 
 
 def test_construction_holds_leveraged_weights_to_their_caps():

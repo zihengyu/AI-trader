@@ -1463,7 +1463,7 @@ intraday refresh interval), user limits
 ``FUND_EARNINGS_MAX_POSITION``, ``FUND_EXTRA_STOCKS`` and ``FUND_EXTRA_ETFS`` (comma-separated additions to
 the tradable universe; ``SYMBOL:group`` counts a symbol against that sector cap; common leveraged, inverse and
 volatility products may enter only through ``FUND_EXTRA_LEVERAGED_ETFS``), ``FUND_EXTRA_LEVERAGED_ETFS``
-(leveraged, inverse or volatility ETFs as hedging or tactical tools; none by default) with
+(more leveraged, inverse or volatility ETFs as hedging or tactical tools; eight are admitted by default) with
 ``FUND_MAX_LEVERAGED_TOTAL`` and ``FUND_MAX_LEVERAGED_POSITION`` (combined and per-symbol weight caps,
 default 0.15 and 0.05), ``FUND_RESEARCH_SYMBOLS`` (research-only stocks for the factor lab),
 ``FUND_EXCLUDE_SYMBOLS``,

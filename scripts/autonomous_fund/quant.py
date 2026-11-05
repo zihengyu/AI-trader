@@ -50,7 +50,9 @@ DEFAULT_GROUPS = {
     "real_estate": ("0.15", ["PLD", "XLRE"]),
     "us_growth_megacap": ("0.35", ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "TSLA", "QQQ", "XLK"]),
     "us_broad_index": ("0.40", ["SPY", "VTI", "DIA", "IWM", "QQQ"]),
-    "treasury_duration": ("0.30", ["IEF", "TLT"]),
+    "treasury_duration": ("0.30", ["IEF", "TLT", "TIP"]),
+    "us_factor": ("0.30", ["MTUM", "QUAL", "USMV", "VLUE"]),
+    "alternatives": ("0.20", ["BTAL", "DBMF", "TAIL", "UUP"]),
 }
 
 # Historical stress windows (peak to trough of the benchmark, approximately).

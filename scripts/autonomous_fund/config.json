@@ -22,7 +22,11 @@
     "VTI": "unlevered_etf", "XLK": "unlevered_etf", "XLF": "unlevered_etf", "XLV": "unlevered_etf",
     "XLE": "unlevered_etf", "XLP": "unlevered_etf", "XLI": "unlevered_etf", "XLY": "unlevered_etf",
     "XLC": "unlevered_etf", "XLU": "unlevered_etf", "XLB": "unlevered_etf", "XLRE": "unlevered_etf",
-    "IEF": "unlevered_etf", "TLT": "unlevered_etf", "GLD": "unlevered_etf",
+    "IEF": "unlevered_etf", "TLT": "unlevered_etf", "GLD": "unlevered_etf", "TIP": "unlevered_etf",
+    "MTUM": "unlevered_etf", "QUAL": "unlevered_etf", "USMV": "unlevered_etf", "VLUE": "unlevered_etf",
+    "BTAL": "unlevered_etf", "DBMF": "unlevered_etf", "TAIL": "unlevered_etf", "UUP": "unlevered_etf",
+    "SH": "leveraged_etf", "PSQ": "leveraged_etf", "DOG": "leveraged_etf", "RWM": "leveraged_etf",
+    "SDS": "leveraged_etf", "QID": "leveraged_etf", "TBF": "leveraged_etf", "VIXY": "leveraged_etf",
     "SGOV": "cash_equivalent"
   },
   "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02"},
@@ -77,7 +81,9 @@
       "us_growth_megacap": {"limit": "0.35", "members": ["AAPL", "MSFT", "NVDA", "GOOGL", "META", "AMZN", "AVGO", "TSLA",
                                                          "QQQ", "XLK"]},
       "us_broad_index": {"limit": "0.40", "members": ["SPY", "VTI", "DIA", "IWM", "QQQ"]},
-      "treasury_duration": {"limit": "0.30", "members": ["IEF", "TLT"]}
+      "treasury_duration": {"limit": "0.30", "members": ["IEF", "TLT", "TIP"]},
+      "us_factor": {"limit": "0.30", "members": ["MTUM", "QUAL", "USMV", "VLUE"]},
+      "alternatives": {"limit": "0.20", "members": ["BTAL", "DBMF", "TAIL", "UUP"]}
     }
   },
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
