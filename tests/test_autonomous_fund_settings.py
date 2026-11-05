@@ -143,6 +143,24 @@ def test_role_models_from_the_environment_rank_above_ai_model(tmp_path, monkeypa
     assert shown["models"] == {"researcher": "openai/fixture-research", "manager": "anthropic/fixture-common"}
 
 
+def test_manager_timeout_from_dotenv_is_visible_and_preserves_legacy_account_identity(tmp_path, monkeypatch, capsys):
+    name = "FUND_MANAGER_RUN_TIMEOUT_SECONDS"
+    shown, _ = run_show(tmp_path, monkeypatch, capsys, f"{name}=360\n")
+    row = next(row for row in shown["settings"] if row["variable"] == name)
+    assert row["value"] == 360 and row["source"] == f"environment ({name})"
+
+    previous = effective({})
+    assert previous.pop("manager_run_timeout_seconds") == 300
+    assert legacy_account_digest("paper", "fixture", previous) == legacy_account_digest(
+        "paper", "fixture", effective({name: "360"}))
+
+
+@pytest.mark.parametrize("value", ["0", "360.5", "900"])
+def test_invalid_manager_timeout_names_the_setting(value):
+    with pytest.raises(RiskError, match="FUND_MANAGER_RUN_TIMEOUT_SECONDS"):
+        effective({"FUND_MANAGER_RUN_TIMEOUT_SECONDS": value})
+
+
 # ----- Startup mode from .env: FUND_MODE / FUND_RUN_DIR / FUND_OBSERVE_ONLY --------------
 
 def test_fund_mode_selects_the_simulation_and_its_own_account_directory(tmp_path, monkeypatch):

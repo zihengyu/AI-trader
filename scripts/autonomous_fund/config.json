@@ -5,6 +5,7 @@
     "manager": "deepseek/deepseek-v4-pro"
   },
   "reasoning_effort": null,
+  "manager_run_timeout_seconds": 300,
   "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 20, "drawdown": "0.08"},
   "universe": {
     "AAPL": "stock", "MSFT": "stock", "AMZN": "stock", "GOOGL": "stock",

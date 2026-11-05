@@ -89,6 +89,8 @@ SETTINGS = {
     "FUND_RESEARCH_MODEL": (("agent_models", "researcher"), str, False, "模型", "研究员模型，例如 deepseek/deepseek-flash"),
     "FUND_DECISION_MODEL": (("agent_models", "manager"), str, False, "模型", "基金经理模型，例如 deepseek/deepseek-v4-pro"),
     "FUND_REASONING_EFFORT": (("reasoning_effort",), _optional, False, "模型", "推理强度 low/medium/high，留空为模型默认"),
+    "FUND_MANAGER_RUN_TIMEOUT_SECONDS": (("manager_run_timeout_seconds",), _int, False, "模型",
+                                         "基金经理每次尝试的整轮超时（秒，默认 300），适用于盘中决策和盘后复盘"),
     "FUND_CRITIC": (("critic", "enabled"), _bool, False, "模型", "是否在研究员和基金经理之间加入反方审查（每次决策多一次模型调用）"),
     "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),

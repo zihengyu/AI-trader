@@ -26,7 +26,7 @@ from .risk import (Account, Intent, Limits, Price, RiskError, bounded_list, boun
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
-                   "construction", "critic", "data_desk")
+                   "construction", "critic", "data_desk", "manager_run_timeout_seconds")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
@@ -363,8 +363,15 @@ class ModelBudget:
         return cls(**section)
 
 
-def agent_worst_case_seconds(role, attempts=None):
-    """Longest one call of `role` can take under LumiBot's retry policy (seconds)."""
+def _manager_run_timeout_seconds(config):
+    seconds = config.get("manager_run_timeout_seconds", AGENT_RUN_TIMEOUTS["manager"])
+    if type(seconds) is not int or not 0 < seconds < MONITOR_AGENT_SECONDS:
+        raise RiskError(f"FUND_MANAGER_RUN_TIMEOUT_SECONDS must be a whole number from 1 to {MONITOR_AGENT_SECONDS - 1}")
+    return seconds
+
+
+def agent_worst_case_seconds(role, attempts=None, *, run_timeout_seconds=None):
+    """Duration of one agent call if each attempt times out (seconds)."""
     from lumibot.components.agents.runtime import GoogleADKRuntime
     if attempts is None:
         raw = os.environ.get("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS")
@@ -373,7 +380,8 @@ def agent_worst_case_seconds(role, attempts=None):
         except ValueError:
             attempts = GoogleADKRuntime._MAX_RUN_ATTEMPTS
     backoff = GoogleADKRuntime._RETRY_BACKOFF_SECONDS
-    return attempts * AGENT_RUN_TIMEOUTS[role] + sum(backoff[min(i, len(backoff) - 1)] for i in range(attempts - 1))
+    timeout = AGENT_RUN_TIMEOUTS[role] if run_timeout_seconds is None else run_timeout_seconds
+    return attempts * timeout + sum(backoff[min(i, len(backoff) - 1)] for i in range(attempts - 1))
 
 
 def prompt_version(models, extra=None):
@@ -441,6 +449,7 @@ def configuration(path, environ=None):
                                           os.environ if environ is None else environ)
     if overrides:
         result["_environment_overrides"] = overrides
+    result["manager_run_timeout_seconds"] = _manager_run_timeout_seconds(result)
     limits = Limits(**result["limits"])
     model_selection(result)
     from .risk import LEVERAGED_KIND, LEVERAGED_OR_INVERSE
@@ -582,6 +591,7 @@ class AutonomousFund(Strategy):
     def initialize(self, config, run_dir, mode, account_binding, model=None, runtime=None, observe_only=False,
                    research_model=None, decision_model=None, memory_mode="rolling", frozen_memory=None,
                    require_monitor=False, live_data=None):
+        run_timeouts = {**AGENT_RUN_TIMEOUTS, "manager": _manager_run_timeout_seconds(config)}
         self.mode = mode
         # Scripted models (tests, mock) stay off the network unless live_data says otherwise: the free
         # rehearsal pairs a scripted AI with every real data source.
@@ -709,25 +719,25 @@ class AutonomousFund(Strategy):
         # Native permissions remove every tool marked as mutating trading state.
         self.agents.create(
             name="researcher", model=self.agent_models["researcher"], output_schema=Research, **common,
-            run_timeout_seconds=AGENT_RUN_TIMEOUTS["researcher"], system_prompt=RESEARCHER_PROMPT,
+            run_timeout_seconds=run_timeouts["researcher"], system_prompt=RESEARCHER_PROMPT,
         )
         self.agents.create(
             name="manager", model=self.agent_models["manager"], output_schema=Decision, **common,
-            run_timeout_seconds=AGENT_RUN_TIMEOUTS["manager"], system_prompt=MANAGER_PROMPT,
+            run_timeout_seconds=run_timeouts["manager"], system_prompt=MANAGER_PROMPT,
         )
         if mode in {"paper", "local"}:
-            worst = {role: agent_worst_case_seconds(role) for role in AGENT_RUN_TIMEOUTS}
+            worst = {role: agent_worst_case_seconds(role, run_timeout_seconds=seconds)
+                     for role, seconds in run_timeouts.items()}
             if max(worst.values()) >= MONITOR_AGENT_SECONDS:
-                # An explicit LUMIBOT_AGENT_MAX_RUN_ATTEMPTS that lets one call outlive the monitor.
                 self.journal.event(self.get_datetime(), "agent_time_budget_exceeds_monitor",
                                    {"worst_case_seconds": worst, "monitor_seconds": MONITOR_AGENT_SECONDS})
-                self.log_message("Agent retries can outlast the monitor's agent limit; lower "
-                                 "LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", color="yellow")
+                self.log_message("Agent retries can outlast the monitor's agent limit; check "
+                                 "LUMIBOT_AGENT_MAX_RUN_ATTEMPTS and FUND_MANAGER_RUN_TIMEOUT_SECONDS", color="yellow")
         self.critic = CriticSettings.from_config(config.get("critic"))
         if self.critic.enabled:
             self.agent_models["critic"] = self.critic.model or self.agent_models["researcher"]
             self.agents.create(name="critic", model=self.agent_models["critic"], output_schema=Critique, **common,
-                               run_timeout_seconds=AGENT_RUN_TIMEOUTS["critic"], system_prompt=CRITIC_PROMPT)
+                               run_timeout_seconds=run_timeouts["critic"], system_prompt=CRITIC_PROMPT)
             self._critic_ready = True
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
                          + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))

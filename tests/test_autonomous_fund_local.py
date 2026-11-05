@@ -400,6 +400,49 @@ def test_delayed_dividend_does_not_credit_shares_bought_on_exdate(tmp_path):
     assert broker.receivables() == 5
 
 
+@pytest.mark.parametrize("seconds, budget_warning", [(360, None), (450, 902)])
+def test_manager_timeout_reaches_both_schemas_and_watchdog_budget(tmp_path, monkeypatch, seconds, budget_warning):
+    from scripts.autonomous_fund.review import PostmarketReview
+    from scripts.autonomous_fund.run import ScriptedRuntime
+    from scripts.autonomous_fund.settings import apply_environment
+    from scripts.autonomous_fund.strategy import AutonomousFund, account_digest
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("IS_BACKTESTING", "false")
+    monkeypatch.setenv("LUMIBOT_AGENT_MAX_RUN_ATTEMPTS", "2")
+    clock = Clock()
+    source = YahooRealtimeData(now=clock, fetch=clock.fetch)
+    config, _ = apply_environment({"model": "deepseek/deepseek-flash", "limits": {},
+                                   "universe": {"ALFA": "stock"}},
+                                  {"FUND_MANAGER_RUN_TIMEOUT_SECONDS": str(seconds)})
+    journal = Journal(tmp_path, account_digest("local", "local-virtual-account"))
+    broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
+    timeouts = []
+
+    class RecordingRuntime(ScriptedRuntime):
+        def run(self, request):
+            timeouts.append(request.run_timeout_seconds)
+            return super().run(request)
+
+    strategy = AutonomousFund(broker=broker, name="ManagerTimeout", parameters={
+        "config": config, "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account",
+        "runtime": RecordingRuntime()})
+    try:
+        strategy._executor._initialize()
+        manager = strategy.agents["manager"]
+        timeouts.clear()
+        context = {"as_of": NOW.isoformat(), "eligible_universe": ["ALFA"]}
+        assert manager.run(context=context).parsed is not None
+        assert manager.run(context={**context, "phase": "postmarket_review", "session": {"session_date": "2026-11-02"}},
+                           output_schema=PostmarketReview).parsed is not None
+        assert timeouts == [seconds, seconds]
+        warnings = [r["body"]["worst_case_seconds"]["manager"] for r in journal.all_events()
+                    if r["kind"] == "agent_time_budget_exceeds_monitor"]
+        assert warnings == ([] if budget_warning is None else [budget_warning])
+    finally:
+        broker._close_connection()
+
+
 def test_local_mode_runs_through_native_strategy_executor_with_scripted_model(tmp_path, monkeypatch):
     from lumibot.traders import Trader
     from scripts.autonomous_fund.run import ScriptedRuntime
