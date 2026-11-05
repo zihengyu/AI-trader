@@ -4,7 +4,8 @@ The data desk (datadesk.py, always on), the one-shot `run prefetch` and the
 runner share this store under `<run-dir>/cache/daily/<day>/`:
 
 - `bars/<SYMBOL>.json`: completed daily bars (date, close, volume, open, high,
-  low) as the data source returned them, sessions BEFORE that day only;
+  low), with an exclusive date cutoff. Intraday readers use earlier sessions;
+  post-close readers may refresh through the session that just finished;
 - `<name>.json`: other data (FRED series, earnings dates, the market snapshot and
   the intraday pulse), rewritten by the desk whenever it refreshes them.
 
@@ -48,17 +49,21 @@ class DailyStore:
         except (OSError, ValueError):
             return None
 
-    def bars(self, day, symbol, length):
+    def bars(self, day, symbol, length, *, cutoff=None):
         """Rows [(date, close, volume, open, high, low)] when stored for at least `length` bars; else None."""
         stored = self._read(self.root / str(day) / "bars" / f"{symbol}.json")
-        if not stored or stored.get("requested", 0) < length:
+        cutoff = str(cutoff or day)
+        if (not stored or stored.get("requested", 0) < length or
+                stored.get("cutoff", str(day)) < cutoff):
             return None
-        return [(date.fromisoformat(r[0]), *r[1:]) for r in stored["rows"]]
+        return [(date.fromisoformat(r[0]), *r[1:]) for r in stored["rows"] if r[0] < cutoff]
 
-    def save_bars(self, day, symbol, length, rows):
-        """Only completed sessions before `day`, never today's forming bar."""
-        kept = [[str(r[0]), *r[1:]] for r in rows if str(r[0]) < str(day)]
-        self._write(self.root / str(day) / "bars" / f"{symbol}.json", {"requested": length, "rows": kept})
+    def save_bars(self, day, symbol, length, rows, *, cutoff=None):
+        """Keep sessions before the caller's verified cutoff (before `day` by default)."""
+        cutoff = str(cutoff or day)
+        kept = [[str(r[0]), *r[1:]] for r in rows if str(r[0]) < cutoff]
+        self._write(self.root / str(day) / "bars" / f"{symbol}.json",
+                    {"requested": length, "cutoff": cutoff, "rows": kept})
 
     def get(self, day, name):
         return self._read(self.root / str(day) / f"{name}.json")

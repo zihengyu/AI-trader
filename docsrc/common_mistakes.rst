@@ -126,6 +126,29 @@ Historical replays retain their dated research and evidence validation before a
 manager decision. Pre-open and post-close research remain read-only lifecycle
 work; this change does not introduce background research workers.
 
+Stale Prices and Changing Historical Fund Reports
+--------------------------------------------------------------------------------
+
+The optional autonomous fund admits a daily close only after that New York
+session's actual NYSE close, including daylight saving and early-close days.
+Before that instant the current daily bar remains excluded. The source cache,
+prefetched file and strategy cache refresh at the close so a morning response
+cannot suppress an available closing price. Missing source closes remain
+disclosed; a current quote is never substituted for a close.
+
+Scorecards refresh when a relevant visible research, decision, review or
+execution event is appended, at the close, and on the next New York date.
+Unrelated heartbeats retain the cache. Future-dated events remain excluded
+when querying with a simulated clock.
+
+Rebuilding an old daily report uses mandate, reserved-cash, target and approval
+evidence available at its cutoff. Approval expiry uses that same instant, and
+the current monitor file is omitted. Later capital changes do not rewrite an
+old report's authorization; missing historical mandate evidence stays unknown.
+The rolling model-cost summary uses one window for call counts, tokens,
+unpriced calls and costs. An empty recent window does not turn old priced
+calls into a missing-price warning.
+
 Many Fund Assessments but Few Telegram Notifications
 --------------------------------------------------------------------------------
 

@@ -3,6 +3,7 @@ import threading
 import time
 import os
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from types import SimpleNamespace
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -36,6 +37,20 @@ class CachedMarketHours:
 from lumibot.entities import Bars, Quote
 
 from .risk import RiskError, instant, number
+
+
+@lru_cache(maxsize=32)
+def _session_close(day):
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=day, end_date=day)
+    return schedule.iloc[0].market_close if not schedule.empty else None
+
+
+def completed_daily_cutoff(now):
+    """Exclusive New York date bound: today's bar becomes usable at its actual exchange close."""
+    now = instant(now)
+    day = now.astimezone(ZoneInfo("America/New_York")).date()
+    close = _session_close(day)
+    return day + timedelta(days=1) if close is not None and now >= close else day
 
 
 class SessionClock:
@@ -258,6 +273,7 @@ class YahooRealtimeData(DataSource):
     def _history(self, asset, interval, period):
         symbol, now = self._symbol(asset), self.get_datetime()
         key = (symbol, interval, period)
+        cutoff = completed_daily_cutoff(now) if interval == "1d" else None
         # A five-second broker poll does not require another identical history
         # download. Source timestamps, never cache age, still gate execution.
         ttl = (15 if self.session.status()["open"] else 300) if interval == "1m" else 900
@@ -266,7 +282,7 @@ class YahooRealtimeData(DataSource):
         # Single flight per series; never hold a global lock during network I/O.
         with lock:
             cached = self._cache.get(key)
-            if cached and time.monotonic() - cached[0] < ttl:
+            if cached and cached[2] == cutoff and time.monotonic() - cached[0] < ttl:
                 self._stats["cache_hits"] += 1
                 return cached[1].copy()
             failure = self._failures.get(key)
@@ -291,7 +307,7 @@ class YahooRealtimeData(DataSource):
                     raise
                 raise RiskError(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})") from None
             self._failures.pop(key, None)
-            self._cache[key] = (time.monotonic(), frame.copy())
+            self._cache[key] = (time.monotonic(), frame.copy(), cutoff)
             return frame
 
     def _download(self, symbol, interval, period, now):
@@ -318,7 +334,7 @@ class YahooRealtimeData(DataSource):
         if interval == "1m":
             frame = frame[frame.index + pd.Timedelta(minutes=1) <= now]
         else:
-            frame = frame[frame.index.date < now.date()]
+            frame = frame[frame.index.date < completed_daily_cutoff(now)]
         if frame.empty:
             raise RiskError("No completed market observations")
         for column in required:

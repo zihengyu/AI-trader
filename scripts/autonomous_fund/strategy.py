@@ -1947,17 +1947,23 @@ class AutonomousFund(Strategy):
             return {"unavailable": type(exc).__name__}
 
     def _scorecards(self, now):
-        """Objective track record from completed closes; cached per trading day."""
+        """Cache objective scores until visible evidence or the completed-session cutoff changes."""
         if getattr(self, "quant", None) is None:
             return None
+        from .market_data import completed_daily_cutoff
+        kinds = ("postmarket_review", "decision_validated", "protective_trigger", "entry_waiting",
+                 "order_submitted", "construction_variant", "research_idea")
+        with self.journal.connection() as db:
+            latest = db.execute("SELECT MAX(sequence) FROM events WHERE kind IN (%s) "
+                                "AND julianday(at)<=julianday(?)" % ",".join("?" * len(kinds)),
+                                (*kinds, instant(now).isoformat())).fetchone()[0]
+        key = (trading_day(now), completed_daily_cutoff(now), latest)
         cached = getattr(self, "_scorecard_cache", None)
-        if cached and cached[0] == trading_day(now):
+        if cached and cached[0] == key:
             return cached[1]
         from .review import _events
         from .scorecard import score_decisions, score_ideas, score_predictions, score_timing
-        rows = _events(self.journal, instant(now), kinds=("postmarket_review", "decision_validated",
-                                                          "protective_trigger", "entry_waiting", "order_submitted",
-                                                          "construction_variant", "research_idea"))
+        rows = _events(self.journal, instant(now), kinds=kinds)
         ideas = [r["body"] for r in rows if r["kind"] == "research_idea"][-200:]
         variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
         timing = [(r["at"], r["kind"], r["body"]) for r in rows
@@ -1995,7 +2001,7 @@ class AutonomousFund(Strategy):
                 self.journal.set_meta("construction_champion", construction["champion"])
                 self.notify("construction_switched", {"from": current, "to": construction["champion"],
                                                       "test": construction["test"]})
-        self._scorecard_cache = (trading_day(now), result)
+        self._scorecard_cache = (key, result)
         return result
 
     def _attribution(self, session, now):
@@ -2255,27 +2261,32 @@ class AutonomousFund(Strategy):
 
     # ----- Quantitative risk view -------------------------------------------------
     def _daily_bars(self, symbol, now):
-        """One daily-history read per symbol and trading day, shared by risk and the factor lab.
+        """One history read per symbol and completed-session cutoff, shared by risk and research.
 
         Returns (rows, error); rows are (date, close, volume). The day's data store
         (filled ahead by the scheduled prefetch) is read first; only a missing
         symbol is fetched, and what was fetched is written back for restarts.
         """
+        from .market_data import completed_daily_cutoff
+        cutoff = completed_daily_cutoff(now)
         day, key = trading_day(now), (trading_day(now), symbol)
         cache = getattr(self, "_bars", None)
-        if cache is None:
-            self._bars = cache = {}  # Test harnesses build the strategy without initialize().
+        if cache is None or getattr(self, "_bars_cutoff", None) != cutoff:
+            # A pre-open response cannot satisfy the post-close view, even within the same day.
+            self._bars = cache = {}
+            self._ohlc = {}
+            self._bars_cutoff = cutoff
         if key not in cache:
             length = history_length(self.quant, getattr(getattr(self, "factor_lab", None), "settings", None))
             store = getattr(self, "daily_store", None)
-            full, error = (store.bars(day, symbol, length) if store is not None else None), None
+            full, error = (store.bars(day, symbol, length, cutoff=cutoff) if store is not None else None), None
             if full is None:
                 full, error = self._fetch_daily_bars(symbol, length, now)
                 from .datastore import bars_settled
                 # Before 06:00 New York the day's split or dividend may be missing: used now, not stored.
                 if full and store is not None and bars_settled(now):
                     try:
-                        store.save_bars(day, symbol, length, full)
+                        store.save_bars(day, symbol, length, full, cutoff=cutoff)
                     except OSError:
                         pass  # The store is a cache: the bars are still used this time.
             if error:
@@ -2283,7 +2294,7 @@ class AutonomousFund(Strategy):
             rows = [(d, close, shares) for d, close, shares, _, _, _ in full or []]
             self._bars = {k: v for k, v in cache.items() if k[0] == day}
             self._ohlc = {k: v for k, v in (getattr(self, "_ohlc", None) or {}).items() if k[0] == day}
-            self._ohlc[key] = {str(d): (o, h, l) for d, _, _, o, h, l in full or [] if d < instant(now).date()}
+            self._ohlc[key] = {str(d): (o, h, l) for d, _, _, o, h, l in full or [] if d < cutoff}
             self._bars[key] = (rows, error)
         return self._bars[key]
 
@@ -2298,7 +2309,8 @@ class AutonomousFund(Strategy):
         if (error or not rows) and fallback is not None:
             # A second, official source for the same completed daily bars (risk and factor history only).
             try:
-                rows = fallback.bars(symbol, length, instant(now).astimezone(ZoneInfo("America/New_York")).date())
+                from .market_data import completed_daily_cutoff
+                rows = fallback.bars(symbol, length, completed_daily_cutoff(now))
                 self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
                                                                   "feed": fallback.feed, "yahoo_error": error})
                 error = None
@@ -2308,9 +2320,10 @@ class AutonomousFund(Strategy):
 
     @staticmethod
     def _completed(rows, now):
-        """Never today's forming (or a future) bar; only real, positive closes."""
-        today = instant(now).date()
-        return [(str(d), close, shares) for d, close, shares in rows if d < today and close == close and close > 0]
+        """Only real, positive closes of sessions completed by the strategy clock."""
+        from .market_data import completed_daily_cutoff
+        cutoff = completed_daily_cutoff(now)
+        return [(str(d), close, shares) for d, close, shares in rows if d < cutoff and close == close and close > 0]
 
     def _daily_closes(self, symbol, now):
         """Completed daily closes for risk estimation: the same window as before (es_lookback_days + 5 bars)."""

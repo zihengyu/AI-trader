@@ -83,14 +83,14 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
     """
     zone = ZoneInfo("America/New_York")
     calls = [r for r in rows if r["kind"] == "agent" and not scripted(r["body"]) and not r["body"].get("cache_hit")]
-    models = {r["body"].get("model") for r in calls}
     now = instant(now) if now is not None else (instant(calls[-1]["at"]) if calls else None)
     start = (now - timedelta(days=days)) if now is not None else None
+    # Counts, unknown-price notices and token totals must describe the same window as costs.
+    calls = [row for row in calls if start is None or start <= instant(row["at"]) <= now]
+    models = {r["body"].get("model") for r in calls}
     by_day, by_role, unpriced, tokens = {}, {}, 0, {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     for row in calls:
         at = instant(row["at"])
-        if start is not None and not start <= at <= now:
-            continue
         body = row["body"]
         counts = body.get("tokens") or token_counts(body.get("usage"))
         for key in tokens:

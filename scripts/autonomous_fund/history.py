@@ -9,7 +9,7 @@ factor lab only: the local virtual broker still matches orders and books
 dividends and splits from its own feed. The consolidated (SIP) feed is asked
 first; an account without it falls back to IEX bars, and the source is recorded.
 """
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .risk import RiskError
@@ -47,7 +47,8 @@ class AlpacaDailyHistory:
         today = today if isinstance(today, date) else date.fromisoformat(str(today)[:10])
         params = {"timeframe": "1Day", "adjustment": "split", "limit": 10000, "feed": self.feed,
                   "start": (today - timedelta(days=int(length * 1.5) + 10)).isoformat(),
-                  "end": (today - timedelta(days=1)).isoformat()}
+                  # Include the whole last eligible session, rather than stopping at UTC midnight.
+                  "end": datetime.combine(today, time.min, ZONE).isoformat()}
         try:
             raw = self._pages(symbol, params)
         except PermissionError:

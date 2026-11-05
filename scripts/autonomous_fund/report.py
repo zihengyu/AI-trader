@@ -14,11 +14,54 @@ REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_val
                 "agent", "notification", "startup", "premarket_research", "postmarket_review",
                 "agent_call_started", "agent_call_finished", "risk_overlay", "decision_backoff", "scorecard",
                 "protective_trigger", "price_alert", "review_triggered", "mandate_initialized",
-                "mandate_capital_changed", "operator_reserve_adjusted")
+                "mandate_capital_changed", "operator_reserve_adjusted", "decision_accepted",
+                "allocation_complete", "operator_approval")
 
 
 
 from .costs import call_cost, cost_summary, rate_for, token_counts  # noqa: F401  (token_counts: rehearsal)
+
+
+def _historical_state(events, approvals, cutoff):
+    """Rebuild mutable report views from evidence already visible at the requested instant."""
+    mandate, target = {}, None
+    visible, plans = [], {}
+    for row in approvals:
+        body = json.loads(row["body"])
+        if body.get("created_at") and instant(body["created_at"]) <= cutoff:
+            visible.append({**row, "state": "pending"})
+            plans[row["id"]] = body
+    for at, kind, body in events:
+        if kind == "mandate_initialized":
+            mandate = {"mandate_capital_basis": body.get("capital_usd"),
+                       "mandate_reserve_cash": body.get("reserved_cash")}
+        elif kind == "mandate_capital_changed":
+            mandate.update(mandate_capital_basis=body.get("to"), mandate_reserve_cash=body.get("reserved_cash"))
+        elif kind == "operator_reserve_adjusted":
+            mandate["mandate_reserve_cash"] = body.get("reserved_cash")
+        elif kind == "decision_accepted":
+            target = [body["id"], "active", body["until_at"], json.dumps(body["decision"])]
+        elif kind == "allocation_complete" and target and body["decision_id"] == target[0]:
+            target[1] = "complete"
+        if kind not in {"decision_accepted", "operator_approval"} and not (
+                kind == "notification" and body.get("kind") == "approval_required"):
+            continue
+        replacement_id = (body.get("details") or {}).get("id") if kind == "notification" else None
+        replacement = plans.get(replacement_id)
+        for row in visible:
+            plan = plans[row["id"]]
+            if instant(plan["created_at"]) > instant(at):
+                continue
+            superseded = (kind == "decision_accepted" and plan.get("decision_id") != body["id"] or
+                          replacement is not None and replacement_id != row["id"] and
+                          replacement.get("decision_id") == plan.get("decision_id"))
+            if superseded and row["state"] in {"pending", "approved"}:
+                row["state"] = "superseded"
+            elif kind == "operator_approval" and body["id"] == row["id"]:
+                row["state"] = body["state"]
+                if body["state"] == "rejected" and target and plan.get("decision_id") == target[0]:
+                    target[1] = "rejected"
+    return mandate, target, visible
 
 
 def report(root, prices=None, write_files=True, *, as_of=None):
@@ -27,6 +70,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     root = Path(root)
     # sqlite3's own context manager only commits; closing() releases the handle.
     with closing(sqlite3.connect(root / "state.sqlite3")) as db:
+        db.execute("BEGIN")  # Events and immutable request bodies come from the same snapshot.
         # Only the kinds a report uses; per-minute liveness rows are skipped.
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
             "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(REPORT_KINDS)),
@@ -38,14 +82,16 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         mandate_meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('mandate_reserve_cash','mandate_capital_basis')"))
     if as_of is not None:
         events = [row for row in events if instant(row[0]) <= instant(as_of)]
-    now = datetime.now(timezone.utc)
+        # Current meta/table states may have changed after the report's cutoff.
+        mandate_meta, target, approval_rows = _historical_state(events, approval_rows, instant(as_of))
+    now = instant(as_of) if as_of is not None else datetime.now(timezone.utc)
     for row in approval_rows:
         row["body"] = json.loads(row["body"])
         row["effective_state"] = "expired" if row["state"] in {"pending", "approved"} and instant(row["body"]["expires_at"]) <= now else row["state"]
     from .evaluation import forward_outcomes
     outcomes = forward_outcomes(events)
     monitor = None
-    if (root / "monitor.json").is_file():
+    if as_of is None and (root / "monitor.json").is_file():
         try:
             monitor = json.loads((root / "monitor.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
