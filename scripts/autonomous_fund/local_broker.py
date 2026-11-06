@@ -157,6 +157,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return self._read_balances(quote_asset, strategy)
 
     def ledger_audit(self, *, strict=True):
+        """Trade guards reconcile money facts; non-strict research audits include NAV history."""
         from .ledger_audit import audit_connection, require_consistent
         with self.journal.connection() as db:
             db.execute("BEGIN")

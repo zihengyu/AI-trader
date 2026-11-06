@@ -255,6 +255,15 @@ audit, not manufactured evidence. Exit codes are 0 for verified, 3 for partial
 or not applicable, and 2 for inconsistent or unavailable books. Verification is
 internal consistency of recorded evidence, not certification of vendor prices.
 
+High-frequency account reads, submissions and pre/post-fill guards reconcile
+the authoritative money, position, order, fill, fee and corporate-action records
+on every call (``scope: ledger``). They do not scan historical NAV projections.
+The explicit audit, reports and research audits retain full historical checking
+(``scope: ledger_and_observations``). Monitor receipts and metrics independently
+validate up to 200 recent candidate snapshots; without a valid candidate they
+leave the account update pending or omit its metrics. Trade-guard work therefore
+does not grow with NAV history, but still grows with actual orders and fills.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

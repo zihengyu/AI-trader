@@ -16,7 +16,38 @@ def _rows(db, sql):
     return [dict(zip(names, row)) for row in cursor]
 
 
-def _audit_connection(db, *, include_trades=False):
+def account_observation(sequence, at, body):
+    """Validate one derived NAV snapshot without scanning unrelated history.
+
+    Return no usable body when the observation is malformed or inconsistent.
+    Both full-history audits and bounded notification reads use this contract.
+    """
+    warnings = []
+    def warn(code):
+        warnings.append({"code": code, "sequence": sequence})
+    try:
+        body = json.loads(body) if isinstance(body, (str, bytes)) else body
+        number(body["cash"])
+        number(body["equity"])
+        instant(body.get("as_of") or at)
+        for quantity in body["positions"].values():
+            number(quantity)
+        if body.get("valuation") is not None:
+            marks = body["valuation"].get("quotes") or {}
+            held = body.get("positions") or {}
+            if not all(symbol in marks for symbol in held):
+                warn("account_mark_missing")
+            else:
+                expected = number(body["cash"]) + number(body.get("receivables", 0)) + sum(
+                    (number(qty) * number(marks[symbol]["price"]) for symbol, qty in held.items()), number(0))
+                if abs(number(body["equity"]) - expected) > Decimal("0.00000001"):
+                    warn("account_nav_arithmetic_mismatch")
+    except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError):
+        warn("invalid_account_observation")
+    return (None if warnings else body), warnings
+
+
+def _audit_connection(db, *, include_trades=False, include_observations=True):
     """Caller owns a consistent read transaction. Do not change tables or rows."""
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if "local_account" not in tables:
@@ -39,32 +70,22 @@ def _audit_connection(db, *, include_trades=False):
               and number(position["average"]) > 0, "invalid_position", symbol=position["symbol"])
     orders = {row["id"]: row for row in _rows(db, "SELECT * FROM local_orders")}
     fills = _rows(db, "SELECT * FROM local_fills ORDER BY observed_at,order_id,bar_start")
-    events = _rows(db, "SELECT sequence,at,kind,body FROM events WHERE kind IN "
-                   "('account','fill','local_corporate_action','local_ledger_origin','startup') ORDER BY sequence")
+    # Money checks run before every submission and fill. Historical NAV rows
+    # are derived projections, checked by the explicit audit/report path, not
+    # dependencies of a new cash/share transaction.
+    kinds = "'fill','local_corporate_action','local_ledger_origin','startup'"
+    if include_observations:
+        kinds += ",'account'"
+    events = _rows(db, f"SELECT sequence,at,kind,body FROM events WHERE kind IN ({kinds}) ORDER BY sequence")
     for event in events:
         if event["kind"] != "account":
             event["body"] = json.loads(event["body"])
             continue
-        try:
-            event["body"] = json.loads(event["body"])
-            body = event["body"]
-            number(body["cash"])
-            number(body["equity"])
-            instant(body.get("as_of") or event["at"])
-            for quantity in body["positions"].values():
-                number(quantity)
-            if body.get("valuation") is not None:
-                marks = body["valuation"].get("quotes") or {}
-                held = body.get("positions") or {}
-                complete = all(symbol in marks for symbol in held)
-                observation(complete, "account_mark_missing", sequence=event["sequence"])
-                if complete:
-                    expected = number(body["cash"]) + number(body.get("receivables", 0)) + sum(
-                        (number(qty) * number(marks[symbol]["price"]) for symbol, qty in held.items()), number(0))
-                    observation(same(body["equity"], expected), "account_nav_arithmetic_mismatch", sequence=event["sequence"])
-        except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError):
-            event["body"] = {}
-            observation(False, "invalid_account_observation", sequence=event["sequence"])
+        body, notices = account_observation(event["sequence"], event["at"], event["body"])
+        event["body"] = body or {}
+        warnings.extend(notices)
+        if notices:
+            invalid_accounts.add(event["sequence"])
     evidence = {}
     for event in events:
         if event["kind"] == "fill" and event["body"].get("bar_start") is not None:
@@ -239,11 +260,12 @@ def _audit_connection(db, *, include_trades=False):
             "arrival_quotes_verified": arrival_verified, **({"execution_quality": quality} if include_trades else {})}
 
 
-def audit_connection(db, *, include_trades=False):
+def audit_connection(db, *, include_trades=False, include_observations=True):
     try:
-        return _audit_connection(db, include_trades=include_trades)
+        result = _audit_connection(db, include_trades=include_trades, include_observations=include_observations)
     except (ValueError, TypeError, KeyError, IndexError, sqlite3.Error, ArithmeticError) as exc:
-        return {"status": "failed", "errors": [{"code": "invalid_ledger_record", "error": type(exc).__name__}]}
+        result = {"status": "failed", "errors": [{"code": "invalid_ledger_record", "error": type(exc).__name__}]}
+    return {**result, "scope": "ledger_and_observations" if include_observations else "ledger"}
 
 
 def audit(root):
@@ -260,7 +282,7 @@ def audit(root):
 
 
 def require_consistent(db):
-    result = audit_connection(db)
+    result = audit_connection(db, include_observations=False)
     if result["status"] == "failed":
         raise RiskError("Local ledger reconciliation failed: " + ", ".join(sorted({r["code"] for r in result["errors"]})))
     return result

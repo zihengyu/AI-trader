@@ -389,11 +389,10 @@ class Monitor:
 
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""
-        from .ledger_audit import audit_connection
-        integrity = audit_connection(db)
+        from .ledger_audit import account_observation, audit_connection
+        integrity = audit_connection(db, include_observations=False)
         if integrity["status"] == "failed":
             return
-        invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not startup or json.loads(startup[0]).get("mode") not in {"local", "paper"}:
             return
@@ -412,9 +411,9 @@ class Monitor:
         if visible:
             account, account_sequence = None, 0
             for row in db.execute("SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
-                if row["sequence"] in invalid_accounts:
+                body, _ = account_observation(row["sequence"], row["at"], row["body"])
+                if body is None:
                     continue
-                body = json.loads(row["body"])
                 observed = instant(body.get("as_of") or row["at"])
                 if instant(row["at"]) <= now and observed <= now:
                     body["as_of"] = str(observed)
@@ -782,17 +781,20 @@ def metrics_text(root, status):
     if book.is_file():
         with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             db.execute("BEGIN")
-            from .ledger_audit import audit_connection
-            integrity = audit_connection(db)
-            invalid = set(integrity.get("invalid_account_sequences", []))
-            row = next((row for row in db.execute("SELECT body,sequence FROM events WHERE kind='account' ORDER BY sequence DESC")
-                        if row[1] not in invalid), None) if integrity["status"] != "failed" else None
+            from .ledger_audit import account_observation, audit_connection
+            integrity = audit_connection(db, include_observations=False)
+            account = None
+            if integrity["status"] != "failed":
+                for sequence, at, body in db.execute(
+                        "SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
+                    account, _ = account_observation(sequence, at, body)
+                    if account is not None:
+                        break
             peak = db.execute("SELECT value FROM meta WHERE key='peak'").fetchone()
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             pending = (db.execute("SELECT count(*) FROM fund_approvals WHERE state='pending'").fetchone()[0]
                        if "fund_approvals" in tables else 0)
-        if row:
-            account = json.loads(row[0])
+        if account is not None:
             equity, cash = float(account["equity"]), float(account["cash"])
             lines += ["# TYPE fund_equity_usd gauge", f"fund_equity_usd {equity:.2f}",
                       "# TYPE fund_cash_usd gauge", f"fund_cash_usd {cash:.2f}",
