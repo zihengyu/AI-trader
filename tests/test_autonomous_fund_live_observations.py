@@ -226,8 +226,13 @@ def test_confirmed_fill_is_disclosed_during_snapshot_outage_then_followed_by_the
 def test_book_change_during_quote_fetch_cannot_publish_mixed_account_state(tmp_path):
     clock, source, journal, broker = setup_book(tmp_path)
     configure(broker)
-    with journal.connection() as db:
-        db.execute("INSERT INTO local_positions VALUES('ALFA',1,'90',?)", (str(clock.value),))
+    # Seed holdings through the real fill path so the new reconciliation check
+    # agrees with the book before this test introduces its concurrent change.
+    submit(broker, journal, clock.value)
+    advance(clock, source)
+    broker.do_polling()
+    count = sum(r["kind"] == "account" for r in journal.all_events())
+    advance(clock, source, 1)
     original = source.get_quote
     def change_book(asset):
         with journal.connection() as db:
@@ -235,11 +240,13 @@ def test_book_change_during_quote_fetch_cannot_publish_mixed_account_state(tmp_p
         return original(asset)
     source.get_quote = change_book
     broker.do_polling()
-    assert not [r for r in journal.all_events() if r["kind"] == "account"]
+    assert sum(r["kind"] == "account" for r in journal.all_events()) == count
     assert "Book changed" in broker._valuation_error
     source.get_quote = original
-    broker.do_polling()  # Changed book bypasses the normal thirty-second interval.
-    assert report(tmp_path, write_files=False)["latest_account"]["equity"] == 9900
+    broker.do_polling()
+    # An unexplained cash mutation is also a ledger inconsistency, so it must
+    # remain unavailable until the original correct cash is restored.
+    assert report(tmp_path, write_files=False)["latest_account"] is None
 
 
 @pytest.mark.parametrize("unavailable", [False, True])

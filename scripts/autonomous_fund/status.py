@@ -180,6 +180,9 @@ def account_lines(account, recent_trades=None, *, now=None):
         unit, label = next((unit, label) for unit, label in (
             (86400, "天"), (3600, "小时"), (60, "分钟"), (1, "秒")) if age >= unit or unit == 1)
         updated = f"{int(age // unit)}{label}前"
+    from .market_data import regular_session_open
+    if not regular_session_open(now):
+        updated = "休市"
     lines = [f"📌 当前实际持仓（快照：{when(at)}）",
              f"账户：净值 {money(account.get('equity'))}（{updated}）"
              f" ｜ 现金 {money(account.get('cash'))}"]
@@ -263,6 +266,8 @@ def summary(root, mode, now=None):
                      + (f"；市场：{open_text}" if open_text else ""))
         if beat.get("valuation_error"):
             lines.append(f"账户估值暂未更新：{beat['valuation_error']}；账户区块保留上次成功快照及其时间。")
+        if beat.get("market_data_error"):
+            lines.append(f"成交等待新行情：{beat['market_data_error']}；自动重试，原订单仍遵守限价和有效期。")
     lines.append(desk_line(root, now))
     book = root / "state.sqlite3"
     if not book.is_file():
@@ -275,6 +280,19 @@ def summary(root, mode, now=None):
         lines.append(f"账本：读取失败（{type(exc).__name__}）")
         return "\n".join(lines)
     account = data.get("latest_account") or {}
+    integrity = data.get("ledger_audit") or {}
+    if integrity.get("status") == "failed":
+        lines.append("账务校验失败：" + ", ".join(sorted({r["code"] for r in integrity.get("errors", [])}))
+                     + "；净值与成交明细暂不可用，需先核对账本。")
+    elif integrity.get("status") == "partial":
+        details = []
+        if integrity.get("missing_evidence"):
+            details.append("缺少历史证据：" + ", ".join(integrity["missing_evidence"]))
+        if integrity.get("warnings"):
+            details.append("估值／统计证据存在异常，已停用对应数据；现金持仓成交校验不受其影响")
+        lines.append("账务校验：部分核实（" + "；".join(details) + "）")
+    elif integrity.get("status") == "verified":
+        lines.append("账务校验：通过（现金、持仓、成交、费用及模拟执行依据一致）")
     if account:
         lines += ["", *account_lines(account, data.get("recent_trades"), now=now), ""]
     if data.get("return") is not None:

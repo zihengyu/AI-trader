@@ -71,10 +71,13 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     # sqlite3's own context manager only commits; closing() releases the handle.
     with closing(sqlite3.connect(root / "state.sqlite3")) as db:
         db.execute("BEGIN")  # Events and immutable request bodies come from the same snapshot.
+        from .ledger_audit import audit_connection
+        integrity = audit_connection(db) if as_of is None else {"status": "not_checked", "reason": "Historical cutoff"}
         # Only the kinds a report uses; per-minute liveness rows are skipped.
-        events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(REPORT_KINDS)),
-            REPORT_KINDS)]
+        invalid_accounts = set(integrity.get("invalid_account_sequences", []))
+        events = [(at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
+            "SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(REPORT_KINDS)),
+            REPORT_KINDS) if not (kind == "account" and sequence in invalid_accounts)]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         approval_rows = [dict(zip(("id", "digest", "state", "body"), r)) for r in db.execute(
             "SELECT id,digest,state,body FROM fund_approvals ORDER BY rowid")] if "fund_approvals" in tables else []
@@ -136,10 +139,19 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     # Its timestamp is observation time, not an invented execution timestamp.
     fills = [row for row in fills if row["broker_id"] not in reconciled] + list(reconciled.values())
     accounts.sort(key=lambda row: instant(row["at"]))
+    if accounts and (accounts[-1].get("valuation") or {}).get("session_close"):
+        closing_mark = accounts[-1]
+        cutoff = instant(closing_mark["valuation"]["session_close"])
+        # Older runners rewrote identical off-hours account observations. A
+        # recovered, source-proven close supersedes those observation clones.
+        accounts = [row for row in accounts if row is closing_mark or
+                    not (cutoff < instant(row["at"]) <= instant(closing_mark["at"]) and
+                         not (row.get("valuation") or {}).get("session_close"))]
     daily = {}
     for row in accounts:
-        daily[trading_day(instant(row["at"]))] = row
-    curve = list(daily.values())
+        day_at = row["as_of"] if (row.get("valuation") or {}).get("session_close") else row["at"]
+        daily[trading_day(instant(day_at))] = row
+    curve = [daily[day] for day in sorted(daily)]
     peak, max_drawdown, previous = 0, 0, None
     for row in curve:
         peak = max(peak, row["equity"])
@@ -248,8 +260,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                     "reserved_cash": mandate_meta.get("mandate_reserve_cash"), "events": mandate_events[-10:]},
         "decision_backoffs": backoffs,
         "observations": len(curve), "starting_equity": initial,
-        "ending_equity": curve[-1]["equity"] if curve else None,
-        "return": curve[-1]["equity"] / initial - 1 if initial is not None and initial > 0 and curve else None,
+        "ending_equity": accounts[-1]["equity"] if accounts else None,
+        "return": accounts[-1]["equity"] / initial - 1 if initial is not None and initial > 0 and accounts else None,
         "max_observed_drawdown": observed_drawdown if observed_peak > 0 else None,
         "max_daily_drawdown": max_drawdown if peak > 0 else None,
         "daily_sharpe_zero_risk_free": sharpe,
@@ -263,12 +275,22 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
         "latest_account": accounts[-1] if accounts else None,
         "recent_trades": recent_trades(events, accounts[-1]["as_of"]) if accounts else [],
+        "ledger_audit": integrity,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
                         "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."
     }
+    if integrity["status"] == "failed":
+        # Retain the audit evidence, but do not publish disputed balances or
+        # trade prices as usable account facts to operators and research tools.
+        for field in ("latest_account", "ending_equity", "return", "observed_fees", "max_observed_drawdown",
+                      "max_daily_drawdown", "daily_sharpe_zero_risk_free"):
+            summary[field] = None
+        summary["recent_trades"] = []
     if not write_files:
         return summary
     (root / "report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    if integrity["status"] == "failed":
+        return summary  # Do not overwrite last-good equity/fill exports with disputed data.
     if premarket:
         (root / "premarket_research.json").write_text(json.dumps(premarket[-1], indent=2, ensure_ascii=False), encoding="utf-8")
     from .review import export_reviews

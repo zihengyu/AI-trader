@@ -16,7 +16,7 @@ from lumibot.trading_builtins import PollingStream
 
 from .journal import encode
 from .market_data import CachedMarketHours
-from .risk import Account, ObservedPrice, RiskError, instant, number, observed_quote, trading_day
+from .risk import Account, MarketDataUnavailable, ObservedPrice, RiskError, instant, number, observed_quote, trading_day
 
 
 class VirtualRiskCancellation(RiskError):
@@ -36,6 +36,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self.fee_rate, self.slippage = number(fee_rate), number(slippage_bps) / 10000
         self.volume_fraction = number(volume_fraction)
         self._last_poll_error = None
+        self._market_data_error = None
         self._valuation_policy = None
         self._valuation_error = None
         self._last_valuation = None
@@ -137,6 +138,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 bucket.append(order)
 
     def _pull_positions(self, strategy):
+        self.ledger_audit()
         name = self._strategy_name_from_input(strategy)
         with self.journal.connection() as db:
             return [Position(name, Asset(row["symbol"], asset_type="stock"), row["quantity"],
@@ -151,6 +153,17 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return number(db.execute("SELECT receivables FROM local_account WHERE id=1").fetchone()[0])
 
     def _get_balances_at_broker(self, quote_asset, strategy):
+        with self._poll_lock:
+            return self._read_balances(quote_asset, strategy)
+
+    def ledger_audit(self, *, strict=True):
+        from .ledger_audit import audit_connection, require_consistent
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            return require_consistent(db) if strict else audit_connection(db)
+
+    def _read_balances(self, quote_asset, strategy):
+        self.ledger_audit()
         self._corporate_actions()
         positions = self._pull_positions(strategy)
         with self.journal.connection() as db:
@@ -165,15 +178,20 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         observed = {}
         market_open = self.is_market_open()
         for position in positions:
+            if not market_open:
+                mark = self._closing_quote(position.asset, self.data_source.session.last_close())
+                mark_day = trading_day(mark.as_of)
+                if mark_day < splits.get(position.asset.symbol, mark_day):
+                    raise MarketDataUnavailable("Price predates applied split; valuation paused")
+                observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
+                value += number(position.quantity) * mark.price
+                continue
             quote = self.data_source.get_quote(position.asset)
             mark_day = trading_day(instant(quote.timestamp))
             if mark_day < splits.get(position.asset.symbol, mark_day):
-                raise RiskError("Price predates applied split; valuation paused")
-            if market_open:
-                mark = observed_quote(quote, self.data_source.get_datetime(), self.limits)
-                observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
-            else:
-                observed[position.asset.symbol] = {"price": str(quote.price), "as_of": str(quote.timestamp)}
+                raise MarketDataUnavailable("Price predates applied split; valuation paused")
+            mark = observed_quote(quote, self.data_source.get_datetime(), self.limits)
+            observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
             value += number(position.quantity) * number(observed[position.asset.symbol]["price"])
         if market_open:
             for mark in observed.values():
@@ -192,6 +210,14 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._valuation_policy = dict(universe=frozenset(universe), mandate=mandate, sweep=sweep,
                                       daily_loss_limit=daily_loss_limit, interval_seconds=interval_seconds,
                                       benchmark_symbols=tuple(benchmark_symbols))
+        with self.journal.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if (not db.execute("SELECT 1 FROM events WHERE kind IN ('local_ledger_origin','startup') LIMIT 1").fetchone()
+                    and not db.execute("SELECT 1 FROM local_fills LIMIT 1").fetchone()
+                    and not db.execute("SELECT 1 FROM local_positions WHERE quantity>0 LIMIT 1").fetchone()):
+                row = db.execute("SELECT cash,receivables FROM local_account WHERE id=1").fetchone()
+                if number(row[0]) == number(mandate.local_account_usd) and number(row[1]) == 0:
+                    self._event(db, "local_ledger_origin", {"cash": row[0], "receivables": row[1], "positions": {}})
 
     @staticmethod
     def _valuation_book(db):
@@ -211,14 +237,29 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         if policy is None:
             return
         start = self.data_source.get_datetime()
+        closed_at = None if self.is_market_open() else self.data_source.session.last_close()
+        book_existed = True
+        if closed_at is not None:
+            # A closing observation is durable, including all-cash books. Reuse
+            # it across polls, pre-open research and restarts until another close.
+            with self.journal.connection() as db:
+                origin = db.execute("SELECT at FROM events WHERE kind IN ('local_ledger_origin','startup') ORDER BY sequence LIMIT 1").fetchone()
+                book_existed = origin is not None and instant(origin[0]) <= closed_at
+                saved = db.execute("SELECT body FROM events WHERE kind='account' AND "
+                                   "json_extract(body,'$.valuation.session_close')=? ORDER BY sequence DESC LIMIT 1",
+                                   (str(closed_at),)).fetchone()
+            if saved:
+                self._last_valuation = json.loads(saved[0])
+                self._valuation_error = None
+                return
         with self.journal.connection() as db:
             db.execute("BEGIN")
+            from .ledger_audit import require_consistent
+            integrity = require_consistent(db)
             book = self._valuation_book(db)
         key = encode(book)
         if self._next_valuation is not None and start < self._next_valuation and key == self._valuation_book_key:
             return
-        if book["positions"] and not self.is_market_open():
-            return  # Closed-market holdings keep their last observed mark and source time.
         self._next_valuation = start + timedelta(seconds=policy["interval_seconds"])
         self._valuation_book_key = key
         mandate, meta = policy["mandate"], book["meta"]
@@ -228,11 +269,12 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         positions = []
         for row in book["positions"]:
             asset = Asset(row["symbol"], asset_type="stock")
-            marks[row["symbol"]] = observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits)
+            marks[row["symbol"]] = (self._closing_quote(asset, closed_at) if closed_at is not None else
+                observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits))
             positions.append(Position("local-valuation", asset, row["quantity"], avg_fill_price=float(number(row["average"]))))
         now = self.data_source.get_datetime()
         for symbol, mark in marks.items():
-            mark.validate(now, self.limits)
+            mark.validate(closed_at or now, self.limits)
             split_days = [item.rsplit(":", 2)[1] for item in book["splits"] if item.rsplit(":", 2)[0] == symbol]
             if split_days and trading_day(mark.as_of) < max(split_days):
                 raise RiskError("Price predates applied split; independent valuation paused")
@@ -257,29 +299,50 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         benchmarks = {}
         for symbol in policy["benchmark_symbols"]:
             try:
-                mark = marks.get(symbol) or observed_quote(self.data_source.get_quote(Asset(symbol, asset_type="stock")),
-                                                           self.data_source.get_datetime(), self.limits)
+                asset = Asset(symbol, asset_type="stock")
+                mark = marks.get(symbol) or (self._closing_quote(asset, closed_at) if closed_at is not None else
+                    observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits))
                 benchmarks[symbol] = str(mark.price)
             except Exception:
                 continue  # Missing benchmark evidence must never invent a return.
         now = self.data_source.get_datetime()
         for mark in marks.values():
-            mark.validate(now, self.limits)
-        account = replace(account, as_of=now)
-        body = {**asdict(account), "valuation": {"source": "local_broker_poll", "quotes": {
+            mark.validate(closed_at or now, self.limits)
+        account = replace(account, as_of=closed_at if closed_at is not None and book_existed else now)
+        body = {**asdict(account), "ledger_audit": integrity, "valuation": {"source": "local_session_close" if closed_at else "local_broker_poll",
+            **({"session_close": str(closed_at), "observed_at": str(now), "book_existed_at_close": book_existed} if closed_at else {}), "quotes": {
             symbol: {"price": str(mark.price), "as_of": str(mark.as_of)}
             for symbol, mark in marks.items() if symbol in holdings}}}
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if self._valuation_book(db) != book:
                 raise RiskError("Book changed during valuation; retry with the next observation")
-            self._event(db, "account", body)
+            if closed_at is not None:
+                if any(instant(row[0]) > closed_at for row in db.execute("SELECT observed_at FROM local_fills")):
+                    raise RiskError("Post-close trades prevent reconstructing the closing book")
+                if any(row[0].rsplit(":", 2)[1] > trading_day(closed_at) for row in db.execute("SELECT id FROM local_actions")):
+                    raise RiskError("Post-close corporate action prevents reconstructing the closing book")
+                if any(instant(row[0]) > closed_at for row in db.execute("SELECT at FROM events WHERE kind IN "
+                        "('mandate_capital_changed','operator_reserve_adjusted')")):
+                    raise RiskError("Post-close reserve change prevents reconstructing the closing sleeve")
+            # Record when the evidence was obtained, retaining the price cutoff
+            # separately. Historical reports cannot see later recovery evidence.
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "account", encode(body)))
             if benchmarks:
-                self._event(db, "benchmark", benchmarks)
-        self.journal.mark_equity(now, account.equity, self.limits)
-        self.journal.observe_session(now, account, policy["daily_loss_limit"])
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "benchmark", encode(benchmarks)))
+        self.journal.mark_equity(account.as_of, account.equity, self.limits)
+        self.journal.observe_session(account.as_of, account, policy["daily_loss_limit"])
         self._last_valuation = json.loads(encode(body))
         self._valuation_error = None
+
+    def _closing_quote(self, asset, closed_at):
+        # Demand the final completed regular-session minute. A stale intraday
+        # mark must never acquire the label or timestamp of a closing price.
+        frame = self.data_source.execution_bars(asset, required_through=closed_at)
+        rows = frame[frame.index + timedelta(minutes=1) == closed_at]
+        if rows.empty:
+            raise RiskError("Closing minute unavailable; retaining the last observed valuation")
+        return ObservedPrice(number(rows.iloc[-1].close), closed_at).validate(closed_at, self.limits)
 
     def _submit_order(self, order):
         if self.require_monitor:
@@ -295,6 +358,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM intents WHERE id=? AND status!='terminal'", (key,)).fetchone()
+            from .ledger_audit import require_consistent
+            require_consistent(db)
             if row is None:
                 raise RiskError("A durable risk reservation is required")
             body = json.loads(row["body"])
@@ -340,6 +405,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             if self._stop_event.is_set():
                 return
             self._corporate_actions()
+            pending = []
             for row in self._pull_broker_all_orders():
                 if row["status"] not in {"new", "partial_fill"}:
                     continue
@@ -349,12 +415,23 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                     self.cancel_order(order)
                     continue
                 if self.matching_enabled and self.is_market_open():
-                    self._match(row, order)
-            self._last_poll_error = None
+                    try:
+                        self._match(row, order)
+                    except MarketDataUnavailable as exc:
+                        # A missing symbol cannot prevent a risk-reducing sale
+                        # of another symbol with its own valid execution data.
+                        pending.append(str(exc))
+            if pending:
+                self._note_market_data_pending("; ".join(dict.fromkeys(pending)))
+            else:
+                self._last_poll_error = None
+                self._market_data_error = None
             try:
                 self._publish_valuation()
             except Exception as exc:
                 self._valuation_error = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
+        except MarketDataUnavailable as exc:
+            self._note_market_data_pending(str(exc))
         except Exception as exc:
             message = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
             if message != self._last_poll_error:
@@ -370,7 +447,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                         "matching_enabled": self.matching_enabled,
                         "market": self.data_source.session.status(), "stopped": (self.journal.root / "STOP").exists(),
                         "matching_error": self._last_poll_error, "pending_orders": pending, **account}
-                body.update(valuation=self._last_valuation, valuation_error=self._valuation_error)
+                body.update(valuation=self._last_valuation, valuation_error=self._valuation_error,
+                            market_data_error=self._market_data_error)
                 if hasattr(self.data_source, "diagnostics"):
                     body["market_data"] = self.data_source.diagnostics()
                 target = self.journal.root / "status.json"
@@ -379,6 +457,12 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 temporary.replace(target)
             except Exception:
                 pass
+
+    def _note_market_data_pending(self, message):
+        if message != self._market_data_error:
+            self.journal.event(self.data_source.get_datetime(), "notification", {
+                "kind": "local_market_data_pending", "details": message})
+        self._market_data_error = message
 
     def _match(self, row, order):
         frame = self.data_source.execution_bars(order.asset)
@@ -420,7 +504,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 quote = self.data_source.get_quote(position.asset)
                 age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
                 if not 0 <= age <= self.limits.quote_max_seconds:
-                    raise RiskError("Stale holding mark; virtual fills paused")
+                    raise MarketDataUnavailable("Stale holding mark; virtual fills paused")
                 marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
         else:
             # A risk-reducing sale never waits on OTHER holdings' marks. Its own bar
@@ -429,9 +513,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 splits = [row[0].rsplit(":", 2)[1] for row in db.execute(
                     "SELECT id FROM local_actions WHERE id LIKE ?", (f"{order.asset.symbol}:%:split",))]
             if splits and trading_day(start) < max(splits):
-                raise RiskError("Price predates applied split; virtual fills paused")
+                raise MarketDataUnavailable("Price predates applied split; virtual fills paused")
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .ledger_audit import require_consistent
+            require_consistent(db)
             row = db.execute("SELECT * FROM local_orders WHERE id=?", (identifier,)).fetchone()
             if row["status"] not in {"new", "partial_fill"} or (row["last_bar"] and start <= instant(row["last_bar"])):
                 return
@@ -478,7 +564,13 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             self._event(db, "fill", {"broker_id": identifier, "symbol": order.asset.symbol, "side": str(order.side),
                                       "quantity": str(quantity), "price": str(price), "trade_cost": str(fee),
                                       "execution_id": identifier + ":" + start.isoformat(), "bar_start": start.isoformat(),
-                                      "evidence_kind": "local_completed_bar_simulation"})
+                                      "evidence_kind": "local_completed_bar_simulation",
+                                      "bar": {key: str(number(bar[key])) for key in ("open", "high", "low", "close", "volume")},
+                                      "execution_assumptions": {"fee_rate": str(self.fee_rate),
+                                          "spread_bps": str(self.data_source.spread * 10000),
+                                          "slippage_bps": str(self.slippage * 10000),
+                                          "volume_fraction": str(self.volume_fraction)}})
+            require_consistent(db)  # Cash, lots, fills and evidence commit together or all roll back.
         order.trade_cost = float(total_fee)
         order.avg_fill_price = float(total / filled)
         self._process_trade_event(order, self.FILLED_ORDER if status == "fill" else self.PARTIALLY_FILLED_ORDER,
@@ -527,7 +619,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                             entitled = self._dividend_quantity(db, asset.symbol, action["date"])
                             db.execute("UPDATE local_account SET receivables=? WHERE id=1", (str(receivable + entitled * amount),))
                         db.execute("INSERT INTO local_actions VALUES(?,?)", (key, str(amount)))
-                        self._event(db, "local_corporate_action", {"symbol": asset.symbol, **action, "kind": kind})
+                        self._event(db, "local_corporate_action", {"symbol": asset.symbol, **action, "kind": kind,
+                            **({"entitled_quantity": str(entitled)} if kind == "dividend" else {})})
 
     @staticmethod
     def _same_action(kind, recorded, amount, action, actions):

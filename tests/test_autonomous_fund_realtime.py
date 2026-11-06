@@ -123,7 +123,10 @@ def test_status_command_reports_pending_requests_and_the_sleeve(tmp_path):
     journal.event(NOW, "account", {"cash": "9000", "equity": "10000", "positions": {"ALFA": 10}})
     bot.batches = [[message("状态", NOW + timedelta(minutes=1))]]
     monitor.poll(NOW + timedelta(minutes=1))
-    assert "待审批请求：1" in bot.sent[-1][0] and "10000" in bot.sent[-1][0]
+    # Status uses the shared reconciled account renderer, including grouped
+    # currency and source-snapshot age, rather than reading a raw journal row.
+    assert "待审批请求：1" in bot.sent[-1][0] and "$10,000.00" in bot.sent[-1][0]
+    assert "$9,000.00" in bot.sent[-1][0] and "（1分钟前）" in bot.sent[-1][0]
 
 
 def test_replies_can_be_disabled_by_the_operator(tmp_path, monkeypatch):

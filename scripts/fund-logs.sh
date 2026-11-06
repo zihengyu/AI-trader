@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Maintenance and logs for the AI paper fund on Ubuntu.
-# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|approvals|decisions [YYYY-MM-DD]]
+# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
 #   errors     last 80 warning/error records in 24 hours, including complete tracebacks
@@ -37,6 +37,8 @@ case "${1:-status}" in
     fi ;;
   report)
     fund report ;;
+  audit)
+    fund audit-ledger ;;
   approvals)
     fund approvals ;;
   decisions)
@@ -47,5 +49,5 @@ case "${1:-status}" in
     if [[ $# -eq 2 ]]; then args+=(--session-date "$2"); fi
     fund "${args[@]}" ;;
   *)
-    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|approvals|decisions [YYYY-MM-DD]]" >&2; exit 2 ;;
+    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]]" >&2; exit 2 ;;
 esac

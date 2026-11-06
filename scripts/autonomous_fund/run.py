@@ -304,7 +304,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -432,6 +432,15 @@ def main(argv=None):
     if args.mode == "decisions":
         from .decision_activity import activity, lines
         print("\n".join(lines(activity(args.run_dir, args.session_date), timeline=True)))
+        return
+    if args.mode == "audit-ledger":
+        from .ledger_audit import audit
+        result = audit(args.run_dir)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        if result["status"] in {"failed", "unavailable"}:
+            raise SystemExit(2)
+        if result["status"] != "verified":
+            raise SystemExit(3)
         return
     if args.mode == "status":
         # Read-only: never creates an account directory or journal.

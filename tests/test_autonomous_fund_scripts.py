@@ -114,8 +114,10 @@ def test_logs_status_explains_the_state_in_one_screen(tmp_path):
     [saved] = [row["body"] for row in Journal(book, "synthetic-script-account").all_events() if row["kind"] == "account"]
     from scripts.autonomous_fund.status import summary
     later = datetime.fromisoformat(saved["as_of"]) + timedelta(minutes=3)
-    assert "净值 $10,000.00（3分钟前）" in summary(book, "local", now=later)
-    assert "前） ｜ 现金" in result.stdout
+    from scripts.autonomous_fund.market_data import regular_session_open
+    label = "3分钟前" if regular_session_open(later) else "休市"
+    assert f"净值 $10,000.00（{label}）" in summary(book, "local", now=later)
+    assert "） ｜ 现金" in result.stdout
     follow = script("fund-logs.sh", tmp_path, env, "logs")
     assert ("+ journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service "
             "-u lumibot-fund-desk.service -f") in follow.stdout

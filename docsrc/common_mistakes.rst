@@ -200,6 +200,7 @@ and entry limits describe a plan; they do not establish that an order filled.
 The equity amount includes the snapshot age in parentheses, using seconds,
 minutes, hours or days. Its age is calculated when status is queried or a notice
 is delivered; a delayed notice never resets the original observation time.
+Outside regular trading hours, the equity label shows that the market is closed.
 
 Local and paper decisions refresh the account after the model returns and before
 queuing the plan notice. A failed refresh is shown as unavailable. Confirmed fills
@@ -222,18 +223,48 @@ is retained. Longer notices arrive as complete text attachments with holdings
 visible in the caption.
 
 In local simulation, the existing broker poll marks the capital sleeve about
-every thirty seconds, and retries immediately after book changes, even while an
+every thirty seconds during the open session, and retries after book changes, even while an
 agent call is running. Marks include cash, receivables and observed position
 values, preserving reserved capital, external holdings and cash-equivalent
 classification. Quotes retain source times. Stale open-session quotes or a book
-change during the read prevent publication; closed-session holdings retain their
-last observation. Status exposes valuation errors without relabeling old equity
+change during the read prevent publication. Both cash-only and invested accounts
+save one closing valuation from the final completed regular-session minute and
+reuse it across polls, restarts and reviews until the next open. Missing final
+minutes are disclosed rather than labeling an old intraday mark as a close.
+Status exposes valuation errors without relabeling old equity
 as a new observation. Paper accounts continue to use broker observations.
 
 Local simulated purchases and sales each deduct a fee of 0.1 percent of traded
 notional. It is already reflected in cash and equity; spread and slippage are
 additional execution-price assumptions. Paper fees follow broker evidence and
 remain unknown when the broker does not report them.
+
+``bash scripts/fund-logs.sh audit`` reconciles the selected local book from a
+read-only database snapshot: opening cash, buys, sales, fees, weighted entry
+prices, quantities, order totals, corporate actions and marked NAV arithmetic.
+New simulated fills retain the OHLCV and execution assumptions in the same
+transaction; reconciliation failure rolls that transaction back. Account reads
+and reports withhold disputed balances and trade prices. Research remains
+available with an explicit audit status in its context.
+
+Submission quotes retain their own source times. Attribution uses the observed
+ask for buys and bid for sales, and never substitutes a limit order price.
+Missing arrivals leave timing and slippage unknown; unreported fees remain
+unknown too. Historical records without the required inputs produce a partial
+audit, not manufactured evidence. Exit codes are 0 for verified, 3 for partial
+or not applicable, and 2 for inconsistent or unavailable books. Verification is
+internal consistency of recorded evidence, not certification of vendor prices.
+
+Missing legacy analytics evidence does not block valid trades. An invalid
+historical NAV projection is reported as a partial-audit warning and excluded
+from reports, notifications and review inputs; cash, shares, fills and fees
+remain independently checked. A real ledger mismatch still blocks execution
+and requires reconciliation. Temporary unavailable, stale or invalid source
+observations keep orders pending for automatic retry without a permanent stop.
+Their limits, expiry and freshness checks continue to apply. A missing symbol's
+execution data does not starve another symbol's valid sale; purchases still
+require a reliable portfolio valuation, and unavailable corporate-action data
+must be checked before execution can continue.
 
 Read-only price alerts may observe symbols outside the tradable universe, such
 as indices without trading volume, when the configured source supplies a fresh

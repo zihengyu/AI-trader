@@ -175,7 +175,7 @@ MODES = {"local": "真实行情本地模拟盘：Yahoo 行情 + 本地虚拟资�
 # preflight commands keep their own directory and never write into an account.
 # Commands that act on the FUND_MODE account. The rehearsal, the prefetch and the data desk
 # belong here too: otherwise they used the earlier default directory, not the running account.
-ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "stop", "resume", "attach-order", "reset-drawdown",
+ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown",
                               "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
                               "notify-test", "status", "decisions", "rehearse", "prefetch", "datadesk"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")

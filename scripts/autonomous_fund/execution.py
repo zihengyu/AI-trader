@@ -125,6 +125,9 @@ class ExecutionState:
                 CREATE TABLE IF NOT EXISTS fund_orders (
                     intent_id TEXT PRIMARY KEY, decision_id TEXT NOT NULL, symbol TEXT NOT NULL,
                     side TEXT NOT NULL, submitted_at TEXT NOT NULL, reference TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS fund_order_quotes (
+                    intent_id TEXT PRIMARY KEY, bid TEXT NOT NULL, ask TEXT NOT NULL,
+                    as_of TEXT NOT NULL, observed_at TEXT NOT NULL);
                 -- Standing AI levels (stop / take-profit / entry) of the latest AI decision.
                 CREATE TABLE IF NOT EXISTS fund_levels (
                     symbol TEXT PRIMARY KEY, decision_id TEXT NOT NULL, body TEXT NOT NULL,
@@ -309,10 +312,16 @@ class ExecutionState:
                                      (decision_id, symbol)).fetchone()[0])
 
     # Execution-quality memory: arrival price and submission time per order.
-    def record_submission(self, intent_id, decision_id, intent, now):
+    def record_submission(self, intent_id, decision_id, intent, now, *, quote=None):
         with self.journal.connection() as db:
             db.execute("INSERT OR REPLACE INTO fund_orders VALUES(?,?,?,?,?,?)", (
                 intent_id, decision_id, intent.symbol, intent.side, str(now), str(intent.limit)))
+            if quote is not None:
+                bid, ask, stamp = number(quote.bid), number(quote.ask), instant(quote.as_of)
+                if not 0 < bid <= ask or stamp > instant(now):
+                    raise RiskError("Invalid submission quote evidence")
+                db.execute("INSERT OR IGNORE INTO fund_order_quotes VALUES(?,?,?,?,?)",
+                           (intent_id, str(bid), str(ask), str(stamp), str(now)))
 
     def mark_protective(self, intent_id, now):
         with self.journal.connection() as db:
@@ -328,6 +337,8 @@ class ExecutionState:
         return instant(row[0]) if row else None
 
     def arrival(self, decision_id, symbol, side):
+        # Execution chase controls use the first submitted limit. Performance
+        # attribution uses observed_arrivals(), which requires actual quotes.
         with self.journal.connection() as db:
             row = db.execute("SELECT reference FROM fund_orders WHERE decision_id=? AND symbol=? AND side=? "
                              "ORDER BY rowid LIMIT 1", (decision_id, symbol, side)).fetchone()
@@ -439,6 +450,25 @@ def operator_connection(root):
             yield db
     finally:
         db.close()
+
+
+def observed_arrivals(db, *, as_of=None):
+    """Executable-side quotes per intent; legacy order limits are not arrival prices."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_order_quotes'").fetchone():
+        return {}
+    result = {}
+    for intent, side, bid, ask, stamp, observed, submitted in db.execute(
+            "SELECT q.intent_id,o.side,q.bid,q.ask,q.as_of,q.observed_at,o.submitted_at FROM fund_order_quotes q "
+            "JOIN fund_orders o ON o.intent_id=q.intent_id"):
+        try:
+            if as_of is not None and instant(observed) > instant(as_of):
+                continue
+            if not 0 < number(bid) <= number(ask) or not instant(stamp) <= instant(observed) <= instant(submitted):
+                continue
+        except (TypeError, ValueError):
+            continue  # Bad analytics evidence is unknown, never an invented execution benchmark.
+        result[intent] = float(number(ask if side == "buy" else bid))
+    return result
 
 
 def approval_code(key):

@@ -52,6 +52,10 @@ SQL_RESEARCH_PROMPT = (
     "Compute lagged returns in one CTE, rolling statistics in the next, and aggregates in a later SELECT; "
     "DuckDB does not allow nested window functions or window functions inside aggregate arguments. "
     "After a query error, use its feedback to correct the SQL and inspect a successful result before citing it. "
+    "If ledger_audit or current_ledger_audit reports failed reconciliation, account balances and fills are "
+    "disputed evidence: disclose the failure and research freely without claiming them as verified facts. "
+    "Partial audits name missing historical evidence; do not invent fees, arrival quotes or slippage, "
+    "and never substitute an order limit for an observed market quote. "
 )
 
 
@@ -1203,6 +1207,23 @@ class AutonomousFund(Strategy):
                 return self._snapshot_account()
         return self._snapshot_account()
 
+    def _verify_local_account_read(self):
+        if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+            self.broker.ledger_audit()
+
+    def get_cash(self):
+        # Fail before native balance-refresh fallback can reuse cached values.
+        self._verify_local_account_read()
+        return super().get_cash()
+
+    def get_portfolio_value(self):
+        self._verify_local_account_read()
+        return super().get_portfolio_value()
+
+    def get_positions(self, *args, **kwargs):
+        self._verify_local_account_read()
+        return super().get_positions(*args, **kwargs)
+
     def _snapshot_account(self):
         start = self.get_datetime()
         orders = self._orders()
@@ -1220,10 +1241,12 @@ class AutonomousFund(Strategy):
         from .holdings import average_prices, split_holdings
         configured = getattr(self, "_configured_universe", None) or self.universe
         baseline = self.journal.get_meta("mandate_external") if mandate.capital_usd is not None else None
+        local_marks = getattr(self.broker, "_last_balance_marks", None) if self.mode == "local" else None
         holdings, external, external_value, shared = split_holdings(
             positions, configured, quote_asset=self.quote_asset, allow_external=mandate.allow_external_holdings,
             baseline=baseline, initialized=baseline is not None,
-            price=lambda symbol: self.get_last_price(Asset(symbol, asset_type="stock")))
+            price=lambda symbol: number(local_marks[symbol]["price"]) if local_marks is not None else
+                                 self.get_last_price(Asset(symbol, asset_type="stock")))
         # Orders on external symbols are the operator's own; orders on eligible
         # symbols, or any unresolved intent of ours, block new submissions.
         open_orders = any(not self._terminal(order) and (not mandate.allow_external_holdings or
@@ -1260,12 +1283,21 @@ class AutonomousFund(Strategy):
         if sweep is not None and account.positions.get(sweep.symbol):
             # Every rule below sees the sweep as cash; only the sweep step trades it.
             from .cash import merge
-            account = merge(account, sweep, self.get_last_price(Asset(sweep.symbol, asset_type="stock")) or 0)
+            mark = local_marks[sweep.symbol]["price"] if local_marks is not None else self.get_last_price(Asset(sweep.symbol, asset_type="stock"))
+            account = merge(account, sweep, mark or 0)
         if reserve or external:
             self.journal.event(start, "broker_account", {"cash": str(broker_cash), "equity": str(broker_equity),
                                "reserved_cash": str(reserve), "external_holdings": {k: str(v) for k, v in external.items()},
                                "external_value": str(external_value)})
         body = asdict(account)
+        if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+            body["ledger_audit"] = self.broker.ledger_audit()
+        if (self.mode == "local" and getattr(self.broker, "_valuation_policy", None) is not None
+                and not self.broker.is_market_open()):
+            # The returned book is a current account read for research. The
+            # public NAV remains the one durable close, not a new off-hours mark.
+            self.broker._publish_valuation()
+            return account
         if self.mode == "local":
             visible = set(account.positions) | set(account.cash_equivalents)
             body["valuation"] = {"source": "local_account_snapshot", "quotes": {
@@ -1409,6 +1441,10 @@ class AutonomousFund(Strategy):
         return parsed.model_dump(exclude_none=isinstance(parsed, Decision))
 
     def _agent_call(self, name, **kwargs):
+        if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+            # A missing legacy input remains explicit; an inconsistent book is
+            # rejected before it can become an agent's account evidence.
+            kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
         key = uuid4().hex
         self.journal.counter("agent_runs", self.get_datetime(), 1)
         self.journal.event(self.get_datetime(), "agent_call_started", {
@@ -1657,6 +1693,8 @@ class AutonomousFund(Strategy):
                                     "max_daily_cost_usd": budget.max_daily_cost_usd,
                                     "skip_quiet_reviews": budget.skip_quiet_reviews,
                                     "max_quiet_minutes": budget.max_quiet_minutes}}
+        if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+            context["ledger_audit"] = self.broker.ledger_audit()
         champion = self._champion()
         failure_role = "manager" if live else "researcher"
         try:
@@ -2134,7 +2172,8 @@ class AutonomousFund(Strategy):
             rows = _events(self.journal, instant(now), kinds=("account", "fill", "fill_reconciled", "order_submitted"))
 
             def local_day(row):
-                return instant(row["at"]).astimezone(zone).date().isoformat()
+                closed = (row["body"].get("valuation") or {}).get("session_close") if row["kind"] == "account" else None
+                return instant(closed or row["at"]).astimezone(zone).date().isoformat()
             accounts = [r for r in rows if r["kind"] == "account"]
             before = [r for r in accounts if local_day(r) < day]
             ending = [r for r in accounts if local_day(r) == day]
@@ -2145,7 +2184,8 @@ class AutonomousFund(Strategy):
             submitted = {str(r["body"].get("broker_id")): r["body"] for r in rows if r["kind"] == "order_submitted"}
             try:
                 with self.journal.connection() as db:
-                    arrivals = {row[0]: float(row[1]) for row in db.execute("SELECT intent_id,reference FROM fund_orders")}
+                    from .execution import observed_arrivals
+                    arrivals = observed_arrivals(db, as_of=now)
             except Exception:
                 arrivals = {}
             orders = {}
@@ -3139,7 +3179,12 @@ class AutonomousFund(Strategy):
             # terminalize without guessing the outcome of a network request.
             self.journal.update(key, None, True, self.get_datetime())
             raise
-        self.execution.record_submission(key, decision_id, intent, now)
+        try:
+            quote = self._price(intent.symbol, record=False)
+        except Exception as exc:
+            quote = None
+            self._disclose("execution_quote_unavailable", type(exc).__name__)
+        self.execution.record_submission(key, decision_id, intent, self.get_datetime(), quote=quote)
         if kind == "protective":
             self.execution.mark_protective(key, now)
         # Call the native implementation, with the only accepted intent schema.

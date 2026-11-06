@@ -23,6 +23,11 @@ class RiskError(ValueError):
     pass
 
 
+class MarketDataUnavailable(RiskError):
+    """An unusable source observation: wait for fresh data without changing the book."""
+    pass
+
+
 def number(value):
     if isinstance(value, bool):
         raise RiskError("Boolean is not a financial number")
@@ -93,7 +98,7 @@ class ObservedPrice:
 
     def validate(self, now, limits):
         if number(self.price) <= 0 or not 0 <= (instant(now) - instant(self.as_of)).total_seconds() <= limits.quote_max_seconds:
-            raise RiskError("Stale, future or nonpositive observation")
+            raise MarketDataUnavailable("Stale, future or nonpositive observation")
         return self
 
 
@@ -103,12 +108,12 @@ def observed_quote(quote, now, limits):
     raw = (getattr(quote, "raw_data", None) or {}).get("original_response")
     stamp = getattr(raw, "timestamp", None)
     if stamp is None:
-        raise RiskError("Missing source quote timestamp")
+        raise MarketDataUnavailable("Missing source quote timestamp")
     price = getattr(quote, "price", None)
     if price is None:
         bid, ask = number(getattr(quote, "bid", None)), number(getattr(quote, "ask", None))
         if not 0 < bid <= ask:
-            raise RiskError("Invalid observed bid/ask")
+            raise MarketDataUnavailable("Invalid observed bid/ask")
         price = (bid + ask) / 2
     return ObservedPrice(number(price), instant(stamp)).validate(now, limits)
 

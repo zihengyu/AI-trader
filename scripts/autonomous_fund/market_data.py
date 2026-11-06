@@ -36,13 +36,23 @@ class CachedMarketHours:
         return cache[key]
 from lumibot.entities import Bars, Quote
 
-from .risk import RiskError, instant, number
+from .risk import MarketDataUnavailable, RiskError, instant, number
 
 
 @lru_cache(maxsize=32)
-def _session_close(day):
+def _session_bounds(day):
     schedule = mcal.get_calendar("NYSE").schedule(start_date=day, end_date=day)
-    return schedule.iloc[0].market_close if not schedule.empty else None
+    return (schedule.iloc[0].market_open, schedule.iloc[0].market_close) if not schedule.empty else (None, None)
+
+
+def _session_close(day):
+    return _session_bounds(day)[1]
+
+
+def regular_session_open(now):
+    now = instant(now)
+    opened, closed = _session_bounds(now.astimezone(ZoneInfo("America/New_York")).date())
+    return opened is not None and opened <= now < closed
 
 
 def completed_daily_cutoff(now):
@@ -64,7 +74,7 @@ class SessionClock:
         now = instant(self.now())
         day = now.astimezone(ZoneInfo("America/New_York")).date()
         if self._day != day:
-            self._schedule = self.calendar.schedule(start_date=day, end_date=day + timedelta(days=14))
+            self._schedule = self.calendar.schedule(start_date=day - timedelta(days=14), end_date=day + timedelta(days=14))
             self._day = day
         for row in self._schedule.itertuples():
             if row.market_open <= now < row.market_close:
@@ -72,6 +82,13 @@ class SessionClock:
             if row.market_open > now:
                 return {"open": False, "next_open": row.market_open.isoformat(), "close": row.market_close.isoformat()}
         raise RiskError("NYSE calendar has no next session")
+
+    def last_close(self):
+        self.status()
+        closes = self._schedule.market_close[self._schedule.market_close <= instant(self.now())]
+        if closes.empty:
+            raise RiskError("NYSE calendar has no completed session")
+        return closes.iloc[-1].to_pydatetime()
 
 
 class MarketDataSettings:
@@ -270,7 +287,7 @@ class YahooRealtimeData(DataSource):
             raise RiskError("Local market data accepts US stocks/ETFs only")
         return asset.symbol
 
-    def _history(self, asset, interval, period):
+    def _history(self, asset, interval, period, required_through=None):
         symbol, now = self._symbol(asset), self.get_datetime()
         key = (symbol, interval, period)
         cutoff = completed_daily_cutoff(now) if interval == "1d" else None
@@ -282,13 +299,15 @@ class YahooRealtimeData(DataSource):
         # Single flight per series; never hold a global lock during network I/O.
         with lock:
             cached = self._cache.get(key)
-            if cached and cached[2] == cutoff and time.monotonic() - cached[0] < ttl:
+            through = cached[1].index[-1] + timedelta(minutes=1) if cached and interval == "1m" else None
+            if (cached and cached[2] == cutoff and time.monotonic() - cached[0] < ttl
+                    and (required_through is None or (through is not None and through >= required_through))):
                 self._stats["cache_hits"] += 1
                 return cached[1].copy()
             failure = self._failures.get(key)
             if failure and time.monotonic() < failure[1]:
                 self._stats["backoff_blocks"] += 1
-                raise RiskError(f"Yahoo market data cooling down for {symbol}; no stale fallback")
+                raise MarketDataUnavailable(f"Yahoo market data cooling down for {symbol}; no stale fallback")
             try:
                 with self._slots:
                     self._stats["requests"] += 1
@@ -304,8 +323,8 @@ class YahooRealtimeData(DataSource):
                     except Exception:
                         pass  # Advisory only; never changes this request's outcome.
                 if isinstance(exc, RiskError):
-                    raise
-                raise RiskError(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})") from None
+                    raise MarketDataUnavailable(str(exc)) from None
+                raise MarketDataUnavailable(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})") from None
             self._failures.pop(key, None)
             self._cache[key] = (time.monotonic(), frame.copy(), cutoff)
             return frame
@@ -365,8 +384,8 @@ class YahooRealtimeData(DataSource):
             frame = frame[frame.index <= self.get_datetime() - timeshift]
         return Bars(frame.tail(length).copy(), self.SOURCE, asset)
 
-    def execution_bars(self, asset):
-        return self._history(asset, "1m", "5d")
+    def execution_bars(self, asset, *, required_through=None):
+        return self._history(asset, "1m", "5d", required_through=required_through)
 
     def session_bars(self, asset):
         """Today's completed minutes only: a fifth of execution_bars' download, for research views."""

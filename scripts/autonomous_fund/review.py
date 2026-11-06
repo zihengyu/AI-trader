@@ -61,6 +61,10 @@ class PostmarketReview(BaseModel):
 
 def _events(journal, now, kinds=None):
     with journal.connection() as db:
+        db.execute("BEGIN")
+        from .ledger_audit import audit_connection
+        integrity = audit_connection(db)
+        invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         if kinds:
             rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence"
                               % ",".join("?" * len(kinds)), tuple(kinds)).fetchall()
@@ -68,7 +72,8 @@ def _events(journal, now, kinds=None):
             rows = db.execute("SELECT sequence,at,kind,body FROM events ORDER BY sequence").fetchall()
     # SQL string ordering is unsafe when timestamps have different UTC offsets.
     return [{"sequence": row[0], "at": row[1], "kind": row[2], "body": json.loads(row[3])}
-            for row in rows if instant(row[1]) <= now]
+            for row in rows if instant(row[1]) <= now and not (row[2] == "account" and
+                (row[0] in invalid_accounts or integrity["status"] == "failed"))]
 
 
 def _available(packet, now):
@@ -98,10 +103,16 @@ def strategy_memory(journal, now):
                                 "summary": p["review"]["summary"]} for p in reviews[-3:]]}
 
 
+def _event_day(row, zone):
+    valuation = (row.get("body") or {}).get("valuation") or {}
+    closing = valuation.get("session_close") if row["kind"] == "account" and valuation.get("book_existed_at_close", True) else None
+    return instant(closing or row["at"]).astimezone(zone).date()
+
+
 def _session(rows, now):
     # Never invent a review of a day before the owned account was observed.
     zone = ZoneInfo("America/New_York")
-    days = {instant(row["at"]).astimezone(zone).date() for row in rows
+    days = {_event_day(row, zone) for row in rows
             if row["kind"] in {"account", "decision_validated", "fill", "fill_reconciled"}}
     if not days:
         return None
@@ -117,10 +128,10 @@ def _session(rows, now):
 def _inputs(rows, session, now):
     zone = ZoneInfo("America/New_York")
     day = session["session_date"]
-    owned = [row for row in rows if str(instant(row["at"]).astimezone(zone).date()) == day]
+    owned = [row for row in rows if str(_event_day(row, zone)) == day]
     accounts = [row for row in rows if row["kind"] == "account"]
     today = [row for row in owned if row["kind"] == "account"]
-    prior = [row for row in accounts if str(instant(row["at"]).astimezone(zone).date()) < day]
+    prior = [row for row in accounts if str(_event_day(row, zone)) < day]
     baseline = prior[-1] if prior else (today[0] if today else None)
     ending = today[-1] if today else None
     start_value = float(baseline["body"]["equity"]) if baseline else None
@@ -137,7 +148,7 @@ def _inputs(rows, session, now):
     for symbol in ("SPY", "QQQ"):
         first = [r for r in rows if r["kind"] == "benchmark" and baseline and
                  instant(r["at"]) <= instant(baseline["at"]) and symbol in r["body"]]
-        last = [r for r in owned if r["kind"] == "benchmark" and ending and
+        last = [r for r in rows if r["kind"] == "benchmark" and ending and
                 instant(r["at"]) <= instant(ending["at"]) and symbol in r["body"]]
         # Exact observation times only; do not compare unmatched windows.
         aligned = (first and last and first[-1]["at"] == baseline["at"] and last[-1]["at"] == ending["at"])
@@ -267,6 +278,8 @@ def review_after_close(strategy):
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}
+    if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
+        context["ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
     if saved is None:
@@ -298,6 +311,8 @@ def review_after_close(strategy):
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
                "research_completed_at": saved["completed_at"], "allowed_evidence_refs": refs,
                "evidence_catalog": catalog}
+    if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
+        context["current_ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
                     "自主改进选股与择时的判断方法，分别列出可检验的调整、依据、验证条件和失效条件；"

@@ -13,7 +13,7 @@ import pytest
 
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.quant import QuantPolicy
-from scripts.autonomous_fund.risk import Intent, Limits, RiskError, number
+from scripts.autonomous_fund.risk import Intent, Limits, Price, RiskError, number
 from scripts.autonomous_fund.validation import (
     ValidationSettings, acceptance, daily_from_minutes, load_closes, paired_test, risk_replay, shadow_pairs,
 )
@@ -262,7 +262,9 @@ def synthetic_run(tmp_path, sessions_count=3, unresolved=False):
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", ((open_ + timedelta(hours=7)).isoformat(),
                        "postmarket_review", json.dumps({"session_date": str(day.date())})))
     first = datetime(days[0].year, days[0].month, days[0].day, 15, tzinfo=timezone.utc)
-    state.record_submission("intent-1", "decision-1", Intent("ALFA", "buy", 5, number("100.00")), first)
+    # A measured execution cost needs a market quote, not just a limit price.
+    state.record_submission("intent-1", "decision-1", Intent("ALFA", "buy", 5, number("100.00")), first,
+                            quote=Price(number(100), number(100), first, number(10000000)))
     journal.event(first, "order_submitted", {"intent_id": "intent-1", "broker_id": "b-1", "decision_id": "decision-1",
                                              "symbol": "ALFA", "side": "buy", "quantity": 5, "limit": "100.00"})
     journal.event(first, "fill", {"broker_id": "b-1", "symbol": "ALFA", "side": "buy", "quantity": "5", "price": "100.05"})

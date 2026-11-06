@@ -119,7 +119,7 @@ def attribution_lines(result):
     groups = result.get("selection_by_group") or {}
     if groups:
         lines.append("- 选股按组：" + "；".join(f"{name} {_percent(value)}" for name, value in groups.items()))
-    for key, label in (("unavailable", "缺数据"), ("fees_unknown", "费用未知"), ("arrival_unknown", "缺到达价（滑点并入择时）"),
+    for key, label in (("unavailable", "缺数据"), ("fees_unknown", "费用未知"), ("arrival_unknown", "缺到达报价（择时／滑点未知）"),
                        ("beta_assumed", "beta 按 1 计")):
         if result.get(key):
             lines.append(f"- {label}：" + "；".join(result[key]))
@@ -400,6 +400,8 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"🚨 交易进程崩溃（{details}）：服务会自动重启，监控确认安全后才恢复交易。"
     elif kind == "blocked":
         text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
+    elif kind == "local_market_data_pending":
+        text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
     elif kind == "bookkeeping_error":
         text = f"⚠️ 记账步骤出错，下一轮自动重试：{details}"
     elif kind == "model_budget_exhausted" and isinstance(details, dict):

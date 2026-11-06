@@ -55,9 +55,12 @@ def test_target_notice_has_observed_shares_and_cost_before_the_rationale(tmp_pat
     assert "BETA：4 股 ｜ 买入均价 $91.25" in text
     # Relative freshness measures the actual snapshot's age at delivery,
     # including delays; it must not restart at the notification's creation.
-    assert "净值 $10,002.40（2分钟前） ｜ 现金 $9,635.00" in text
+    # This delivery fixture is a Sunday: closed-session NAV has no running age.
+    assert "净值 $10,002.40（休市） ｜ 现金 $9,635.00" in text
     from scripts.autonomous_fund.notifications import readable
-    delayed = readable("decision_changed", details, now=NOW + timedelta(minutes=5))
+    open_at = NOW + timedelta(days=1)
+    delayed_details = {**details, "account": {**details["account"], "as_of": str(open_at - timedelta(minutes=2))}}
+    delayed = readable("decision_changed", delayed_details, now=open_at + timedelta(minutes=5))
     assert "净值 $10,002.40（7分钟前）" in delayed
     assert text.index("目标现金") < text.index("📌 当前实际持仓") < text.index("理由：")
     assert details["account"]["as_of"] == str(account.as_of)

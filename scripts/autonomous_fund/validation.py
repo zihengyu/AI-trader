@@ -319,14 +319,17 @@ def acceptance(root, criteria=None, now=None):
     root = Path(root)
     now = instant(now or datetime.now(timezone.utc))
     with closing(sqlite3.connect((root / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")
+        from .ledger_audit import audit_connection
+        integrity = audit_connection(db)
         def rows(kinds):
             return [(at, kind, json.loads(body)) for at, kind, body in db.execute(
                 "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(kinds)), kinds)
                 if instant(at) <= now]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         unresolved = db.execute("SELECT count(*) FROM intents WHERE status!='terminal'").fetchone()[0]
-        references = {(r[0], r[1], r[2]): float(r[3]) for r in db.execute(
-            "SELECT decision_id,symbol,side,reference FROM fund_orders ORDER BY rowid DESC")} if "fund_orders" in tables else {}
+        from .execution import observed_arrivals
+        references = observed_arrivals(db, as_of=now)
         approvals = dict(db.execute("SELECT state,count(*) FROM fund_approvals GROUP BY state")) if "fund_approvals" in tables else {}
         # Every configuration tried counts against the deflated Sharpe ratio, including rejected factors.
         factor_trials = db.execute("SELECT count(*) FROM fund_factors").fetchone()[0] if "fund_factors" in tables else 0
@@ -359,18 +362,21 @@ def acceptance(root, criteria=None, now=None):
     count = lambda kind: sum(1 for _, k, _ in events if k == kind)  # noqa: E731
     submitted = [b for _, k, b in events if k == "order_submitted"]
     by_broker = {str(b["broker_id"]): b for b in submitted}
-    slippage = []
+    slippage, slippage_unknown = [], 0
     for _, kind, body in events:
         if kind not in {"fill", "fill_reconciled"}:
             continue
         order = by_broker.get(str(body.get("broker_id")))
         if not order:
+            slippage_unknown += 1
             continue
-        arrival = references.get((order.get("decision_id"), order["symbol"], order["side"]))
+        arrival = references.get(order.get("intent_id"))
         if arrival and float(body.get("price") or 0) > 0:
             fill = float(body["price"])
             sign = 1 if order["side"] == "buy" else -1
             slippage.append(sign * (fill - arrival) / arrival * 10000)
+        else:
+            slippage_unknown += 1
     agents = [b for _, k, b in events if k == "agent"]
     failures = sum(1 for b in agents if b.get("parse_error"))
     equity = [float(b["equity"]) for _, b in accounts]
@@ -404,8 +410,12 @@ def acceptance(root, criteria=None, now=None):
         "bot_crashes": sum(1 for n in notes if n.get("kind") == "bot_crash"),
         "bookkeeping_errors": sum(1 for n in notes if n.get("kind") == "bookkeeping_error"),
         "auto_resumes": count("auto_resume"),
+        "ledger_status": integrity["status"], "fills_with_unknown_slippage": slippage_unknown,
     }
     checks = [
+        ("local_ledger_verified", integrity["status"], "verified or not_applicable",
+         lambda v, t: v in {"verified", "not_applicable"}),
+        ("max_unknown_slippage_fills", slippage_unknown, 0, lambda v, t: v <= t),
         ("min_sessions", metrics["sessions_observed"], criteria["min_sessions"], lambda v, t: v >= t),
         ("min_iteration_ratio", metrics["median_iteration_ratio"], criteria["min_iteration_ratio"],
          lambda v, t: v is not None and v >= t),

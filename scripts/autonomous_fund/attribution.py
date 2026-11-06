@@ -12,8 +12,7 @@ w_i = q_i x close_i(D-1) / equity(D-1) and the completed close-to-close return r
 - timing of the session's trades against the close: buys q x (close - arrival),
   sells q x (arrival - close);
 - execution slippage against the arrival price: buys q x (arrival - fill),
-  sells q x (fill - arrival); a fill without a recorded arrival puts its whole
-  difference into timing and is listed;
+  sells q x (fill - arrival); missing arrivals leave timing and slippage unknown;
 - fees: minus the recorded trade costs (unknown fees are listed, not taken as 0).
 
 Each part is divided by equity(D-1). The observed return comes from the account
@@ -96,7 +95,9 @@ def attribute(start, end, fills, closes, previous_day, day, groups=None, benchma
         arrival = fill.get("arrival")
         if arrival is None:
             no_arrival.append(symbol)
-            arrival = price
+            trades.append({"symbol": symbol, "side": "buy" if sign > 0 else "sell", "quantity": quantity,
+                           "fill": price, "arrival": None, "close": final, "timing": None, "slippage": None})
+            continue
         timing, slippage = sign * quantity * (final - float(arrival)), sign * quantity * (float(arrival) - price)
         parts["timing"] += timing / equity
         parts["slippage"] += slippage / equity
@@ -105,7 +106,11 @@ def attribute(start, end, fills, closes, previous_day, day, groups=None, benchma
                        "slippage": slippage / equity})
     observed = float(end["equity"]) / equity - 1
     explained = sum(parts.values())
-    return {"status": "partial" if unavailable or fees_unknown else "complete", "session_date": day,
+    if no_arrival:
+        parts["timing"], parts["slippage"] = None, None
+    if fees_unknown:
+        parts["fees"] = None
+    return {"status": "partial" if unavailable or fees_unknown or no_arrival else "complete", "session_date": day,
             "previous_session": previous_day, "start_equity": equity, "observed_return": observed,
             "components": parts, "explained": explained, "unexplained": observed - explained,
             "benchmark": benchmark, "benchmark_return": market_return,

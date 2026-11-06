@@ -72,9 +72,10 @@ def test_missing_inputs_are_named_not_estimated():
     assert result["status"] == "partial"
     assert any(item.startswith("GHOST") for item in result["unavailable"])
     assert any(item.startswith("SGOV") for item in result["unavailable"]) and result["components"]["cash_equivalent"] == 0
-    # Without an arrival price the whole difference is timing, and the fill is listed.
-    assert result["components"]["slippage"] == 0 and result["components"]["timing"] == pytest.approx(10 * (51 - 50.2) / 1e4)
-    assert result["arrival_unknown"] == ["BETA"] and result["fees_unknown"] == ["BETA"] and result["components"]["fees"] == 0
+    # Missing quotes cannot establish timing or zero slippage; unreported fees
+    # likewise remain unknown rather than becoming a zero-cost claim.
+    assert result["components"]["slippage"] is None and result["components"]["timing"] is None
+    assert result["arrival_unknown"] == ["BETA"] and result["fees_unknown"] == ["BETA"] and result["components"]["fees"] is None
     short = {"SPY": closes["SPY"][-3:], "ALFA": closes["ALFA"][-3:]}
     assert attribute({"equity": "10000", "positions": {"ALFA": "20"}}, {"equity": "10000"}, [], short, PREVIOUS,
                      DAY)["beta_assumed"] == ["ALFA"]
@@ -97,6 +98,10 @@ def test_the_strategy_attributes_from_the_journal_without_double_counting_fills(
     with journal.connection() as db:
         db.execute("INSERT INTO fund_orders VALUES(?,?,?,?,?,?)", ("intent-1", "decision-1", "BETA", "buy",
                                                                   at(day, 15).isoformat(), "99.5"))
+        # Attribution needs observed market quotes; the saved order limit alone
+        # is deliberately insufficient evidence for arrival/slippage.
+        db.execute("INSERT INTO fund_order_quotes VALUES(?,?,?,?,?)", (
+            "intent-1", "99.4", "99.5", at(day, 15).isoformat(), at(day, 15).isoformat()))
     for quantity in ("4", "6"):  # Callbacks for partial fills, then the reconciled whole order.
         journal.event(at(day, 16), "fill", {"broker_id": "broker-1", "symbol": "BETA", "side": "buy",
                                             "quantity": quantity, "price": "100", "trade_cost": None})
@@ -111,6 +116,11 @@ def test_the_strategy_attributes_from_the_journal_without_double_counting_fills(
     assert result["components"]["fees"] == pytest.approx(-0.4 / 10000)
     assert result["components"]["slippage"] == pytest.approx(10 * (99.5 - 100) / 10000)
     assert result["by_symbol"][0]["symbol"] == "ALFA" and result["by_symbol"][0]["beta"] is not None
+    with journal.connection() as db:
+        db.execute("DELETE FROM fund_order_quotes")
+    legacy = strategy._attribution({"session_date": str(day.date())}, NOW)
+    assert legacy["status"] == "partial" and legacy["trades"][0]["arrival"] is None
+    assert legacy["components"]["slippage"] is None
     assert strategy._attribution({"session_date": "2026-01-02"}, NOW)["status"] == "unavailable"
 
 

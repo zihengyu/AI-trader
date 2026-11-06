@@ -389,6 +389,11 @@ class Monitor:
 
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""
+        from .ledger_audit import audit_connection
+        integrity = audit_connection(db)
+        if integrity["status"] == "failed":
+            return
+        invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not startup or json.loads(startup[0]).get("mode") not in {"local", "paper"}:
             return
@@ -407,6 +412,8 @@ class Monitor:
         if visible:
             account, account_sequence = None, 0
             for row in db.execute("SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
+                if row["sequence"] in invalid_accounts:
+                    continue
                 body = json.loads(row["body"])
                 observed = instant(body.get("as_of") or row["at"])
                 if instant(row["at"]) <= now and observed <= now:
@@ -723,14 +730,15 @@ class Monitor:
     def _status_text(self, now):
         with operator_connection(self.root) as db:
             pending = db.execute("SELECT count(*) FROM fund_approvals WHERE state='pending'").fetchone()[0]
-            account = db.execute("SELECT at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
             health = db.execute("SELECT value FROM fund_monitor_meta WHERE key='health'").fetchone()
         lines = [f"监控状态：{health[0] if health else 'unknown'}；STOP：{(self.root / 'STOP').exists()}",
                  f"待审批请求：{pending}"]
-        if account:
-            body = json.loads(account[1])
-            lines.append(f"最新分仓净值 ${body.get('equity')}，现金 ${body.get('cash')}，持仓 {encode(body.get('positions'))}"
-                         f"（{account[0]}）")
+        from .report import report
+        from .status import account_lines
+        snapshot = report(self.root, write_files=False)
+        lines += account_lines(snapshot.get("latest_account"), now=now)
+        if snapshot.get("ledger_audit", {}).get("status") == "failed":
+            lines.append("账务校验未通过，争议账户数据暂不展示。")
         try:
             status = json.loads((self.root / "status.json").read_text(encoding="utf-8"))
             if status.get("valuation_error"):
@@ -773,7 +781,12 @@ def metrics_text(root, status):
     book = root / "state.sqlite3"
     if book.is_file():
         with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            row = db.execute("SELECT body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
+            db.execute("BEGIN")
+            from .ledger_audit import audit_connection
+            integrity = audit_connection(db)
+            invalid = set(integrity.get("invalid_account_sequences", []))
+            row = next((row for row in db.execute("SELECT body,sequence FROM events WHERE kind='account' ORDER BY sequence DESC")
+                        if row[1] not in invalid), None) if integrity["status"] != "failed" else None
             peak = db.execute("SELECT value FROM meta WHERE key='peak'").fetchone()
             tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             pending = (db.execute("SELECT count(*) FROM fund_approvals WHERE state='pending'").fetchone()[0]
