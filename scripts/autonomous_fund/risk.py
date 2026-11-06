@@ -86,6 +86,34 @@ class Price:
 
 
 @dataclass(frozen=True)
+class ObservedPrice:
+    """A read-only mark; freshness matters, trading liquidity is a separate contract."""
+    price: Decimal
+    as_of: datetime
+
+    def validate(self, now, limits):
+        if number(self.price) <= 0 or not 0 <= (instant(now) - instant(self.as_of)).total_seconds() <= limits.quote_max_seconds:
+            raise RiskError("Stale, future or nonpositive observation")
+        return self
+
+
+def observed_quote(quote, now, limits):
+    # Quote.timestamp can synthesize receipt time. Use retained source evidence,
+    # just as the trading path does, without imposing its liquidity requirement.
+    raw = (getattr(quote, "raw_data", None) or {}).get("original_response")
+    stamp = getattr(raw, "timestamp", None)
+    if stamp is None:
+        raise RiskError("Missing source quote timestamp")
+    price = getattr(quote, "price", None)
+    if price is None:
+        bid, ask = number(getattr(quote, "bid", None)), number(getattr(quote, "ask", None))
+        if not 0 < bid <= ask:
+            raise RiskError("Invalid observed bid/ask")
+        price = (bid + ask) / 2
+    return ObservedPrice(number(price), instant(stamp)).validate(now, limits)
+
+
+@dataclass(frozen=True)
 class Account:
     cash: Decimal
     equity: Decimal
@@ -220,8 +248,11 @@ def validate_decision(decision, now, universe, limits):
     if not now + timedelta(minutes=1) <= review <= now + timedelta(days=1):
         raise RiskError("Next review must be within one minute to one day")
     for alert in decision.get("alerts") or []:
-        if alert["symbol"] not in universe:
-            raise RiskError("Price alerts may watch only eligible symbols")
+        # A watch can observe an index or another non-tradable instrument.
+        # Only targets grant order intent; their universe check above stays strict.
+        symbol = alert["symbol"]
+        if not isinstance(symbol, str) or not symbol.strip() or len(symbol) > 64:
+            raise RiskError("A price alert needs a nonempty symbol of at most 64 characters")
         bounds = [number(alert[k]) for k in ("above", "below") if alert.get(k) is not None]
         if not bounds or any(b <= 0 for b in bounds):
             raise RiskError("A price alert needs a positive above or below level")

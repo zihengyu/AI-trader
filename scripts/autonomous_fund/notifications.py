@@ -283,7 +283,7 @@ def _stop_text(stop):
     return label, hint
 
 
-def readable(kind, details, sequence=None):
+def readable(kind, details, sequence=None, *, now=None):
     """Chinese text for the notices an operator reads most; None keeps the generic format."""
     from .settings import MODES
     from .status import REASONS
@@ -322,7 +322,7 @@ def readable(kind, details, sequence=None):
         account = details.get("account")
         if account:
             from .status import account_lines
-            lines += ["", *account_lines(account, details.get("recent_trades")), ""]
+            lines += ["", *account_lines(account, details.get("recent_trades"), now=now), ""]
         if details.get("research_summary"):
             lines.append(f"今日盘前研究要点：{details['research_summary']}")
         if details.get("close"):
@@ -342,7 +342,7 @@ def readable(kind, details, sequence=None):
         header = ("🧭 今日首次复核：维持目标组合" if details.get("first_today") else "🧭 AI 调整目标组合")
         if details.get("level_changes") and details.get("weight_changed") is False:
             header = "🧭 AI 更新交易价位"
-        lines = [f"{header}（{_when(details.get('at'))}）"]
+        lines = [f"{header}（{_when(details.get('at'))}）", "这是目标计划，实际买卖以成交更新为准。"]
         for label, rows in (("买入／加仓", [r for r in changes if float(r["to"]) > float(r["from"])]),
                             ("卖出／减仓", [r for r in changes if float(r["to"]) < float(r["from"])]),
                             ("不变", [r for r in changes if float(r["to"]) == float(r["from"])])):
@@ -350,7 +350,7 @@ def readable(kind, details, sequence=None):
                 if label == "不变":
                     lines.append(f"不变：{row['symbol']} {percent(row['to'])}{levels(row)}")
                 else:
-                    lines.append(f"{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
+                    lines.append(f"计划{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
         for change in details.get("level_changes") or []:
             before, after = change["before"], change["after"]
             parts = []
@@ -365,13 +365,18 @@ def readable(kind, details, sequence=None):
             lines.append(f"价位调整：{change['symbol']}（{'，'.join(parts)}）")
         lines.append(f"目标现金约 {percent(details.get('cash_weight') or 0)}")
         from .status import account_lines
-        lines += ["", *account_lines(details.get("account"), details.get("recent_trades"))]
+        lines += ["", *account_lines(details.get("account"), details.get("recent_trades"), now=now)]
         if details.get("rationale"):
             lines += ["", f"理由：{details['rationale']}"]
         if details.get("next_review_at"):
             lines.append(f"下次复核：{_when(details['next_review_at'])}")
         lines.append("权重是上限：风控可能按波动、尾部风险等再缩小；买入在自动额度内直接执行，超出额度会发审批。")
         text = "\n".join(lines)
+    elif kind == "execution_update" and isinstance(details, dict):
+        from .status import account_lines
+        title = "✅ 成交已确认，账户快照待更新" if details.get("account_pending") else "✅ 成交后账户更新"
+        text = "\n".join([f"{title}（{_when(details.get('at'))}）", "",
+                           *account_lines(details.get("account"), details.get("recent_trades"), now=now)])
     elif kind == "stop_active" and isinstance(details, dict):
         label, hint = _stop_text(details)
         text = f"⏸ 交易已停止（{label}）——{hint}；期间不会下新单。"

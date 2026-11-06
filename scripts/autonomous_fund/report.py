@@ -116,7 +116,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                              "position_average_prices": body.get("position_average_prices") or {},
                              "cash_equivalents": body.get("cash_equivalents") or {},
                              "cash_equivalent_value": body.get("cash_equivalent_value", 0),
-                             "receivables": float(body.get("receivables", 0))})
+                             "receivables": float(body.get("receivables", 0)),
+                             **({"valuation": body["valuation"]} if "valuation" in body else {})})
         elif kind == "benchmark":
             benchmarks[instant(at)] = body
         elif kind == "fill":

@@ -18,9 +18,9 @@ from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
 from .journal import Journal, encode
-from .risk import (Account, Intent, Limits, Price, RiskError, bounded_list, bounded_text, decision_levels,
+from .risk import (Account, Intent, Limits, ObservedPrice, Price, RiskError, bounded_list, bounded_text, decision_levels,
                    desired_shares, instant, number, plan,
-                   trading_day, validate_decision, validate_evidence)
+                   observed_quote, trading_day, validate_decision, validate_evidence)
 
 # Configuration sections that are operator policy, not account identity. They
 # are validated and audited at every startup, never part of the account binding.
@@ -155,6 +155,8 @@ MANAGER_PROMPT = (
     "take_profit_weight, and with price alerts: a deterministic watcher checks them every minute without "
     "calling you, executes protective exits automatically and wakes you early on alerts, large moves or "
     "market stress (watch_triggers explains why you were woken). Prefer levels to very frequent reviews. "
+    "Price alerts are read-only observations and may watch symbols outside eligible_universe when the "
+    "configured data source supplies fresh prices; this never permits targets or orders outside eligible_universe. "
     "A review you scheduled is skipped without calling you while nothing has changed (no trigger, fill, holding "
     "change or new research since your allocation completed); you are still called at least every "
     "model_budget.max_quiet_minutes, so set alerts and news_watch for anything that should wake you sooner. "
@@ -266,7 +268,7 @@ class Target(BaseModel):
 
 class Alert(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    symbol: str
+    symbol: str = Field(min_length=1, max_length=64)
     above: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     below: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     reason: bounded_text(300, 1)
@@ -677,6 +679,11 @@ class AutonomousFund(Strategy):
         from .factors import FactorLab, FactorSettings
         from .performance import PerformanceSettings
         self.performance = PerformanceSettings.from_config(config.get("performance"))
+        if mode == "local":
+            self.broker.configure_valuation(
+                universe=self._configured_universe, mandate=self.mandate, sweep=self.cash_sweep,
+                daily_loss_limit=self.quant.daily_loss_limit, interval_seconds=30,
+                benchmark_symbols=tuple(dict.fromkeys(("SPY", "QQQ", *self.performance.symbols()))))
         factor_settings = FactorSettings.from_config(config.get("factor_lab"))
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
         self.sec = None
@@ -1188,11 +1195,20 @@ class AutonomousFund(Strategy):
             self.journal.update(key, broker_id, self._terminal(order), self.get_datetime())
 
     def _snapshot(self):
+        # The local matcher can fill while the AI runs. Read its cash and lots
+        # under the same lock so a notification cannot mix two book revisions.
+        lock = getattr(self.broker, "_poll_lock", None) if self.mode == "local" else None
+        if lock is not None:
+            with lock:
+                return self._snapshot_account()
+        return self._snapshot_account()
+
+    def _snapshot_account(self):
         start = self.get_datetime()
         orders = self._orders()
         if self.mode in {"paper", "local"}:
-            positions = self.broker._pull_positions(self)
             cash, _, equity = self.broker._get_balances_at_broker(self.quote_asset, self)
+            positions = self.broker._pull_positions(self)
         else:
             positions = self.get_positions()
             cash, equity = self.get_cash(), self.get_portfolio_value()
@@ -1249,7 +1265,13 @@ class AutonomousFund(Strategy):
             self.journal.event(start, "broker_account", {"cash": str(broker_cash), "equity": str(broker_equity),
                                "reserved_cash": str(reserve), "external_holdings": {k: str(v) for k, v in external.items()},
                                "external_value": str(external_value)})
-        self.journal.event(start, "account", asdict(account))
+        body = asdict(account)
+        if self.mode == "local":
+            visible = set(account.positions) | set(account.cash_equivalents)
+            body["valuation"] = {"source": "local_account_snapshot", "quotes": {
+                symbol: mark for symbol, mark in getattr(self.broker, "_last_balance_marks", {}).items()
+                if symbol in visible}}
+        self.journal.event(start, "account", body)
         if getattr(self, "quant", None) is not None:
             self.journal.mark_equity(start, account.equity, self.limits)
             self.journal.observe_session(start, account, self.quant.daily_loss_limit)
@@ -1335,6 +1357,15 @@ class AutonomousFund(Strategy):
             self.journal.event(now, "market_observation", {"symbol": symbol, **asdict(result),
                                                          "liquidity_through": str(frame.index[-1])})
         return result
+
+    def _alert_price(self, symbol):
+        """Observe a symbol without granting it trading permission or requiring volume."""
+        now, asset = self.get_datetime(), Asset(symbol, asset_type="stock")
+        if self.mode in {"local", "paper"}:
+            quote = self.get_quote(asset)
+            return observed_quote(quote, self.get_datetime(), self.limits)
+        # Native historical reads already follow the strategy clock.
+        return ObservedPrice(number(self.get_last_price(asset)), now).validate(now, self.limits)
 
     def _record_agent(self, name, result, phase=None):
         from .costs import call_cost, rate_for, token_counts
@@ -1667,7 +1698,15 @@ class AutonomousFund(Strategy):
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
-        self._announce_decision(decision, now, account=account, decision_id=accepted_id)
+        announcement_account = account
+        if live:
+            try:
+                announcement_account = self._snapshot()
+            except Exception as exc:
+                announcement_account = None
+                self._disclose("notification_snapshot_unavailable", type(exc).__name__)
+        self._announce_decision(decision, self.get_datetime() if live else now,
+                                account=announcement_account, decision_id=accepted_id)
         try:
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:
@@ -1900,7 +1939,7 @@ class AutonomousFund(Strategy):
         levels, alerts = self.execution.levels(), self.execution.alerts()
         latest = self.execution.latest(now)
         latest_targets = {t["symbol"] for t in json.loads(latest["body"])["targets"]} if latest else set()
-        symbols = set(account.positions) | {a["symbol"] for a in alerts} | (latest_targets & set(self.universe))
+        symbols = set(account.positions) | (latest_targets & set(self.universe))
         prices = {}
         for symbol in sorted(symbols):
             try:
@@ -1970,12 +2009,19 @@ class AutonomousFund(Strategy):
         self._protective_needed = needed
         for alert in alerts:
             price = prices.get(alert["symbol"])
-            if price is None:
+            try:
+                observation = (ObservedPrice((number(price.bid) + number(price.ask)) / 2, price.as_of)
+                               if price is not None else self._alert_price(alert["symbol"]))
+                observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
+            except Exception as exc:
+                self._disclose("price_alert_unavailable", {"symbol": alert["symbol"],
+                    "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
                 continue
-            mark = (number(price.bid) + number(price.ask)) / 2
+            mark = observation.price
             crossed = ((alert.get("above") is not None and mark >= number(alert["above"])) or
                        (alert.get("below") is not None and mark <= number(alert["below"])))
-            if crossed and self.execution.trigger_alert(alert["id"], now, {**alert, "mark": str(mark)}):
+            if crossed and self.execution.trigger_alert(alert["id"], now, {
+                    **alert, "mark": str(mark), "source_as_of": str(observation.as_of)}):
                 self._request_review(now, "price_alert", {"symbol": alert["symbol"], "mark": str(mark),
                                                           "alert_reason": alert["reason"]})
         move = number(self.execution_policy.review_on_move)

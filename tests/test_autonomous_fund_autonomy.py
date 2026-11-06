@@ -31,6 +31,9 @@ def watching(tmp_path, quotes, mandate=None):
     strategy.mandate = Mandate.from_config(mandate)
     strategy.next_review = None
     strategy._price = lambda symbol, record=True: quotes[symbol]
+    # Read-only watches no longer invoke the execution/liquidity quote path.
+    from scripts.autonomous_fund.risk import ObservedPrice
+    strategy._alert_price = lambda symbol: ObservedPrice((quotes[symbol].bid + quotes[symbol].ask) / 2, quotes[symbol].as_of)
     strategy.create_order = lambda asset, quantity, side, **kw: Order("quant-test", asset, quantity, side,
                                                                       limit_price=kw["limit_price"])
     return strategy
@@ -171,7 +174,8 @@ def test_mandate_instructions_reach_the_manager_and_review_reports_compliance(tm
     ({"symbol": "ALFA", "weight": .05, "stop_loss": 110, "take_profit": 105}, []),
     ({"symbol": "ALFA", "weight": .05, "take_profit_weight": .01}, []),
     ({"symbol": "ALFA", "weight": .05, "take_profit": 110, "take_profit_weight": .05}, []),
-    ({"symbol": "ALFA", "weight": .05}, [{"symbol": "OUTSIDE", "above": 1, "reason": "r"}]),
+    # Out-of-universe observation alerts are valid; out-of-universe targets
+    # remain rejected by the dedicated trading permission controls.
     ({"symbol": "ALFA", "weight": .05}, [{"symbol": "ALFA", "above": 100, "below": 101, "reason": "r"}]),
     ({"symbol": "ALFA", "weight": .05}, [{"symbol": "ALFA", "reason": "r"}]),
 ])

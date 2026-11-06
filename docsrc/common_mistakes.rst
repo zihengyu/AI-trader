@@ -197,6 +197,16 @@ actual holdings in a separate block before the AI rationale. Each security has
 its observed share count and average purchase price, alongside account equity,
 cash and the original snapshot time. Target weights, target cash percentages
 and entry limits describe a plan; they do not establish that an order filled.
+The equity amount includes the snapshot age in parentheses, using seconds,
+minutes, hours or days. Its age is calculated when status is queried or a notice
+is delivered; a delayed notice never resets the original observation time.
+
+Local and paper decisions refresh the account after the model returns and before
+queuing the plan notice. A failed refresh is shown as unavailable. Confirmed fills
+produce a separate account update with post-fill holdings and recent trades.
+If that snapshot remains unavailable for sixty seconds, the monitor first sends
+the confirmed trades with an explicit pending-snapshot label, then follows with
+the account when it becomes available. Delivery cursors survive monitor restarts.
 
 Average purchase prices come from the local book or broker position response
 and cover only the AI capital sleeve. Older snapshots without a recorded cost
@@ -210,6 +220,26 @@ replaces that order's callbacks; other partial fills remain separate. Order
 limits are never presented as execution prices. The complete decision rationale
 is retained. Longer notices arrive as complete text attachments with holdings
 visible in the caption.
+
+In local simulation, the existing broker poll marks the capital sleeve about
+every thirty seconds, and retries immediately after book changes, even while an
+agent call is running. Marks include cash, receivables and observed position
+values, preserving reserved capital, external holdings and cash-equivalent
+classification. Quotes retain source times. Stale open-session quotes or a book
+change during the read prevent publication; closed-session holdings retain their
+last observation. Status exposes valuation errors without relabeling old equity
+as a new observation. Paper accounts continue to use broker observations.
+
+Local simulated purchases and sales each deduct a fee of 0.1 percent of traded
+notional. It is already reflected in cash and equity; spread and slippage are
+additional execution-price assumptions. Paper fees follow broker evidence and
+remain unknown when the broker does not report them.
+
+Read-only price alerts may observe symbols outside the tradable universe, such
+as indices without trading volume, when the configured source supplies a fresh
+positive price and its source timestamp. Missing, stale or future quotes are
+disclosed and retried. An observation alert never authorizes an order or target
+outside the tradable universe.
 
 Invalid Structured Answers in the Autonomous Fund
 --------------------------------------------------------------------------------

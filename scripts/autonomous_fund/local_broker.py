@@ -5,6 +5,7 @@ This module has no provider trading client, URL or authentication path.
 import json
 import os
 import threading
+from dataclasses import asdict, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from zoneinfo import ZoneInfo
@@ -15,7 +16,7 @@ from lumibot.trading_builtins import PollingStream
 
 from .journal import encode
 from .market_data import CachedMarketHours
-from .risk import RiskError, instant, number, trading_day
+from .risk import Account, ObservedPrice, RiskError, instant, number, observed_quote, trading_day
 
 
 class VirtualRiskCancellation(RiskError):
@@ -35,6 +36,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self.fee_rate, self.slippage = number(fee_rate), number(slippage_bps) / 10000
         self.volume_fraction = number(volume_fraction)
         self._last_poll_error = None
+        self._valuation_policy = None
+        self._valuation_error = None
+        self._last_valuation = None
+        self._next_valuation = None
+        self._valuation_book_key = None
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
@@ -156,16 +162,124 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 if kind == "split":
                     splits[symbol] = max(day, splits.get(symbol, day))
         value = number(0)
+        observed = {}
+        market_open = self.is_market_open()
         for position in positions:
             quote = self.data_source.get_quote(position.asset)
             mark_day = trading_day(instant(quote.timestamp))
             if mark_day < splits.get(position.asset.symbol, mark_day):
                 raise RiskError("Price predates applied split; valuation paused")
-            value += number(position.quantity) * number(quote.price)
+            if market_open:
+                mark = observed_quote(quote, self.data_source.get_datetime(), self.limits)
+                observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
+            else:
+                observed[position.asset.symbol] = {"price": str(quote.price), "as_of": str(quote.timestamp)}
+            value += number(position.quantity) * number(observed[position.asset.symbol]["price"])
+        if market_open:
+            for mark in observed.values():
+                ObservedPrice(number(mark["price"]), instant(mark["as_of"])).validate(self.data_source.get_datetime(), self.limits)
+        self._last_balance_marks = observed
         return float(cash), float(value), float(cash + value + receivables)
 
     def get_historical_account_value(self):
         return {}
+
+    def configure_valuation(self, *, universe, mandate, sweep=None, daily_loss_limit=None,
+                            interval_seconds=30, benchmark_symbols=()):
+        """Use the existing broker poll to mark the bound sleeve during long AI calls."""
+        if not 5 <= interval_seconds <= 300:
+            raise RiskError("Valuation interval must be from 5 to 300 seconds")
+        self._valuation_policy = dict(universe=frozenset(universe), mandate=mandate, sweep=sweep,
+                                      daily_loss_limit=daily_loss_limit, interval_seconds=interval_seconds,
+                                      benchmark_symbols=tuple(benchmark_symbols))
+
+    @staticmethod
+    def _valuation_book(db):
+        """One read transaction's book identity, also checked before publishing marks."""
+        return {
+            "balance": dict(db.execute("SELECT cash,receivables FROM local_account WHERE id=1").fetchone()),
+            "positions": [dict(row) for row in db.execute("SELECT * FROM local_positions WHERE quantity>0 ORDER BY symbol")],
+            "meta": dict(db.execute("SELECT key,value FROM meta WHERE key IN "
+                                    "('mandate_reserve_cash','mandate_external')")),
+            "splits": [row[0] for row in db.execute("SELECT id FROM local_actions WHERE id LIKE '%:split' ORDER BY id")],
+            "pending": db.execute("SELECT count(*) FROM intents WHERE status!='terminal'").fetchone()[0],
+            "last_fill": db.execute("SELECT coalesce(max(rowid),0) FROM local_fills").fetchone()[0],
+        }
+
+    def _publish_valuation(self):
+        policy = self._valuation_policy
+        if policy is None:
+            return
+        start = self.data_source.get_datetime()
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            book = self._valuation_book(db)
+        key = encode(book)
+        if self._next_valuation is not None and start < self._next_valuation and key == self._valuation_book_key:
+            return
+        if book["positions"] and not self.is_market_open():
+            return  # Closed-market holdings keep their last observed mark and source time.
+        self._next_valuation = start + timedelta(seconds=policy["interval_seconds"])
+        self._valuation_book_key = key
+        mandate, meta = policy["mandate"], book["meta"]
+        if mandate.capital_usd is not None and "mandate_reserve_cash" not in meta:
+            raise RiskError("Capital sleeve must be initialized before independent valuation")
+        marks = {}
+        positions = []
+        for row in book["positions"]:
+            asset = Asset(row["symbol"], asset_type="stock")
+            marks[row["symbol"]] = observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits)
+            positions.append(Position("local-valuation", asset, row["quantity"], avg_fill_price=float(number(row["average"]))))
+        now = self.data_source.get_datetime()
+        for symbol, mark in marks.items():
+            mark.validate(now, self.limits)
+            split_days = [item.rsplit(":", 2)[1] for item in book["splits"] if item.rsplit(":", 2)[0] == symbol]
+            if split_days and trading_day(mark.as_of) < max(split_days):
+                raise RiskError("Price predates applied split; independent valuation paused")
+        from .holdings import average_prices, split_holdings
+        limited = mandate.capital_usd is not None
+        baseline = json.loads(meta["mandate_external"]) if limited and "mandate_external" in meta else None
+        holdings, _, external_value, _ = split_holdings(
+            positions, policy["universe"], allow_external=mandate.allow_external_holdings,
+            baseline=baseline, initialized=baseline is not None, price=lambda symbol: marks[symbol].price)
+        cash, receivables = number(book["balance"]["cash"]), number(book["balance"]["receivables"])
+        reserve = number(meta.get("mandate_reserve_cash", 0)) if limited else number(0)
+        equity = cash + receivables + sum((number(row["quantity"]) * marks[row["symbol"]].price
+                                         for row in book["positions"]), number(0))
+        account = Account(cash - reserve, equity - external_value - reserve, holdings, now,
+                          bool(book["pending"]), receivables, position_average_prices=average_prices(positions, holdings))
+        if account.cash < 0 or account.equity <= 0:
+            raise RiskError("Independent sleeve valuation has invalid cash or equity")
+        if policy["sweep"] is not None:
+            from .cash import merge
+            sweep = policy["sweep"]
+            account = merge(account, sweep, marks[sweep.symbol].price if sweep.symbol in marks else 0)
+        benchmarks = {}
+        for symbol in policy["benchmark_symbols"]:
+            try:
+                mark = marks.get(symbol) or observed_quote(self.data_source.get_quote(Asset(symbol, asset_type="stock")),
+                                                           self.data_source.get_datetime(), self.limits)
+                benchmarks[symbol] = str(mark.price)
+            except Exception:
+                continue  # Missing benchmark evidence must never invent a return.
+        now = self.data_source.get_datetime()
+        for mark in marks.values():
+            mark.validate(now, self.limits)
+        account = replace(account, as_of=now)
+        body = {**asdict(account), "valuation": {"source": "local_broker_poll", "quotes": {
+            symbol: {"price": str(mark.price), "as_of": str(mark.as_of)}
+            for symbol, mark in marks.items() if symbol in holdings}}}
+        with self.journal.connection() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if self._valuation_book(db) != book:
+                raise RiskError("Book changed during valuation; retry with the next observation")
+            self._event(db, "account", body)
+            if benchmarks:
+                self._event(db, "benchmark", benchmarks)
+        self.journal.mark_equity(now, account.equity, self.limits)
+        self.journal.observe_session(now, account, policy["daily_loss_limit"])
+        self._last_valuation = json.loads(encode(body))
+        self._valuation_error = None
 
     def _submit_order(self, order):
         if self.require_monitor:
@@ -237,6 +351,10 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 if self.matching_enabled and self.is_market_open():
                     self._match(row, order)
             self._last_poll_error = None
+            try:
+                self._publish_valuation()
+            except Exception as exc:
+                self._valuation_error = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
         except Exception as exc:
             message = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
             if message != self._last_poll_error:
@@ -252,6 +370,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                         "matching_enabled": self.matching_enabled,
                         "market": self.data_source.session.status(), "stopped": (self.journal.root / "STOP").exists(),
                         "matching_error": self._last_poll_error, "pending_orders": pending, **account}
+                body.update(valuation=self._last_valuation, valuation_error=self._valuation_error)
                 if hasattr(self.data_source, "diagnostics"):
                     body["market_data"] = self.data_source.diagnostics()
                 target = self.journal.root / "status.json"

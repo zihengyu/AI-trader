@@ -7,7 +7,7 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -107,8 +107,15 @@ def test_logs_status_explains_the_state_in_one_screen(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     # Account amounts use dollars, grouping and cents in the separate holdings block.
     for text in ("模式：local", "交易：已停止（人工停止：新账户首次启动", "fund-start.sh", "独立监控：stopped",
-                 "账户：净值 $10,000.00", "📌 当前实际持仓", "最近通知：", "stop_active"):
+                 "账户：净值 $10,000.00（", "📌 当前实际持仓", "最近通知：", "stop_active"):
         assert text in result.stdout, result.stdout
+    # The shared CLI renderer measures elapsed time from the persisted account,
+    # so re-querying an old observation cannot make its equity look fresh.
+    [saved] = [row["body"] for row in Journal(book, "synthetic-script-account").all_events() if row["kind"] == "account"]
+    from scripts.autonomous_fund.status import summary
+    later = datetime.fromisoformat(saved["as_of"]) + timedelta(minutes=3)
+    assert "净值 $10,000.00（3分钟前）" in summary(book, "local", now=later)
+    assert "前） ｜ 现金" in result.stdout
     follow = script("fund-logs.sh", tmp_path, env, "logs")
     assert ("+ journalctl -u lumibot-fund-runner.service -u lumibot-fund-monitor.service "
             "-u lumibot-fund-desk.service -f") in follow.stdout

@@ -147,10 +147,11 @@ def cost_line(costs):
     return text
 
 
-def account_lines(account, recent_trades=None):
+def account_lines(account, recent_trades=None, *, now=None):
     """Separate observed holdings from AI targets, retaining the snapshot's own time."""
     from zoneinfo import ZoneInfo
     from .risk import number
+    now = now or datetime.now(timezone.utc)
 
     def money(value):
         try:
@@ -170,18 +171,33 @@ def account_lines(account, recent_trades=None):
         except (TypeError, ValueError):
             return "时间未知"
 
-    if not account or account.get("unavailable"):
-        return ["📌 当前实际持仓：暂无可用账户快照"]
+    available = bool(account and not account.get("unavailable"))
+    account = account if available else {}
     at = account.get("as_of") or account.get("at")
+    age = _age(at, now)
+    updated = "时间未知" if age is None else "时间异常"
+    if age is not None and age >= 0:
+        unit, label = next((unit, label) for unit, label in (
+            (86400, "天"), (3600, "小时"), (60, "分钟"), (1, "秒")) if age >= unit or unit == 1)
+        updated = f"{int(age // unit)}{label}前"
     lines = [f"📌 当前实际持仓（快照：{when(at)}）",
-             f"账户：净值 {money(account.get('equity'))} ｜ 现金 {money(account.get('cash'))}"]
+             f"账户：净值 {money(account.get('equity'))}（{updated}）"
+             f" ｜ 现金 {money(account.get('cash'))}"]
+    if not available:
+        lines = ["📌 当前实际持仓：暂无可用账户快照"]
+    quote_times = [mark.get("as_of") for mark in (account.get("valuation", {}).get("quotes") or {}).values()]
+    try:
+        if quote_times:
+            lines.append(f"估值行情最早时间：{when(min(quote_times, key=instant))}")
+    except (TypeError, ValueError):
+        pass  # Legacy records still disclose the account snapshot time above.
     prices = account.get("position_average_prices") or {}
     positions = account.get("positions") or {}
     for symbol, quantity in sorted(positions.items()):
         if number(quantity) == 0:
             continue
         lines.append(f"• {symbol}：{shares(quantity)} 股 ｜ 买入均价 {money(prices.get(symbol))}")
-    if not any(number(quantity) != 0 for quantity in positions.values()):
+    if available and not any(number(quantity) != 0 for quantity in positions.values()):
         lines.append("• 暂无证券持仓")
     swept = account.get("cash_equivalents") or {}
     if swept:
@@ -245,6 +261,8 @@ def summary(root, mode, now=None):
         open_text = ("开盘中" if market.get("open") else f"休市，下次开盘 {market.get('next_open')}") if market else ""
         lines.append(f"交易进程：{beat.get('runner_state')}（心跳 {int(age) if age is not None else '?'} 秒前）"
                      + (f"；市场：{open_text}" if open_text else ""))
+        if beat.get("valuation_error"):
+            lines.append(f"账户估值暂未更新：{beat['valuation_error']}；账户区块保留上次成功快照及其时间。")
     lines.append(desk_line(root, now))
     book = root / "state.sqlite3"
     if not book.is_file():
@@ -258,7 +276,7 @@ def summary(root, mode, now=None):
         return "\n".join(lines)
     account = data.get("latest_account") or {}
     if account:
-        lines += ["", *account_lines(account, data.get("recent_trades")), ""]
+        lines += ["", *account_lines(account, data.get("recent_trades"), now=now), ""]
     if data.get("return") is not None:
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")

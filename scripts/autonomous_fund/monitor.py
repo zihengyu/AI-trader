@@ -322,6 +322,7 @@ class Monitor:
                     "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
                     "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
             self._queue_weekly(db, reviews, now)
+            self._queue_fill_updates(db, now)
             # Drop stale first-start alerts; retain recent requests and failures.
             # A durable cursor bounds each poll to new notifications. It never
             # advances past one stamped in the future, which is revisited later.
@@ -385,6 +386,62 @@ class Monitor:
             following = schedule.index[0].date() if len(schedule) else None
             cache[day] = following is None or following.isocalendar()[:2] != session.isocalendar()[:2]
         return cache[day]
+
+    def _queue_fill_updates(self, db, now):
+        """Recover confirmed-fill notices once a coherent post-fill account exists."""
+        startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+        if not startup or json.loads(startup[0]).get("mode") not in {"local", "paper"}:
+            return
+        saved = db.execute("SELECT value FROM fund_monitor_meta WHERE key='fill_notification_cursor'").fetchone()
+        cursor = int(saved[0]) if saved else 0
+        rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE sequence>? "
+                          "AND kind IN ('fill','fill_reconciled') ORDER BY sequence LIMIT 200", (cursor,)).fetchall()
+        visible = []
+        for row in rows:
+            if instant(row["at"]) > now:
+                break
+            if now - instant(row["at"]) > timedelta(hours=1):
+                cursor = row["sequence"]
+            else:
+                visible.append(row)
+        if visible:
+            account, account_sequence = None, 0
+            for row in db.execute("SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
+                body = json.loads(row["body"])
+                observed = instant(body.get("as_of") or row["at"])
+                if instant(row["at"]) <= now and observed <= now:
+                    body["as_of"] = str(observed)
+                    if account is None or observed > instant(account["as_of"]):
+                        account = body
+                        account_sequence = row["sequence"]
+            cutoff = instant(account["as_of"]) if account is not None else None
+            completed = []
+            for row in visible:
+                if cutoff is None or instant(row["at"]) > cutoff or row["sequence"] >= account_sequence:
+                    break
+                completed.append(row)
+            waiting = False
+            if not completed:
+                # Confirmed trades remain useful while a data outage prevents
+                # marking the remaining holdings. Never attach pre-fill lots.
+                prior = db.execute("SELECT value FROM fund_monitor_meta WHERE key='fill_snapshot_pending'").fetchone()
+                if now - instant(visible[0]["at"]) < timedelta(seconds=60) or (prior and int(prior[0]) >= visible[-1]["sequence"]):
+                    return
+                waiting, account, cutoff, completed = True, None, now, visible
+            from .holdings import recent_trades
+            trades = recent_trades([(at, kind, json.loads(body)) for at, kind, body in db.execute(
+                "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")], cutoff)
+            details = {"at": str(now), "account": account, "recent_trades": trades,
+                       "fill_sequences": [row["sequence"] for row in completed], "account_pending": waiting}
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+                "kind": "execution_update", "details": details})))
+            if waiting:
+                db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('fill_snapshot_pending',?)",
+                           (str(completed[-1]["sequence"]),))
+            else:
+                cursor = completed[-1]["sequence"]
+        if cursor:
+            db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('fill_notification_cursor',?)", (str(cursor),))
 
     def _queue_weekly(self, db, reviews, now):
         """One weekly report per ISO week, after the review of the week's last session (recent reviews only)."""
@@ -539,7 +596,7 @@ class Monitor:
                                   f"approval-{body['details']['id']}.txt", message))
                 else:
                     from .notifications import LONG_MESSAGE, readable
-                    message = readable(body.get("kind"), body.get("details"), row["sequence"]) or text
+                    message = readable(body.get("kind"), body.get("details"), row["sequence"], now=now) or text
                     if len(message) <= LONG_MESSAGE:
                         result = self.transport.send(message)
                     else:  # A long research text arrives whole, as a document.
@@ -674,6 +731,12 @@ class Monitor:
             body = json.loads(account[1])
             lines.append(f"最新分仓净值 ${body.get('equity')}，现金 ${body.get('cash')}，持仓 {encode(body.get('positions'))}"
                          f"（{account[0]}）")
+        try:
+            status = json.loads((self.root / "status.json").read_text(encoding="utf-8"))
+            if status.get("valuation_error"):
+                lines.append(f"账户估值暂未更新：{status['valuation_error']}；保留上次成功快照及其时间。")
+        except (OSError, ValueError):
+            pass
         return "\n".join(lines)
 
     def _answer(self, now, text, reply_to, audit):
