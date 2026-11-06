@@ -31,7 +31,8 @@ def harness(tmp_path):
     strategy.broker = SimpleNamespace(is_market_open=lambda: False)
     strategy._snapshot = lambda: Account(number(10000), number(10000), {}, strategy.get_datetime())
     strategy.log_message = lambda *args, **kwargs: None
-    strategy.notify = lambda kind, details: strategy.journal.event(strategy.get_datetime(), "notification", {"kind": kind, "details": details})
+    # App lifecycle notices use the outbox; notify_user keeps its native API.
+    strategy._notify_fund = lambda kind, details: strategy.journal.event(strategy.get_datetime(), "notification", {"kind": kind, "details": details})
     calls = []
 
     def research(**kwargs):

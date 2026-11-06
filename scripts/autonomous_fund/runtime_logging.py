@@ -1,5 +1,6 @@
 """Keep dependency logging failures from terminating the fund's scheduler."""
 import logging
+import json
 import sys
 
 
@@ -21,8 +22,12 @@ class SchedulerLogger(logging.LoggerAdapter):
             # Never bypass a failed redaction filter with the original message,
             # arguments, exception text or extras; they can contain credentials.
             try:
+                from .diagnostics import exception_diagnostic
+                diagnostic = json.dumps(exception_diagnostic(error, phase="scheduler_logging"),
+                                        ensure_ascii=True, separators=(",", ":"))
                 sys.stderr.write(f"FUND scheduler_logging_error: {type(error).__name__}; "
-                                 "original log record withheld; scheduler continues\n")
+                                 "original log record withheld; scheduler continues; "
+                                 f"diagnostic={diagnostic}\n")
             except Exception:
                 pass  # Even an unavailable stderr cannot end scheduling.
 

@@ -82,7 +82,8 @@ def test_diagnostic_logging_survives_a_broken_journal(tmp_path):
     strategy = live(tmp_path)
     logs, notices = [], []
     strategy.log_message = lambda message, **kwargs: logs.append(message)
-    strategy.notify = lambda kind, details: notices.append((kind, details))
+    # Exercise app-notice failures while preserving the native public API.
+    strategy._notify_fund = lambda kind, details: notices.append((kind, details))
     strategy.journal.event = lambda *args: (_ for _ in ()).throw(OSError("private journal error"))
     strategy._disclose_failure("blocked", OSError("private provider error"), phase="trading_iteration")
     assert notices == [("blocked", "OSError")]

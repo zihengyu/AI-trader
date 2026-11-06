@@ -69,7 +69,8 @@ def test_even_a_broken_notification_path_does_not_end_the_process(tmp_path, monk
     strategy = live(tmp_path)
     monkeypatch.setattr(strategy.journal, "export", failing)
     monkeypatch.setattr(report_module, "report", failing)
-    strategy.notify = failing
+    # The protected path is the app's operational outbox, not native notify().
+    strategy._notify_fund = failing
     strategy.on_trading_iteration()
     strategy.after_market_closes()
 

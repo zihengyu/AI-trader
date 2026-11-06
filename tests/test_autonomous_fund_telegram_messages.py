@@ -131,7 +131,8 @@ def deciding(tmp_path):
     from .test_autonomous_fund_quant import harness
     strategy = harness(tmp_path, mode="local")
     strategy.log_message = lambda *args, **kwargs: None
-    strategy.notify = lambda kind, details: strategy.journal.event(NOW, "notification", {"kind": kind, "details": details})
+    # Lifecycle notices use the app outbox while native notify remains available.
+    strategy._notify_fund = lambda kind, details: strategy.journal.event(NOW, "notification", {"kind": kind, "details": details})
     return strategy
 
 

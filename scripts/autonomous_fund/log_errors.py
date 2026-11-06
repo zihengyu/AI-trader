@@ -17,6 +17,8 @@ TRACE = re.compile(
     r"The above exception was the direct cause|[\w.]+(?:Error|Exception)(?::|$)|"
     r"KeyboardInterrupt|SystemExit)"
 )
+VALIDATION = re.compile(r"validation errors? for\b|structured_output_invalid:")
+VALIDATION_FIELD = re.compile(r"^[\w]+(?:\.[\w]+)*(?:\[[\d,]+\])?$")
 
 
 def _label(entry):
@@ -33,23 +35,27 @@ def error_records(entries, limit=80):
     Another service's output must not break a traceback. The limit applies to
     records rather than lines, so even a long traceback retains its first frame.
     """
-    records, traces = deque(maxlen=limit), {}
+    records, traces, validations = deque(maxlen=limit), {}, set()
     for entry in entries:
         message = entry.get("MESSAGE", "")
         if not isinstance(message, str):
             continue
         key = (entry.get("_SYSTEMD_UNIT"), entry.get("_PID"))
         current = traces.get(key)
-        if current is not None and (not message or TRACE.match(message)):
+        if current is not None and (not message or TRACE.match(message) or
+                                    (key in validations and VALIDATION_FIELD.fullmatch(message))):
             current.append(message)
             continue
         traces.pop(key, None)
+        validations.discard(key)
         is_trace = message.startswith(("Traceback (", "Exception in thread ", "--- Logging error ---"))
         if is_trace or ERROR.search(message):
             record = [_label(entry), message]
             records.append(record)
-            if is_trace:
+            if is_trace or VALIDATION.search(message):
                 traces[key] = record
+            if VALIDATION.search(message):
+                validations.add(key)
     return ["\n".join(record) for record in records]
 
 

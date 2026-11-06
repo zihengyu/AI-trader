@@ -64,6 +64,10 @@ def test_actual_sdk_redaction_failure_withholds_sensitive_record(monkeypatch, ca
     SchedulerLogger(logger, {}).warning("synthetic-private-token %s", "synthetic-private-argument")
     output = capsys.readouterr()
     assert "scheduler_logging_error: KeyError" in output.err
+    # Retain safe source locations so a future SDK failure can be diagnosed
+    # without exposing the failed record, exception message or arguments.
+    assert '"phase":"scheduler_logging"' in output.err
+    assert '"function":"broken_namespace"' in output.err
     assert "synthetic-private" not in output.err + output.out
 
 

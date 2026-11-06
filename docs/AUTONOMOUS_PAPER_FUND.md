@@ -659,6 +659,31 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 （2026-11-03 一次反方审查的摘要超出 1500 字被整份丢弃）。实盘模式下证据时间写成区间（`A ~ B`）时取结束时间，写不出可读时间的
 用校验时刻并在 `estimate_reason` 注明；历史回放仍然严格：时间必须可读，区间按结束时间判断是否晚于模拟时刻。
 
+证据的日期估计说明统一使用 `estimate_reason`。输入兼容说明字段 `estimated_note`：只提供别名时按
+`estimate_reason` 保存；同时提供时，空说明或相同说明合并为一个字段，保留非空说明；两个非空说明不一致时拒收。
+这不会忽略其他未知字段，也不会把非字符串转成文字；必填字段和历史证据的时间、估计依据校验保持有效。
+输入原文仍由原生 trace 保存，规范化后的证据只保留 `estimate_reason`，无需重新调用研究员。
+反方审查兼容额外的 `missing_evidence_placeholder: null` 空占位字段；非空占位字段和其他未知字段仍拒收，
+真实的 `missing_evidence` 列表不会被占位字段替换或丢弃。
+
+`Invalid structured agent answer` 通知现在包含失败角色、已提供的阶段、字段位置和错误代码，例如
+`researcher/postmarket_review; schema_validation: evidence[0].observed_at (string_type)`。
+告警最多显示五处错误，未知字段名显示为 `<extra>`，不会把模型输入值、研究正文或提供方错误内容复制到通知中。
+账户账本的 `agent.answer_diagnostic` 保留错误分类、数量和同一份安全位置；原始 `parse_error` 与研究全文仍留在账本／trace 中供核查。
+超时等运行失败单独标为 `runtime_error: TimeoutError`，空回答为 `missing_answer`，无法提取 JSON 为 `invalid_json`。
+这些诊断在本地使用同一解析器和 schema 完成，不发起新的模型请求，也不会把失败结果激活为策略备忘。
+`fund-logs.sh errors` 同时保留校验错误下一行的字段位置、缩进详情及说明链接，其他进程的心跳不会切断它们；
+正常的大型研究输出仍不进入异常摘要。
+
+原生 `notify_user(title, message, severity, enabled)` 使用 LumiBot 的通知管理器，并将本账户的消息排入
+`fund_outbox` 持久化队列；原生 `Strategy.notify` 的接口、回测禁发和 `enabled=false` 行为保持有效，
+其他已配置通知提供方继续收到原生分发。队列确认的 `payload.status=queued` 仅表示已落盘，
+Telegram 送达仍由独立监控确认。AI 通知固定记为 `agent_notice` 并标注供参考，不能伪装成审批请求或健康故障；
+接收人来自该账户已有的监控配置。内部业务告警单独使用 `_notify_fund`，不再覆盖原生通知接口。
+
+三个角色的研究提示均说明 DuckDB 的实际表结构检查、CTE 只在本条语句内有效，以及用多个 CTE 分开计算
+滞后收益、滚动统计和聚合。查询错误仍返回给模型，由它修正并核对成功结果；这些提示不保证模型永不写错 SQL。
+
 **反方审查**（`critic` 段，`FUND_CRITIC`）：基金经理决策前可调用一个只读的 AI 角色（默认用研究员的模型，
 可用 `FUND_CRITIC_MODEL` 指定），专门给出研究的最强反面论证：反面证据、已被定价或拥挤的逻辑、估值、事件和流动性风险、
 观点之间的相关性、陈旧或无日期的证据。输出按证券列出的疑虑和缺失的证据（`critique`），基金经理必须在理由里回应重要疑虑。

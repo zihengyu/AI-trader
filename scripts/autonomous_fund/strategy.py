@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
 
 from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
@@ -46,6 +46,14 @@ AGENT_RUN_TIMEOUTS = {"researcher": 420, "critic": 300, "manager": 300}
 AGENT_RUN_ATTEMPTS = 2  # The fund CLI's default for LUMIBOT_AGENT_MAX_RUN_ATTEMPTS.
 MONITOR_AGENT_SECONDS = 900
 
+SQL_RESEARCH_PROMPT = (
+    " For DuckDB research, inspect SHOW TABLES and DESCRIBE the loaded table before assuming column names; "
+    "use the actual returned schema. A CTE and its aliases exist only within that one SQL statement. "
+    "Compute lagged returns in one CTE, rolling statistics in the next, and aggregates in a later SELECT; "
+    "DuckDB does not allow nested window functions or window functions inside aggregate arguments. "
+    "After a query error, use its feedback to correct the SQL and inspect a successful result before citing it. "
+)
+
 
 # System prompts are module constants so their digest (prompt_version) identifies
 # which instructions produced each decision; scorecards are grouped by it.
@@ -59,6 +67,7 @@ RESEARCHER_PROMPT = (
     "In historical mode only use information public by as_of, completed bars and "
     "historical fundamentals/news versions. For an undated source estimate first "
     "availability from context, mark estimated=true and explain estimate_reason. "
+    "Use estimate_reason for the date explanation; do not add a separate estimated_note field. "
     "Known future documents must not be opened. When historical=false there are no historical "
     "publication-date restrictions, and available_at may be null for undated sources. "
     "Use observed_at to identify the observation time. Write available_at and observed_at each as ONE "
@@ -87,7 +96,7 @@ RESEARCHER_PROMPT = (
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
     "of time; an unfinished run returns nothing."
-)
+) + SQL_RESEARCH_PROMPT
 CRITIC_PROMPT = (
     "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
     "AGAINST the research's main ideas and the current portfolio: contrary evidence, crowded or already-priced "
@@ -96,8 +105,8 @@ CRITIC_PROMPT = (
     "portfolio-level) with evidence, and list missing evidence. Never fabricate; say when the research holds up. "
     "Keep the summary under 3000 characters, each concern and its evidence under 800, at most 10 concerns. "
     "You do not decide or trade; the manager weighs your critique. In historical mode use only information "
-    "public by as_of."
-)
+    "public by as_of. Return only the requested schema fields, without placeholder fields."
+) + SQL_RESEARCH_PROMPT
 MANAGER_PROMPT = (
     "You are the sole investment decision maker for this long-only paper portfolio. "
     "Pursue long-term risk-adjusted returns, without a fixed signal or obligation to trade. "
@@ -172,7 +181,7 @@ MANAGER_PROMPT = (
     "approval policy. "
     "In phase=postmarket_review return the requested review schema instead of portfolio targets: "
     "assess actual outcomes and update a provisional strategy memo, with no orders or permission changes."
-)
+) + SQL_RESEARCH_PROMPT
 
 
 class Evidence(BaseModel):
@@ -181,7 +190,28 @@ class Evidence(BaseModel):
     available_at: str | None
     observed_at: str
     estimated: bool
-    estimate_reason: str
+    estimate_reason: str = Field(validation_alias=AliasChoices("estimate_reason", "estimated_note"))
+
+    @model_validator(mode="before")
+    @classmethod
+    def reconcile_estimate_explanations(cls, value):
+        """Accept one explicit explanation alias, keeping conflicts and other extras invalid.
+
+        Models sometimes add an empty alias beside the requested field. That
+        must not discard a paid research answer; a different nonempty explanation
+        must not be silently dropped or overwrite the canonical one either.
+        """
+        if not isinstance(value, dict) or "estimate_reason" not in value or "estimated_note" not in value:
+            return value
+        reason, note = value["estimate_reason"], value["estimated_note"]
+        if not isinstance(reason, str) or not isinstance(note, str):
+            return value  # Preserve strict type validation rather than coercing or dropping data.
+        if reason.strip() and note.strip() and reason.strip() != note.strip():
+            raise ValueError("Conflicting publication-date estimate explanations")
+        result = dict(value)
+        result.pop("estimated_note")
+        result["estimate_reason"] = reason if reason.strip() else note
+        return result
 
 
 def _confidence(value):
@@ -262,6 +292,15 @@ class Critique(BaseModel):
     summary: bounded_text(3000, 1)
     concerns: bounded_list(Concern, 10) = Field(default_factory=list)
     missing_evidence: bounded_list(bounded_text(400), 10) = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def omit_empty_placeholder(cls, value):
+        # A null rendering placeholder carries no evidence. Keep every other
+        # extra invalid, including a non-null placeholder that would lose text.
+        if isinstance(value, dict) and "missing_evidence_placeholder" in value and value["missing_evidence_placeholder"] is None:
+            return {key: item for key, item in value.items() if key != "missing_evidence_placeholder"}
+        return value
 
 
 class Decision(BaseModel):
@@ -628,6 +667,8 @@ class AutonomousFund(Strategy):
             "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
             "mandate": asdict(self.mandate), "universe": sorted(config["universe"].items())}).encode()).hexdigest()
         self._bars, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
+        from .notifications import FundOutboxProvider
+        self.notifications.providers.append(FundOutboxProvider(self))
         self._last_report, self._overlay_logged, self._chase_noted = None, {}, set()
         self._triggers, self._move_noted, self._entry_noted, self._last_stressed = [], set(), set(), None
         self._scorecard_cache = None
@@ -767,7 +808,7 @@ class AutonomousFund(Strategy):
             try:
                 self._snapshot()
             except Exception as exc:
-                self.notify("initial_snapshot_unavailable", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+                self._notify_fund("initial_snapshot_unavailable", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         if self.news is not None and not observe_only:
             # Headlines for the whole operator universe help the AI find opportunities;
             # filings are fetched for held positions once the account is observed.
@@ -799,9 +840,9 @@ class AutonomousFund(Strategy):
                 self._disclose("bookkeeping_error", f"{getattr(step, '__name__', 'step')}: {type(exc).__name__}")
 
     def _disclose(self, kind, details):
-        """notify(), but even a broken journal or logger cannot raise from here."""
+        """App notice, but even a broken journal or logger cannot raise from here."""
         try:
-            self.notify(kind, details)
+            self._notify_fund(kind, details)
         except Exception:
             try:
                 import logging
@@ -862,7 +903,7 @@ class AutonomousFund(Strategy):
             from .review import review_after_close
             review_after_close(self)
         except Exception as exc:
-            self.notify("postmarket_review_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._notify_fund("postmarket_review_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         try:
             # Once per completed review: test whether the learned memo beats the baseline,
             # after that session's shadow decision exists (never before the close).
@@ -875,7 +916,7 @@ class AutonomousFund(Strategy):
                     self._evaluate_learning(self.get_datetime())
                     self.journal.set_meta("learning_evaluated_session", session)
         except Exception as exc:
-            self.notify("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+            self._notify_fund("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
 
     def _announce_decision(self, decision, now, account=None, decision_id=None):
         """Tell the operator when the AI changes the target portfolio, and its first plan
@@ -1307,13 +1348,28 @@ class AutonomousFund(Strategy):
                                               result.model, len(models)))
             if cost:
                 self.journal.counter("model_cost_microusd", now, int(round(cost * 1e6)))
+        diagnostic = None
+        if result.parse_error or result.parsed is None:
+            from .diagnostics import structured_answer_diagnostic
+            schema = {"researcher": Research, "manager": Decision, "critic": Critique}.get(name)
+            if name == "manager" and phase == "postmarket_review":
+                from .review import PostmarketReview
+                schema = PostmarketReview
+            diagnostic = structured_answer_diagnostic(result, schema)
         self.journal.event(now, "agent", {
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
             "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
             "mock": self.scripted, "phase": phase, "tokens": tokens,
-            "cost_usd": round(cost, 6) if cost is not None else None})
-        if result.parse_error or result.parsed is None:
-            raise RiskError("Invalid structured agent answer")
+            "cost_usd": round(cost, 6) if cost is not None else None,
+            **({"answer_diagnostic": diagnostic} if diagnostic else {})})
+        if diagnostic:
+            detail = diagnostic["kind"]
+            if "errors" in diagnostic:
+                detail += ": " + "; ".join(f"{item['path']} ({item['type']})" for item in diagnostic["errors"])
+            elif "error" in diagnostic:
+                detail += ": " + diagnostic["error"]
+            role = name + (f"/{phase}" if phase else "")
+            raise RiskError(f"Invalid structured agent answer: {role}; {detail}")
         parsed = result.parsed
         if not hasattr(parsed, "model_dump"):
             return parsed
@@ -1339,7 +1395,8 @@ class AutonomousFund(Strategy):
         finally:
             self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
 
-    def notify(self, kind, details):
+    def _notify_fund(self, kind, details):
+        """Queue application events; keep Strategy.notify's native public contract."""
         # The separately running monitor delivers this persistent outbox. An
         # unchanged condition repeated every minute is journaled once per window.
         now, key = self.get_datetime(), (kind, encode(details))
@@ -1347,10 +1404,12 @@ class AutonomousFund(Strategy):
         if notices is not None:
             last = notices.get(key)
             if last is not None and 0 <= (now - last).total_seconds() < NOTICE_WINDOWS.get(kind, 1800):
-                return
-            notices[key] = now
+                return False
         self.journal.event(now, "notification", {"kind": kind, "details": details})
+        if notices is not None:
+            notices[key] = now  # A failed journal write must remain retryable.
         self.log_message(f"FUND {kind}: {details}", color="yellow")
+        return True
 
     def on_trading_iteration(self):
         self._begin_preparation()
@@ -1381,7 +1440,7 @@ class AutonomousFund(Strategy):
                 record = stops.read(self.halt_path.parent) or {}
                 # One notice per (who, why) and window, not per rewrite: a restart loop or a
                 # flapping watchdog reason must not turn into a stream of alerts.
-                self.notify("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
+                self._notify_fund("stop_active", {"class": record.get("class"), "reason": record.get("reason"),
                                             "orders": "no new orders"})
                 self._warm_optional(now)  # Ready when trading resumes; never an order.
                 return
@@ -1401,7 +1460,7 @@ class AutonomousFund(Strategy):
                     return
             paused = self.journal.mark_equity(now, account.equity, self.limits)
             if paused:
-                self.notify("drawdown_pause", "New risk is paused until explicit operator reset")
+                self._notify_fund("drawdown_pause", "New risk is paused until explicit operator reset")
             if account.open_orders:
                 self._manage_open_orders(now)
                 if getattr(self, "quant", None) is not None:
@@ -1519,7 +1578,7 @@ class AutonomousFund(Strategy):
         spent = self.journal.counter("model_cost_microusd", now) / 1e6
         if spent < float(budget.max_daily_cost_usd):
             return False
-        self.notify("model_cost_budget_exhausted", {"day": trading_day(now), "cost_usd": round(spent, 4),
+        self._notify_fund("model_cost_budget_exhausted", {"day": trading_day(now), "cost_usd": round(spent, 4),
                                                     "limit_usd": budget.max_daily_cost_usd, "skipped": step})
         return True
 
@@ -1533,7 +1592,7 @@ class AutonomousFund(Strategy):
         if runs + required_runs > budget.max_agent_runs_per_day - budget.reserved_review_runs:
             # Existing accepted targets keep executing without new inference; the
             # budget resets at the next New York trading day.
-            self.notify("model_budget_exhausted", {"day": trading_day(now), "runs": runs,
+            self._notify_fund("model_budget_exhausted", {"day": trading_day(now), "runs": runs,
                         "limit": budget.max_agent_runs_per_day, "reserved_for_reviews": budget.reserved_review_runs})
             return
         context = {"as_of": now.isoformat(), "historical": self.mode not in {"paper", "local"},
@@ -1792,7 +1851,7 @@ class AutonomousFund(Strategy):
                                         "sessions and |t| >= switch_t_stat; otherwise the current arm keeps trading."}
         if switch:
             self.journal.set_meta("learning_champion", switch)
-            self.notify("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
+            self._notify_fund("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
                                                        "pairs": stats["pairs"]})
         self.journal.set_meta("learning_evaluation", evaluation)
         self.journal.event(now, "learning_evaluation", evaluation)
@@ -2012,7 +2071,7 @@ class AutonomousFund(Strategy):
             result["construction"] = construction
             if settings.mode == "auto" and construction["champion"] != current:
                 self.journal.set_meta("construction_champion", construction["champion"])
-                self.notify("construction_switched", {"from": current, "to": construction["champion"],
+                self._notify_fund("construction_switched", {"from": current, "to": construction["champion"],
                                                       "test": construction["test"]})
         self._scorecard_cache = (key, result)
         return result
@@ -3081,4 +3140,4 @@ class AutonomousFund(Strategy):
     def on_abrupt_closing(self):
         if getattr(self, "news", None) is not None:
             self.news.close()
-        self.notify("stopped", "Runner stopped; broker orders retain their broker-observed state")
+        self._notify_fund("stopped", "Runner stopped; broker orders retain their broker-observed state")

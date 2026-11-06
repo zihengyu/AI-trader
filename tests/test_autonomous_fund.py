@@ -171,7 +171,8 @@ def harness(tmp_path, mode="mock"):
     strategy.limits = LIMITS
     strategy.session_orders = {}
     strategy.get_datetime = lambda: NOW
-    strategy.notify = lambda *args: None
+    # App notices are separate from the native notify_user provider interface.
+    strategy._notify_fund = lambda *args: None
     return strategy
 
 

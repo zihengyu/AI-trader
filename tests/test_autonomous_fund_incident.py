@@ -63,3 +63,25 @@ def test_monitor_sigint_exits_cleanly_without_clearing_the_stop(tmp_path, monkey
     monkeypatch.setattr(monitor, "run_monitor", interrupted)
     run.main(["monitor", "--run-dir", str(tmp_path), "--console-only"])
     assert stops.read(tmp_path)["class"] == "operator"
+
+
+def test_errors_keep_validation_fields_and_details_across_interleaved_processes():
+    from scripts.autonomous_fund.log_errors import error_records
+
+    def entry(message, pid="1"):
+        return {"MESSAGE": message, "_PID": pid, "_SYSTEMD_UNIT": "synthetic.service"}
+
+    records = [entry("WARNING Agent answer did not match Research: 1 validation error for Research"),
+               entry("evidence.3.observed_at"), entry("INFO monitor heartbeat", "2"),
+               entry("  Input should be a valid string [type=string_type, input_value=None]"),
+               entry("    For further information visit https://errors.pydantic.dev/example"),
+               entry("INFO [agents] summary=" + "x" * 20000),
+               entry("WARNING structured_output_invalid: 1 validation error for Critique"),
+               entry("missing_evidence_placeholder"),
+               entry("  Extra inputs are not permitted [type=extra_forbidden]"),
+               entry("INFO normal iteration")]
+    result = error_records(records)
+    assert len(result) == 2
+    assert "evidence.3.observed_at" in result[0] and "string_type" in result[0]
+    assert "missing_evidence_placeholder" in result[1] and "extra_forbidden" in result[1]
+    assert "summary=" not in "\n".join(result) and "heartbeat" not in "\n".join(result)

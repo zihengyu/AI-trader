@@ -67,7 +67,8 @@ def harness(tmp_path, frames=None, last=None, approval=None, quant=None, mode="m
     strategy.universe = frozenset(UNIVERSE)
     strategy.get_datetime = lambda: NOW
     strategy.notices = []
-    strategy.notify = lambda kind, details: strategy.notices.append((kind, details))
+    # Observe internal risk notices without overriding native provider fanout.
+    strategy._notify_fund = lambda kind, details: strategy.notices.append((kind, details))
     strategy.quant = QuantPolicy.from_config(quant, UNIVERSE, LIMITS)
     strategy.execution_policy, strategy.model_budget = ExecutionPolicy(), ModelBudget()
     strategy.execution = ExecutionState(strategy.journal, ApprovalPolicy.from_config(approval))
@@ -394,8 +395,8 @@ def test_identical_notices_are_journaled_once_per_window(tmp_path):
     strategy.get_datetime = lambda: clock[0]
     for minute in range(40):
         clock[0] = NOW + timedelta(minutes=minute)
-        AutonomousFund.notify(strategy, "blocked", "Stale account snapshot")
-    AutonomousFund.notify(strategy, "blocked", "Different reason")
+        AutonomousFund._notify_fund(strategy, "blocked", "Stale account snapshot")
+    AutonomousFund._notify_fund(strategy, "blocked", "Different reason")
     with strategy.journal.connection() as db:
         rows = [json.loads(r[0]) for r in db.execute("SELECT body FROM events WHERE kind='notification'")]
     assert [r["details"] for r in rows] == ["Stale account snapshot", "Stale account snapshot", "Different reason"]

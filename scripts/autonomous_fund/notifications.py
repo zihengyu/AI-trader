@@ -8,6 +8,28 @@ from .journal import encode
 from .risk import RiskError, instant
 
 
+class FundOutboxProvider:
+    """Native notification provider backed by this account's durable outbox."""
+
+    provider = "fund_outbox"
+
+    def __init__(self, strategy):
+        self.strategy = strategy
+
+    def notify(self, *, title, message, severity="info", **kwargs):
+        from lumibot.components.notifications.base import NotificationResult
+
+        # AI text must never masquerade as an approval request or health event.
+        # The monitor owns transport and its already bound recipient; queueing
+        # acknowledges durable acceptance, not Telegram delivery.
+        queued = self.strategy._notify_fund("agent_notice", {
+            "title": title, "message": message, "severity": severity})
+        return NotificationResult(ok=True, provider=self.provider, title=title, message=message,
+                                  severity=severity, skipped=not queued,
+                                  reason=None if queued else "duplicate notice",
+                                  payload={"status": "queued" if queued else "deduplicated"})
+
+
 TRIGGERS = {
     "single_order_at_least_8_percent": "单笔交易达到净值的 8%（旧版逐笔规则）",
     "single_order_threshold": "单笔交易达到人工审批阈值（旧版逐笔规则）",
@@ -267,7 +289,10 @@ def readable(kind, details, sequence=None):
     from .status import REASONS
     details = details if details is not None else {}
     text = None
-    if kind == "premarket_research":
+    if kind == "agent_notice":
+        text = (f"AI 通知（供参考） · {details.get('severity', 'info')}\n"
+                f"{details.get('title', '')}\n{details.get('message', '')}")
+    elif kind == "premarket_research":
         phase = {"before_market_opens": "开盘前", "closed_startup": "休市期间"}.get(details.get("phase"), "盘前")
         lines = [f"📊 盘前研究 · {phase}（开盘 {_when(details.get('session_open'))}）", "", details.get("summary") or ""]
         evidence = details.get("evidence") or []

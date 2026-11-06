@@ -170,7 +170,8 @@ def test_the_critic_is_skipped_at_the_cost_cap(tmp_path):
     from tests.test_autonomous_fund_construction import critic_strategy
     fake, _, now = critic_strategy(tmp_path, run=lambda **kw: pytest.fail("no critique past the cost cap"))
     fake.model_budget, notices = ModelBudget(max_daily_cost_usd="1"), []
-    fake.notify = lambda kind, details: notices.append(kind)
+    # Intercept the app outbox without replacing the native notify contract.
+    fake._notify_fund = lambda kind, details: notices.append(kind)
     fake.journal.counter("model_cost_microusd", now, 2_000_000)
     assert AutonomousFund._critique(fake, {}, {"summary": "r", "evidence": []}, fake.model_budget, now) is None
     assert notices == ["model_cost_budget_exhausted"]

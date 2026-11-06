@@ -113,7 +113,7 @@ def test_recovery_message_does_not_promise_a_resume_that_cannot_happen(tmp_path)
 def test_every_new_stop_is_announced_with_its_reason(tmp_path):
     from .test_autonomous_fund_stability import live
     strategy = live(tmp_path)
-    del strategy.notify  # The real, deduplicating notify.
+    del strategy._notify_fund  # Use the app outbox's real deduplication, preserving native notify().
     strategy._notices = {}
     stops.clear(tmp_path)  # live() leaves an older empty STOP, which counts as an operator stop.
     stops.write(tmp_path, "service", "service_start", NOW)
@@ -251,7 +251,7 @@ def test_windows_children_share_one_short_grace_period_and_a_stuck_one_never_blo
 def test_repeated_stops_with_the_same_reason_are_announced_once(tmp_path):
     from .test_autonomous_fund_stability import live
     strategy = live(tmp_path)
-    del strategy.notify
+    del strategy._notify_fund  # Exercise app-notice deduplication after the native API was restored.
     strategy._notices = {}
     stops.clear(tmp_path)
     for minutes in (0, 1, 2):  # Restart loop: a fresh service STOP record each time.

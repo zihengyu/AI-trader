@@ -211,6 +211,49 @@ limits are never presented as execution prices. The complete decision rationale
 is retained. Longer notices arrive as complete text attachments with holdings
 visible in the caption.
 
+Invalid Structured Answers in the Autonomous Fund
+--------------------------------------------------------------------------------
+
+Evidence uses ``estimate_reason`` for a publication-date explanation. The optional
+fund also accepts ``estimated_note`` as an explicit input alias and saves only
+the canonical field. An empty or identical duplicate is accepted; a nonempty
+alias can supply an empty canonical explanation. Conflicting nonempty
+explanations, incorrect types, missing required fields and other unknown fields
+are still rejected. Historical timestamp and estimate-explanation checks remain
+in force. This compatibility requires no additional model request, and the
+original answer remains in the native trace.
+Critiques also accept ``missing_evidence_placeholder: null`` as an empty rendering
+placeholder. Non-null placeholders and other unknown fields remain invalid;
+the actual ``missing_evidence`` list is preserved.
+
+An ``Invalid structured agent answer`` notice identifies the agent, the phase
+when supplied, and up to five field positions and error codes. For example,
+``researcher/postmarket_review; schema_validation: evidence[0].observed_at (string_type)``
+identifies a timestamp supplied with the wrong type. Unknown field names appear
+as ``<extra>``; input values and provider exception messages are not copied into
+the notice. The journal's ``agent.answer_diagnostic`` retains the error category,
+count and safe positions; consult the original ``parse_error`` and the call's
+``trace=`` file for the complete answer.
+
+Runtime failures such as ``runtime_error: TimeoutError`` are distinguished from
+schema mismatches, ``missing_answer`` and ``invalid_json``. A rejected postmarket
+answer does not activate a new strategy memo; the last valid memo stays in use.
+``fund-logs.sh errors`` retains the following field-location and indented detail
+lines in the same error record, including when other processes log between them.
+
+The autonomous fund keeps the native ``Strategy.notify`` and ``notify_user``
+contracts. Its ``fund_outbox`` provider queues AI notices durably for the selected
+account's monitor, while native disabled/backtest behavior and other configured
+providers remain effective. ``payload.status=queued`` acknowledges persistence;
+Telegram delivery is confirmed separately. These notices use ``agent_notice``
+and cannot be presented as operational approval or health events. Internal
+application alerts use a separate ``_notify_fund`` method.
+
+For DuckDB research, the fund's role prompts explain inspecting actual tables
+and columns, keeping CTE aliases within one statement, and separating lagged
+returns, rolling statistics and aggregates into successive CTEs. Query failures
+remain visible so the agent can correct and verify its work.
+
 Evidence References Rejected in an Autonomous Fund Postmarket Review
 --------------------------------------------------------------------------------
 
