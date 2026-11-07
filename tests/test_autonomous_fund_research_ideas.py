@@ -227,3 +227,11 @@ def test_scorecards_and_their_summary_score_registered_ideas(tmp_path):
     assert summary["verdict"] == "insufficient_sample"
     from scripts.autonomous_fund.notifications import idea_text
     assert "研究想法：共 1 条，已打分 1" in idea_text(strategy._scorecards(NOW)["ideas"])
+
+
+def test_the_idea_schema_sent_to_the_model_uses_standard_json_schema_bounds():
+    """The confidence bound reaches the provider as minimum/maximum, never as pydantic's ge/le names."""
+    import json
+    schema = Research.model_json_schema()["$defs"]["Idea"]["properties"]["confidence"]
+    assert (schema["minimum"], schema["maximum"]) == (0.5, 0.95)
+    assert '"ge"' not in json.dumps(Research.model_json_schema()) and '"le"' not in json.dumps(Research.model_json_schema())
