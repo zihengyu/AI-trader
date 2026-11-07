@@ -66,6 +66,7 @@ def components():
 
     return SimpleNamespace(httpx=httpx, jsonschema=jsonschema, request=LlmRequest, types=types,
         adapter=deepseek_llm.DeepSeekResponsesLlm, resolve=runtime._resolve_model_for_adk,
+        wire_schema=deepseek_llm.strict_output_schema,
         protocol=native_output_protocol, instruction=structured_output_instruction, schema_model=Research,
         aggregate=runtime._aggregate_usage_metadata,
         adapter_sha256=hashlib.sha256(Path(deepseek_llm.__file__).read_bytes()).hexdigest(),
@@ -107,7 +108,8 @@ def provider_error_diagnostic(error):
     elif schema and (unavailable or "unknown variant" in text or "supported values" in text) and (
             "json_schema" in text or "response_format" in text or "format type" in text):
         problem = "schema_format_unavailable"
-    elif schema and "required" in text and any(term in text for term in ("properties", "every", "all", "missing")):
+    elif "required" in text and (schema or ("properties" in text and "object" in text)) and any(
+            term in text for term in ("properties", "every", "all", "missing")):
         problem = "schema_required_fields_rejected"
     elif schema and ("invalid" in text or "additionalproperties" in text or "additional properties" in text):
         problem = "schema_definition_rejected"
@@ -165,11 +167,13 @@ def load_secrets(path):
 
 
 def offline_transport(c, model, schema):
+    wire_schema = c.wire_schema(schema)
+
     def handle(request):
         body = json.loads(request.content)
         if (str(request.url) != "https://api.deepseek.com/responses" or
                 body["model"] != model.removeprefix("deepseek/") or
-                body["text"]["format"]["schema"] != schema):
+                body["text"]["format"]["schema"] != wire_schema):
             raise ProbeFailure("offline_request_contract_mismatch")
         results = [item for item in body["input"] if item["type"] == "function_call_output"]
         if not results:
@@ -235,6 +239,11 @@ def validate_answer(c, response, case, schema):
     except c.jsonschema.ValidationError as error:
         case["schema_validator"] = error.validator
         raise ProbeFailure("schema_validation") from None
+    try:
+        c.jsonschema.validate(value, c.wire_schema(schema))
+    except c.jsonschema.ValidationError as error:
+        case["schema_validator"] = error.validator
+        raise ProbeFailure("wire_schema_validation") from None
     result = c.schema_model.model_validate(value).model_dump()
     case["schema_valid"] = True
     return result
@@ -250,10 +259,11 @@ async def exercise(c, args, model, case, checkpoint):
         adapter._transport = offline_transport(c, model, schema)
     case["protocol"] = c.protocol(model)
     case["schema_sha256"] = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
+    case["wire_schema_sha256"] = hashlib.sha256(json.dumps(c.wire_schema(schema), sort_keys=True).encode()).hexdigest()
     evidence = {"source": "probe:" + uuid4().hex, "available_at": None, "observed_at": utc_now(),
                 "estimated": False, "estimate_reason": ""}
     tool = c.types.FunctionDeclaration(name=TOOL_NAME, description="Read one synthetic evidence record for this diagnostic.",
-        parameters_json_schema={"type": "object", "properties": {}, "additionalProperties": False})
+        parameters_json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False})
     request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=(
         f"先调用 {TOOL_NAME} 读取合成证据，然后返回完整 Research JSON。summary 用中文简短说明这是接口测试，"
         "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]。不要猜测或编造证据。"))])],

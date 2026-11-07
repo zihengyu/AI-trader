@@ -9,7 +9,7 @@ import pytest
 from google.adk.models.llm_request import LlmRequest
 from google.genai import types
 
-from lumibot.components.agents.deepseek_llm import DeepSeekResponsesLlm, _input_items
+from lumibot.components.agents.deepseek_llm import DeepSeekResponsesLlm, _input_items, strict_output_schema
 from lumibot.components.agents.runtime import GoogleADKRuntime, RuntimeRequest, _resolve_model_for_adk
 from lumibot.components.agents.schemas import AgentRunResult, BoundTool
 from lumibot.components.agents.structured_output import parse_structured_output
@@ -20,6 +20,79 @@ SCHEMA = {"type": "object", "properties": {"summary": {"type": "string", "minLen
           "required": ["summary", "evidence"], "additionalProperties": False}
 ANSWER = {"summary": "Synthetic observed result", "evidence": ["Recorded observation"]}
 MODELS = ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"]
+
+
+def missing_required_properties(schema):
+    """Independent mock-provider rule for the reported strict-schema rejection."""
+    missing = []
+
+    def inspect(value):
+        if isinstance(value, dict):
+            properties = value.get("properties")
+            if isinstance(properties, dict):
+                missing.extend(key for key in properties if key not in value.get("required", []))
+            for key, child in value.items():
+                if key not in {"default", "examples", "enum", "const"}:
+                    inspect(child)
+        elif isinstance(value, list):
+            for child in value:
+                inspect(child)
+
+    inspect(schema)
+    return missing
+
+
+def test_strict_wire_schema_requires_defaulted_fields_without_mutating_types_values_or_caller():
+    import jsonschema
+
+    literal = {"properties": {"observed": {"type": "boolean"}}}
+    schema = {"type": "object", "properties": {
+        "summary": {"type": "string", "minLength": 1},
+        "records": {"type": "array", "default": [], "minItems": 0,
+                    "items": {"anyOf": [{"$ref": "#/$defs/Record"}, {"type": "null"}]}},
+        "label": {"type": "string", "default": "unspecified"}}, "required": ["summary"],
+        "$defs": {"Record": {"type": "object", "properties": {
+            "valid": {"type": "boolean", "default": False}}, "additionalProperties": False}},
+        "default": literal, "examples": [literal], "enum": [literal], "const": literal}
+    original = deepcopy(schema)
+    wire = strict_output_schema(schema)
+    assert missing_required_properties(schema) == ["records", "label", "valid"]
+    assert not missing_required_properties(wire)
+    assert schema == original
+    assert wire["required"] == ["summary", "records", "label"] and wire["additionalProperties"] is False
+    assert wire["properties"] == original["properties"]
+    assert wire["$defs"]["Record"]["properties"] == original["$defs"]["Record"]["properties"]
+    for key in ("default", "examples", "enum", "const"):
+        assert wire[key] == original[key]
+    # Validate field constraints separately from the literal-preservation fixtures.
+    contract = {key: value for key, value in wire.items() if key not in {"default", "examples", "enum", "const"}}
+    jsonschema.validate({"summary": "observed", "records": [{"valid": False}, None], "label": "unspecified"}, contract)
+    for invalid in ({"summary": "observed"}, {"summary": "observed", "records": [], "label": None},
+                    {"summary": "", "records": [], "label": "unspecified"}):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(invalid, contract)
+
+
+@pytest.mark.parametrize("keyword", ["anyOf", "oneOf", "allOf", "prefixItems", "items"])
+def test_strict_wire_schema_visits_schema_lists(keyword):
+    schema = {keyword: [{"type": "object", "properties": {"count": {"type": "integer", "default": 0}}}, False]}
+    wire = strict_output_schema(schema)
+    assert wire[keyword][0]["required"] == ["count"] and wire[keyword][1] is False
+    assert "required" not in schema[keyword][0]
+
+
+def test_strict_wire_schema_preserves_explicit_open_maps_and_existing_requirements():
+    for extra in (True, {"type": "object", "properties": {"source": {"type": "string"}}}):
+        schema = {"type": "object", "properties": {"label": {"type": "string"}},
+                  "required": ["label", "undeclared"], "additionalProperties": extra}
+        wire = strict_output_schema(schema)
+        assert wire["required"] == ["label", "undeclared"]
+        # Explicit map semantics are never silently replaced by a closed object.
+        if extra is True:
+            assert wire["additionalProperties"] is True
+        else:
+            assert wire["additionalProperties"]["required"] == ["source"]
+            assert "required" not in extra
 
 
 def terminal(model, *, output=None, status="completed"):
@@ -128,10 +201,18 @@ def test_existing_provider_endpoint_override_is_preserved(monkeypatch):
 
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("body", [ANSWER, {"summary": "Missing evidence"}])
-def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monkeypatch, model, body):
+@pytest.mark.parametrize("defaulted_fields", [False, True])
+def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monkeypatch, model, body, defaulted_fields):
     from lumibot.components.agents import runtime as runtime_module
 
     sent, observed = [], []
+    schema = deepcopy(SCHEMA)
+    answer = deepcopy(body)
+    if defaulted_fields:
+        schema["properties"]["notes"] = {"type": "array", "default": [], "items": {
+            "type": "object", "properties": {"observed": {"type": "boolean", "default": False}}}}
+        answer["notes"] = []
+    original_schema = deepcopy(schema)
 
     def observe(value: int):
         """Return a synthetic read-only observation."""
@@ -139,7 +220,11 @@ def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monke
         return {"observed": value}
 
     def handle(request):
-        sent.append(json.loads(request.content))
+        payload = json.loads(request.content)
+        if missing_required_properties(payload["text"]["format"]["schema"]):
+            return httpx.Response(400, json={"error": {"code": "invalid_request_error", "message":
+                "Required properties must include all properties in the object"}})
+        sent.append(payload)
         if len(sent) == 1:
             return httpx.Response(200, json=terminal(model, output=[
                 {"id": "rs_synthetic", "type": "reasoning", "summary": [], "content": [
@@ -149,7 +234,13 @@ def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monke
         assert len(sent) == 2
         return httpx.Response(200, json=terminal(model, output=[
             {"id": "msg_final", "type": "message", "role": "assistant", "status": "completed",
-             "content": [{"type": "output_text", "text": json.dumps(body), "annotations": []}]}]))
+             "content": [{"type": "output_text", "text": json.dumps(answer), "annotations": []}]}]))
+
+    if defaulted_fields:
+        # Reproduce the old 400 before exercising the repaired real ADK tool loop.
+        rejected = handle(httpx.Request("POST", "https://api.deepseek.com/responses", json={
+            "text": {"format": {"schema": schema}}}))
+        assert rejected.status_code == 400 and not sent
 
     original = runtime_module._resolve_model_for_adk
 
@@ -166,10 +257,12 @@ def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monke
         memory_state=None, memory_notes=[], include_builtin_skills=False,
         bound_tools=[BoundTool("observe", "Read a synthetic observation.", observe, source="custom",
                                metadata={"mutates_trading": False})],
-        max_output_tokens=256, reasoning_effort="high", output_schema=SCHEMA)
+        max_output_tokens=256, reasoning_effort="high", output_schema=schema)
     result = GoogleADKRuntime().run(request)
     assert observed == [3] and len(sent) == 2
-    assert all(row["text"]["format"]["schema"] == SCHEMA for row in sent)
+    # Defaulted fields must now be required on every continuation's wire schema.
+    assert all(not missing_required_properties(row["text"]["format"]["schema"]) for row in sent)
+    assert schema == original_schema
     assert all([tool["name"] for tool in row["tools"]] == ["observe"] for row in sent)
     assert any(item["type"] == "reasoning" and item["content"][0]["text"] ==
                "Inspect the recorded observation before answering." for item in sent[1]["input"])
@@ -180,8 +273,8 @@ def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monke
     assert result.usage["candidates_token_count"] == 20
     assert result.usage["cached_content_token_count"] == 14
     assert result.usage["thoughts_token_count"] == 8
-    parsed, error = parse_structured_output(result.summary, SCHEMA, None)
-    assert parsed == (ANSWER if body == ANSWER else None)
+    parsed, error = parse_structured_output(result.summary, schema, None)
+    assert parsed == (answer if body == ANSWER else None)
     assert bool(error) == (body != ANSWER)
 
 
@@ -240,9 +333,12 @@ def test_manager_passes_create_and_run_schemas_to_the_runtime_and_separates_old_
     override = {"type": "object", "required": ["summary"]}
     assert agent.run(output_schema=override).parsed == ANSWER
     assert seen[0].output_schema == SCHEMA and seen[1].output_schema == override
-    assert all(payload["structured_output_protocol"] == "deepseek_responses_json_schema_v1" for payload in payloads)
+    # v2 separates required-field normalization from the previous native wire contract.
+    assert all(payload["structured_output_protocol"] == "deepseek_responses_json_schema_v2" for payload in payloads)
     old = {key: value for key, value in payloads[0].items() if key != "structured_output_protocol"}
     assert original(old) != original(payloads[0])
+    prior_native = {**payloads[0], "structured_output_protocol": "deepseek_responses_json_schema_v1"}
+    assert original(prior_native) != original(payloads[0])
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -306,7 +402,8 @@ def test_unstructured_and_other_model_routes_keep_their_existing_provider_adapte
 
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("role", ["researcher", "critic", "manager", "review"])
-def test_all_fund_role_schemas_reach_native_requests_unchanged(model, role):
+def test_all_fund_role_schemas_use_strict_wire_copy_and_original_local_validation(model, role):
+    import jsonschema
     from types import SimpleNamespace
     from scripts.autonomous_fund.review import PostmarketReview
     from scripts.autonomous_fund.run import ScriptedRuntime
@@ -314,15 +411,20 @@ def test_all_fund_role_schemas_reach_native_requests_unchanged(model, role):
 
     schema_model = {"researcher": Research, "critic": Critique, "manager": Decision, "review": PostmarketReview}[role]
     schema = schema_model.model_json_schema()
+    original_schema = deepcopy(schema)
     fixture = ScriptedRuntime().run(SimpleNamespace(bound_tools=[], agent_name="manager" if role == "review" else role,
         context={"as_of": "2026-11-02T21:05:00+00:00", "eligible_universe": ["ALFA"],
                  "phase": "postmarket_review" if role == "review" else "research", "session": {"session_date": "2026-11-02"}}))
+    # Emit a complete synthetic model response to satisfy the stricter wire contract.
+    answer = schema_model.model_validate_json(fixture.summary)
 
     def handle(request):
-        assert json.loads(request.content)["text"]["format"]["schema"] == schema
+        wire = json.loads(request.content)["text"]["format"]["schema"]
+        assert wire == strict_output_schema(schema) and not missing_required_properties(wire)
+        jsonschema.validate(answer.model_dump(mode="json"), wire)
         return httpx.Response(200, json=terminal(model, output=[{"id": "msg_role", "type": "message",
             "role": "assistant", "status": "completed", "content": [
-                {"type": "output_text", "text": fixture.summary, "annotations": []}]}]))
+                {"type": "output_text", "text": answer.model_dump_json(), "annotations": []}]}]))
 
     adapter = DeepSeekResponsesLlm(model=model, output_schema=schema, transport=httpx.MockTransport(handle))
 
@@ -332,4 +434,4 @@ def test_all_fund_role_schemas_reach_native_requests_unchanged(model, role):
     [result] = asyncio.run(consume())
     parsed, error = parse_structured_output(result.content.parts[0].text, schema, schema_model)
     assert error is None
-    assert parsed.model_dump() == schema_model.model_validate_json(fixture.summary).model_dump()
+    assert parsed.model_dump() == answer.model_dump() and schema == original_schema

@@ -31,7 +31,8 @@ _FENCE_PATTERN = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
 def native_output_protocol(model: Any) -> str | None:
     """Documented provider capabilities, shared by routing and replay identity."""
     if isinstance(model, str) and model in {"deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"}:
-        return "deepseek_responses_json_schema_v1"
+        # v2 requires every declared object property in the provider schema.
+        return "deepseek_responses_json_schema_v2"
     return None
 
 

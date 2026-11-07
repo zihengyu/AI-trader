@@ -311,6 +311,10 @@ requests the full ``Research`` schema. Direct DeepSeek Flash and Pro calls now
 also send that schema to the Responses API as native JSON Schema output,
 including across research-tool continuations. Schema-invalid answers are still
 rejected locally; provider failures and truncation remain possible.
+The sender requires every declared property in a separate strict wire schema,
+including defaulted fields and nested definitions. The original caller schema,
+field types, defaults and local validation remain intact; the model must emit
+those fields explicitly.
 A schema mismatch or invalid JSON allows
 one additional researcher correction per review attempt, with the original
 answer, safe field diagnostics and the same input snapshot. Both calls retain
@@ -341,6 +345,12 @@ without copying provider messages, input values, secrets or private endpoints.
 An unknown category remains ``provider_request_rejected``. These are diagnostic
 labels, not automatic fallback rules. Real-provider qualification remains
 blocked until the actual request passes; local mock success cannot replace it.
+A rejection saying ``required`` must include all ``properties`` identifies the
+strict object rule. Earlier requests sent Pydantic's defaulted fields as
+optional. Update both the adapter and script to use the strict wire-schema
+adaptation for Flash and Pro, then rerun the same real-provider command. The
+report distinguishes the original schema fingerprint from the wire schema and
+validates the final JSON against both contracts.
 
 Runtime failures such as ``runtime_error: TimeoutError`` are distinguished from
 schema mismatches, ``missing_answer`` and ``invalid_json``. A rejected postmarket

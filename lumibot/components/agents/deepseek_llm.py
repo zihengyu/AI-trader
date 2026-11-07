@@ -18,6 +18,53 @@ from openai import AsyncOpenAI
 from pydantic import PrivateAttr
 
 
+def strict_output_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Adapt object fields to DeepSeek's strict request contract on a copy.
+
+    Pydantic omits defaulted fields from ``required``; the provider requires
+    every declared property there, including inside references and unions.
+    Keep their types/defaults and the caller's local validation unchanged:
+    the model must emit valid values, rather than Python filling in an answer
+    or making non-nullable fields nullable to satisfy the transport.
+    """
+    result = json.loads(json.dumps(schema))
+
+    def visit(node):
+        if not isinstance(node, dict):
+            return
+        properties = node.get("properties")
+        if isinstance(properties, dict):
+            required = node.get("required", [])
+            if isinstance(required, list):
+                # Preserve existing requirements, even for an invalid caller
+                # schema; transport normalization must not weaken constraints.
+                node["required"] = list(dict.fromkeys([*properties, *required]))
+            node.setdefault("additionalProperties", False)
+        # Only descend schema keywords. Defaults, examples, enum and const can
+        # contain arbitrary objects whose literal values must remain intact.
+        for keyword in ("properties", "$defs", "definitions", "patternProperties", "dependentSchemas", "dependencies"):
+            children = node.get(keyword)
+            if isinstance(children, dict):
+                for child in children.values():
+                    visit(child)
+        for keyword in ("items", "additionalItems", "contains", "additionalProperties", "unevaluatedProperties",
+                        "unevaluatedItems", "propertyNames", "not", "if", "then", "else", "contentSchema"):
+            child = node.get(keyword)
+            if isinstance(child, list):
+                for item in child:
+                    visit(item)
+            else:
+                visit(child)
+        for keyword in ("anyOf", "oneOf", "allOf", "prefixItems"):
+            children = node.get(keyword)
+            if isinstance(children, list):
+                for child in children:
+                    visit(child)
+
+    visit(result)
+    return result
+
+
 def _content(value, *, assistant=False):
     if not isinstance(value, list):
         return value
@@ -123,6 +170,7 @@ class DeepSeekResponsesLlm(BaseLlm):
     The outer runtime continues to own retry and whole-run time limits.
     """
     _schema: dict[str, Any] = PrivateAttr()
+    _wire_schema: dict[str, Any] = PrivateAttr()
     _api_key: str = PrivateAttr()
     _api_base: str = PrivateAttr()
     _timeout: float | None = PrivateAttr()
@@ -138,6 +186,7 @@ class DeepSeekResponsesLlm(BaseLlm):
             raise ValueError("DeepSeek structured output requires DEEPSEEK_API_KEY")
         super().__init__(model=model)
         self._schema = json.loads(json.dumps(output_schema))
+        self._wire_schema = strict_output_schema(self._schema)
         self._api_key = key
         # Preserve the provider SDK's existing endpoint override; never borrow
         # an OpenAI endpoint/key or silently downgrade to prompt-only output.
@@ -150,7 +199,7 @@ class DeepSeekResponsesLlm(BaseLlm):
         messages, tools, _, params, choice = await _get_completion_inputs(llm_request, self.model)
         body = {"model": self.model.removeprefix("deepseek/"), "input": _input_items(messages),
                 "text": {"format": {"type": "json_schema", "name": "agent_answer",
-                                     "schema": self._schema, "strict": True}}}
+                                     "schema": self._wire_schema, "strict": True}}}
         if tools:
             if any(tool.get("type") != "function" for tool in tools):
                 raise ValueError("DeepSeek Responses requires function tools")

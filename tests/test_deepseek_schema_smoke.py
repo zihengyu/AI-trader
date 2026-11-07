@@ -32,6 +32,9 @@ def test_default_mode_exercises_both_models_offline_and_reports_known_usage(tmp_
     assert [case["model"] for case in report["cases"]] == list(smoke.MODELS.values())
     for case in report["cases"]:
         assert case["schema_valid"] and case["tool_roundtrip"] and case["usage_complete"]
+        # The request copy now requires defaulted fields; the local contract is unchanged.
+        assert case["protocol"] == "deepseek_responses_json_schema_v2"
+        assert len(case["wire_schema_sha256"]) == 64 and case["wire_schema_sha256"] != case["schema_sha256"]
         assert len(case["requests"]) == 2
         assert case["usage"]["prompt_token_count"] == 22
         assert case["usage"]["candidates_token_count"] == 14
@@ -86,6 +89,7 @@ def mock_real_provider(monkeypatch, mutation):
 @pytest.mark.parametrize("failure,code,schema_valid,request_count", [
     ("reject", None, False, 1),
     ("missing_fields", "schema_validation", False, 2),
+    ("missing_defaulted_field", "wire_schema_validation", False, 2),
     ("incomplete", "provider_response_unsuccessful", False, 2),
     ("wrong_evidence", "evidence_does_not_match_tool", True, 2),
 ])
@@ -104,6 +108,9 @@ def test_real_mode_reports_failures_without_fabricating_fields_and_continues_the
             answer = json.loads(value["output"][0]["content"][0]["text"])
             if failure == "missing_fields":
                 answer = {"ideas": []}
+            elif failure == "missing_defaulted_field":
+                # A native strict-output pass also requires explicitly emitted defaults.
+                answer.pop("ideas")
             else:
                 answer["evidence"][0]["source"] = "fabricated:synthetic"
             value["output"][0]["content"][0]["text"] = json.dumps(answer)
@@ -201,6 +208,7 @@ def test_wall_timeout_keeps_unknown_usage_and_does_not_retry(tmp_path, monkeypat
     ("This response_format type is unavailable now", "schema_format_unavailable"),
     ("Unknown variant json_schema; supported values: text, json_object", "schema_format_unavailable"),
     ("Invalid schema: required must include all properties", "schema_required_fields_rejected"),
+    ("Required properties must include all properties in the object", "schema_required_fields_rejected"),
     ("Invalid schema: minItems is not supported", "schema_keyword_rejected"),
     ("The json_schema format is not supported with tools", "schema_tools_combination_rejected"),
     ("The json_schema format is unsupported in thinking mode", "schema_reasoning_combination_rejected"),

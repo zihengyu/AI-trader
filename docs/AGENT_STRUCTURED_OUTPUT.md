@@ -3,7 +3,7 @@
 Native provider schema requests and local validation for generic LumiBot agents.
 
 Last Updated: 2026-11-07
-Status: Implemented locally; real-provider qualification blocked by HTTP 400
+Status: Strict required-field adaptation implemented locally; real-provider rerun pending
 Audience: Agent runtime maintainers and strategy authors
 
 ## Overview
@@ -22,6 +22,16 @@ JSON Schema. They keep their selected model IDs. Provider protocol conversion be
 Calls without a schema, other DeepSeek model IDs and other providers retain
 their existing routes.
 
+Before sending, the adapter creates a separate strict wire schema. Every
+declared object property is required, including Pydantic fields with defaults
+and fields inside referenced definitions, arrays and unions. Objects with
+declared properties receive `additionalProperties: false` when unspecified;
+explicit map settings are preserved and may still be rejected by the provider.
+Types, constraints, default annotations and literal values are retained. The
+caller schema and local validator stay unchanged. Defaulted fields must be
+emitted explicitly with valid values; Python does not fill in missing model
+answers or introduce nullable types to make a request pass.
+
 The adapter uses the selected provider's explicit `DEEPSEEK_API_KEY` and honors
 the SDK's existing optional `DEEPSEEK_API_BASE`. It never borrows OpenAI
 credentials or endpoints. An endpoint or schema rejection is a provider error;
@@ -38,8 +48,9 @@ schema validation remains required; a schema cannot prove evidence, dates,
 citations or an investment claim correct.
 
 Native DeepSeek schema runs add a protocol revision to their replay-cache key.
-An old prompt-only cached answer cannot qualify as a native schema response.
-No cache is deleted.
+Revision `deepseek_responses_json_schema_v2` separates this strict wire contract
+from both prompt-only and the earlier unadapted native-schema entries. No cache
+is deleted.
 
 ## Configuration Classes And Negative Controls
 
@@ -51,6 +62,10 @@ Deterministic tests cover both Flash and Pro HTTP payloads, real ADK tool
 continuations, original reasoning and call-ID replay, multimodal input
 conversion, token/cache accounting, schema failures, incomplete responses,
 provider endpoint selection, missing credentials and replay-key separation.
+An independent mock-provider check first rejects schemas with optional
+properties, then accepts the adapted request through the ADK tool loop. All
+four optional application role schemas are checked for both model IDs, with
+the original caller schemas and local validation preserved.
 Existing provider, permission, historical-evidence and application regressions
 remain separate controls.
 
@@ -60,15 +75,17 @@ Run the standalone script from the deployed checkout with the same Python
 environment and provider settings as the service. It tests both Flash and Pro
 against the application's actual `Research` schema, including `summary` and
 `evidence`. Each model must first request a synthetic read-only evidence tool,
-then return plain JSON that passes JSON Schema and Pydantic validation and
-copies the tool's actual evidence. It does not connect to a broker, read a
+then return plain JSON that passes both original and wire JSON Schema checks
+and Pydantic validation. It must copy the tool's actual evidence. It does not connect to a broker, read a
 customer account or place orders.
 
-A real-provider run has returned HTTP 400 for both models on their first
-request. This is failed provider qualification, not evidence that either model
-accepted the requested native schema. The status alone does not identify which
-request field or combination was rejected. Local mock passes must not be used
-to describe this path as verified against the real provider.
+A real-provider run returned HTTP 400 for both models on their first request.
+A subsequent Flash diagnostic identified a strict object rule: `required`
+must contain every property. The original Pydantic `Research` schema omitted
+defaulted fields such as `ideas`, including defaults in nested definitions.
+The sender now adapts this rule generically for both models. Successful real
+provider qualification is still pending; local mock passes do not establish
+that the remote service accepts every part of the corrected request.
 
 The default is offline HTTP simulation, with no provider credentials needed:
 
@@ -95,7 +112,8 @@ explicit secret file, and other providers' keys are not loaded from it.
 
 The console shows each model's schema/tool outcome and reported token/cache
 usage. A unique report under `artifacts/verification/deepseek-schema-smoke/`
-records mode, source/schema fingerprints, SDK versions, per-request status,
+records mode, source fingerprints, original and wire schema fingerprints, SDK
+versions, per-request status,
 available usage and the synthetic final answer. `--output` selects a new file;
 existing files are never overwritten. A started request is checkpointed before
 inference; interruption and timeout leave unreported usage unknown. Provider
@@ -113,7 +131,8 @@ reloaded its code. This diagnostic is independent of semantic/release evals.
 The report and console now retain safe `provider_problem` categories rather
 than only `http_status: 400`. They can distinguish a reported unavailable schema
 format, rejected schema keywords or required-field rules, an invalid schema
-definition, and a schema/tool or schema/reasoning combination rejection.
+definition, and a schema/tool or schema/reasoning combination rejection. The
+all-properties-required error is recognized even without the word `schema`.
 `provider_request_rejected` means the available message does not match a known
 category; it must not be relabeled as proven schema support or non-support.
 
@@ -125,9 +144,10 @@ categories explain evidence; they do not select a provider, retry a request,
 change a schema or silently downgrade the requested output mode.
 
 Connection errors separately identify DNS or certificate verification failures
-from exception types, without copying hostnames or exception messages. Update
-the diagnostic and repeat the same explicit real-provider command to capture
-the relevant category before changing the production request contract.
+from exception types, without copying hostnames or exception messages. After
+updating the adapter and diagnostic together in the selected environment,
+repeat the explicit real-provider command. A new rejection still needs its
+specific evidence; no fallback or blanket support claim follows from a 400.
 
 ## Source To Served Evidence
 
