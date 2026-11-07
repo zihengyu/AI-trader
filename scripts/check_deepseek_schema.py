@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import importlib.metadata
 import json
+import math
 import os
 import re
 import socket
@@ -31,7 +32,9 @@ MODELS = {"flash": "deepseek/deepseek-flash", "pro": "deepseek/deepseek-v4-pro"}
 TOOL_NAME = "schema_probe_evidence"
 # Every production answer schema, plus a probe of whether the provider enforces the constraints
 # our local validation relies on. Requests per model for each case.
-CASES = {"research": 2, "decision": 1, "critique": 1, "review": 1, "constraints": 2}
+# A model may read the tool more than once before answering; production agents run several tool rounds.
+MAX_TOOL_ROUNDS = 3
+CASES = {"research": 1 + MAX_TOOL_ROUNDS, "decision": 1, "critique": 1, "review": 1, "constraints": 2}
 REVIEW_REFS = ["event:1", "research:1", "context:session"]
 
 _PROVIDER_CODES = {"invalid_request_error", "invalid_json_schema", "unsupported_parameter", "unsupported_value",
@@ -175,8 +178,9 @@ def load_secrets(path):
             os.environ[name] = values[name]
 
 
-def offline_transport(c, model, schema, answer=None):
-    """Mock DeepSeek: the research tool round trip, or (with `answer`) one final JSON message."""
+def offline_transport(c, model, schema, answer=None, tool_rounds=1):
+    """Mock DeepSeek: the research tool round trip (`tool_rounds` calls before answering), or (with `answer`)
+    one final JSON message."""
     wire_schema = c.wire_schema(schema)
 
     def handle(request):
@@ -190,9 +194,9 @@ def offline_transport(c, model, schema, answer=None):
             output = [{"id": "msg_probe", "type": "message", "role": "assistant", "status": "completed",
                        "content": [{"type": "output_text", "annotations": [],
                                     "text": json.dumps(answer, ensure_ascii=False)}]}]
-        elif not results:
-            output = [{"id": "fc_probe", "type": "function_call", "call_id": "call_probe",
-                       "name": TOOL_NAME, "arguments": "{}"}]
+        elif len(results) < tool_rounds:
+            output = [{"id": f"fc_probe_{len(results) + 1}", "type": "function_call",
+                       "call_id": f"call_probe_{len(results) + 1}", "name": TOOL_NAME, "arguments": "{}"}]
         else:
             text = results[-1]["output"]
             if isinstance(text, list):
@@ -287,23 +291,32 @@ async def exercise(c, args, model, case, checkpoint):
         "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]。不要猜测或编造证据。"))])],
         config=c.types.GenerateContentConfig(system_instruction=c.instruction(schema),
             tools=[c.types.Tool(function_declarations=[tool])], max_output_tokens=args.max_output_tokens))
-    first = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
-    calls = [part.function_call for part in (first.content.parts if first.content else []) if part.function_call]
+    response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
+    calls = [part.function_call for part in (response.content.parts if response.content else []) if part.function_call]
     if not calls:
-        validate_answer(c, first, case, schema)
+        validate_answer(c, response, case, schema)
         raise ProbeFailure("tool_not_requested")
-    ids = [call.id for call in calls]
-    if any(call.name != TOOL_NAME or call.args for call in calls) or not all(ids) or len(set(ids)) != len(ids):
-        raise ProbeFailure("unexpected_tool_call")
-    case["tool_calls"] = len(calls)
-    request.contents.extend([first.content, c.types.Content(role="user", parts=[
-        c.types.Part(function_response=c.types.FunctionResponse(id=call.id, name=call.name,
-            response={"evidence": evidence})) for call in calls])])
-    final = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
-    if any(part.function_call for part in (final.content.parts if final.content else [])):
-        raise ProbeFailure("additional_tool_round_requested")
-    answer = validate_answer(c, final, case, schema)
-    if answer["evidence"] != [evidence]:
+    rounds = 0
+    while calls:
+        # Reading the same evidence again is allowed (production agents run several tool rounds); a model
+        # that never stops asking is not, and an unexpected or malformed call never is.
+        if rounds == MAX_TOOL_ROUNDS:
+            raise ProbeFailure("too_many_tool_rounds")
+        ids = [call.id for call in calls]
+        if any(call.name != TOOL_NAME or call.args for call in calls) or not all(ids) or len(set(ids)) != len(ids):
+            raise ProbeFailure("unexpected_tool_call")
+        rounds += 1
+        case["tool_calls"] += len(calls)
+        case["tool_rounds"] = rounds
+        request.contents.extend([response.content, c.types.Content(role="user", parts=[
+            c.types.Part(function_response=c.types.FunctionResponse(id=call.id, name=call.name,
+                response={"evidence": evidence})) for call in calls])])
+        response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
+        calls = [part.function_call for part in (response.content.parts if response.content else [])
+                 if part.function_call]
+    answer = validate_answer(c, response, case, schema)
+    # The same record listed twice after two reads is harmless; anything else is not what the tool returned.
+    if not answer["evidence"] or any(item != evidence for item in answer["evidence"]):
         raise ProbeFailure("evidence_does_not_match_tool")
     case.update(status="passed", tool_roundtrip=True, answer=answer)
 
@@ -408,8 +421,16 @@ async def _single(c, args, model, case, checkpoint, schema_name, prompt, offline
 
 
 CONSTRAINT_NOTE = ("held: this answer kept the constraint, by the provider's enforcement or because the model ignored "
-                   "the instruction; not_enforced: the provider returned a value the schema forbids, so local "
-                   "validation can still reject a production answer of that kind.")
+                   "the instruction; held_null: a nullable field was answered with null instead of the forbidden "
+                   "value; not_enforced: the provider returned a value the schema forbids, so local validation can "
+                   "still reject a production answer of that kind; untested: the field was missing or not a number.")
+
+
+def _observed(value):
+    """A returned value for the report: null or a finite number as is, anything else only by its type."""
+    if value is None or (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)):
+        return value
+    return {"type": type(value).__name__}
 
 
 async def exercise_constraints(c, args, model, case, checkpoint):
@@ -424,6 +445,9 @@ async def exercise_constraints(c, args, model, case, checkpoint):
         {"summary": "约束测试。", "evidence": [evidence], "ideas": []}, validate=False)
     findings["Research.summary minLength 1"] = "not_enforced" if research.get("summary") == "" else "held"
     findings["Research.evidence minItems 1"] = "not_enforced" if research.get("evidence") == [] else "held"
+    observed = case.setdefault("constraint_observed", {})
+    observed["Research.summary length"] = len(research["summary"]) if isinstance(research.get("summary"), str) else None
+    observed["Research.evidence items"] = len(research["evidence"]) if isinstance(research.get("evidence"), list) else None
     as_of, expires, review = _times()
     decision = await _single(c, args, model, case, checkpoint, "decision", (
         "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
@@ -438,8 +462,11 @@ async def exercise_constraints(c, args, model, case, checkpoint):
     weight, entry = first.get("weight"), first.get("entry_limit")
     findings["Target.weight maximum 1"] = ("untested" if not isinstance(weight, (int, float)) else
                                            "not_enforced" if weight > 1 else "held")
-    findings["Target.entry_limit exclusiveMinimum 0"] = ("untested" if not isinstance(entry, (int, float)) else
-                                                         "not_enforced" if entry <= 0 else "held")
+    # entry_limit may be null: answering null instead of the forbidden 0 keeps the constraint ("held_null").
+    findings["Target.entry_limit exclusiveMinimum 0"] = (
+        "held_null" if "entry_limit" in first and entry is None else
+        "untested" if not isinstance(entry, (int, float)) else "not_enforced" if entry <= 0 else "held")
+    observed["Target.weight"], observed["Target.entry_limit"] = _observed(weight), _observed(entry)
     if "not_enforced" in findings.values():
         raise ProbeFailure("provider_constraint_not_enforced")
     case["schema_valid"] = True
@@ -543,8 +570,10 @@ def main(argv=None):
                         known = [row["usage"] for row in case["requests"] if row["usage"] is not None]
                         case["usage"] = c.aggregate(known)
                         case["usage_complete"] = bool(case["requests"]) and len(known) == len(case["requests"])
-                        detail = (f" tool_roundtrip={case['tool_roundtrip']}" if name == "research" else
-                                  " " + json.dumps(case.get("constraint_findings", {}), ensure_ascii=False)
+                        detail = (f" tool_roundtrip={case['tool_roundtrip']} tool_rounds={case.get('tool_rounds', 0)}"
+                                  if name == "research" else
+                                  " " + json.dumps(case.get("constraint_findings", {}), ensure_ascii=False) +
+                                  " observed=" + json.dumps(case.get("constraint_observed", {}), ensure_ascii=False)
                                   if name == "constraints" else "")
                         print(f"[{case['status'].upper()}] {model} {name} schema={case['schema_valid']}{detail} "
                               f"requests={len(case['requests'])}", flush=True)
@@ -555,6 +584,7 @@ def main(argv=None):
                         checkpoint()
                 if "constraints" in cases:
                     print("约束说明：held 表示这次回答满足约束（可能是 DeepSeek 强制，也可能只是模型没照做）；"
+                          "held_null 表示该字段允许为空，模型用 null 代替了被禁止的值；"
                           "not_enforced 表示 DeepSeek 没有强制该约束，本地校验仍会拒绝这类回答。", flush=True)
                 exit_code = 0 if all(case["status"] == "passed" for case in report["cases"]) else 1
                 report["status"] = "passed" if exit_code == 0 else "failed"

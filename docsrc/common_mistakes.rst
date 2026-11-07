@@ -331,13 +331,16 @@ For a standalone checkout diagnostic, run
 check the real Flash and Pro endpoints, use ``--real-models`` with
 ``DEEPSEEK_API_KEY`` supplied in the process environment or an explicitly
 selected ``--env-file "<your-secret-file>"``. Real mode generates provider usage
-and makes at most four requests, with no automatic retry. It checks the actual
+and makes at most eight requests, with no automatic retry. A model may read the
+synthetic tool up to three times before answering; a fourth request for it fails
+as ``too_many_tool_rounds``. It checks the actual
 ``Research`` schema, a synthetic read-only tool round trip and reported usage;
 JSON reports are saved under ``artifacts/verification/deepseek-schema-smoke/``.
 Add ``--schemas all`` to also check the ``Decision``, ``Critique`` and
 ``PostmarketReview`` schemas and a constraint probe that asks for values the
 schema forbids (an empty ``summary``, a weight above 1, a zero price); any such
-value returned is reported as ``not_enforced`` and fails the check (14 requests
+value returned is reported as ``not_enforced`` and fails the check, and a
+``null`` price, which the schema allows, as ``held_null`` (at most 18 requests
 for both models).
 It does not connect to a broker or establish that a running service has reloaded
 the current code. An offline pass does not establish real provider support.

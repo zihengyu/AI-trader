@@ -28,10 +28,11 @@ def test_default_mode_exercises_both_models_offline_and_reports_known_usage(tmp_
     assert smoke.main(["--output", str(output)]) == 0
     report = json.loads(output.read_text())
     assert report["mode"] == "offline" and report["status"] == "passed"
-    assert report["max_provider_requests"] == 4
+    assert report["max_provider_requests"] == 2 * (1 + smoke.MAX_TOOL_ROUNDS)
     assert [case["model"] for case in report["cases"]] == list(smoke.MODELS.values())
     for case in report["cases"]:
         assert case["schema_valid"] and case["tool_roundtrip"] and case["usage_complete"]
+        assert case["tool_rounds"] == 1 and case["tool_calls"] == 1
         # The request copy now requires defaulted fields; the local contract is unchanged.
         assert case["protocol"] == "deepseek_responses_json_schema_v2"
         assert len(case["wire_schema_sha256"]) == 64 and case["wire_schema_sha256"] != case["schema_sha256"]
@@ -275,7 +276,7 @@ def test_all_cases_cover_every_production_schema_offline(tmp_path, capsys):
     assert smoke.main(["--schemas", "all", "--output", str(output)]) == 0
     report = json.loads(output.read_text())
     assert report["schemas"] == ["research", "decision", "critique", "review", "constraints"]
-    assert report["max_provider_requests"] == 2 * 7
+    assert report["max_provider_requests"] == 2 * (1 + smoke.MAX_TOOL_ROUNDS + 1 + 1 + 1 + 2)
     assert [(c["model"], c["schema"]) for c in report["cases"]] == [
         (model, name) for model in smoke.MODELS.values() for name in report["schemas"]]
     assert all(case["status"] == "passed" and case["usage_complete"] for case in report["cases"])
@@ -284,6 +285,8 @@ def test_all_cases_cover_every_production_schema_offline(tmp_path, capsys):
     assert decision["answer"]["targets"][0]["entry_limit"] == 100.0 and len(decision["requests"]) == 1
     constraints = next(c for c in report["cases"] if c["schema"] == "constraints")
     assert set(constraints["constraint_findings"].values()) == {"held"} and len(constraints["requests"]) == 2
+    assert constraints["constraint_observed"] == {"Research.summary length": 5, "Research.evidence items": 1,
+                                                  "Target.weight": 1.0, "Target.entry_limit": 0.01}
     assert set(constraints["schemas"]) == {"research", "decision"}
     assert "约束说明" in capsys.readouterr().out
 
@@ -340,3 +343,44 @@ def test_unknown_cases_are_refused_before_any_request(value, tmp_path):
     with pytest.raises(SystemExit) as stopped:
         smoke.main(["--schemas", value, "--output", str(tmp_path / "never.json")])
     assert stopped.value.code == 2 and not (tmp_path / "never.json").exists()
+
+
+def rounds_transport(monkeypatch, rounds):
+    original = smoke.offline_transport
+    monkeypatch.setattr(smoke, "offline_transport", lambda c, model, schema, answer=None: original(
+        c, model, schema, answer, tool_rounds=rounds))
+
+
+def test_reading_the_tool_again_before_answering_is_allowed_up_to_the_limit(tmp_path, monkeypatch, capsys):
+    # A real model read the evidence a second time before answering; production agents allow that.
+    rounds_transport(monkeypatch, smoke.MAX_TOOL_ROUNDS)
+    output = tmp_path / "rounds.json"
+    assert smoke.main(["--model", "pro", "--output", str(output)]) == 0
+    [case] = json.loads(output.read_text())["cases"]
+    assert case["status"] == "passed" and case["tool_roundtrip"]
+    assert case["tool_rounds"] == case["tool_calls"] == smoke.MAX_TOOL_ROUNDS
+    assert len(case["requests"]) == 1 + smoke.MAX_TOOL_ROUNDS and case["usage_complete"]
+    assert f"tool_rounds={smoke.MAX_TOOL_ROUNDS}" in capsys.readouterr().out
+
+
+def test_a_model_that_keeps_calling_the_tool_fails_without_an_extra_request(tmp_path, monkeypatch):
+    rounds_transport(monkeypatch, smoke.MAX_TOOL_ROUNDS + 1)
+    output = tmp_path / "endless.json"
+    assert smoke.main(["--model", "flash", "--output", str(output)]) == 1
+    [case] = json.loads(output.read_text())["cases"]
+    assert case["error"]["code"] == "too_many_tool_rounds" and not case["tool_roundtrip"]
+    # Within the request budget: the call past the limit is refused, not answered.
+    assert len(case["requests"]) == 1 + smoke.MAX_TOOL_ROUNDS and case["tool_rounds"] == smoke.MAX_TOOL_ROUNDS
+
+
+def test_a_null_entry_limit_holds_the_constraint_through_the_nullable_option(tmp_path, monkeypatch):
+    def null_entry(prompt, answer):
+        if "格式约束测试" in prompt and "targets" in answer:
+            answer["targets"][0]["entry_limit"] = None
+        return answer
+    patched_answers(monkeypatch, null_entry)
+    output = tmp_path / "null.json"
+    assert smoke.main(["--schemas", "constraints", "--model", "pro", "--output", str(output)]) == 0
+    [case] = json.loads(output.read_text())["cases"]
+    assert case["constraint_findings"]["Target.entry_limit exclusiveMinimum 0"] == "held_null"
+    assert case["constraint_observed"]["Target.entry_limit"] is None and case["status"] == "passed"

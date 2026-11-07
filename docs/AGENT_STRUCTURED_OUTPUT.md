@@ -101,8 +101,11 @@ the process environment, or select an untracked secret file explicitly:
 .venv/bin/python scripts/check_deepseek_schema.py --real-models --env-file "<your-secret-file>"
 ```
 
-Real mode creates DeepSeek usage: at most two provider requests per selected
-model, four for the default `--model both`, without automatic retries. Use
+Real mode creates DeepSeek usage: at most four provider requests per selected
+model, eight for the default `--model both`, without automatic retries. A
+model may read the tool again before answering, as production agents may: up
+to three tool rounds pass and are recorded as `tool_rounds`; a fourth request
+for the tool fails as `too_many_tool_rounds` without another provider request. Use
 `--model flash` or `--model pro` to select one model. Each request defaults to
 4,096 maximum output tokens and a 120-second wall/request timeout, adjustable
 with `--max-output-tokens` and `--request-timeout-seconds` (at most 300 seconds).
@@ -111,22 +114,26 @@ No `.env` is discovered automatically. Process values take precedence over the
 explicit secret file, and other providers' keys are not loaded from it.
 
 `--schemas` selects the cases (comma-separated, or `all`); the default
-`research` keeps the original two-request check above:
+`research` keeps the original tool round-trip check above:
 
 | Case | Requests per model | What it checks |
 |---|---|---|
-| `research` | 2 | `Research` with a synthetic read-only tool round trip |
+| `research` | 2-4 | `Research` with a synthetic read-only tool round trip (one to three tool rounds) |
 | `decision` | 1 | `Decision`, whose price levels add `exclusiveMinimum` (absent from `Research`); the times must be copied |
 | `critique` | 1 | `Critique` |
 | `review` | 1 | `PostmarketReview`; `evidence_refs` must come from the supplied list, as in production |
 | `constraints` | 2 | Asks on purpose for an empty `summary`, an empty `evidence`, a weight of 1.5 and an `entry_limit` of 0 |
 
-`all` makes 7 requests per model, 14 for both. The constraint probe reports
-`held` or `not_enforced` per constraint and fails the case on any
+`all` makes at most 9 requests per model, 18 for both. The constraint probe
+reports `held` or `not_enforced` per constraint and fails the case on any
 `not_enforced`: that value reached us although the schema forbids it, so the
 provider does not enforce it and local validation can still reject a
 production answer of that kind. `held` cannot tell provider enforcement from a
-model that ignored the instruction; it is evidence, not proof.
+model that ignored the instruction; it is evidence, not proof. `entry_limit`
+is nullable, so a `null` answer in place of the forbidden 0 is `held_null`;
+`untested` means the field was missing or not a number. The values the model
+returned are recorded under `constraint_observed` (a non-numeric value only by
+its type) and printed with the findings.
 
 ```bash
 .venv/bin/python scripts/check_deepseek_schema.py --real-models --schemas all

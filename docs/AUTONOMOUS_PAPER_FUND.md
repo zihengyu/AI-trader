@@ -1160,10 +1160,12 @@ Flash 成功结果先提交 SQLite；Pro 失败后，下次上述检查复用该
 部署后可单独运行 `scripts/check_deepseek_schema.py`：默认 `--offline` 只做模拟；
 显式 `--real-models` 才调用真实 Flash／Pro，并可用 `--env-file "<your-secret-file>"` 选择密钥文件。
 脚本统一用当前 `Research` schema 检查 `summary`／`evidence`、合成只读工具往返和已报告用量，
-默认最多四次提供方请求，不自动重试、不连接券商；结果保存在 `artifacts/verification/deepseek-schema-smoke/`。
+默认最多八次提供方请求（模型回答前可再次读取工具，最多三轮，记录为 `tool_rounds`；
+第四次要求工具判为 `too_many_tool_rounds`），不自动重试、不连接券商；结果保存在 `artifacts/verification/deepseek-schema-smoke/`。
 `--schemas all` 再检查基金经理决策（`Decision`，含 `Research` 没有的 `exclusiveMinimum`）、反方审查（`Critique`）、
 盘后复盘（`PostmarketReview`，引用必须来自给定清单）和约束探针（故意要求空 `summary`、空 `evidence`、权重 1.5、入场价 0：
-返回了这些值说明 DeepSeek 没有强制该约束，记为 `not_enforced` 并判为失败），两个模型共 14 次请求。
+返回了这些值说明 DeepSeek 没有强制该约束，记为 `not_enforced` 并判为失败；入场价可为空，
+模型用 null 代替 0 记为 `held_null`；实际返回值记录在 `constraint_observed`），两个模型最多 18 次请求。
 它不代替完整账户策略复现，也不能证明正在运行的服务已经重载新代码；详见 `docs/AGENT_STRUCTURED_OUTPUT.md`。
 真实接口若在第一次请求就返回 HTTP 400，表示请求被拒绝，不能据此声称原生 Schema 已实测可用。
 更新后的诊断会提供 `provider_problem`：区分格式不可用、Schema 关键字／必填项规则被拒绝、
