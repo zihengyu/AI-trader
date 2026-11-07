@@ -9,9 +9,9 @@ from time import monotonic
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
-from typing import Annotated, Literal
+from typing import Literal
 
-from pydantic import AliasChoices, BaseModel, BeforeValidator, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
@@ -242,8 +242,15 @@ class Idea(BaseModel):
     edge_source: bounded_text(500, 1)
     catalyst: bounded_text(400) = ""
     invalidation: bounded_text(400, 1)
-    confidence: Annotated[float, BeforeValidator(_confidence), Field(ge=0.5, le=0.95, allow_inf_nan=False)]
+    # Plain Field constraints so the model's JSON Schema carries standard minimum/maximum (the
+    # Annotated form rendered non-standard "ge"/"le" keys); the clamp still runs before validation.
+    confidence: float = Field(ge=0.5, le=0.95, allow_inf_nan=False)
     evidence_refs: bounded_list(int, 12) = Field(default_factory=list)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _keep_confidence_in_range(cls, value):
+        return _confidence(value)
 
 
 def _idea_key(idea):

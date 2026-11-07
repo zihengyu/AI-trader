@@ -210,6 +210,7 @@ def test_wall_timeout_keeps_unknown_usage_and_does_not_retry(tmp_path, monkeypat
     ("Invalid schema: required must include all properties", "schema_required_fields_rejected"),
     ("Required properties must include all properties in the object", "schema_required_fields_rejected"),
     ("Invalid schema: minItems is not supported", "schema_keyword_rejected"),
+    ("Invalid schema: exclusiveMinimum is not supported", "schema_keyword_rejected"),  # Decision's price levels.
     ("The json_schema format is not supported with tools", "schema_tools_combination_rejected"),
     ("The json_schema format is unsupported in thinking mode", "schema_reasoning_combination_rejected"),
     ("Invalid schema: additionalProperties must be false", "schema_definition_rejected"),
@@ -265,3 +266,77 @@ def test_real_mode_report_keeps_specific_schema_rejection_for_operator(tmp_path,
     assert error["provider_problem"] == request_error["provider_problem"] == "schema_format_unavailable"
     assert len(report["cases"][0]["requests"]) == 1  # No retry or format downgrade hides a rejection.
     assert report["cases"][1]["status"] == "passed"
+
+
+# ----- Every production schema and the constraint probe ------------------------------------------
+
+def test_all_cases_cover_every_production_schema_offline(tmp_path, capsys):
+    output = tmp_path / "all.json"
+    assert smoke.main(["--schemas", "all", "--output", str(output)]) == 0
+    report = json.loads(output.read_text())
+    assert report["schemas"] == ["research", "decision", "critique", "review", "constraints"]
+    assert report["max_provider_requests"] == 2 * 7
+    assert [(c["model"], c["schema"]) for c in report["cases"]] == [
+        (model, name) for model in smoke.MODELS.values() for name in report["schemas"]]
+    assert all(case["status"] == "passed" and case["usage_complete"] for case in report["cases"])
+    decision = next(c for c in report["cases"] if c["schema"] == "decision")
+    # The decision's price levels exercise the exclusiveMinimum keyword the research schema never sends.
+    assert decision["answer"]["targets"][0]["entry_limit"] == 100.0 and len(decision["requests"]) == 1
+    constraints = next(c for c in report["cases"] if c["schema"] == "constraints")
+    assert set(constraints["constraint_findings"].values()) == {"held"} and len(constraints["requests"]) == 2
+    assert set(constraints["schemas"]) == {"research", "decision"}
+    assert "约束说明" in capsys.readouterr().out
+
+
+def patched_answers(monkeypatch, mutate):
+    """Offline transport whose final answers pass through `mutate(prompt, answer)` first."""
+    original = smoke.offline_transport
+
+    def transport(c, model, schema, answer=None):
+        if answer is None:
+            return original(c, model, schema)
+
+        def handle(request):
+            body = json.loads(request.content)
+            prompt = json.dumps(body["input"], ensure_ascii=False)
+            return original(c, model, schema, mutate(prompt, json.loads(json.dumps(answer)))).handle_request(request)
+        return httpx.MockTransport(handle)
+    monkeypatch.setattr(smoke, "offline_transport", transport)
+
+
+def test_a_provider_that_ignores_a_constraint_is_reported(tmp_path, monkeypatch):
+    def ignore_min_length(prompt, answer):
+        if "格式约束测试" in prompt and "summary" in answer:
+            answer.update(summary="", evidence=[])
+        return answer
+    patched_answers(monkeypatch, ignore_min_length)
+    output = tmp_path / "constraints.json"
+    assert smoke.main(["--schemas", "constraints", "--model", "flash", "--output", str(output)]) == 1
+    [case] = json.loads(output.read_text())["cases"]
+    assert case["status"] == "failed" and case["error"]["code"] == "provider_constraint_not_enforced"
+    assert case["constraint_findings"]["Research.summary minLength 1"] == "not_enforced"
+    assert case["constraint_findings"]["Research.evidence minItems 1"] == "not_enforced"
+    assert case["constraint_findings"]["Target.weight maximum 1"] == "held"  # Both requests ran and were judged.
+    assert len(case["requests"]) == 2
+
+
+def test_a_review_citing_outside_the_list_fails_like_production(tmp_path, monkeypatch):
+    def cite_unknown(prompt, answer):
+        for change in answer.get("selection_adjustments", []):
+            change["evidence_refs"] = ["event:999"]
+        return answer
+    patched_answers(monkeypatch, cite_unknown)
+    output = tmp_path / "review.json"
+    assert smoke.main(["--schemas", "review,decision", "--model", "pro", "--output", str(output)]) == 1
+    cases = json.loads(output.read_text())["cases"]
+    assert [case["schema"] for case in cases] == ["decision", "review"]  # A fixed order, whatever was typed.
+    decision, review = cases
+    assert review["error"]["code"] == "review_reference_outside_list"
+    assert review["schema_valid"] and decision["status"] == "passed"  # Valid JSON; the reference check failed.
+
+
+@pytest.mark.parametrize("value", ["bogus", "research,bogus", ","])
+def test_unknown_cases_are_refused_before_any_request(value, tmp_path):
+    with pytest.raises(SystemExit) as stopped:
+        smoke.main(["--schemas", value, "--output", str(tmp_path / "never.json")])
+    assert stopped.value.code == 2 and not (tmp_path / "never.json").exists()

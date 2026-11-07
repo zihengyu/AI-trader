@@ -110,6 +110,28 @@ with `--max-output-tokens` and `--request-timeout-seconds` (at most 300 seconds)
 No `.env` is discovered automatically. Process values take precedence over the
 explicit secret file, and other providers' keys are not loaded from it.
 
+`--schemas` selects the cases (comma-separated, or `all`); the default
+`research` keeps the original two-request check above:
+
+| Case | Requests per model | What it checks |
+|---|---|---|
+| `research` | 2 | `Research` with a synthetic read-only tool round trip |
+| `decision` | 1 | `Decision`, whose price levels add `exclusiveMinimum` (absent from `Research`); the times must be copied |
+| `critique` | 1 | `Critique` |
+| `review` | 1 | `PostmarketReview`; `evidence_refs` must come from the supplied list, as in production |
+| `constraints` | 2 | Asks on purpose for an empty `summary`, an empty `evidence`, a weight of 1.5 and an `entry_limit` of 0 |
+
+`all` makes 7 requests per model, 14 for both. The constraint probe reports
+`held` or `not_enforced` per constraint and fails the case on any
+`not_enforced`: that value reached us although the schema forbids it, so the
+provider does not enforce it and local validation can still reject a
+production answer of that kind. `held` cannot tell provider enforcement from a
+model that ignored the instruction; it is evidence, not proof.
+
+```bash
+.venv/bin/python scripts/check_deepseek_schema.py --real-models --schemas all
+```
+
 The console shows each model's schema/tool outcome and reported token/cache
 usage. A unique report under `artifacts/verification/deepseek-schema-smoke/`
 records mode, source fingerprints, original and wire schema fingerprints, SDK
