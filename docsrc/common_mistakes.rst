@@ -334,6 +334,11 @@ selected ``--env-file "<your-secret-file>"``. Real mode generates provider usage
 and makes at most four requests, with no automatic retry. It checks the actual
 ``Research`` schema, a synthetic read-only tool round trip and reported usage;
 JSON reports are saved under ``artifacts/verification/deepseek-schema-smoke/``.
+Add ``--schemas all`` to also check the ``Decision``, ``Critique`` and
+``PostmarketReview`` schemas and a constraint probe that asks for values the
+schema forbids (an empty ``summary``, a weight above 1, a zero price); any such
+value returned is reported as ``not_enforced`` and fails the check (14 requests
+for both models).
 It does not connect to a broker or establish that a running service has reloaded
 the current code. An offline pass does not establish real provider support.
 If both models return HTTP 400 on the first request, the provider has rejected

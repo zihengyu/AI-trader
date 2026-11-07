@@ -17,7 +17,7 @@ import socket
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -29,6 +29,10 @@ if str(REPO_ROOT) not in sys.path:
 
 MODELS = {"flash": "deepseek/deepseek-flash", "pro": "deepseek/deepseek-v4-pro"}
 TOOL_NAME = "schema_probe_evidence"
+# Every production answer schema, plus a probe of whether the provider enforces the constraints
+# our local validation relies on. Requests per model for each case.
+CASES = {"research": 2, "decision": 1, "critique": 1, "review": 1, "constraints": 2}
+REVIEW_REFS = ["event:1", "research:1", "context:session"]
 
 _PROVIDER_CODES = {"invalid_request_error", "invalid_json_schema", "unsupported_parameter", "unsupported_value",
                    "model_not_found", "authentication_error", "insufficient_balance", "insufficient_quota",
@@ -42,6 +46,7 @@ _DIAGNOSTIC_TERMS = {
     "model", "thinking", "reasoning", "effort", "required", "properties", "additionalproperties",
     "minlength", "maxlength", "minitems", "maxitems", "default", "null", "string", "boolean", "expected",
     "missing", "must", "only", "not", "supported", "now", "parameter", "unknown", "error", "oneof", "anyof",
+    "minimum", "maximum", "exclusiveminimum", "exclusivemaximum",
     "allof", "ref", "defs", "value", "in", "context", "and", "of", "for", "is", "the", "supplied", "every",
     "all", "keys", "including", "array", "object", "cannot", "together", "with", "additional", "contains",
 }
@@ -62,9 +67,11 @@ def components():
     from google.genai import types
     from lumibot.components.agents import deepseek_llm, runtime
     from lumibot.components.agents.structured_output import native_output_protocol, structured_output_instruction
-    from scripts.autonomous_fund.strategy import Research
+    from scripts.autonomous_fund.review import PostmarketReview
+    from scripts.autonomous_fund.strategy import Critique, Decision, Research
 
-    return SimpleNamespace(httpx=httpx, jsonschema=jsonschema, request=LlmRequest, types=types,
+    return SimpleNamespace(models={"research": Research, "decision": Decision, "critique": Critique,
+                                   "review": PostmarketReview},httpx=httpx, jsonschema=jsonschema, request=LlmRequest, types=types,
         adapter=deepseek_llm.DeepSeekResponsesLlm, resolve=runtime._resolve_model_for_adk,
         wire_schema=deepseek_llm.strict_output_schema,
         protocol=native_output_protocol, instruction=structured_output_instruction, schema_model=Research,
@@ -103,7 +110,9 @@ def provider_error_diagnostic(error):
             unavailable or "together" in text or "cannot" in text):
         problem = "schema_tools_combination_rejected"
     elif schema and unavailable and any(term in text for term in ("minlength", "maxlength", "minitems", "maxitems",
-                                                                 "default", "$ref", "$defs", "oneof", "anyof")):
+                                                                 "default", "$ref", "$defs", "oneof", "anyof",
+                                                                 "minimum", "maximum", "exclusiveminimum",
+                                                                 "exclusivemaximum")):
         problem = "schema_keyword_rejected"
     elif schema and (unavailable or "unknown variant" in text or "supported values" in text) and (
             "json_schema" in text or "response_format" in text or "format type" in text):
@@ -166,7 +175,8 @@ def load_secrets(path):
             os.environ[name] = values[name]
 
 
-def offline_transport(c, model, schema):
+def offline_transport(c, model, schema, answer=None):
+    """Mock DeepSeek: the research tool round trip, or (with `answer`) one final JSON message."""
     wire_schema = c.wire_schema(schema)
 
     def handle(request):
@@ -176,7 +186,11 @@ def offline_transport(c, model, schema):
                 body["text"]["format"]["schema"] != wire_schema):
             raise ProbeFailure("offline_request_contract_mismatch")
         results = [item for item in body["input"] if item["type"] == "function_call_output"]
-        if not results:
+        if answer is not None:
+            output = [{"id": "msg_probe", "type": "message", "role": "assistant", "status": "completed",
+                       "content": [{"type": "output_text", "annotations": [],
+                                    "text": json.dumps(answer, ensure_ascii=False)}]}]
+        elif not results:
             output = [{"id": "fc_probe", "type": "function_call", "call_id": "call_probe",
                        "name": TOOL_NAME, "arguments": "{}"}]
         else:
@@ -227,13 +241,17 @@ async def request_once(adapter, request, case, checkpoint, timeout):
     return response
 
 
-def validate_answer(c, response, case, schema):
+def answer_json(response):
     text = "".join(part.text or "" for part in (response.content.parts if response.content else [])
                    if not part.thought and not part.function_call)
     try:
-        value = json.loads(text)  # Fences and prose fail here: test the native format, not parser leniency.
+        return json.loads(text)  # Fences and prose fail here: test the native format, not parser leniency.
     except (ValueError, TypeError):
         raise ProbeFailure("invalid_json") from None
+
+
+def validate_answer(c, response, case, schema, model=None):
+    value = answer_json(response)
     try:
         c.jsonschema.validate(value, schema)
     except c.jsonschema.ValidationError as error:
@@ -244,7 +262,7 @@ def validate_answer(c, response, case, schema):
     except c.jsonschema.ValidationError as error:
         case["schema_validator"] = error.validator
         raise ProbeFailure("wire_schema_validation") from None
-    result = c.schema_model.model_validate(value).model_dump()
+    result = (model or c.schema_model).model_validate(value).model_dump()
     case["schema_valid"] = True
     return result
 
@@ -290,6 +308,165 @@ async def exercise(c, args, model, case, checkpoint):
     case.update(status="passed", tool_roundtrip=True, answer=answer)
 
 
+def _times():
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    return now.isoformat(), (now + timedelta(hours=6)).isoformat(), (now + timedelta(hours=1)).isoformat()
+
+
+def _same_instant(left, right):
+    try:
+        return datetime.fromisoformat(str(left).replace("Z", "+00:00")) == datetime.fromisoformat(right)
+    except ValueError:
+        return False
+
+
+def _decision_case():
+    as_of, expires, review = _times()
+    prompt = ("这是接口测试，不是投资决策。可选证券只有 SPY 和 SGOV。返回完整 Decision JSON："
+              f"as_of 必须是 {as_of}，expires_at 必须是 {expires}，next_review_at 必须是 {review}；"
+              "rationale 用中文一句话说明这是接口测试；targets 只有一条：symbol SPY，weight 0.1，entry_limit 100，"
+              "stop_loss 90，take_profit 120，take_profit_weight 0.5；alerts 一条：symbol SPY，above 130，below null，"
+              "reason 说明是测试；news_watch 一条：query 为 interface test，reason 说明是测试；idea_refs 为空列表。")
+    offline = {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "这是接口测试。",
+               "targets": [{"symbol": "SPY", "weight": 0.1, "entry_limit": 100.0, "stop_loss": 90.0,
+                            "take_profit": 120.0, "take_profit_weight": 0.5}],
+               "alerts": [{"symbol": "SPY", "above": 130.0, "below": None, "reason": "测试提醒"}],
+               "news_watch": [{"query": "interface test", "reason": "测试"}], "idea_refs": []}
+
+    def check(answer):
+        if not all(_same_instant(answer[key], value) for key, value in (
+                ("as_of", as_of), ("expires_at", expires), ("next_review_at", review))):
+            raise ProbeFailure("decision_times_not_copied")
+    return prompt, offline, check
+
+
+def _critique_case():
+    prompt = ("这是接口测试，不是真实研究。合成研究摘要：SPY 近期上涨，研究员认为趋势会延续。按 Critique schema 返回："
+              "summary 用中文一句话；concerns 一条：symbol 为 SPY，concern 和 evidence 各一句话；missing_evidence 一条。")
+    offline = {"summary": "这是接口测试的反方意见。",
+               "concerns": [{"symbol": "SPY", "concern": "趋势可能反转。", "evidence": "仅有合成摘要。"}],
+               "missing_evidence": ["没有真实证据。"]}
+    return prompt, offline, None
+
+
+def _review_case():
+    from zoneinfo import ZoneInfo
+    day = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    as_of = _times()[0]
+    prompt = ("这是接口测试，不是真实复盘。按 PostmarketReview schema 用中文返回完整 JSON："
+              f"session_date 必须是 {day}，as_of 必须是 {as_of}；summary 一句话；selection_adjustments 一条，"
+              f"其 evidence_refs 只能从 {json.dumps(REVIEW_REFS)} 中逐字复制，例如 [\"event:1\"]；"
+              "timing_adjustments 和 retired_hypotheses 为空列表；retained_lessons 和 data_gaps 各一条；confidence 为 low；"
+              "strategy_memo 一句话；predictions 一条：symbol SPY、direction up、horizon_sessions 5、benchmark SPY、"
+              "hypothesis_ref 为 h1；mandate_compliance 为空字符串；factor_proposals 一条：name 为 probe_momentum，"
+              "expression 为 rank(ret(21))，horizon_sessions 5，hypothesis 一句话，universe 为 stocks。")
+    adjustment = {"hypothesis": "接口测试假设。", "rationale": "合成依据。", "evidence_refs": ["event:1"],
+                  "validation": "无。", "invalidated_when": "无。"}
+    offline = {"session_date": day, "as_of": as_of, "summary": "这是接口测试。",
+               "selection_adjustments": [adjustment], "timing_adjustments": [], "retained_lessons": ["测试。"],
+               "retired_hypotheses": [], "data_gaps": ["没有真实数据。"], "confidence": "low",
+               "strategy_memo": "接口测试，没有策略结论。",
+               "predictions": [{"symbol": "SPY", "direction": "up", "horizon_sessions": 5, "benchmark": "SPY",
+                                "hypothesis_ref": "h1"}], "mandate_compliance": "",
+               "factor_proposals": [{"name": "probe_momentum", "expression": "rank(ret(21))", "horizon_sessions": 5,
+                                     "hypothesis": "接口测试。", "universe": "stocks"}]}
+
+    def check(answer):
+        if answer["session_date"] != day or not _same_instant(answer["as_of"], as_of):
+            raise ProbeFailure("review_session_not_copied")
+        refs = [ref for group in ("selection_adjustments", "timing_adjustments")
+                for change in answer[group] for ref in change["evidence_refs"]]
+        if any(ref not in REVIEW_REFS for ref in refs):
+            # The production review refuses such references too (exact match only).
+            raise ProbeFailure("review_reference_outside_list")
+    return prompt, offline, check
+
+
+async def _single(c, args, model, case, checkpoint, schema_name, prompt, offline, validate=True):
+    """One request without tools for a production schema; returns the validated (or raw) answer."""
+    schema_model = c.models[schema_name]
+    schema = schema_model.model_json_schema()
+    adapter = c.resolve(model, output_schema=schema, reasoning_effort=args.reasoning_effort,
+                        model_request_timeout_seconds=args.request_timeout_seconds)
+    if not isinstance(adapter, c.adapter) or c.protocol(model) is None:
+        raise ProbeFailure("native_schema_adapter_unavailable")
+    if not args.real_models:
+        adapter._transport = offline_transport(c, model, schema, offline)
+    case["protocol"] = c.protocol(model)
+    case.setdefault("schemas", {})[schema_name] = {
+        "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest(),
+        "wire_schema_sha256": hashlib.sha256(json.dumps(c.wire_schema(schema), sort_keys=True).encode()).hexdigest()}
+    request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=prompt)])],
+        config=c.types.GenerateContentConfig(system_instruction=c.instruction(schema),
+                                             max_output_tokens=args.max_output_tokens))
+    response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
+    if any(part.function_call for part in (response.content.parts if response.content else [])):
+        raise ProbeFailure("unexpected_tool_call")  # No tool was offered.
+    if not validate:
+        return answer_json(response)
+    return validate_answer(c, response, case, schema, schema_model)
+
+
+CONSTRAINT_NOTE = ("held: this answer kept the constraint, by the provider's enforcement or because the model ignored "
+                   "the instruction; not_enforced: the provider returned a value the schema forbids, so local "
+                   "validation can still reject a production answer of that kind.")
+
+
+async def exercise_constraints(c, args, model, case, checkpoint):
+    """Ask on purpose for values the schema forbids; any that come back were not enforced by the provider."""
+    evidence = {"source": "probe:" + uuid4().hex, "available_at": None, "observed_at": utc_now(),
+                "estimated": False, "estimate_reason": ""}
+    findings = case.setdefault("constraint_findings", {})
+    case["constraint_note"] = CONSTRAINT_NOTE
+    research = await _single(c, args, model, case, checkpoint, "research", (
+        "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
+        "summary 必须是空字符串 \"\"，evidence 必须是空列表 []，ideas 为空列表 []。不要输出其他内容。"),
+        {"summary": "约束测试。", "evidence": [evidence], "ideas": []}, validate=False)
+    findings["Research.summary minLength 1"] = "not_enforced" if research.get("summary") == "" else "held"
+    findings["Research.evidence minItems 1"] = "not_enforced" if research.get("evidence") == [] else "held"
+    as_of, expires, review = _times()
+    decision = await _single(c, args, model, case, checkpoint, "decision", (
+        "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
+        f"as_of 为 {as_of}，expires_at 为 {expires}，next_review_at 为 {review}，rationale 写“约束测试”；"
+        "targets 只有一条：symbol SPY，weight 必须是 1.5，entry_limit 必须是 0，stop_loss、take_profit、"
+        "take_profit_weight 为 null；alerts、news_watch、idea_refs 为空列表。"),
+        {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "约束测试",
+         "targets": [{"symbol": "SPY", "weight": 1.0, "entry_limit": 0.01, "stop_loss": None, "take_profit": None,
+                      "take_profit_weight": None}], "alerts": [], "news_watch": [], "idea_refs": []}, validate=False)
+    targets = decision.get("targets") if isinstance(decision.get("targets"), list) else []
+    first = targets[0] if targets and isinstance(targets[0], dict) else {}
+    weight, entry = first.get("weight"), first.get("entry_limit")
+    findings["Target.weight maximum 1"] = ("untested" if not isinstance(weight, (int, float)) else
+                                           "not_enforced" if weight > 1 else "held")
+    findings["Target.entry_limit exclusiveMinimum 0"] = ("untested" if not isinstance(entry, (int, float)) else
+                                                         "not_enforced" if entry <= 0 else "held")
+    if "not_enforced" in findings.values():
+        raise ProbeFailure("provider_constraint_not_enforced")
+    case["schema_valid"] = True
+
+
+async def exercise_case(c, args, model, case, checkpoint):
+    """A production schema other than the research tool round trip (`exercise`)."""
+    name = case["schema"]
+    if name == "constraints":
+        await exercise_constraints(c, args, model, case, checkpoint)
+    else:
+        prompt, offline, check = {"decision": _decision_case, "critique": _critique_case, "review": _review_case}[name]()
+        answer = await _single(c, args, model, case, checkpoint, name, prompt, offline)
+        if check is not None:
+            check(answer)
+        case["answer"] = answer
+    case["status"] = "passed"
+
+
+def selected_cases(value):
+    names = list(CASES) if value.strip() == "all" else [n.strip() for n in value.split(",") if n.strip()]
+    unknown = sorted(set(names) - set(CASES))
+    if unknown or not names:
+        raise ValueError("unknown case: " + ", ".join(unknown) if unknown else "no case selected")
+    return [name for name in CASES if name in names]
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="检查 Flash/Pro 的原生 Schema、工具往返和用量；默认离线模拟。")
     mode = parser.add_mutually_exclusive_group()
@@ -301,7 +478,14 @@ def main(argv=None):
     parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--request-timeout-seconds", type=float, default=120)
     parser.add_argument("--reasoning-effort", choices=("none", "low", "high", "max"), default="high")
+    parser.add_argument("--schemas", default="research",
+                        help="research（默认，带工具往返）、decision、critique、review、constraints（约束是否被强制），"
+                             "逗号分隔，或 all 全部")
     args = parser.parse_args(argv)
+    try:
+        cases = selected_cases(args.schemas)
+    except ValueError as error:
+        parser.error("--schemas：" + str(error) + "；可选 " + "、".join(CASES) + " 或 all")
     if args.max_output_tokens < 1 or not 0 < args.request_timeout_seconds <= 300:
         parser.error("max-output-tokens 必须为正；request-timeout-seconds 必须在 (0, 300] 内")
     if args.env_file is not None and not args.real_models:
@@ -310,7 +494,8 @@ def main(argv=None):
     output = args.output or REPO_ROOT / "artifacts/verification/deepseek-schema-smoke" / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex[:8] + ".json")
     report = {"mode": "real_models" if args.real_models else "offline", "started_at": utc_now(),
-              "status": "running", "max_provider_requests": 2 * len(models), "cases": []}
+              "status": "running", "schemas": cases,
+              "max_provider_requests": sum(CASES[name] for name in cases) * len(models), "cases": []}
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -338,28 +523,39 @@ def main(argv=None):
                 c = components()
                 report["implementation"] = {"adapter_sha256": c.adapter_sha256, "runtime_sha256": c.runtime_sha256,
                     "script_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                    "schema": "Research", "sdk_versions": {name: importlib.metadata.version(name)
+                    "schemas": cases, "sdk_versions": {name: importlib.metadata.version(name)
                         for name in ("google-adk", "litellm", "openai")}}
                 print(("真实 DeepSeek" if args.real_models else "离线模拟（不验证真实服务）") +
-                      f"：最多 {2 * len(models)} 次请求；每次最多 {args.max_output_tokens} 输出 tokens。", flush=True)
+                      f"：{'、'.join(cases)}；最多 {report['max_provider_requests']} 次请求；"
+                      f"每次最多 {args.max_output_tokens} 输出 tokens。", flush=True)
                 for model in models:
-                    case = {"model": model, "status": "running", "schema_valid": False,
-                            "tool_roundtrip": False, "tool_calls": 0, "requests": []}
-                    report["cases"].append(case)
-                    try:
-                        asyncio.run(exercise(c, args, model, case, checkpoint))
-                    except Exception as error:
-                        case.update(status="failed", error=safe_error(error))
-                    known = [row["usage"] for row in case["requests"] if row["usage"] is not None]
-                    case["usage"] = c.aggregate(known)
-                    case["usage_complete"] = bool(case["requests"]) and len(known) == len(case["requests"])
-                    print(f"[{case['status'].upper()}] {model} schema={case['schema_valid']} "
-                          f"tool_roundtrip={case['tool_roundtrip']} requests={len(case['requests'])}", flush=True)
-                    if case.get("error"):
-                        print("  " + json.dumps(case["error"], ensure_ascii=False), flush=True)
-                    print("  用量：" + json.dumps(case["usage"], ensure_ascii=False) +
-                          ("" if case["usage_complete"] else "；部分请求用量未知"), flush=True)
-                    checkpoint()
+                    for name in cases:
+                        case = {"model": model, "schema": name, "status": "running", "schema_valid": False,
+                                "requests": []}
+                        if name == "research":
+                            case.update(tool_roundtrip=False, tool_calls=0)
+                        report["cases"].append(case)
+                        try:
+                            asyncio.run(exercise(c, args, model, case, checkpoint) if name == "research" else
+                                        exercise_case(c, args, model, case, checkpoint))
+                        except Exception as error:
+                            case.update(status="failed", error=safe_error(error))
+                        known = [row["usage"] for row in case["requests"] if row["usage"] is not None]
+                        case["usage"] = c.aggregate(known)
+                        case["usage_complete"] = bool(case["requests"]) and len(known) == len(case["requests"])
+                        detail = (f" tool_roundtrip={case['tool_roundtrip']}" if name == "research" else
+                                  " " + json.dumps(case.get("constraint_findings", {}), ensure_ascii=False)
+                                  if name == "constraints" else "")
+                        print(f"[{case['status'].upper()}] {model} {name} schema={case['schema_valid']}{detail} "
+                              f"requests={len(case['requests'])}", flush=True)
+                        if case.get("error"):
+                            print("  " + json.dumps(case["error"], ensure_ascii=False), flush=True)
+                        print("  用量：" + json.dumps(case["usage"], ensure_ascii=False) +
+                              ("" if case["usage_complete"] else "；部分请求用量未知"), flush=True)
+                        checkpoint()
+                if "constraints" in cases:
+                    print("约束说明：held 表示这次回答满足约束（可能是 DeepSeek 强制，也可能只是模型没照做）；"
+                          "not_enforced 表示 DeepSeek 没有强制该约束，本地校验仍会拒绝这类回答。", flush=True)
                 exit_code = 0 if all(case["status"] == "passed" for case in report["cases"]) else 1
                 report["status"] = "passed" if exit_code == 0 else "failed"
             except KeyboardInterrupt:
