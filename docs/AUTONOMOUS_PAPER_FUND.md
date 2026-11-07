@@ -1150,6 +1150,24 @@ Telegram 持久化发送状态、重试和限流等待；相同告警在 30 分�
 没有自动补齐所有历史日期或全天候后台任务。需要保持交易进程运行，关闭进程期间不调用模型。
 
 Flash 成功结果先提交 SQLite；Pro 失败后，下次上述检查复用该阶段，保留原始时间、模型和 Mock 来源。
+盘后研究调用明确要求完整 `Research` JSON：非空 `summary`、至少一条 `evidence` 及其必填来源／时间字段。
+使用 `deepseek/deepseek-flash` 或 `deepseek/deepseek-v4-pro` 的结构化 Agent 调用还会把实际 schema
+传给 DeepSeek Responses API 的 `text.format`，包括研究员、反方、盘中经理和盘后经理各自的结构。
+研究工具、推理原文、工具调用 ID／结果和缓存／输出用量保持在调用链中；`DEEPSEEK_API_KEY` 仍为必需，
+已有 `DEEPSEEK_API_BASE` 覆盖必须支持 `/responses`，不会借用 OpenAI 的凭证或地址，也不会静默降级。
+未完成或失败响应即使带有看似完整的 JSON 也不作为最终回答；提供方报告的用量仍保留。
+接口结构约束不能保证请求一定完成或研究事实正确，必填字段、真实证据时间和引用仍由本地校验。
+部署后可单独运行 `scripts/check_deepseek_schema.py`：默认 `--offline` 只做模拟；
+显式 `--real-models` 才调用真实 Flash／Pro，并可用 `--env-file "<your-secret-file>"` 选择密钥文件。
+脚本统一用当前 `Research` schema 检查 `summary`／`evidence`、合成只读工具往返和已报告用量，
+默认最多四次提供方请求，不自动重试、不连接券商；结果保存在 `artifacts/verification/deepseek-schema-smoke/`。
+它不代替完整账户策略复现，也不能证明正在运行的服务已经重载新代码；详见 `docs/AGENT_STRUCTURED_OUTPUT.md`。
+如果研究员返回的 JSON 不符合 schema 或无法提取 JSON，每次复盘尝试最多额外纠正一次，提供原始回答、
+安全的字段错误位置及同一份输入快照，要求模型根据真实证据返回完整结果；程序不自动补摘要、证据或日期。
+两次回答和用量均保留在 `agent` 记录，`postmarket_research_retry` 记录纠正原因。
+纠正受 STOP、当天调用次数及费用预算限制，并为后续基金经理调用留出次数；成功后仍校验证据时间，
+实盘无日期来源继续可用。传输／运行失败、空回答和历史证据晚于回放时点不触发这种格式纠正。
+纠正后仍不合格则保留告警，不保存为成功研究或新备忘。
 完成的复盘不会因重复回调、重启或重新导出而再次调用模型。模型失败会写入 `postmarket_review_error` 通知，
 旧备忘保持有效，未完成的复盘不激活。外部调用成功、落盘前崩溃的极短窗口仍可能重复付费，不能声称模型请求恰好一次。
 如果只有引用校验失败，每次尝试最多让同一基金经理额外修正一次：提供原复盘、失败位置及同一份证据清单，

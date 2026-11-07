@@ -199,3 +199,254 @@ def test_empty_and_non_json_answers_have_safe_diagnostic_categories(tmp_path, te
     with pytest.raises(RiskError, match=kind):
         strategy._record_agent("researcher", result)
 
+
+@pytest.mark.parametrize("mode", ["local", "paper", "backtest"])
+@pytest.mark.parametrize("bad_answer", ["{}", '{"ideas": []}', '{"summary": "Incomplete research"}',
+                                       "Synthetic prose without JSON"])
+def test_postmarket_research_gets_one_audited_format_correction(tmp_path, mode, bad_answer):
+    from scripts.autonomous_fund.review import strategy_memory
+
+    strategy, calls = review_harness(tmp_path)
+    strategy.mode = mode
+    strategy.model_budget = SimpleNamespace(max_agent_runs_per_day=3, max_daily_cost_usd=None)
+    original = strategy.agents["researcher"].run
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 1:
+            result = result_for({})
+            result.summary = bad_answer
+            result.parsed, result.parse_error = parse_structured_output(
+                bad_answer, Research.model_json_schema(), Research)
+            return result
+        result = original(**kwargs)
+        if mode != "backtest":
+            # Live undated sources remain usable after correction.
+            result.parsed.evidence[0].available_at = None
+            result.summary = result.parsed.model_dump_json()
+        return result
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    strategy.after_market_closes()
+    assert len(attempts) == 2  # A completed review never repays either stage.
+    assert all(attempt["output_schema"] is Research for attempt in attempts)
+    first, second = (attempt["context"] for attempt in attempts)
+    correction = second["structured_answer_correction"]
+    assert correction["previous_answer"] == bad_answer
+    assert {key: value for key, value in second.items() if key != "structured_answer_correction"} == first
+    assert first["orders_enabled"] is False
+    if bad_answer == "{}":
+        assert correction["diagnostic"]["errors"] == [
+            {"path": "summary", "type": "missing"}, {"path": "evidence", "type": "missing"}]
+    [retry] = events(strategy, "postmarket_research_retry")
+    assert retry["answer_diagnostic"] == correction["diagnostic"]
+    agents = events(strategy, "agent")
+    assert [agent["name"] for agent in agents] == ["researcher", "researcher", "manager"]
+    assert agents[0]["summary"] == bad_answer and agents[0]["parse_error"]
+    assert sum(agent["usage"]["input_tokens"] for agent in agents) == 33
+    assert sum(agent["usage"]["output_tokens"] for agent in agents) == 21
+    assert strategy.journal.counter("agent_runs", CLOSE) == 3
+    [saved] = events(strategy, "postmarket_research")
+    # Compare the persisted snapshot after the journal's Decimal serialization.
+    assert saved["context"] == json.loads(json.dumps(first, default=str))
+    assert "structured_answer_correction" not in saved["context"]
+    assert len(events(strategy, "postmarket_review")) == 1
+    assert strategy_memory(strategy.journal, CLOSE)["version"] == 1
+    assert [name for name, _ in calls] == ["researcher", "manager"]
+    assert not events(strategy, "notification") and not strategy.journal.pending()
+
+
+def test_failed_postmarket_correction_keeps_the_previous_memo_and_both_invalid_answers(tmp_path):
+    from scripts.autonomous_fund.review import strategy_memory
+
+    strategy, calls = review_harness(tmp_path)
+    strategy.after_market_closes()
+    tomorrow = CLOSE + timedelta(days=1)
+    strategy.get_datetime = lambda: tomorrow
+    strategy.journal.event(tomorrow - timedelta(hours=4), "account", {
+        "cash": "9100", "equity": "10000", "positions": {"ALFA": 9}})
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        return result_for({"summary": "Synthetic private research text"})
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == 2
+    assert len(events(strategy, "postmarket_research_retry")) == 1
+    assert len(events(strategy, "postmarket_research")) == len(events(strategy, "postmarket_review")) == 1
+    assert strategy_memory(strategy.journal, tomorrow)["version"] == 1
+    assert [name for name, _ in calls] == ["researcher", "manager"]
+    assert [agent["parse_error"] is not None for agent in events(strategy, "agent")[-2:]] == [True, True]
+    notice = events(strategy, "notification")[-1]
+    assert "researcher/postmarket_review" in notice["details"] and "evidence (missing)" in notice["details"]
+    assert "private research" not in json.dumps(events(strategy, "postmarket_research_retry"))
+    assert "private research" not in notice["details"]
+    assert not strategy.journal.pending()
+
+
+@pytest.mark.parametrize("blocked", ["stop", "cost", "runs"])
+def test_postmarket_research_correction_respects_stop_cost_and_room_for_the_manager(tmp_path, blocked):
+    strategy, calls = review_harness(tmp_path)
+    strategy.model_budget = SimpleNamespace(max_agent_runs_per_day=2 if blocked == "runs" else 60,
+                                            max_daily_cost_usd=None)
+    cost_checks, attempts = [], []
+
+    def cost_exhausted(now, step):
+        cost_checks.append(step)
+        return blocked == "cost"
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        if blocked == "stop":
+            strategy.halt_path.touch()
+        return result_for({})
+
+    strategy._cost_exhausted = cost_exhausted
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == strategy.journal.counter("agent_runs", CLOSE) == 1
+    assert not calls and not events(strategy, "postmarket_research_retry")
+    assert not events(strategy, "postmarket_research") and not events(strategy, "postmarket_review")
+    if blocked == "cost":
+        assert "postmarket_research_correction" in cost_checks
+    assert not strategy.journal.pending()
+
+
+@pytest.mark.parametrize("failure", ["runtime", "empty", "transport"])
+def test_postmarket_non_format_failures_do_not_start_a_correction(tmp_path, failure):
+    strategy, calls = review_harness(tmp_path)
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        if failure == "transport":
+            raise ConnectionError("Synthetic private provider message")
+        result = result_for({})
+        if failure == "runtime":
+            result.payload = {"runtime_error": True, "error_class": "TimeoutError"}
+        else:
+            result.summary = ""
+        return result
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == 1 and not calls
+    assert not events(strategy, "postmarket_research_retry")
+    assert not events(strategy, "postmarket_research") and not events(strategy, "postmarket_review")
+    assert len(events(strategy, "agent")) == 1
+    assert "private provider" not in events(strategy, "notification")[-1]["details"]
+
+
+@pytest.mark.parametrize("corrected", [False, True])
+def test_postmarket_format_correction_never_bypasses_historical_evidence_cutoffs(tmp_path, corrected):
+    strategy, calls = review_harness(tmp_path)
+    strategy.mode = "backtest"
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        if corrected and len(attempts) == 1:
+            return result_for({})
+        body = research_body()
+        body["evidence"][0]["available_at"] = (CLOSE + timedelta(days=1)).isoformat()
+        return result_for(body)
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == (2 if corrected else 1)
+    assert len(events(strategy, "postmarket_research_retry")) == int(corrected)
+    assert "after the simulated cutoff" in events(strategy, "notification")[-1]["details"]
+    assert not calls and not events(strategy, "postmarket_review") and not events(strategy, "postmarket_research")
+    assert not strategy.journal.pending()
+
+
+def test_interrupted_correction_retains_unknown_usage_without_another_retry(tmp_path):
+    strategy, calls = review_harness(tmp_path)
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        if len(attempts) == 2:
+            raise ConnectionError("Synthetic private provider message")
+        return result_for({})
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == 2 and not calls
+    agents = events(strategy, "agent")
+    assert agents[0]["usage"] == {"input_tokens": 11, "output_tokens": 7}
+    assert agents[1]["usage"] is None and agents[1]["parse_error"] == "ConnectionError"
+    assert strategy.journal.counter("agent_runs", CLOSE) == 2
+    assert len(events(strategy, "postmarket_research_retry")) == 1
+    assert not events(strategy, "postmarket_research") and not events(strategy, "postmarket_review")
+    assert events(strategy, "notification")[-1]["details"] == "ConnectionError"
+
+
+def test_correction_costs_are_counted_with_the_original_failed_call(tmp_path):
+    strategy, _ = review_harness(tmp_path)
+    strategy.scripted = False  # Synthetic responses exercise real cost accounting without inference.
+    strategy.config["model_prices_per_million"] = {
+        model: {"input": 1, "output": 2} for model in ("fixture/research", "fixture/flash", "fixture/pro")}
+    original = strategy.agents["researcher"].run
+    attempts = []
+
+    def researcher(**kwargs):
+        attempts.append(kwargs)
+        return result_for({}) if len(attempts) == 1 else original(**kwargs)
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    assert len(attempts) == 2 and len(events(strategy, "postmarket_review")) == 1
+    assert [agent["cost_usd"] for agent in events(strategy, "agent")] == [0.000025] * 3
+    assert strategy.journal.counter("model_cost_microusd", CLOSE) == 75
+
+
+def test_postmarket_correction_through_native_agent_handles_and_local_broker(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.journal import Journal
+    from scripts.autonomous_fund.local_broker import LocalPaperBroker
+    from scripts.autonomous_fund.market_data import YahooRealtimeData
+    from scripts.autonomous_fund.risk import Limits
+    from scripts.autonomous_fund.run import ScriptedRuntime
+    from scripts.autonomous_fund.strategy import AutonomousFund, account_digest
+    from .test_autonomous_fund_local import Clock
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("LUMIBOT_MEMORY_DIR", str(tmp_path / "memory"))
+    monkeypatch.setenv("IS_BACKTESTING", "false")
+    clock = Clock()
+    source = YahooRealtimeData(now=clock, fetch=clock.fetch)
+    config = {"model": "deepseek/deepseek-flash", "limits": {}, "universe": {"ALFA": "stock"}}
+    journal = Journal(tmp_path, account_digest("local", "synthetic-format-account"))
+    broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
+    requests = []
+
+    class FormatRuntime(ScriptedRuntime):
+        def run(self, request):
+            requests.append(request)
+            result = super().run(request)  # Also checks that trading mutation tools are absent.
+            if len(requests) == 1:
+                result.summary = "{}"
+            return result
+
+    strategy = AutonomousFund(broker=broker, name="FormatRecovery", parameters={
+        "config": config, "run_dir": str(tmp_path), "mode": "local",
+        "account_binding": "synthetic-format-account", "runtime": FormatRuntime()})
+    try:
+        strategy._executor._initialize()
+        strategy._snapshot()
+        clock.value = CLOSE
+        source._cache.clear()
+        strategy.after_market_closes()
+        strategy.after_market_closes()
+        assert [request.agent_name for request in requests] == ["researcher", "researcher", "manager"]
+        assert requests[1].context["structured_answer_correction"]["previous_answer"] == "{}"
+        assert len(events(strategy, "postmarket_review")) == 1
+        assert [agent["parse_error"] is not None for agent in events(strategy, "agent")] == [True, False, False]
+        assert not journal.pending() and not events(strategy, "order_submitted")
+    finally:
+        broker._close_connection()
+

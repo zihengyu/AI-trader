@@ -305,6 +305,34 @@ the notice. The journal's ``agent.answer_diagnostic`` retains the error category
 count and safe positions; consult the original ``parse_error`` and the call's
 ``trace=`` file for the complete answer.
 
+For postmarket research, ``summary (missing); evidence (missing)`` means the
+extracted JSON lacks both required fields. Each research attempt explicitly
+requests the full ``Research`` schema. Direct DeepSeek Flash and Pro calls now
+also send that schema to the Responses API as native JSON Schema output,
+including across research-tool continuations. Schema-invalid answers are still
+rejected locally; provider failures and truncation remain possible.
+A schema mismatch or invalid JSON allows
+one additional researcher correction per review attempt, with the original
+answer, safe field diagnostics and the same input snapshot. Both calls retain
+their answers and usage in the journal; ``postmarket_research_retry`` records
+the correction. STOP and the existing call/cost budgets apply, including room
+for the subsequent manager call. No fields or evidence are fabricated by the
+application. A still-invalid correction is rejected; successful research is
+saved and reused. Transport failures, empty answers and historical evidence
+cutoff violations do not trigger this format correction. Live undated sources
+remain allowed, and historical publication-date checks remain enforced.
+
+For a standalone checkout diagnostic, run
+``.venv/bin/python scripts/check_deepseek_schema.py --offline``. To explicitly
+check the real Flash and Pro endpoints, use ``--real-models`` with
+``DEEPSEEK_API_KEY`` supplied in the process environment or an explicitly
+selected ``--env-file "<your-secret-file>"``. Real mode generates provider usage
+and makes at most four requests, with no automatic retry. It checks the actual
+``Research`` schema, a synthetic read-only tool round trip and reported usage;
+JSON reports are saved under ``artifacts/verification/deepseek-schema-smoke/``.
+It does not connect to a broker or establish that a running service has reloaded
+the current code. An offline pass does not establish real provider support.
+
 Runtime failures such as ``runtime_error: TimeoutError`` are distinguished from
 schema mismatches, ``missing_answer`` and ``invalid_json``. A rejected postmarket
 answer does not activate a new strategy memo; the last valid memo stays in use.

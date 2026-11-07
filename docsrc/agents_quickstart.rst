@@ -319,6 +319,22 @@ Optional. Most AI strategies do not need this: agents pass plain-language notes 
 
 With a pydantic model, ``result.parsed`` is an instance of that model. When the answer does not match, ``result.parsed`` is ``None``, ``result.parse_error`` explains why, and ``result.warnings`` contains a ``structured_output_invalid`` entry. No extra model call is made. Tools still work normally; the schema only shapes the final answer.
 
+Direct ``deepseek/deepseek-flash`` and ``deepseek/deepseek-v4-pro`` agents with
+``output_schema`` send the schema to the provider's Responses API as
+``text.format.type=json_schema`` without changing their model IDs or tools.
+Set ``DEEPSEEK_API_KEY``; ``DEEPSEEK_API_BASE`` may
+retain a compatible endpoint override. No OpenAI key or endpoint is borrowed,
+and a rejected schema is not silently downgraded to prompt-only output.
+Calls without a schema, other DeepSeek model IDs and other providers keep their
+existing behavior.
+
+The DeepSeek adapter buffers each response until completion and preserves
+reasoning text, tool-call IDs/results and token/cache usage through subsequent
+tool calls. Incomplete or failed responses do not become final answers, even
+when their partial text looks valid; reported usage is retained. Local schema
+validation still applies. Schema constraints do not prove evidence, dates or
+citations correct, and cannot guarantee that a provider request completes.
+
 Running a Backtest
 ------------------
 

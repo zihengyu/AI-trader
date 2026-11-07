@@ -2247,6 +2247,13 @@ class AgentHandle:
             if resolved_max_output_tokens is not None:
                 # Added only when set so existing replay-cache keys are unchanged.
                 cache_payload["max_output_tokens"] = resolved_max_output_tokens
+            if schema_json is not None:
+                from .structured_output import native_output_protocol
+
+                protocol = native_output_protocol(model_name)
+                if protocol is not None:
+                    # A prompt-only replay is not evidence of native schema output.
+                    cache_payload["structured_output_protocol"] = protocol
             cache_key = self.manager.replay_cache.compute_key(cache_payload)
             strategy = self.manager.strategy
             should_replay = bool(getattr(strategy, "is_backtesting", False))
@@ -2306,6 +2313,7 @@ class AgentHandle:
                 run_timeout_seconds=resolved_run_timeout_seconds,
                 max_output_tokens=resolved_max_output_tokens,
                 reasoning_effort=resolved_reasoning_effort,
+                output_schema=schema_json,
             )
             self.manager._reserve_model_call(agent_name=self.name, model=model_name)
         # Strategy-level safety net with live-vs-backtest branching.

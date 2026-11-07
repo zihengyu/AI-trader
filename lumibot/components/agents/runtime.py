@@ -748,6 +748,8 @@ class RuntimeRequest:
     # Private synchronous append owner supplied by the caller (e.g. MemoryStore).
     # Only bounded intent/status and original-argument hash enter this callback.
     tool_journal_callback: Callable[[dict[str, Any]], None] | None = None
+    # The normalized application contract, separate from its prompt rendering.
+    output_schema: dict[str, Any] | None = None
 
 
 _LITELLM_CONFIGURED = False
@@ -1514,6 +1516,7 @@ def _resolve_model_for_adk(
     model_request_timeout_seconds: float | None = None,
     reasoning_effort: str | None = None,
     disable_provider_retries: bool = False,
+    output_schema: dict[str, Any] | None = None,
 ) -> Any:
     # Native Gemini IDs take ADK's fast path as plain strings. Any other
     # provider prefix (e.g. "openai/...", "xai/...", "anthropic/...") is
@@ -1556,6 +1559,17 @@ def _resolve_model_for_adk(
         )
     if _is_native_gemini_model(model):
         return model
+    from .structured_output import native_output_protocol
+
+    if output_schema is not None and native_output_protocol(model) is not None:
+        _configure_litellm_quietly()
+        from .deepseek_llm import DeepSeekResponsesLlm
+
+        return DeepSeekResponsesLlm(
+            model=model, output_schema=output_schema,
+            model_request_timeout_seconds=_coerce_positive_timeout_seconds(model_request_timeout_seconds),
+            reasoning_effort=reasoning_effort,
+        )
     if lower.startswith("xai/"):
         _sync_xai_api_key_alias()
     if lower.startswith("together_ai/"):
@@ -1947,6 +1961,7 @@ class GoogleADKRuntime:
                 model_request_timeout_seconds=model_request_timeout_seconds,
                 reasoning_effort=request.reasoning_effort,
                 disable_provider_retries=request.model_call_budget is not None,
+                output_schema=request.output_schema,
             ),
             instruction=self._instruction_for(request),
             tools=tools,

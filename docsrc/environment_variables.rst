@@ -1402,6 +1402,11 @@ execution is enabled by changing models or policies.
 
 OpenAI requires ``OPENAI_API_KEY``; Anthropic requires ``ANTHROPIC_API_KEY``;
 DeepSeek requires ``DEEPSEEK_API_KEY``. Only the selected provider's key is needed.
+DeepSeek Flash/Pro agents requesting ``output_schema`` use its native Responses API;
+``DEEPSEEK_API_BASE`` preserves the provider SDK's existing optional endpoint
+override, which must support ``/responses`` for these calls. The default native
+schema endpoint is ``https://api.deepseek.com``. Missing DeepSeek credentials
+never fall back to an OpenAI key. No additional variable enables schema output.
 The ``local`` mode combines public Yahoo observations with a durable local virtual
 account and requires no brokerage key. Delayed or unavailable data blocks fills;
 minute OHLCV and an explicit spread proxy are not exchange bid/ask quotes.

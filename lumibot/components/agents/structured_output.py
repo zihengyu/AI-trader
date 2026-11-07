@@ -8,7 +8,9 @@ back wrapped in a markdown code fence and broke the strategy's parser.
 How it works (provider-agnostic, so it also works with tools on every model):
 
 1. The schema is appended to the agent's system prompt as an exact final-answer
-   format instruction.
+   format instruction and carried separately on the runtime request. Direct
+   DeepSeek Flash/Pro schema runs also send it as native Responses ``text.format``
+   JSON Schema; other routes retain their existing prompt behavior.
 2. After the run, the final answer text is parsed: code fences are removed and
    the first complete JSON value is extracted.
 3. The value is validated against the JSON Schema (or the pydantic model), and
@@ -24,6 +26,13 @@ import re
 from typing import Any
 
 _FENCE_PATTERN = re.compile(r"```(?:json|JSON)?\s*(.*?)```", re.DOTALL)
+
+
+def native_output_protocol(model: Any) -> str | None:
+    """Documented provider capabilities, shared by routing and replay identity."""
+    if isinstance(model, str) and model in {"deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"}:
+        return "deepseek_responses_json_schema_v1"
+    return None
 
 
 def normalize_output_schema(schema: Any) -> tuple[dict[str, Any], Any | None]:

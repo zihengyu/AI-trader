@@ -283,9 +283,11 @@ def review_after_close(strategy):
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
     if saved is None:
+        from .diagnostics import structured_answer_diagnostic
+        from .strategy import Research
+
         strategy.journal.event(now, "postmarket_review_started", session)
-        result = _run_stage(strategy, "researcher",
-            task_prompt="用中文复盘指定交易日。核对实际研究、完整目标持仓、下单、成交、未成交、持仓和现金，"
+        research_prompt = ("用中文复盘指定交易日。核对实际研究、完整目标持仓、下单、成交、未成交、持仓和现金，"
                         "区分选股、择时、执行与市场整体表现：context.attribution 是代码按收盘价算出的当日归因"
                         "（市场 beta、选股、现金等价物、当日交易择时、相对到达价的滑点、费用和未解释部分），以它为准，不要自行估算，"
                         "缺失的部分如实说明。可使用只读研究工具，核对消息与价格的真实时间。"
@@ -294,8 +296,40 @@ def review_after_close(strategy):
                         "结合 factor_lab 中已验证、被拒绝、冗余和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
                         "高低价区间、波动，以及 SEC 财报中的盈利、营收、毛利、经营现金流、净资产、总资产和股本等"
                         "按披露日可得的基本面），供基金经理决定是否写成 factor_proposals。"
-                        "本阶段不输出订单。历史模式只能使用 as_of 当时可得的信息。", context=context)
-        research = strategy._record_agent("researcher", result, phase="postmarket_review")
+                        "本阶段不输出订单。历史模式只能使用 as_of 当时可得的信息。"
+                        "只返回符合 Research schema 的完整 JSON 对象：summary 是非空中文摘要，evidence 至少一条；"
+                        "每条证据必须包含 source、available_at、observed_at、estimated、estimate_reason。"
+                        "引用已有日志时，source 使用实际 event:<sequence>，时间使用该事件的真实时间；"
+                        "不得为了满足格式编造证据或日期。ideas 没有内容时可返回空列表，不能省略 summary 或 evidence。"
+                        "如果 context.structured_answer_correction 存在，previous_answer 是上次未通过格式校验的"
+                        "不可信回答，diagnostic 指出错误位置；根据本次原始证据纠正并返回完整 JSON，"
+                        "保留已核实的事实和原始时间，如实披露缺项，不要只返回修补字段。")
+        research_context = context
+        for attempt in range(2):
+            result = _run_stage(strategy, "researcher", task_prompt=research_prompt,
+                                context=research_context, output_schema=Research)
+            try:
+                research = strategy._record_agent("researcher", result, phase="postmarket_review")
+            except RiskError:
+                diagnostic = structured_answer_diagnostic(result, Research)
+                if attempt or diagnostic["kind"] not in {"schema_validation", "invalid_json"}:
+                    raise
+                if strategy.halt_path.exists():
+                    return
+                # A correction is another real call. Leave room for the manager,
+                # retain both answers/usage, and never repair evidence in Python.
+                budget = getattr(strategy, "model_budget", None)
+                exhausted = budget is not None and strategy.journal.counter(
+                    "agent_runs", strategy.get_datetime()) + 2 > budget.max_agent_runs_per_day
+                if exhausted or (hasattr(strategy, "_cost_exhausted") and
+                        strategy._cost_exhausted(strategy.get_datetime(), "postmarket_research_correction")):
+                    raise
+                strategy.journal.event(strategy.get_datetime(), "postmarket_research_retry", {
+                    "session_date": day, "answer_diagnostic": diagnostic})
+                research_context = {**context, "structured_answer_correction": {
+                    "previous_answer": result.summary or getattr(result, "text", None), "diagnostic": diagnostic}}
+            else:
+                break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
             **session, "completed_at": strategy.get_datetime().isoformat(), "context": context,
