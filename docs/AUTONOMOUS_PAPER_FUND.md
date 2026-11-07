@@ -1162,6 +1162,12 @@ Flash 成功结果先提交 SQLite；Pro 失败后，下次上述检查复用该
 脚本统一用当前 `Research` schema 检查 `summary`／`evidence`、合成只读工具往返和已报告用量，
 默认最多四次提供方请求，不自动重试、不连接券商；结果保存在 `artifacts/verification/deepseek-schema-smoke/`。
 它不代替完整账户策略复现，也不能证明正在运行的服务已经重载新代码；详见 `docs/AGENT_STRUCTURED_OUTPUT.md`。
+真实接口若在第一次请求就返回 HTTP 400，表示请求被拒绝，不能据此声称原生 Schema 已实测可用。
+更新后的诊断会提供 `provider_problem`：区分格式不可用、Schema 关键字／必填项规则被拒绝、
+定义不被接受，以及 Schema 与工具／推理模式的组合不兼容；未知原因仍保留为 `provider_request_rejected`。
+同时保留已知提供方错误码、公开参数名和只含公开 API／Schema 词汇的 `diagnostic_terms`，
+不复制错误正文、输入值、密钥、私有地址或请求 ID。分类仅用于定位，不触发重试、自动删字段或输出模式降级。
+目前首次真实检查中两个模型均返回了 HTTP 400，仍需取得具体拒绝原因并通过真实调用，才能完成提供方验证。
 如果研究员返回的 JSON 不符合 schema 或无法提取 JSON，每次复盘尝试最多额外纠正一次，提供原始回答、
 安全的字段错误位置及同一份输入快照，要求模型根据真实证据返回完整结果；程序不自动补摘要、证据或日期。
 两次回答和用量均保留在 `agent` 记录，`postmarket_research_retry` 记录纠正原因。

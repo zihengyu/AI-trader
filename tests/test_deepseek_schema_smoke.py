@@ -195,3 +195,65 @@ def test_wall_timeout_keeps_unknown_usage_and_does_not_retry(tmp_path, monkeypat
     assert len(sent) == len(case["requests"]) == 1
     assert case["error"]["type"] == "TimeoutError" and case["requests"][0]["usage"] is None
     assert not case["usage_complete"]
+
+
+@pytest.mark.parametrize("message,problem", [
+    ("This response_format type is unavailable now", "schema_format_unavailable"),
+    ("Unknown variant json_schema; supported values: text, json_object", "schema_format_unavailable"),
+    ("Invalid schema: required must include all properties", "schema_required_fields_rejected"),
+    ("Invalid schema: minItems is not supported", "schema_keyword_rejected"),
+    ("The json_schema format is not supported with tools", "schema_tools_combination_rejected"),
+    ("The json_schema format is unsupported in thinking mode", "schema_reasoning_combination_rejected"),
+    ("Invalid schema: additionalProperties must be false", "schema_definition_rejected"),
+    ("Invalid model: model does not exist", "model_rejected"),
+])
+def test_provider_rejections_keep_safe_actionable_categories_without_messages(message, problem):
+    from openai import BadRequestError
+
+    private = " synthetic-private-token https://private-endpoint.example.test/secret"
+    error = BadRequestError("SDK message: " + private,
+        response=httpx.Response(400, request=httpx.Request("POST", "https://api.deepseek.com/responses")),
+        body={"error": {"message": message + private, "code": "invalid_request_error", "param": "text.format"}})
+    result = smoke.safe_error(error)
+    assert result["http_status"] == 400 and result["provider_problem"] == problem
+    assert result["provider_code"] == "invalid_request_error" and result["parameter"] == "text.format"
+    serialized = json.dumps(result)
+    assert "synthetic-private" not in serialized and "private-endpoint" not in serialized
+    assert "message" not in result and len(result["message_sha256"]) == 64
+
+
+@pytest.mark.parametrize("body", [{"message": "opaque", "code": {"private": "value"}, "param": ["secret"]},
+                                  ["private body"], "private body"])
+def test_provider_error_unknown_body_shapes_and_values_do_not_leak(body):
+    from openai import BadRequestError
+
+    error = BadRequestError("synthetic-private-error",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://api.deepseek.com/responses")), body=body)
+    result = smoke.safe_error(error)
+    assert "private" not in json.dumps(result) and "secret" not in json.dumps(result)
+
+
+def test_connection_diagnostic_distinguishes_dns_without_echoing_the_hostname():
+    import socket
+
+    error = RuntimeError("synthetic-private-host")
+    error.__cause__ = socket.gaierror(8, "synthetic-private-host could not resolve")
+    result = smoke.safe_error(error)
+    assert result["connection_problem"] == "dns_resolution_failed"
+    assert "private" not in json.dumps(result)
+
+
+def test_real_mode_report_keeps_specific_schema_rejection_for_operator(tmp_path, monkeypatch):
+    def reject(c, body, response):
+        return c.httpx.Response(400, json={"error": {"message": "This response_format type is unavailable now",
+                                                   "type": "invalid_request_error", "code": "invalid_request_error"}})
+
+    mock_real_provider(monkeypatch, reject)
+    output = tmp_path / "rejected-schema.json"
+    assert smoke.main(["--real-models", "--output", str(output)]) == 1
+    report = json.loads(output.read_text())
+    error = report["cases"][0]["error"]
+    request_error = report["cases"][0]["requests"][0]["error"]
+    assert error["provider_problem"] == request_error["provider_problem"] == "schema_format_unavailable"
+    assert len(report["cases"][0]["requests"]) == 1  # No retry or format downgrade hides a rejection.
+    assert report["cases"][1]["status"] == "passed"

@@ -332,6 +332,15 @@ and makes at most four requests, with no automatic retry. It checks the actual
 JSON reports are saved under ``artifacts/verification/deepseek-schema-smoke/``.
 It does not connect to a broker or establish that a running service has reloaded
 the current code. An offline pass does not establish real provider support.
+If both models return HTTP 400 on the first request, the provider has rejected
+the request before the tool round trip; a status alone cannot identify the
+cause. Updated diagnostics include ``provider_problem``, known provider codes,
+API parameter names and allowlisted ``diagnostic_terms``. They distinguish
+schema-format, keyword, required-field and tool/reasoning-combination rejections
+without copying provider messages, input values, secrets or private endpoints.
+An unknown category remains ``provider_request_rejected``. These are diagnostic
+labels, not automatic fallback rules. Real-provider qualification remains
+blocked until the actual request passes; local mock success cannot replace it.
 
 Runtime failures such as ``runtime_error: TimeoutError`` are distinguished from
 schema mismatches, ``missing_answer`` and ``invalid_json``. A rejected postmarket

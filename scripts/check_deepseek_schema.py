@@ -12,6 +12,9 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
+import socket
+import ssl
 import sys
 import time
 from datetime import datetime, timezone
@@ -26,6 +29,22 @@ if str(REPO_ROOT) not in sys.path:
 
 MODELS = {"flash": "deepseek/deepseek-flash", "pro": "deepseek/deepseek-v4-pro"}
 TOOL_NAME = "schema_probe_evidence"
+
+_PROVIDER_CODES = {"invalid_request_error", "invalid_json_schema", "unsupported_parameter", "unsupported_value",
+                   "model_not_found", "authentication_error", "insufficient_balance", "insufficient_quota",
+                   "rate_limit_exceeded"}
+_REQUEST_PARAMETERS = {"model", "input", "instructions", "tools", "tool_choice", "reasoning", "reasoning.effort",
+                       "text", "text.format", "text.format.type", "text.format.schema", "response_format",
+                       "max_output_tokens", "stream"}
+_DIAGNOSTIC_TERMS = {
+    "invalid", "unsupported", "unavailable", "available", "schema", "json_schema", "json_object",
+    "response_format", "strict", "format", "type", "text", "tools", "tool", "input", "input_text", "output_text",
+    "model", "thinking", "reasoning", "effort", "required", "properties", "additionalproperties",
+    "minlength", "maxlength", "minitems", "maxitems", "default", "null", "string", "boolean", "expected",
+    "missing", "must", "only", "not", "supported", "now", "parameter", "unknown", "error", "oneof", "anyof",
+    "allof", "ref", "defs", "value", "in", "context", "and", "of", "for", "is", "the", "supplied", "every",
+    "all", "keys", "including", "array", "object", "cannot", "together", "with", "additional", "contains",
+}
 
 
 class ProbeFailure(Exception):
@@ -53,6 +72,55 @@ def components():
         runtime_sha256=hashlib.sha256(Path(runtime.__file__).read_bytes()).hexdigest())
 
 
+def provider_error_diagnostic(error):
+    """Classify provider rejection without copying its message or input values.
+
+    A bare 400 cannot distinguish unsupported schema output from a rejected
+    keyword or a tool/reasoning combination. Only fixed labels and public API
+    vocabulary leave this boundary; unknown detail remains local to the SDK.
+    """
+    body = getattr(error, "body", None)
+    detail = body.get("error", body) if isinstance(body, dict) else {}
+    if not isinstance(detail, dict):
+        detail = {}
+    result = {}
+    code = detail.get("code") or getattr(error, "code", None)
+    if isinstance(code, str) and code in _PROVIDER_CODES:
+        result["provider_code"] = code
+    parameter = detail.get("param") or getattr(error, "param", None)
+    if isinstance(parameter, str) and parameter in _REQUEST_PARAMETERS:
+        result["parameter"] = parameter
+    message = detail.get("message")
+    if not isinstance(message, str) or not message:
+        return result
+    text = message.lower()
+    unavailable = any(term in text for term in ("unavailable", "unsupported", "not supported", "not support"))
+    schema = any(term in text for term in ("schema", "response_format", "text.format"))
+    if schema and ("thinking" in text or "reasoning" in text) and unavailable:
+        problem = "schema_reasoning_combination_rejected"
+    elif schema and ("tools" in text or "tool calling" in text) and (
+            unavailable or "together" in text or "cannot" in text):
+        problem = "schema_tools_combination_rejected"
+    elif schema and unavailable and any(term in text for term in ("minlength", "maxlength", "minitems", "maxitems",
+                                                                 "default", "$ref", "$defs", "oneof", "anyof")):
+        problem = "schema_keyword_rejected"
+    elif schema and (unavailable or "unknown variant" in text or "supported values" in text) and (
+            "json_schema" in text or "response_format" in text or "format type" in text):
+        problem = "schema_format_unavailable"
+    elif schema and "required" in text and any(term in text for term in ("properties", "every", "all", "missing")):
+        problem = "schema_required_fields_rejected"
+    elif schema and ("invalid" in text or "additionalproperties" in text or "additional properties" in text):
+        problem = "schema_definition_rejected"
+    elif "model" in text and ("not found" in text or "does not exist" in text or "invalid model" in text):
+        problem = "model_rejected"
+    else:
+        problem = "provider_request_rejected"
+    result["provider_problem"] = problem
+    result["diagnostic_terms"] = [word for word in re.findall(r"[a-z_]+", text) if word in _DIAGNOSTIC_TERMS][:40]
+    result["message_sha256"] = hashlib.sha256(message.encode()).hexdigest()
+    return result
+
+
 def safe_error(error):
     # Provider exceptions can contain URLs, request bodies and credentials.
     result = {"type": type(error).__name__}
@@ -61,6 +129,19 @@ def safe_error(error):
     code = getattr(error, "status_code", None)
     if type(code) is int:
         result["http_status"] = code
+        result.update(provider_error_diagnostic(error))
+    cause, seen = error, set()
+    for _ in range(6):
+        if cause is None or id(cause) in seen:
+            break
+        seen.add(id(cause))
+        if isinstance(cause, socket.gaierror):
+            result["connection_problem"] = "dns_resolution_failed"
+            break
+        if isinstance(cause, ssl.SSLCertVerificationError):
+            result["connection_problem"] = "certificate_verification_failed"
+            break
+        cause = cause.__cause__ or cause.__context__
     if isinstance(error, ModuleNotFoundError):
         name = error.name or "unknown"
         result["missing_module"] = name if all(c.isalnum() or c in "_." for c in name) else "unknown"

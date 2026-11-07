@@ -3,7 +3,7 @@
 Native provider schema requests and local validation for generic LumiBot agents.
 
 Last Updated: 2026-11-07
-Status: Implemented; local protocol qualification only
+Status: Implemented locally; real-provider qualification blocked by HTTP 400
 Audience: Agent runtime maintainers and strategy authors
 
 ## Overview
@@ -64,6 +64,12 @@ then return plain JSON that passes JSON Schema and Pydantic validation and
 copies the tool's actual evidence. It does not connect to a broker, read a
 customer account or place orders.
 
+A real-provider run has returned HTTP 400 for both models on their first
+request. This is failed provider qualification, not evidence that either model
+accepted the requested native schema. The status alone does not identify which
+request field or combination was rejected. Local mock passes must not be used
+to describe this path as verified against the real provider.
+
 The default is offline HTTP simulation, with no provider credentials needed:
 
 ```bash
@@ -101,6 +107,27 @@ An offline pass does not establish provider support. A real pass checks this
 small request/tool path in the current Python process, not a complete strategy,
 every role schema, repeated-run reliability or whether a running service has
 reloaded its code. This diagnostic is independent of semantic/release evals.
+
+### Diagnosing A First-Request HTTP 400
+
+The report and console now retain safe `provider_problem` categories rather
+than only `http_status: 400`. They can distinguish a reported unavailable schema
+format, rejected schema keywords or required-field rules, an invalid schema
+definition, and a schema/tool or schema/reasoning combination rejection.
+`provider_request_rejected` means the available message does not match a known
+category; it must not be relabeled as proven schema support or non-support.
+
+Known public provider error codes and API parameter names are retained.
+`diagnostic_terms` contains only allowlisted public API/schema vocabulary and
+`message_sha256` identifies the message without storing it. Provider messages,
+input values, secrets, private endpoints and request IDs are not copied. These
+categories explain evidence; they do not select a provider, retry a request,
+change a schema or silently downgrade the requested output mode.
+
+Connection errors separately identify DNS or certificate verification failures
+from exception types, without copying hostnames or exception messages. Update
+the diagnostic and repeat the same explicit real-provider command to capture
+the relevant category before changing the production request contract.
 
 ## Source To Served Evidence
 
