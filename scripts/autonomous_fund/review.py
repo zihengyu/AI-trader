@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 import pandas_market_calendars as mcal
 from pydantic import BaseModel, ConfigDict, Field
 
-from .journal import encode
+from .journal import encode, event_body
 from .risk import RiskError, bounded_list, bounded_text, instant, validate_evidence
 
 
@@ -72,7 +72,7 @@ def _events(journal, now, kinds=None):
         else:
             rows = db.execute("SELECT sequence,at,kind,body FROM events ORDER BY sequence").fetchall()
     # SQL string ordering is unsafe when timestamps have different UTC offsets.
-    return [{"sequence": row[0], "at": row[1], "kind": row[2], "body": json.loads(row[3])}
+    return [{"sequence": row[0], "at": row[1], "kind": row[2], "body": event_body(row[2], row[3])}
             for row in rows if instant(row[1]) <= now and not (row[2] == "account" and
                 (row[0] in invalid_accounts or integrity["status"] == "failed"))]
 

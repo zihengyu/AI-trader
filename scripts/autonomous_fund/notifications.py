@@ -4,7 +4,7 @@ from collections import Counter
 from zoneinfo import ZoneInfo
 
 from .execution import operator_connection
-from .journal import encode
+from .journal import encode, event_body
 from .risk import RiskError, instant
 
 
@@ -99,7 +99,7 @@ FACTOR_STATUS = {"validated": "通过", "rejected": "未通过", "insufficient_d
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
-                "model_cost_budget_exhausted", "decision_drought"}
+                "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body"}
 
 
 ATTRIBUTION_LABELS = {"market": "市场（beta×基准）", "selection": "选股", "cash_equivalent": "现金等价物",
@@ -163,7 +163,7 @@ def daily_document(root, sequence):
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         # Only the kinds this document lists; the journal also holds a NAV mark
         # and a benchmark about every 30 seconds of market time.
-        events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+        events = [(at, kind, event_body(kind, body)) for at, kind, body in db.execute(
             "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(DAILY_KINDS)),
             DAILY_KINDS) if instant(at) <= cutoff]
         # The scorecard and factor tests are written just after the review itself
@@ -591,7 +591,7 @@ def _weekly_events(db, cutoff, zone):
                 except (TypeError, ValueError):
                     pass
         else:
-            events.append((at, kind, json.loads(body)))
+            events.append((at, kind, event_body(kind, body)))
     events += [(at, "account", {"equity": equity}) for at, equity in marks.values()]
     events += [(at, "benchmark", values) for at, values in prices.values()]
     return events

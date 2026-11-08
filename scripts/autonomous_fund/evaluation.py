@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 import pandas_market_calendars as mcal
 
+from .journal import event_body
 from .risk import RiskError, instant
 
 
@@ -54,8 +55,8 @@ def event_bodies(db, sequences):
     sequences, bodies = sorted(set(sequences)), {}
     for start in range(0, len(sequences), 500):
         batch = sequences[start:start + 500]
-        bodies.update((sequence, json.loads(body)) for sequence, body in db.execute(
-            "SELECT sequence,body FROM events WHERE sequence IN (%s)" % ",".join("?" * len(batch)), batch))
+        bodies.update((sequence, event_body(kind, body)) for sequence, kind, body in db.execute(
+            "SELECT sequence,kind,body FROM events WHERE sequence IN (%s)" % ",".join("?" * len(batch)), batch))
     return bodies
 
 
