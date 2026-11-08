@@ -304,7 +304,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -323,6 +323,7 @@ def main(argv=None):
                         help="rehearse: data stages only, no model calls (no model cost)")
     parser.add_argument("--real-models", action="store_true",
                         help="rehearse: call the real models (costs money); default is a free scripted AI")
+    parser.add_argument("--apply", action="store_true", help="prune: delete; without it, only show what would go")
     parser.add_argument("--observe-only", action="store_true", help="Local account monitoring without model calls or orders")
     parser.add_argument("--require-monitor", action="store_true", help="Block local/paper orders unless an independent Telegram monitor is fresh")
     parser.add_argument("--env-file", type=Path, help="Explicit optional secret file; never auto-discovered")
@@ -432,6 +433,10 @@ def main(argv=None):
     if args.mode == "decisions":
         from .decision_activity import activity, lines
         print("\n".join(lines(activity(args.run_dir, args.session_date), timeline=True)))
+        return
+    if args.mode == "prune":
+        from .retention import lines, prune
+        print("\n".join(lines(prune(args.run_dir, apply=args.apply))))
         return
     if args.mode == "audit-ledger":
         from .ledger_audit import audit

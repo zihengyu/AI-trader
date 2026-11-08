@@ -255,3 +255,22 @@ def test_a_backup_never_fills_the_disk_it_frees_old_snapshots_first_or_is_skippe
         body = json.loads(db.execute("SELECT body FROM events WHERE kind='notification' "
                                      "ORDER BY sequence DESC LIMIT 1").fetchone()[0])
     assert body["kind"] == "backup_skipped" and "磁盘空间不足" in readable("backup_skipped", body["details"])
+
+
+def test_the_daily_backup_also_prunes_what_nothing_reads(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import deploy
+    book, env = account_book(tmp_path)
+    folder = book / "cache" / "agent_runtime" / "traces" / "manager"
+    folder.mkdir(parents=True)
+    old = folder / "old.json"
+    old.write_text("{}")
+    os.utime(old, (0, 0))  # Decades old: removed with the daily backup.
+    monkeypatch.delenv("FUND_RUN_DIR", raising=False)
+    deploy.main(["rotate-backup", "--env-file", str(env), "--backup-dir", str(tmp_path / "backups")])
+    assert not old.exists() and len(list((tmp_path / "backups").iterdir())) == 1
+    assert Journal(book, "synthetic-script-account").events(("account",))  # The journal itself is untouched.
+
+
+def test_fund_logs_prune_refuses_unknown_arguments(tmp_path):
+    _, env = account_book(tmp_path)
+    assert script("fund-logs.sh", tmp_path, env, "prune", "--everything").returncode == 2

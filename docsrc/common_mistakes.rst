@@ -309,6 +309,13 @@ deletes the snapshots its rotation would delete anyway, but only when that makes
 enough room. Otherwise it skips the backup without deleting any snapshot, and
 the monitor sends a ``backup_skipped`` notice.
 
+After the daily backup, the fund removes data that nothing reads any more:
+ordinary headlines after 30 days, material ones after 180, LumiBot's per-call
+agent traces after 30 days, and monthly ``events-YYYY-MM.jsonl.gz`` export
+archives after 12 months. The ledger, orders, fills, decisions, research,
+reviews, scorecards, factor tests, notices and NAV marks are never removed.
+Preview with ``bash scripts/fund-logs.sh prune``, and delete with ``--apply``.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

@@ -210,14 +210,21 @@ def main(argv=None):
         from .settings import startup
         values = dotenv_values(args.env_file) if args.env_file.is_file() else {}
         _, run_dir, _, _ = startup("start", args.run_dir, {**values, **os.environ})
+        skipped = None
         try:
             target = rotate(run_dir, args.backup_dir, args.keep)
         except BackupSpaceError as exc:
+            skipped = exc
             try:
                 _notify_backup_skipped(run_dir, str(exc))  # The monitor sends it; a failed timer alone is silent.
             except Exception:
                 pass  # The skipped backup itself is still reported by the failing service.
-            raise
+        # Daily retention of data nothing reads any more (retention.py), after the snapshot
+        # or when there was no room for one; never the ledger, decisions or reviews.
+        from .retention import lines, prune
+        print("\n".join(lines(prune(run_dir, apply=True))))
+        if skipped is not None:
+            raise skipped
         print(f"Journal snapshot {target} (restores into STOP; secrets excluded).")
         return
     if os.name != "posix":
