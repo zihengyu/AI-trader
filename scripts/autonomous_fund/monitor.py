@@ -119,6 +119,8 @@ class Monitor:
                 CREATE TABLE IF NOT EXISTS fund_deliveries (
                     sequence INTEGER PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL,
                     next_at TEXT NOT NULL, last_error TEXT, message_id TEXT);
+                -- Every poll looks up the few deliveries still due and counts them by state.
+                CREATE INDEX IF NOT EXISTS fund_deliveries_state ON fund_deliveries(state);
                 CREATE TABLE IF NOT EXISTS fund_monitor_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
             if transport is not None:

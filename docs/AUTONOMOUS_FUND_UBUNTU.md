@@ -489,6 +489,10 @@ systemd、监督和持久化降低中断风险，无法保证永不故障。整�
 sudo -u "<service-user>" .venv/bin/python -m scripts.autonomous_fund.deploy rotate-backup --keep 14
 ```
 
+备份前先检查磁盘：可用空间要容纳一份完整账本，并在备份后至少留 512 MB（高于监控 200 MB 的低磁盘 STOP 线），
+否则先删除本次轮换本来就要删的最旧快照；删了也不够时跳过当天备份、不删除任何已有快照，并通过监控发送
+“备份已跳过：磁盘空间不足”提醒。这样备份不会因写满磁盘而触发交易停止。
+
 快照仍在同一台机器上。异地保存请自行把 `artifacts/fund-backups/` 同步到对象存储或另一台主机（例如每天
 `rsync -a artifacts/fund-backups/ <backup-host>:<path>/`，或用云厂商的对象存储同步工具）。
 

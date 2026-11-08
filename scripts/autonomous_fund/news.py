@@ -199,6 +199,10 @@ class NewsWatch:
                     kind TEXT NOT NULL, symbols TEXT NOT NULL, query TEXT, title TEXT NOT NULL, url TEXT NOT NULL,
                     material TEXT, consumed INTEGER NOT NULL DEFAULT 0, baseline INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS fund_news_observed ON fund_news(observed_at);
+                -- take_material reads and marks these on every strategy iteration, inside a write
+                -- transaction; without it both statements scanned every headline ever stored.
+                CREATE INDEX IF NOT EXISTS fund_news_unconsumed ON fund_news(observed_at)
+                    WHERE material IS NOT NULL AND consumed=0;
             """)
 
     def watch(self, symbols, held, queries):

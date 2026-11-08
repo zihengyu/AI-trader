@@ -1297,7 +1297,8 @@ class AutonomousFund(Strategy):
                                "external_value": str(external_value)})
         body = asdict(account)
         if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
-            body["ledger_audit"] = self.broker.ledger_audit()
+            from .ledger_audit import stamp
+            body["ledger_audit"] = stamp(self.broker.ledger_audit())  # Reconciled now; the verdict is stored.
         if (self.mode == "local" and getattr(self.broker, "_valuation_policy", None) is not None
                 and not self.broker.is_market_open()):
             # The returned book is a current account read for research. The
@@ -1481,6 +1482,12 @@ class AutonomousFund(Strategy):
         self.journal.event(now, "notification", {"kind": kind, "details": details})
         if notices is not None:
             notices[key] = now  # A failed journal write must remain retryable.
+            if len(notices) > 512:
+                # A key holds the whole encoded details, and most notices are distinct: keep
+                # only entries that can still suppress a repeat, or the dict grows for months.
+                horizon = max([1800, *NOTICE_WINDOWS.values()])
+                for old in [k for k, at in notices.items() if (now - at).total_seconds() >= horizon]:
+                    del notices[old]
         self.log_message(f"FUND {kind}: {details}", color="yellow")
         return True
 

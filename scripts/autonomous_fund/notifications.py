@@ -295,7 +295,10 @@ def readable(kind, details, sequence=None, *, now=None):
     from .status import REASONS
     details = details if details is not None else {}
     text = None
-    if kind == "agent_notice":
+    if kind == "backup_skipped":
+        text = ("⚠️ 今天的账户备份已跳过：磁盘空间不足（为避免磁盘写满触发交易停止）。\n"
+                f"{details.get('reason', '')}\n请清理磁盘或把旧备份移到别处；交易未受影响。")
+    elif kind == "agent_notice":
         text = (f"AI 通知（供参考） · {details.get('severity', 'info')}\n"
                 f"{details.get('title', '')}\n{details.get('message', '')}")
     elif kind == "premarket_research":

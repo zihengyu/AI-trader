@@ -301,6 +301,14 @@ no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
 (100,000 marks: about 1.9 s to 1.0 s, same findings).
 
+NAV marks store the audit's verdict (status, scope, counts, missing evidence,
+error and warning codes), not the full replayed book, which ``fund-logs.sh
+audit`` reproduces at any time. The daily backup checks free space first. A full
+copy must leave 512 MB free, above the monitor's 200 MB low-disk STOP. It first
+deletes the snapshots its rotation would delete anyway, but only when that makes
+enough room. Otherwise it skips the backup without deleting any snapshot, and
+the monitor sends a ``backup_skipped`` notice.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

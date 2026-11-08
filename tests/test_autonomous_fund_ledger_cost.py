@@ -359,3 +359,46 @@ def test_the_daily_document_does_not_parse_nav_marks(tmp_path, monkeypatch):
     text = daily_document(tmp_path, sequence)
     assert "日报" in (text[1] if isinstance(text, tuple) else text)
     assert len(reads) <= 2  # The report reads its first and latest marks; the document reads none.
+
+
+def test_nav_marks_store_the_audit_verdict_not_the_replayed_book(tmp_path):
+    _, _, journal, _, _ = traded_book(tmp_path)
+    with journal.connection() as db:
+        body = json.loads(db.execute("SELECT body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()[0])
+    verdict = body["ledger_audit"]
+    assert verdict["status"] == "verified" and verdict["scope"] == "ledger" and verdict["fills_checked"] == 1
+    assert {"replayed", "warnings", "errors"}.isdisjoint(verdict)  # Cash and positions are already in the mark.
+    assert verdict["error_codes"] == [] and verdict["warning_count"] == 0
+    assert ledger_audit.audit(tmp_path)["replayed"]["positions"]  # The full replay is one command away.
+
+
+def test_notice_suppression_keys_are_pruned_once_they_can_no_longer_suppress(tmp_path):
+    from scripts.autonomous_fund.strategy import AutonomousFund, NOTICE_WINDOWS
+    from scripts.autonomous_fund.journal import Journal
+    fund = object.__new__(AutonomousFund)
+    clock = [datetime(2026, 11, 2, 15, tzinfo=timezone.utc)]
+    fund.journal, fund._notices = Journal(tmp_path, "synthetic-notice-account"), {}
+    fund.get_datetime, fund.log_message = lambda: clock[0], lambda *a, **k: None
+    for i in range(2000):  # A month of distinct notices, one every 20 minutes.
+        assert AutonomousFund._notify_fund(fund, "synthetic_notice", {"i": i})
+        clock[0] += timedelta(minutes=20)
+    horizon = max([1800, *NOTICE_WINDOWS.values()])
+    assert len(fund._notices) <= 512 + horizon // 1200 + 1
+    assert not AutonomousFund._notify_fund(fund, "synthetic_notice", {"i": 1999})  # A recent repeat is still held.
+    AutonomousFund._notify_fund(fund, "stop_active", {"reason": "x"})
+    clock[0] += timedelta(hours=5)
+    for i in range(600):
+        AutonomousFund._notify_fund(fund, "synthetic_notice", {"j": i})
+    assert not AutonomousFund._notify_fund(fund, "stop_active", {"reason": "x"})  # Its 6-hour window survives pruning.
+
+
+def test_unconsumed_material_news_is_found_through_its_index(tmp_path):
+    from scripts.autonomous_fund.journal import Journal
+    from scripts.autonomous_fund.news import NewsSettings, NewsWatch
+    journal = Journal(tmp_path, "synthetic-news-account")
+    NewsWatch(journal, NewsSettings(enabled=True))
+    with journal.connection() as db:
+        for sql in ("SELECT * FROM fund_news WHERE material IS NOT NULL AND consumed=0 ORDER BY observed_at",
+                    "UPDATE fund_news SET consumed=1 WHERE material IS NOT NULL AND consumed=0"):
+            plan = [tuple(row) for row in db.execute("EXPLAIN QUERY PLAN " + sql).fetchall()]
+            assert "fund_news_unconsumed" in str(plan)  # Each iteration, not a scan of every stored headline.

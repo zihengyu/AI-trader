@@ -334,7 +334,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         for mark in marks.values():
             mark.validate(closed_at or now, self.limits)
         account = replace(account, as_of=closed_at if closed_at is not None and book_existed else now)
-        body = {**asdict(account), "ledger_audit": integrity, "valuation": {"source": "local_session_close" if closed_at else "local_broker_poll",
+        from .ledger_audit import stamp
+        body = {**asdict(account), "ledger_audit": stamp(integrity), "valuation": {"source": "local_session_close" if closed_at else "local_broker_poll",
             **({"session_close": str(closed_at), "observed_at": str(now), "book_existed_at_close": book_existed} if closed_at else {}), "quotes": {
             symbol: {"price": str(mark.price), "as_of": str(mark.as_of)}
             for symbol, mark in marks.items() if symbol in holdings}}}

@@ -311,6 +311,21 @@ def audit(root):
     return {"checked_at": datetime.now(timezone.utc).isoformat(), **result}
 
 
+def stamp(result):
+    """An audit's verdict to store beside a NAV mark: status, scope, counts, missing evidence and codes.
+
+    The full result repeats the replayed book (cash and every position) and each
+    warning; a mark is written about every 30 seconds, and `fund-logs.sh audit`
+    reruns the full replay from the ledger at any time.
+    """
+    kept = ("status", "scope", "origin", "missing_evidence", "orders_checked", "fills_checked",
+            "execution_inputs_verified", "arrival_quotes_verified")
+    return {**{key: result[key] for key in kept if key in result},
+            "error_codes": sorted({row["code"] for row in result.get("errors", [])}),
+            "warning_codes": sorted({row["code"] for row in result.get("warnings", [])}),
+            "warning_count": len(result.get("warnings", []))}
+
+
 def require_consistent(db):
     result = audit_connection(db, include_observations=False)
     if result["status"] == "failed":
