@@ -75,9 +75,48 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         integrity = audit_connection(db) if as_of is None else {"status": "not_checked", "reason": "Historical cutoff"}
         # Only the kinds a report uses; per-minute liveness rows are skipped.
         invalid_accounts = set(integrity.get("invalid_account_sequences", []))
-        events = [(at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
-            "SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(REPORT_KINDS)),
-            REPORT_KINDS) if not (kind == "account" and sequence in invalid_accounts)]
+        cutoff = instant(as_of) if as_of is not None else None
+        kinds = [kind for kind in REPORT_KINDS if kind not in ("account", "benchmark")]
+        sequenced = [(sequence, at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
+            "SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(kinds)),
+            kinds) if cutoff is None or instant(at) <= cutoff]
+        events = [(at, kind, body) for _, at, kind, body in sequenced]
+        # NAV marks and benchmarks (one each about every 30 seconds of market
+        # time): ordering, the closing-mark rule, the daily curve and drawdown
+        # use light fields of every mark; bodies are read only for marks shown.
+        from .evaluation import benchmark_events, event_bodies, nav_marks, outcome_inputs
+        marks = nav_marks(db, until=cutoff, excluded=invalid_accounts)
+        light = sorted(marks, key=lambda mark: mark[2])  # Stable: sequence order within one instant.
+        if light and light[-1][4]:
+            closing_mark, close_cutoff = light[-1], instant(light[-1][4])
+            # Older runners rewrote identical off-hours account observations. A
+            # recovered, source-proven close supersedes those observation clones.
+            light = [mark for mark in light if mark is closing_mark or
+                     not (close_cutoff < mark[2] <= closing_mark[2] and not mark[4])]
+        daily = {}
+        for mark in light:
+            daily[trading_day(instant(mark[5] or mark[1]) if mark[4] else mark[2])] = mark
+        shown = {mark[0] for mark in daily.values()} | ({light[0][0], light[-1][0]} if light else set())
+        bodies, shown_accounts = event_bodies(db, shown), {}
+        for sequence, at, *_ in light:
+            if sequence in shown and sequence not in shown_accounts:
+                body = bodies[sequence]
+                shown_accounts[sequence] = {
+                    "at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
+                    "as_of": body.get("as_of") or at, "positions": body["positions"],
+                    "position_average_prices": body.get("position_average_prices") or {},
+                    "cash_equivalents": body.get("cash_equivalents") or {},
+                    "cash_equivalent_value": body.get("cash_equivalent_value", 0),
+                    "receivables": float(body.get("receivables", 0)),
+                    **({"valuation": body["valuation"]} if "valuation" in body else {})}
+        first_account = shown_accounts[light[0][0]] if light else None
+        last_account = shown_accounts[light[-1][0]] if light else None
+        benchmarks = {}
+        for _, at, _, body in benchmark_events(db, {instant(row["at"]) for row in (first_account, last_account) if row},
+                                               until=cutoff):
+            benchmarks[instant(at)] = body
+        outcome_events = [(at, kind, body) for _, at, kind, body in sorted(
+            sequenced + outcome_inputs(db, marks, until=cutoff), key=lambda row: row[0])]
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         approval_rows = [dict(zip(("id", "digest", "state", "body"), r)) for r in db.execute(
             "SELECT id,digest,state,body FROM fund_approvals ORDER BY rowid")] if "fund_approvals" in tables else []
@@ -92,14 +131,14 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         row["body"] = json.loads(row["body"])
         row["effective_state"] = "expired" if row["state"] in {"pending", "approved"} and instant(row["body"]["expires_at"]) <= now else row["state"]
     from .evaluation import forward_outcomes
-    outcomes = forward_outcomes(events)
+    outcomes = forward_outcomes(outcome_events)
     monitor = None
     if as_of is None and (root / "monitor.json").is_file():
         try:
             monitor = json.loads((root / "monitor.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             monitor = {"status": "unavailable"}
-    accounts, benchmarks, fills, usage, notifications, reconciled = [], {}, [], [], [], {}
+    fills, usage, notifications, reconciled = [], [], [], {}
     decisions = 0
     incomplete_fills = False
     startup = next((body for _, kind, body in reversed(events) if kind == "startup"), {})
@@ -113,17 +152,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     backoffs = sum(kind == "decision_backoff" for _, kind, _ in events)
     reviews = [body for _, kind, body in events if kind == "postmarket_review"]
     for at, kind, body in events:
-        if kind == "account":
-            accounts.append({"at": at, "equity": float(body["equity"]), "cash": float(body["cash"]),
-                             "as_of": body.get("as_of") or at, "positions": body["positions"],
-                             "position_average_prices": body.get("position_average_prices") or {},
-                             "cash_equivalents": body.get("cash_equivalents") or {},
-                             "cash_equivalent_value": body.get("cash_equivalent_value", 0),
-                             "receivables": float(body.get("receivables", 0)),
-                             **({"valuation": body["valuation"]} if "valuation" in body else {})})
-        elif kind == "benchmark":
-            benchmarks[instant(at)] = body
-        elif kind == "fill":
+        if kind == "fill":
             fills.append({"at": at, **body, "evidence_kind": body.get("evidence_kind", "native_fill_callback")})
         elif kind == "fill_reconciled":
             reconciled[body["broker_id"]] = {"at": at, **body, "evidence_kind": "broker_cumulative_observation"}
@@ -138,20 +167,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     # A recovered cumulative broker fill replaces callbacks for that order.
     # Its timestamp is observation time, not an invented execution timestamp.
     fills = [row for row in fills if row["broker_id"] not in reconciled] + list(reconciled.values())
-    accounts.sort(key=lambda row: instant(row["at"]))
-    if accounts and (accounts[-1].get("valuation") or {}).get("session_close"):
-        closing_mark = accounts[-1]
-        cutoff = instant(closing_mark["valuation"]["session_close"])
-        # Older runners rewrote identical off-hours account observations. A
-        # recovered, source-proven close supersedes those observation clones.
-        accounts = [row for row in accounts if row is closing_mark or
-                    not (cutoff < instant(row["at"]) <= instant(closing_mark["at"]) and
-                         not (row.get("valuation") or {}).get("session_close"))]
-    daily = {}
-    for row in accounts:
-        day_at = row["as_of"] if (row.get("valuation") or {}).get("session_close") else row["at"]
-        daily[trading_day(instant(day_at))] = row
-    curve = [daily[day] for day in sorted(daily)]
+    curve = [shown_accounts[daily[day][0]] for day in sorted(daily)]
     peak, max_drawdown, previous = 0, 0, None
     for row in curve:
         peak = max(peak, row["equity"])
@@ -162,12 +178,13 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         else:
             row["daily_return"] = row["equity"] / previous - 1 if previous > 0 else None
         previous = row["equity"]
-    initial = accounts[0]["equity"] if accounts else None
+    initial = first_account["equity"] if light else None
     observed_peak, observed_drawdown = 0, 0
-    for row in accounts:
-        observed_peak = max(observed_peak, row["equity"])
+    for row in light:
+        equity = float(row[3])
+        observed_peak = max(observed_peak, equity)
         if observed_peak > 0:
-            observed_drawdown = max(observed_drawdown, 1 - row["equity"] / observed_peak)
+            observed_drawdown = max(observed_drawdown, 1 - equity / observed_peak)
     returns = [row["daily_return"] for row in curve[1:]]
     sharpe = None
     if len(returns) > 1 and all(value is not None for value in returns):
@@ -178,14 +195,14 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     for symbol in ("SPY", "QQQ"):
         # Compare the same first/last instants as the account's total return. A mark earlier
         # that day cannot stand in for a missing endpoint after a source failure.
-        anchors = [accounts[0], accounts[-1]] if accounts else []
+        anchors = [first_account, last_account] if light else []
         endpoints = [benchmarks.get(instant(row["at"]), {}).get(symbol) for row in anchors]
         try:
             benchmark_prices = [float(value) for value in endpoints]
         except (TypeError, ValueError):
             benchmark_prices = []
         comparison[symbol] = (benchmark_prices[-1] / benchmark_prices[0] - 1
-                              if len(accounts) > 1 and len(benchmark_prices) == 2 and
+                              if len(light) > 1 and len(benchmark_prices) == 2 and
                               all(math.isfinite(value) and value > 0 for value in benchmark_prices) else None)
     # A partially filled order's trade_cost may be cumulative. Never sum repeated
     # cumulative observations. Missing broker fees remain unknown, not zero.
@@ -260,8 +277,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                     "reserved_cash": mandate_meta.get("mandate_reserve_cash"), "events": mandate_events[-10:]},
         "decision_backoffs": backoffs,
         "observations": len(curve), "starting_equity": initial,
-        "ending_equity": accounts[-1]["equity"] if accounts else None,
-        "return": accounts[-1]["equity"] / initial - 1 if initial is not None and initial > 0 and accounts else None,
+        "ending_equity": last_account["equity"] if light else None,
+        "return": last_account["equity"] / initial - 1 if initial is not None and initial > 0 and light else None,
         "max_observed_drawdown": observed_drawdown if observed_peak > 0 else None,
         "max_daily_drawdown": max_drawdown if peak > 0 else None,
         "daily_sharpe_zero_risk_free": sharpe,
@@ -270,11 +287,11 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "fill_details_incomplete": incomplete_fills,
         "model_usage": totals, "model_usage_by_model": by_model,
         "model_costs": cost_summary([{"at": row["at"], "kind": "agent", "body": row} for row in usage],
-                                    accounts[-1]["equity"] if accounts else None, as_of or now, prices),
+                                    last_account["equity"] if light else None, as_of or now, prices),
         "unfinished_model_calls": list(unfinished.values()),
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
-        "latest_account": accounts[-1] if accounts else None,
-        "recent_trades": recent_trades(events, accounts[-1]["as_of"]) if accounts else [],
+        "latest_account": last_account,
+        "recent_trades": recent_trades(events, last_account["as_of"]) if light else [],
         "ledger_audit": integrity,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
                         "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."

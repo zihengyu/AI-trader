@@ -909,10 +909,9 @@ class AutonomousFund(Strategy):
         return strategy_memory(self.journal, self.get_datetime())
 
     def _strategy_evaluations(self):
-        from .evaluation import forward_outcomes
-        from .review import _events
-        rows = _events(self.journal, instant(self.get_datetime()), kinds=("postmarket_review", "account", "benchmark"))
-        return forward_outcomes([(r["at"], r["kind"], r["body"]) for r in rows])[-3:]
+        # Built for every decision context: reads each day's last NAV mark, not every mark.
+        from .evaluation import forward_outcomes, outcome_events
+        return forward_outcomes(outcome_events(self.journal, self.get_datetime()))[-3:]
 
     def _review_after_close(self):
         if getattr(self, "memory_mode", "rolling") != "rolling":

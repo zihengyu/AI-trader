@@ -22,6 +22,101 @@ def frozen_memory(packet, now):
             "mock": packet["mock"], "review": packet["review"], "qualification_frozen": True}
 
 
+# One NAV mark is written about every 30 seconds of market time. Reports and
+# decision contexts used to parse and keep every mark and benchmark body, so
+# their memory grew with the fund's whole history (about 730 MB per report
+# after 100,000 marks). These helpers read the few fields that ordering and
+# drawdown need for all marks, and full bodies only for the marks shown.
+_MARK_FIELDS = ("SELECT sequence,at,"
+                "CASE WHEN json_valid(body) THEN json_extract(body,'$.equity') END,"
+                "CASE WHEN json_valid(body) THEN json_extract(body,'$.valuation.session_close') END,"
+                "CASE WHEN json_valid(body) THEN json_extract(body,'$.as_of') END "
+                "FROM events WHERE kind='account' ORDER BY sequence")
+
+
+def nav_marks(db, *, until=None, excluded=frozenset()):
+    """Usable NAV marks in sequence order as (sequence, at, instant, equity, session_close, as_of).
+
+    `equity` is the stored value (pass it to float()); `as_of` is kept only for closing marks.
+    """
+    marks = []
+    for sequence, at, equity, close, as_of in db.execute(_MARK_FIELDS):
+        if sequence in excluded:
+            continue
+        moment = instant(at)
+        if until is None or moment <= until:
+            marks.append((sequence, at, moment, equity, close, as_of if close else None))
+    return marks
+
+
+def event_bodies(db, sequences):
+    """{sequence: parsed body} for the given event sequences, read in bounded batches."""
+    sequences, bodies = sorted(set(sequences)), {}
+    for start in range(0, len(sequences), 500):
+        batch = sequences[start:start + 500]
+        bodies.update((sequence, json.loads(body)) for sequence, body in db.execute(
+            "SELECT sequence,body FROM events WHERE sequence IN (%s)" % ",".join("?" * len(batch)), batch))
+    return bodies
+
+
+def benchmark_events(db, instants, *, until=None):
+    """The last benchmark event at each of `instants`, and at the latest instant, as (sequence, at, "benchmark", body).
+
+    Readers key benchmarks by instant, so a later event at the same instant replaces an earlier one.
+    """
+    matched, latest, latest_at = {}, None, None
+    for sequence, at in db.execute("SELECT sequence,at FROM events WHERE kind='benchmark' ORDER BY sequence"):
+        moment = instant(at)
+        if until is not None and moment > until:
+            continue
+        if moment in instants:
+            matched[moment] = (sequence, at)
+        if latest_at is None or moment >= latest_at:
+            latest, latest_at = (sequence, at), moment
+    wanted = sorted(set(matched.values()) | ({latest} if latest else set()))
+    bodies = event_bodies(db, [sequence for sequence, _ in wanted])
+    return [(sequence, at, "benchmark", bodies[sequence]) for sequence, at in wanted]
+
+
+def outcome_inputs(db, marks, *, until=None):
+    """The account and benchmark events `forward_outcomes` reads, as (sequence, at, kind, body).
+
+    It uses each New York date's last mark (by time, then sequence), the date
+    its session calendar starts from (the earliest local date of any mark),
+    the benchmarks at those instants, and the latest benchmark, which can set
+    its clock. Passing only these gives the same result as passing all of them.
+    """
+    zone, last, earliest = ZoneInfo("America/New_York"), {}, None
+    for mark in marks:
+        sequence, moment = mark[0], mark[2]
+        day = moment.astimezone(zone).date()
+        if day not in last or (moment, sequence) >= (last[day][2], last[day][0]):
+            last[day] = mark
+        if earliest is None or moment.date() < earliest[2].date():
+            earliest = mark
+    kept = {mark[0]: mark for mark in last.values()}
+    if earliest is not None:
+        kept[earliest[0]] = earliest
+    accounts = [(sequence, at, "account", {"equity": equity}) for sequence, at, _, equity, _, _ in kept.values()]
+    return sorted(accounts + benchmark_events(db, {mark[2] for mark in kept.values()}, until=until))
+
+
+def outcome_events(journal, now):
+    """`forward_outcomes` input visible at `now`, with review._events' exclusions, without every mark."""
+    from .ledger_audit import audit_connection
+    now = instant(now)
+    with journal.connection() as db:
+        db.execute("BEGIN")
+        integrity = audit_connection(db)
+        reviews = [(sequence, at, "postmarket_review", json.loads(body)) for sequence, at, body in db.execute(
+            "SELECT sequence,at,body FROM events WHERE kind='postmarket_review' ORDER BY sequence") if instant(at) <= now]
+        # A failed reconciliation withholds every account mark, as review._events does.
+        marks = [] if integrity["status"] == "failed" else nav_marks(
+            db, until=now, excluded=set(integrity.get("invalid_account_sequences", [])))
+        rows = reviews + outcome_inputs(db, marks, until=now)
+    return [(at, kind, body) for _, at, kind, body in sorted(rows, key=lambda row: row[0])]
+
+
 def forward_outcomes(events):
     """Portfolio outcomes after a memo, explicitly NOT its causal treatment effect."""
     if not events:

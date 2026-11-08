@@ -273,6 +273,13 @@ at a time instead of loaded together; the agent-context audit checks each mark
 once per process and then only new marks, while the explicit audit, reports and
 the daily review still check every mark.
 
+Reports (rebuilt every five minutes by the runner, and by status commands) and
+the manager's strategy follow-up no longer parse and keep every NAV mark and
+benchmark body. Every mark contributes its time, equity and closing flag to the
+ordering, closing-mark rule, daily curve and observed drawdown; full bodies are
+read only for the marks shown, and the follow-up uses each New York day's last
+mark. The results are unchanged.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees
