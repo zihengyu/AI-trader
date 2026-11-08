@@ -264,6 +264,51 @@ validate up to 200 recent candidate snapshots; without a valid candidate they
 leave the account update pending or omit its metrics. Trade-guard work therefore
 does not grow with NAV history, but still grows with actual orders and fills.
 
+That growth is linear: each order and fill record is parsed once, and dividend
+entitlements use per-symbol share changes instead of re-reading every fill for
+every dividend. The replay runs when a valuation is due, when a minute bar could
+fill an order (before and after the fill), when a fill is new to the monitor and
+before a submission, not on every five-second poll. NAV marks are streamed one
+at a time instead of loaded together; the agent-context audit checks each mark
+once per process and then only new marks, while the explicit audit, reports and
+the daily review still check every mark.
+
+Reports (rebuilt every five minutes by the runner, and by status commands) and
+the manager's strategy follow-up no longer parse and keep every NAV mark and
+benchmark body. Every mark contributes its time, equity and closing flag to the
+ordering, closing-mark rule, daily curve and observed drawdown; full bodies are
+read only for the marks shown, and the follow-up uses each New York day's last
+mark. The results are unchanged.
+
+The post-market review returns as soon as it finds that the session is already
+reviewed. Otherwise it reads that session's events, the previous session's last
+NAV mark, the benchmark observations aligned with those marks, the day's
+premarket research and saved review stages, instead of the whole journal. The
+weekly report keeps each day's last NAV mark and last valid benchmark price, and
+rehearsals read only the events their own run wrote. The monitor's metrics
+reconcile the ledger again when cash, fills, orders or corporate actions change,
+and otherwise at most once a minute instead of on every ten-second poll.
+
+Notification lookups by type use the ``events_notification_kind`` index, which
+the runner creates at its next start, and the daily report reads only the event
+kinds it lists. A notification whose stored body is not valid JSON used to make
+every monitor poll fail, so no later notice (a STOP alert included) was sent. It
+is now recorded as ``suppressed`` with ``last_error`` set to
+``malformed_notification_body``, and later notices are delivered.
+
+Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
+no longer audit every NAV mark, and the daily attribution reads the bodies of
+only the two marks it compares. A full NAV-mark check converts each value once
+(100,000 marks: about 1.9 s to 1.0 s, same findings).
+
+NAV marks store the audit's verdict (status, scope, counts, missing evidence,
+error and warning codes), not the full replayed book, which ``fund-logs.sh
+audit`` reproduces at any time. The daily backup checks free space first. A full
+copy must leave 512 MB free, above the monitor's 200 MB low-disk STOP. It first
+deletes the snapshots its rotation would delete anyway, but only when that makes
+enough room. Otherwise it skips the backup without deleting any snapshot, and
+the monitor sends a ``backup_skipped`` notice.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

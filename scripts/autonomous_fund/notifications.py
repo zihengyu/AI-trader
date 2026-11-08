@@ -147,6 +147,11 @@ def _percent(value):
     return "暂无" if value is None else f"{value * 100:.2f}%"
 
 
+TRADE_KINDS = ("order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval")
+WATCH_KINDS = ("protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit")
+DAILY_KINDS = TRADE_KINDS + WATCH_KINDS + ("notification",)
+
+
 def daily_document(root, sequence):
     # The AI supplies neither a file path nor an upload URL. Render one exact
     # journal row in memory, so a prompt cannot turn reports into file exfiltration.
@@ -156,8 +161,11 @@ def daily_document(root, sequence):
             raise RiskError("Daily report has no matching completed review")
         packet = json.loads(row[0])
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
+        # Only the kinds this document lists; the journal also holds a NAV mark
+        # and a benchmark about every 30 seconds of market time.
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-            "SELECT at,kind,body FROM events ORDER BY sequence") if instant(at) <= cutoff]
+            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(DAILY_KINDS)),
+            DAILY_KINDS) if instant(at) <= cutoff]
         # The scorecard and factor tests are written just after the review itself
         # (a live clock has moved on), so select them by session, not by time.
         related = [(kind, json.loads(body)) for kind, body in db.execute(
@@ -168,11 +176,9 @@ def daily_document(root, sequence):
     review, session = packet["review"], packet["session"]
     zone = ZoneInfo("America/New_York")
     day_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
-                  if instant(at).astimezone(zone).date().isoformat() == day and
-                  kind in {"order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval"}]
+                  if instant(at).astimezone(zone).date().isoformat() == day and kind in TRADE_KINDS]
     watch_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
-                    if instant(at).astimezone(zone).date().isoformat() == day and
-                    kind in {"protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit"}]
+                    if instant(at).astimezone(zone).date().isoformat() == day and kind in WATCH_KINDS]
     lines = [f"# {day} 模拟账户日报及盘后复盘", "",
              f"报告截止：{packet['completed_at']}；模式：{snapshot['mode']}；Mock：{packet['mock']}",
              f"模型：{encode(packet['models'])}；策略备忘版本：{packet['version']}", "",
@@ -289,7 +295,10 @@ def readable(kind, details, sequence=None, *, now=None):
     from .status import REASONS
     details = details if details is not None else {}
     text = None
-    if kind == "agent_notice":
+    if kind == "backup_skipped":
+        text = ("⚠️ 今天的账户备份已跳过：磁盘空间不足（为避免磁盘写满触发交易停止）。\n"
+                f"{details.get('reason', '')}\n请清理磁盘或把旧备份移到别处；交易未受影响。")
+    elif kind == "agent_notice":
         text = (f"AI 通知（供参考） · {details.get('severity', 'info')}\n"
                 f"{details.get('title', '')}\n{details.get('message', '')}")
     elif kind == "premarket_research":
@@ -521,6 +530,41 @@ def _weekly_facts(events, monday, sunday, zone):
     return facts
 
 
+def _weekly_events(db, cutoff, zone):
+    """WEEKLY_KINDS events up to `cutoff`, as _weekly_facts reads them, without every NAV mark and benchmark.
+
+    _weekly_facts keeps the last equity of each New York date and, per symbol,
+    the last positive benchmark price of each date. Those are the only account
+    and benchmark facts kept here (one event each per date); a NAV mark and a
+    benchmark are written about every 30 seconds of market time.
+    """
+    events, marks, prices = [], {}, {}
+    for at, kind, body, equity in db.execute(
+            "SELECT at,kind,CASE WHEN kind='account' THEN NULL ELSE body END,"
+            "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.equity') END "
+            "FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)), WEEKLY_KINDS):
+        moment = instant(at)
+        if moment > cutoff:
+            continue
+        day = moment.astimezone(zone).date()
+        if kind == "account":
+            marks[day] = (at, equity)
+        elif kind == "benchmark":
+            latest = prices.setdefault(day, [at, {}])
+            latest[0] = at
+            for symbol, value in json.loads(body).items():
+                try:
+                    if float(value) > 0:
+                        latest[1][symbol] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            events.append((at, kind, json.loads(body)))
+    events += [(at, "account", {"equity": equity}) for at, equity in marks.values()]
+    events += [(at, "benchmark", values) for at, values in prices.values()]
+    return events
+
+
 def weekly_document(root, sequence):
     """The week's report ending with one completed post-market review: (filename, markdown).
 
@@ -536,9 +580,7 @@ def weekly_document(root, sequence):
         packet = json.loads(row[0])
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         monday, sunday, label = week_of(day)
-        events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)),
-            WEEKLY_KINDS) if instant(at) <= cutoff]
+        events = _weekly_events(db, cutoff, zone)
         # Written just after each review, so selected by session date like the daily report.
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "

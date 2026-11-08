@@ -704,7 +704,7 @@ def adjust_reserve(args):
     journal = Journal(args.run_dir, binding[0])
     external = None
     if args.rebaseline_external:
-        latest = [row["body"] for row in journal.all_events() if row["kind"] == "broker_account"]
+        latest = [row["body"] for row in journal.events(("broker_account",), latest=1)]
         if not latest:
             raise RiskError("No observed external holdings to re-baseline")
         external = {k: number(v) for k, v in latest[-1]["external_holdings"].items()}

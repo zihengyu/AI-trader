@@ -14,6 +14,26 @@ def encode(value):
     return json.dumps(value, default=str, ensure_ascii=False, allow_nan=False)
 
 
+# A notification's own kind, as an indexed expression (see events_notification_kind).
+# Lookups must use this exact text to use the index. json_valid keeps a malformed
+# body from failing its own insert. The monitor otherwise re-read every notification
+# body on each 10-second poll to find the few of one kind.
+NOTIFICATION_KIND = "(CASE WHEN json_valid(body) THEN json_extract(body,'$.kind') END)"
+
+
+def notification_body(text):
+    """A stored notification body as a dict, or None when it is not a JSON object.
+
+    Readers that scan notices skip such a row instead of failing on it: one
+    corrupt row must not stop supervision or later notices.
+    """
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
 class Journal:
     def __init__(self, root, binding, legacy_bindings=(), migrate_any_legacy=None):
         """Open the account journal bound to `binding`.
@@ -38,8 +58,9 @@ class Journal:
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
                     kind TEXT NOT NULL, body TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS events_kind_sequence ON events(kind, sequence);
+                CREATE INDEX IF NOT EXISTS events_notification_kind ON events(%s, sequence) WHERE kind='notification';
                 CREATE INDEX IF NOT EXISTS intents_day ON intents(day);
-            """)
+            """ % NOTIFICATION_KIND)
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
             if old and old[0] != binding:
@@ -303,6 +324,28 @@ class Journal:
     def all_events(self):
         with self.connection() as db:
             rows = [dict(r) for r in db.execute("SELECT * FROM events ORDER BY sequence")]
+        for row in rows:
+            row["body"] = json.loads(row["body"])
+        return rows
+
+    def events(self, kinds=None, *, after=0, latest=None):
+        """all_events() restricted to `kinds` and sequences after `after`; `latest` keeps only the last n.
+
+        A long-running account holds a NAV mark and a benchmark about every 30
+        seconds of market time, so reading every event is for small books only.
+        """
+        where, arguments = ["sequence>?"], [after]
+        if kinds:
+            where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            arguments += list(kinds)
+        sql = "SELECT * FROM events WHERE " + " AND ".join(where)
+        if latest is not None:
+            sql = f"SELECT * FROM ({sql} ORDER BY sequence DESC LIMIT ?) ORDER BY sequence"
+            arguments.append(int(latest))
+        else:
+            sql += " ORDER BY sequence"
+        with self.connection() as db:
+            rows = [dict(r) for r in db.execute(sql, arguments)]
         for row in rows:
             row["body"] = json.loads(row["body"])
         return rows

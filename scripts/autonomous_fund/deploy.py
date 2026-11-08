@@ -111,6 +111,23 @@ def sandbox_properties(repo, run_dir, env_file, user):
 
 
 BACKUP_NAME = re.compile(r"\d{8}-\d{6}")
+# Free space a backup must leave: above the monitor's 200 MB low-disk STOP, with room to keep trading.
+BACKUP_RESERVE_BYTES = 512_000_000
+
+
+class BackupSpaceError(RiskError):
+    pass
+
+
+def _snapshots(backup_dir):
+    return sorted(p for p in backup_dir.iterdir()
+                  if p.is_dir() and BACKUP_NAME.fullmatch(p.name) and (p / "state.sqlite3").is_file())
+
+
+def _remove(snapshot):
+    for child in snapshot.iterdir():
+        child.unlink()
+    snapshot.rmdir()
 
 
 def rotate(root, backup_dir, keep=14, now=None):
@@ -122,18 +139,41 @@ def rotate(root, backup_dir, keep=14, now=None):
     from datetime import datetime, timezone
     if type(keep) is not int or not 1 <= keep <= 365:
         raise RiskError("keep must be 1..365 snapshots")
+    import shutil
     backup_dir = Path(backup_dir)
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    book = Path(root) / "state.sqlite3"
+    needed = sum(path.stat().st_size for path in (book, Path(str(book) + "-wal")) if path.is_file())
+    needed += BACKUP_RESERVE_BYTES
+    free = shutil.disk_usage(backup_dir).free
+    if free < needed:
+        # A full copy must not fill the disk: that would stop trading (the monitor's low-disk STOP).
+        # The oldest snapshots this rotation would delete anyway go first, but only when that
+        # makes room; a skipped backup never costs an existing one.
+        existing = _snapshots(backup_dir)
+        doomed = existing[:max(0, len(existing) - (keep - 1))]
+        reclaimed = sum(path.stat().st_size for old in doomed for path in old.iterdir() if path.is_file())
+        if free + reclaimed < needed:
+            raise BackupSpaceError(f"Backup skipped: it needs {needed} bytes free (journal plus a "
+                                   f"{BACKUP_RESERVE_BYTES}-byte reserve), {free} are free")
+        for old in doomed:
+            _remove(old)
     stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
     target = backup_dir / stamp
     backup(root, target)
-    snapshots = sorted(p for p in backup_dir.iterdir()
-                       if p.is_dir() and BACKUP_NAME.fullmatch(p.name) and (p / "state.sqlite3").is_file())
-    for old in snapshots[:-keep]:
-        for child in old.iterdir():
-            child.unlink()
-        old.rmdir()
+    for old in _snapshots(backup_dir)[:-keep]:
+        _remove(old)
     return target
+
+
+def _notify_backup_skipped(run_dir, reason):
+    from datetime import datetime, timezone
+    from .journal import encode
+    book = Path(run_dir) / "state.sqlite3"
+    if book.is_file():
+        with sqlite3.connect(book, timeout=10) as db:
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (datetime.now(timezone.utc).isoformat(),
+                       "notification", encode({"kind": "backup_skipped", "details": {"reason": reason}})))
 
 
 def main(argv=None):
@@ -170,7 +210,14 @@ def main(argv=None):
         from .settings import startup
         values = dotenv_values(args.env_file) if args.env_file.is_file() else {}
         _, run_dir, _, _ = startup("start", args.run_dir, {**values, **os.environ})
-        target = rotate(run_dir, args.backup_dir, args.keep)
+        try:
+            target = rotate(run_dir, args.backup_dir, args.keep)
+        except BackupSpaceError as exc:
+            try:
+                _notify_backup_skipped(run_dir, str(exc))  # The monitor sends it; a failed timer alone is silent.
+            except Exception:
+                pass  # The skipped backup itself is still reported by the failing service.
+            raise
         print(f"Journal snapshot {target} (restores into STOP; secrets excluded).")
         return
     if os.name != "posix":

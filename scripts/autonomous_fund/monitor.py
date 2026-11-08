@@ -12,7 +12,7 @@ from uuid import uuid4
 import requests
 
 from .execution import EXECUTION_REVISION, approval_code, operator_connection, resolve_approval
-from .journal import encode
+from .journal import NOTIFICATION_KIND, encode, notification_body
 from .risk import RiskError, instant
 
 
@@ -119,6 +119,8 @@ class Monitor:
                 CREATE TABLE IF NOT EXISTS fund_deliveries (
                     sequence INTEGER PRIMARY KEY, state TEXT NOT NULL, attempts INTEGER NOT NULL,
                     next_at TEXT NOT NULL, last_error TEXT, message_id TEXT);
+                -- Every poll looks up the few deliveries still due and counts them by state.
+                CREATE INDEX IF NOT EXISTS fund_deliveries_state ON fund_deliveries(state);
                 CREATE TABLE IF NOT EXISTS fund_monitor_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             """)
             if transport is not None:
@@ -310,7 +312,7 @@ class Monitor:
             # One indexed pass per poll; never a full-table scan per review.
             notified = {row[0] for row in db.execute(
                 "SELECT json_extract(body,'$.details.review_sequence') FROM events WHERE kind='notification' "
-                "AND json_extract(body,'$.kind')='postmarket_report'")}
+                f"AND {NOTIFICATION_KIND}='postmarket_report'")}
             reviews = db.execute("SELECT sequence,at FROM events WHERE kind='postmarket_review'").fetchall()
             for review in reviews:
                 if review["sequence"] in notified:
@@ -336,7 +338,13 @@ class Monitor:
                 exists = db.execute("SELECT 1 FROM fund_deliveries WHERE sequence=?", (row["sequence"],)).fetchone()
                 if exists:
                     continue
-                body = json.loads(row["body"])
+                body = notification_body(row["body"])
+                if body is None:
+                    # One corrupt row must not stop every later notice: the failed poll
+                    # rolled back its cursor, so it would fail on this row forever.
+                    db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,?,NULL)", (
+                        row["sequence"], "suppressed", 0, now.isoformat(), "malformed_notification_body"))
+                    continue
                 duplicate = False
                 prior_rows = [] if body.get("kind") in {"watchdog_stop", "watchdog_recovered", "approval_required"} else db.execute(
                     "SELECT e.at,e.body FROM events e JOIN fund_deliveries d ON e.sequence=d.sequence WHERE d.state!='suppressed' AND e.sequence<? ORDER BY e.sequence DESC LIMIT 30", (row["sequence"],))
@@ -390,9 +398,6 @@ class Monitor:
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""
         from .ledger_audit import account_observation, audit_connection
-        integrity = audit_connection(db, include_observations=False)
-        if integrity["status"] == "failed":
-            return
         startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not startup or json.loads(startup[0]).get("mode") not in {"local", "paper"}:
             return
@@ -400,6 +405,11 @@ class Monitor:
         cursor = int(saved[0]) if saved else 0
         rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE sequence>? "
                           "AND kind IN ('fill','fill_reconciled') ORDER BY sequence LIMIT 200", (cursor,)).fetchall()
+        if not rows:
+            return  # Nothing to announce: no full ledger replay on every 10-second poll.
+        integrity = audit_connection(db, include_observations=False)
+        if integrity["status"] == "failed":
+            return
         visible = []
         for row in rows:
             if instant(row["at"]) > now:
@@ -454,9 +464,12 @@ class Monitor:
         from .notifications import week_of
         sent = {row[0] for row in db.execute(
             "SELECT json_extract(body,'$.details.week') FROM events WHERE kind='notification' "
-            "AND json_extract(body,'$.kind')='weekly_report'")}
+            f"AND {NOTIFICATION_KIND}='weekly_report'")}
         for review in reviews[-7:]:
-            packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
+            # Two fields of a packet that can hold 100 KB of session evidence, read on every poll.
+            packet = dict(zip(("completed_at", "session_date"), db.execute(
+                "SELECT json_extract(body,'$.completed_at'),json_extract(body,'$.session_date') FROM events "
+                "WHERE sequence=?", (review["sequence"],)).fetchone()))
             completed = instant(packet["completed_at"])
             if completed > now or now - completed > timedelta(days=7):
                 continue
@@ -522,7 +535,7 @@ class Monitor:
         for row in db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200"):
             if instant(row["at"]) < opened:
                 break
-            if json.loads(row["body"]).get("kind") in LEGITIMATE_PAUSES:
+            if (notification_body(row["body"]) or {}).get("kind") in LEGITIMATE_PAUSES:
                 return  # The day's model budget is spent: deciding nothing is the configured behavior.
         failures = sum(instant(r[0]) >= opened for r in db.execute(
             "SELECT at FROM events WHERE kind='decision_backoff' ORDER BY sequence DESC LIMIT 100"))
@@ -781,10 +794,9 @@ def metrics_text(root, status):
     if book.is_file():
         with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             db.execute("BEGIN")
-            from .ledger_audit import account_observation, audit_connection
-            integrity = audit_connection(db, include_observations=False)
+            from .ledger_audit import account_observation
             account = None
-            if integrity["status"] != "failed":
+            if _metrics_ledger_status(db, book) != "failed":
                 for sequence, at, body in db.execute(
                         "SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
                     account, _ = account_observation(sequence, at, body)
@@ -810,6 +822,32 @@ def metrics_text(root, status):
                 lines += ["# TYPE fund_drawdown gauge", f"fund_drawdown {max(0.0, 1 - equity / high):.6f}"]
         lines += ["# TYPE fund_pending_approvals gauge", f"fund_pending_approvals {pending}"]
     return "\n".join(lines) + "\n"
+
+
+# The metrics only decide whether to publish the equity gauges, every 10-second
+# poll. Reconcile again when the ledger's money facts visibly change, and at
+# least once a minute; the runner reconciles before every submission and fill.
+METRICS_AUDIT_SECONDS = 60
+_metrics_audits = {}
+
+
+def _metrics_ledger_status(db, book):
+    from .ledger_audit import audit_connection
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    fingerprint = db.execute(
+        "SELECT (SELECT cash||'/'||receivables FROM local_account WHERE id=1),"
+        "(SELECT count(*)||'/'||coalesce(max(rowid),0) FROM local_fills),"
+        "(SELECT count(*)||'/'||total(filled)||'/'||coalesce(max(rowid),0) FROM local_orders),"
+        "(SELECT count(*) FROM local_actions),"
+        "(SELECT coalesce(max(sequence),0) FROM events WHERE kind IN "
+        "('fill','local_corporate_action','local_ledger_origin','startup'))").fetchone() \
+        if {"local_account", "local_fills", "local_orders", "local_actions"} <= tables else None
+    key, now = str(book.resolve()), time.monotonic()
+    cached = _metrics_audits.get(key)
+    if cached is None or cached[1] != fingerprint or now - cached[0] >= METRICS_AUDIT_SECONDS:
+        cached = (now, fingerprint, audit_connection(db, include_observations=False)["status"])
+        _metrics_audits[key] = cached
+    return cached[2]
 
 
 def write_metrics(root, status):

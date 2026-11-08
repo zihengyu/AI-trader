@@ -16,6 +16,9 @@ def _rows(db, sql):
     return [dict(zip(names, row)) for row in cursor]
 
 
+_ZERO, _CENT_MILLIONTH = Decimal(0), Decimal("0.00000001")
+
+
 def account_observation(sequence, at, body):
     """Validate one derived NAV snapshot without scanning unrelated history.
 
@@ -27,24 +30,52 @@ def account_observation(sequence, at, body):
         warnings.append({"code": code, "sequence": sequence})
     try:
         body = json.loads(body) if isinstance(body, (str, bytes)) else body
-        number(body["cash"])
-        number(body["equity"])
+        # Each value is converted once: full audits run this for every NAV mark.
+        cash, equity = number(body["cash"]), number(body["equity"])
         instant(body.get("as_of") or at)
-        for quantity in body["positions"].values():
-            number(quantity)
+        quantities = {symbol: number(quantity) for symbol, quantity in body["positions"].items()}
         if body.get("valuation") is not None:
             marks = body["valuation"].get("quotes") or {}
-            held = body.get("positions") or {}
-            if not all(symbol in marks for symbol in held):
+            if not all(symbol in marks for symbol in quantities):
                 warn("account_mark_missing")
             else:
-                expected = number(body["cash"]) + number(body.get("receivables", 0)) + sum(
-                    (number(qty) * number(marks[symbol]["price"]) for symbol, qty in held.items()), number(0))
-                if abs(number(body["equity"]) - expected) > Decimal("0.00000001"):
+                expected = cash + number(body.get("receivables", 0)) + sum(
+                    (quantity * number(marks[symbol]["price"]) for symbol, quantity in quantities.items()), _ZERO)
+                if abs(equity - expected) > _CENT_MILLIONTH:
                     warn("account_nav_arithmetic_mismatch")
     except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError):
         warn("invalid_account_observation")
     return (None if warnings else body), warnings
+
+
+def observation_findings(db, after=0):
+    """Warnings for the NAV marks after sequence `after`: (warnings, invalid sequences, last sequence seen).
+
+    Marks are checked one at a time and never kept: there is one about every
+    30 seconds of market time, and holding them all took memory in proportion
+    to the fund's whole history on every audit.
+    """
+    warnings, invalid, last = [], set(), after
+    for sequence, at, body in db.execute(
+            "SELECT sequence,at,body FROM events WHERE kind='account' AND sequence>? ORDER BY sequence", (after,)):
+        notices = account_observation(sequence, at, body)[1]
+        warnings.extend(notices)
+        if notices:
+            invalid.add(sequence)
+        last = sequence
+    return warnings, invalid, last
+
+
+def with_observations(ledger, warnings, invalid):
+    """A ledger-scope result extended with NAV-mark findings, shaped as `audit_connection(db)` returns it."""
+    result = {**ledger, "scope": "ledger_and_observations"}
+    if "warnings" not in ledger:  # The ledger itself could not be read; nothing to add.
+        return result
+    result["warnings"] = list(warnings) + ledger["warnings"]
+    result["invalid_account_sequences"] = sorted(set(ledger["invalid_account_sequences"]) | set(invalid))
+    result["status"] = ("failed" if result["errors"] else
+                        "partial" if result["missing_evidence"] or result["warnings"] else "verified")
+    return result
 
 
 def _audit_connection(db, *, include_trades=False, include_observations=True):
@@ -69,23 +100,23 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
         check(number(position["quantity"]) >= 0 and number(position["quantity"]) == int(number(position["quantity"]))
               and number(position["average"]) > 0, "invalid_position", symbol=position["symbol"])
     orders = {row["id"]: row for row in _rows(db, "SELECT * FROM local_orders")}
+    # Each order body is parsed once. These checks run before every submission
+    # and fill, so repeated parsing per fill and per dividend grew quadratically.
+    bodies = {identifier: json.loads(order["body"]) for identifier, order in orders.items()}
+    intents = {row["id"]: row for row in _rows(
+        db, "SELECT id,body,broker_id FROM intents WHERE id IN (SELECT intent_id FROM local_orders)")}
     fills = _rows(db, "SELECT * FROM local_fills ORDER BY observed_at,order_id,bar_start")
     # Money checks run before every submission and fill. Historical NAV rows
     # are derived projections, checked by the explicit audit/report path, not
     # dependencies of a new cash/share transaction.
-    kinds = "'fill','local_corporate_action','local_ledger_origin','startup'"
-    if include_observations:
-        kinds += ",'account'"
-    events = _rows(db, f"SELECT sequence,at,kind,body FROM events WHERE kind IN ({kinds}) ORDER BY sequence")
+    events = _rows(db, "SELECT sequence,at,kind,body FROM events WHERE kind IN "
+                       "('fill','local_corporate_action','local_ledger_origin','startup') ORDER BY sequence")
     for event in events:
-        if event["kind"] != "account":
-            event["body"] = json.loads(event["body"])
-            continue
-        body, notices = account_observation(event["sequence"], event["at"], event["body"])
-        event["body"] = body or {}
+        event["body"] = json.loads(event["body"])
+    if include_observations:
+        notices, invalid, _ = observation_findings(db)
         warnings.extend(notices)
-        if notices:
-            invalid_accounts.add(event["sequence"])
+        invalid_accounts |= invalid
     evidence = {}
     for event in events:
         if event["kind"] == "fill" and event["body"].get("bar_start") is not None:
@@ -115,7 +146,7 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
         if order is None:
             check(False, "fill_without_order", order_id=identifier)
             continue
-        body = json.loads(order["body"])
+        body = bodies[identifier]
         qty, price, fee = number(fill["quantity"]), number(fill["price"]), number(fill["fee"])
         check(qty > 0 and qty == int(qty) and price > 0 and fee >= 0, "invalid_fill", order_id=identifier)
         check(body["side"] in {"buy", "sell"}, "invalid_order_side", order_id=identifier)
@@ -164,14 +195,14 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
         fill_steps.append((event["sequence"], {**body, "quantity": qty, "price": price, "fee": fee}))
     check(not evidence, "orphan_fill_events")
     for identifier, order in orders.items():
-        total, body = totals[identifier], json.loads(order["body"])
+        total, body = totals[identifier], bodies[identifier]
         check(same(order["filled"], total["quantity"]) and same(order["notional"], total["notional"])
               and same(order["fee"], total["fee"]), "order_fill_totals_mismatch", order_id=identifier)
         check(total["quantity"] <= number(body["quantity"]), "order_overfilled", order_id=identifier)
         check((order["status"] != "fill" or total["quantity"] == number(body["quantity"]))
               and (order["status"] != "new" or total["quantity"] == 0), "order_status_mismatch", order_id=identifier)
-        intent = db.execute("SELECT body,broker_id FROM intents WHERE id=?", (order["intent_id"],)).fetchone()
-        check(intent is not None and json.loads(intent[0]) == body and str(intent[1]) == identifier,
+        intent = intents.get(order["intent_id"])
+        check(intent is not None and json.loads(intent["body"]) == body and str(intent["broker_id"]) == identifier,
               "order_intent_mismatch", order_id=identifier)
     origin = next((event["body"] for event in events if event["kind"] == "local_ledger_origin"), None)
     origin_source = "recorded_opening_book" if origin else None
@@ -190,16 +221,15 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
         positions = {s: {"quantity": number(p["quantity"]), "average": number(p["average"])}
                      for s, p in origin.get("positions", {}).items()}
         actions = {row["id"]: number(row["amount"]) for row in _rows(db, "SELECT * FROM local_actions")}
+        share_changes = {}  # symbol -> [(observed_at, "fill", signed quantity)], built once for every dividend.
+        for fill in fills:
+            body = bodies.get(fill["order_id"])
+            if body is not None:
+                share_changes.setdefault(body["symbol"], []).append((
+                    instant(fill["observed_at"]), "fill", number(fill["quantity"]) * (1 if body["side"] == "buy" else -1)))
         def entitlement(symbol, date):
             cutoff = datetime.combine(datetime.fromisoformat(date).date(), time(), tzinfo=ZoneInfo("America/New_York"))
-            changes = []
-            for fill in fills:
-                order = orders.get(fill["order_id"])
-                if order is None:
-                    continue
-                body = json.loads(order["body"])
-                if body["symbol"] == symbol and instant(fill["observed_at"]) < cutoff:
-                    changes.append((instant(fill["observed_at"]), "fill", number(fill["quantity"]) * (1 if body["side"] == "buy" else -1)))
+            changes = [change for change in share_changes.get(symbol, ()) if change[0] < cutoff]
             for key, amount in actions.items():
                 name, day, kind = key.rsplit(":", 2)
                 if name == symbol and kind == "split" and day <= date:
@@ -279,6 +309,21 @@ def audit(root):
         except (ValueError, TypeError, KeyError, sqlite3.Error) as exc:
             result = {"status": "failed", "errors": [{"code": "invalid_ledger_record", "error": type(exc).__name__}]}
     return {"checked_at": datetime.now(timezone.utc).isoformat(), **result}
+
+
+def stamp(result):
+    """An audit's verdict to store beside a NAV mark: status, scope, counts, missing evidence and codes.
+
+    The full result repeats the replayed book (cash and every position) and each
+    warning; a mark is written about every 30 seconds, and `fund-logs.sh audit`
+    reruns the full replay from the ledger at any time.
+    """
+    kept = ("status", "scope", "origin", "missing_evidence", "orders_checked", "fills_checked",
+            "execution_inputs_verified", "arrival_quotes_verified")
+    return {**{key: result[key] for key in kept if key in result},
+            "error_codes": sorted({row["code"] for row in result.get("errors", [])}),
+            "warning_codes": sorted({row["code"] for row in result.get("warnings", [])}),
+            "warning_count": len(result.get("warnings", []))}
 
 
 def require_consistent(db):

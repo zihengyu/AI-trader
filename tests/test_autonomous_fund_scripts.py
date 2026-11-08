@@ -225,3 +225,33 @@ def test_a_restart_is_confirmed_only_by_a_newer_monitor_state(tmp_path):
     written = datetime.now(timezone.utc).timestamp()
     assert monitor_ready(book) and monitor_ready(book, after=written - 60)
     assert not monitor_ready(book, after=written + 1)  # The previous monitor's last write does not count.
+
+
+def test_a_backup_never_fills_the_disk_it_frees_old_snapshots_first_or_is_skipped(tmp_path, monkeypatch):
+    """A full copy on a nearly full disk would trip the monitor's low-disk STOP and halt trading."""
+    import shutil as shutil_module
+    import sqlite3
+    from collections import namedtuple
+    from datetime import timedelta
+    from scripts.autonomous_fund import deploy
+    from scripts.autonomous_fund.notifications import readable
+    book, _ = account_book(tmp_path)
+    start = datetime(2026, 11, 2, 22, 45, tzinfo=timezone.utc)
+    made = [deploy.rotate(book, tmp_path / "backups", keep=3, now=start + timedelta(days=i)) for i in range(3)]
+    needed = (book / "state.sqlite3").stat().st_size + deploy.BACKUP_RESERVE_BYTES
+    oldest = sum(path.stat().st_size for path in made[0].iterdir())
+    Usage = namedtuple("Usage", "total used free")
+    free = {"bytes": needed - oldest}  # Enough once the snapshot this rotation would drop anyway is gone.
+    monkeypatch.setattr(shutil_module, "disk_usage", lambda path: Usage(0, 0, free["bytes"]))
+    newest = deploy.rotate(book, tmp_path / "backups", keep=3, now=start + timedelta(days=3))
+    kept = sorted(p.name for p in (tmp_path / "backups").iterdir())
+    assert kept == sorted([made[1].name, made[2].name, newest.name])  # The oldest went first; three kept.
+    free["bytes"] = 0  # Freeing old snapshots cannot make room now.
+    with pytest.raises(deploy.BackupSpaceError, match="Backup skipped"):
+        deploy.rotate(book, tmp_path / "backups", keep=3, now=start + timedelta(days=4))
+    assert sorted(p.name for p in (tmp_path / "backups").iterdir()) == kept  # Nothing created, nothing lost.
+    deploy._notify_backup_skipped(book, "Backup skipped: synthetic")
+    with sqlite3.connect(book / "state.sqlite3") as db:
+        body = json.loads(db.execute("SELECT body FROM events WHERE kind='notification' "
+                                     "ORDER BY sequence DESC LIMIT 1").fetchone()[0])
+    assert body["kind"] == "backup_skipped" and "磁盘空间不足" in readable("backup_skipped", body["details"])

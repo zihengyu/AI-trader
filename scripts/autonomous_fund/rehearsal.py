@@ -118,7 +118,7 @@ FAILED_STAGES = {"postmarket_review_error", "premarket_research_error"}
 def answer_problems(journal, after=0):
     """Model answers this rehearsal lost or degraded: schema mismatches, unusable critiques, failed stages."""
     problems, located = [], set()
-    rows = [r for r in journal.all_events() if r["sequence"] > after]
+    rows = journal.events(after=after)  # This rehearsal's events only, not the copied history.
     for row in rows:
         body = row["body"] if isinstance(row["body"], dict) else {}
         if row["kind"] == "agent" and body.get("parse_error"):
@@ -148,9 +148,7 @@ def agent_calls(journal, after=0):
     from .report import token_counts
     from .risk import instant
     started, calls, awaiting = {}, [], {}
-    for row in journal.all_events():
-        if row["sequence"] <= after:
-            continue  # The account's own history, not this run.
+    for row in journal.events(after=after):  # This run's events, not the account's own history.
         body = row["body"]
         if row["kind"] == "agent_call_started":
             started[body["id"]] = (body["name"], instant(row["at"]))
@@ -296,8 +294,7 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
     strategy = stages.run("start the strategy (startup and pre-open research)", build, kind="model")
     if strategy is None:
         return _finish(scratch, stages, root, keep, extra={"ai": ai})
-    research = next((r["body"] for r in reversed(strategy.journal.all_events())
-                     if r["kind"] == "premarket_research"), None)
+    research = next((r["body"] for r in strategy.journal.events(("premarket_research",), latest=1)), None)
     stages.rows[-1]["detail"] = ("pre-open research " + (research.get("phase", "saved") if research else "not run")
                                  + ("; observe-only, no model calls" if not models else ""))
     at = strategy.get_datetime()
@@ -329,11 +326,11 @@ def rehearse(account_dir, config, *, models=True, runtime=None, source=None, now
             raise
 
     def judge_decision(value):
-        names = [r["body"]["name"] for r in strategy.journal.all_events() if r["kind"] == "agent"]
+        names = [r["body"]["name"] for r in strategy.journal.events(("agent",), latest=3)]
         detail = "models: " + ", ".join(names[-3:])
         if value == "quotes":
             detail += "; order sizes need live quotes and are planned at the open"
-        if not any(r["kind"] == "decision_validated" for r in strategy.journal.all_events()):
+        if not strategy.journal.events(("decision_validated",), latest=1):
             return "fail", detail + "; no validated decision"
         return "ok", detail
     stages.run("critic and manager decision (real models)" if ai == "real" else
