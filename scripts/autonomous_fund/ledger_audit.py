@@ -326,8 +326,75 @@ def stamp(result):
             "warning_count": len(result.get("warnings", []))}
 
 
+# What _audit_connection reads for the ledger scope: every committed change to it,
+# from any connection or tool, bumps meta 'ledger_version' through these triggers.
+LEDGER_TABLES = ("local_account", "local_positions", "local_orders", "local_fills", "local_actions", "intents",
+                 "fund_orders", "fund_order_quotes")
+LEDGER_EVENT_KINDS = ("fill", "local_corporate_action", "local_ledger_origin", "startup")
+_BUMP = "UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='ledger_version';"
+
+
+def _trigger_names():
+    return ({f"ledger_version_{table}_{op}" for table in LEDGER_TABLES for op in ("insert", "update", "delete")} |
+            {f"ledger_version_events_{op}" for op in ("insert", "update", "delete")})
+
+
+def install_version_triggers(db):
+    """Create the ledger_version triggers for the tables that exist (idempotent; caller commits)."""
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "meta" not in tables or "events" not in tables:
+        return
+    db.execute("INSERT OR IGNORE INTO meta VALUES('ledger_version','0')")
+    for table in LEDGER_TABLES:
+        if table in tables:
+            for op in ("insert", "update", "delete"):
+                db.execute(f"CREATE TRIGGER IF NOT EXISTS ledger_version_{table}_{op} AFTER {op.upper()} ON {table} "
+                           f"BEGIN {_BUMP} END")
+    kinds = ",".join(f"'{kind}'" for kind in LEDGER_EVENT_KINDS)
+    for op, condition in (("insert", f"NEW.kind IN ({kinds})"), ("delete", f"OLD.kind IN ({kinds})"),
+                          ("update", f"OLD.kind IN ({kinds}) OR NEW.kind IN ({kinds})")):
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS ledger_version_events_{op} AFTER {op.upper()} ON events "
+                   f"WHEN {condition} BEGIN {_BUMP} END")
+
+
+def ledger_version(db):
+    """The ledger's change counter, or None when any trigger is missing (then nothing may be reused)."""
+    present = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND "
+                                            "name LIKE 'ledger_version_%'")}
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    expected = {name for name in _trigger_names()
+                if name.startswith("ledger_version_events_") or name.rsplit("_", 1)[0][len("ledger_version_"):] in tables}
+    if not expected <= present:
+        return None
+    row = db.execute("SELECT value FROM meta WHERE key='ledger_version'").fetchone()
+    return None if row is None else str(row[0])
+
+
+def ledger_result(db, cache):
+    """audit_connection(db, include_observations=False), reused while ledger_version is unchanged.
+
+    Only for a read transaction or one with no writes yet: uncommitted writes bump
+    the counter too, and a rolled-back value could later recur for other content.
+    `cache` is a dict the caller keeps; failures are never reused.
+    """
+    import copy
+    version = ledger_version(db)
+    if version is not None and cache.get("version") == version:
+        return copy.deepcopy(cache["result"])
+    result = audit_connection(db, include_observations=False)
+    if version is not None and result["status"] != "failed":
+        cache.update(version=version, result=copy.deepcopy(result))
+    else:
+        cache.clear()
+    return result
+
+
+def failed_message(result):
+    return "Local ledger reconciliation failed: " + ", ".join(sorted({r["code"] for r in result["errors"]}))
+
+
 def require_consistent(db):
     result = audit_connection(db, include_observations=False)
     if result["status"] == "failed":
-        raise RiskError("Local ledger reconciliation failed: " + ", ".join(sorted({r["code"] for r in result["errors"]})))
+        raise RiskError(failed_message(result))
     return result

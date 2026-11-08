@@ -301,6 +301,16 @@ no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
 (100,000 marks: about 1.9 s to 1.0 s, same findings).
 
+Account reads (LumiBot makes dozens each iteration) used to replay every fill
+since the account opened. SQLite triggers on the audited tables and event kinds
+now bump ``ledger_version`` on any insert, update or delete, from any connection
+or tool. A read reuses the last replay while the version is unchanged, so 43
+replays for a startup and one iteration became 5. The verdict is the same: a
+change made through another connection is still caught on the next read,
+failures are never reused, and a missing trigger disables reuse. Uncommitted
+writes inside an order or fill transaction are still checked directly in that
+transaction.
+
 NAV marks store the audit's verdict (status, scope, counts, missing evidence,
 error and warning codes), not the full replayed book, which ``fund-logs.sh
 audit`` reproduces at any time. The daily backup checks free space first. A full
