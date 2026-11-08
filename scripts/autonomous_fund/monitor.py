@@ -576,13 +576,28 @@ class Monitor:
             gate = db.execute("SELECT value FROM fund_monitor_meta WHERE key='next_delivery_at'").fetchone()
             if gate and instant(gate[0]) > now:
                 return
-            rows = db.execute("SELECT d.*,e.body FROM fund_deliveries d JOIN events e ON e.sequence=d.sequence WHERE d.state IN ('pending','retry','sending') ORDER BY d.sequence").fetchall()
+            # Parse due times before LIMIT: text ordering is unsafe across UTC offsets,
+            # and SQLite's julianday rounds away the microseconds in a delivery lease.
+            db.create_function("fund_delivery_due", 1, lambda at: instant(at) <= now, deterministic=True)
+            selected = " AND sequence=?" if only is not None else ""
+            rows = db.execute(
+                "SELECT d.*,e.body FROM (SELECT * FROM fund_deliveries "
+                "WHERE state IN ('pending','retry','sending') AND fund_delivery_due(next_at)" + selected +
+                " ORDER BY sequence LIMIT 2) d JOIN events e ON e.sequence=d.sequence ORDER BY d.sequence",
+                (only,) if only is not None else ()).fetchall()
         # Bound delivery work so the independent health gate stays fresh while
         # sending slow uploads; remaining durable messages wait for the next poll.
-        for row in [r for r in rows if instant(r["next_at"]) <= now and (only is None or r["sequence"] == only)][:2]:
+        for row in rows:
             if deadline is not None and self.clock() >= deadline:
                 break
-            body = json.loads(row["body"])
+            body = notification_body(row["body"])
+            if body is None:
+                # Existing queued rows can also be damaged after their initial cursor pass.
+                with operator_connection(self.root) as db:
+                    db.execute("UPDATE fund_deliveries SET state='suppressed',last_error='malformed_notification_body' "
+                               "WHERE sequence=? AND state IN ('pending','retry','sending') AND next_at=?",
+                               (row["sequence"], row["next_at"]))
+                continue
             text = f"LumiBot 模拟账户 · 事件 #{row['sequence']}\n{body.get('kind')}\n{encode(body.get('details'))}"
             with operator_connection(self.root) as db:
                 db.execute("BEGIN IMMEDIATE")

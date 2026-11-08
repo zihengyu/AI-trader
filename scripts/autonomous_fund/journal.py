@@ -34,6 +34,19 @@ def notification_body(text):
     return body if isinstance(body, dict) else None
 
 
+def event_body(kind, text):
+    """Project an unreadable notice as a diagnostic; ledger and research evidence stay strict.
+
+    The raw notice remains in SQLite. Its sequence/time are retained by readers,
+    so exports expose the damage without blocking every subsequent event.
+    """
+    if kind == "notification":
+        body = notification_body(text)
+        return body if body is not None else {
+            "kind": "malformed_notification_body", "details": {"reason": "Stored notice is not a JSON object"}}
+    return json.loads(text)
+
+
 class Journal:
     def __init__(self, root, binding, legacy_bindings=(), migrate_any_legacy=None):
         """Open the account journal bound to `binding`.
@@ -313,7 +326,7 @@ class Journal:
         # SQLite is authoritative; these are rebuildable human-readable exports.
         with target.open("a" if append else "w", encoding="utf-8") as out:
             for row in rows:
-                row["body"] = json.loads(row["body"])
+                row["body"] = event_body(row["kind"], row["body"])
                 out.write(encode(row) + "\n")
         if rows or not append:
             with self.connection() as db:
@@ -325,7 +338,7 @@ class Journal:
         with self.connection() as db:
             rows = [dict(r) for r in db.execute("SELECT * FROM events ORDER BY sequence")]
         for row in rows:
-            row["body"] = json.loads(row["body"])
+            row["body"] = event_body(row["kind"], row["body"])
         return rows
 
     def events(self, kinds=None, *, after=0, latest=None):
@@ -347,7 +360,7 @@ class Journal:
         with self.connection() as db:
             rows = [dict(r) for r in db.execute(sql, arguments)]
         for row in rows:
-            row["body"] = json.loads(row["body"])
+            row["body"] = event_body(row["kind"], row["body"])
         return rows
 
     def recent_trades(self, as_of):

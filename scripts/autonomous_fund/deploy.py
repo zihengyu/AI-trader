@@ -4,6 +4,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import sqlite3
+from contextlib import closing
 
 from .risk import RiskError
 
@@ -83,21 +84,35 @@ def generate(repo, run_dir, env_file, user, mode):
     return units
 
 
-def backup(root, destination):
-    """Consistent online SQLite snapshot; preserve stop state, exclude all keys."""
-    root, destination = Path(root), Path(destination)
+def _check_backup(root, destination):
+    """Reject a missing source or occupied destination before starting a copy."""
     if destination.exists():
         raise RiskError("Backup destination must be new; existing backups are never overwritten")
     if not (root / "state.sqlite3").is_file():
         raise RiskError("No account journal to back up")
+
+
+def backup(root, destination):
+    """Consistent online SQLite snapshot; preserve stop state, exclude all keys."""
+    root, destination = Path(root), Path(destination)
+    _check_backup(root, destination)
     destination.mkdir(parents=True, mode=0o700)
-    with sqlite3.connect((root / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True) as source:
-        with sqlite3.connect(destination / "state.sqlite3") as target:
-            source.backup(target)
-    os.chmod(destination / "state.sqlite3", 0o600)
-    # Always restore into STOP, even if the source account was trading.
-    from . import stops
-    stops.write(destination, "operator", "restored_backup")
+    try:
+        # A concurrent rotation must never count an in-progress or interrupted copy as recoverable.
+        incomplete = destination / ".incomplete"
+        incomplete.touch()
+        # SQLite's context manager commits/rolls back; it does not close the connection.
+        with closing(sqlite3.connect((root / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as source:
+            with closing(sqlite3.connect(destination / "state.sqlite3")) as target:
+                source.backup(target)
+        os.chmod(destination / "state.sqlite3", 0o600)
+        # Always restore into STOP, even if the source account was trading.
+        from . import stops
+        stops.write(destination, "operator", "restored_backup")
+        incomplete.unlink()
+    except BaseException:
+        _remove(destination)  # Only this call's exclusively created directory, after closing all handles.
+        raise
 
 
 SANDBOX_KEYS = ("WorkingDirectory", "Environment", "UMask", "NoNewPrivileges", "PrivateTmp", "ProtectSystem",
@@ -121,7 +136,8 @@ class BackupSpaceError(RiskError):
 
 def _snapshots(backup_dir):
     return sorted(p for p in backup_dir.iterdir()
-                  if p.is_dir() and BACKUP_NAME.fullmatch(p.name) and (p / "state.sqlite3").is_file())
+                  if p.is_dir() and not p.is_symlink() and BACKUP_NAME.fullmatch(p.name)
+                  and (p / "state.sqlite3").is_file() and not (p / ".incomplete").exists())
 
 
 def _remove(snapshot):
@@ -140,26 +156,32 @@ def rotate(root, backup_dir, keep=14, now=None):
     if type(keep) is not int or not 1 <= keep <= 365:
         raise RiskError("keep must be 1..365 snapshots")
     import shutil
+    root = Path(root)
     backup_dir = Path(backup_dir)
+    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
+    target = backup_dir / stamp
+    _check_backup(root, target)
+    # Validate once before reclamation; backup() repeats only the inexpensive path checks.
+    with closing(sqlite3.connect((root / "state.sqlite3").resolve().as_uri() + "?mode=ro", uri=True)) as source:
+        if source.execute("PRAGMA quick_check").fetchone() != ("ok",):
+            raise RiskError("Source journal failed SQLite integrity validation")
     backup_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    book = Path(root) / "state.sqlite3"
+    book = root / "state.sqlite3"
     needed = sum(path.stat().st_size for path in (book, Path(str(book) + "-wal")) if path.is_file())
     needed += BACKUP_RESERVE_BYTES
     free = shutil.disk_usage(backup_dir).free
     if free < needed:
         # A full copy must not fill the disk: that would stop trading (the monitor's low-disk STOP).
-        # The oldest snapshots this rotation would delete anyway go first, but only when that
-        # makes room; a skipped backup never costs an existing one.
+        # Reclaim only snapshots this rotation would delete anyway, retaining at least the
+        # newest completed copy until its replacement succeeds (including when keep=1).
         existing = _snapshots(backup_dir)
-        doomed = existing[:max(0, len(existing) - (keep - 1))]
+        doomed = existing[:max(0, len(existing) - max(1, keep - 1))]
         reclaimed = sum(path.stat().st_size for old in doomed for path in old.iterdir() if path.is_file())
         if free + reclaimed < needed:
             raise BackupSpaceError(f"Backup skipped: it needs {needed} bytes free (journal plus a "
                                    f"{BACKUP_RESERVE_BYTES}-byte reserve), {free} are free")
         for old in doomed:
             _remove(old)
-    stamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%d-%H%M%S")
-    target = backup_dir / stamp
     backup(root, target)
     for old in _snapshots(backup_dir)[:-keep]:
         _remove(old)

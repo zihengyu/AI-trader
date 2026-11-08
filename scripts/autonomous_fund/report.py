@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timezone
 
+from .journal import event_body
 from .risk import instant, trading_day
 
 
@@ -77,7 +78,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         cutoff = instant(as_of) if as_of is not None else None
         kinds = [kind for kind in REPORT_KINDS if kind not in ("account", "benchmark")]
-        sequenced = [(sequence, at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
+        sequenced = [(sequence, at, kind, event_body(kind, body)) for sequence, at, kind, body in db.execute(
             "SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(kinds)),
             kinds) if cutoff is None or instant(at) <= cutoff]
         events = [(at, kind, body) for _, at, kind, body in sequenced]
@@ -268,6 +269,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "strategy_memory_version": reviews[-1]["version"] if reviews else None,
         # Identical consecutive blocks are journaled once per 30 minutes.
         "blocked_iterations": sum(row["kind"] == "blocked" for row in notifications),
+        "malformed_notifications": sum(row.get("kind") == "malformed_notification_body" for row in notifications),
         "latest_risk_overlay": risk_overlays[-1] if risk_overlays else None,
         "latest_scorecard": scorecards[-1] if scorecards else None,
         "protective_triggers": triggers["protective_trigger"][-20:],

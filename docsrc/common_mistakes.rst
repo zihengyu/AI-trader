@@ -295,6 +295,16 @@ kinds it lists. A notification whose stored body is not valid JSON used to make
 every monitor poll fail, so no later notice (a STOP alert included) was sent. It
 is now recorded as ``suppressed`` with ``last_error`` set to
 ``malformed_notification_body``, and later notices are delivered.
+Reports, review inputs, daily/weekly documents and JSONL exports retain a
+``malformed_notification_body`` diagnostic instead of failing on that notice.
+``report.json`` counts them in ``malformed_notifications``; JSONL exports retain
+the event's time and sequence. The original text remains in SQLite.
+Malformed money, fill and research evidence still raises an error.
+
+Delivery selects due messages (and the explicitly selected message, when
+requested) before loading at most two bodies. A large outage backlog therefore
+does not load every queued body into Python on each poll. Due-time comparisons
+preserve UTC offsets and microsecond precision, including in-flight leases.
 
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
@@ -303,11 +313,16 @@ only the two marks it compares. A full NAV-mark check converts each value once
 
 NAV marks store the audit's verdict (status, scope, counts, missing evidence,
 error and warning codes), not the full replayed book, which ``fund-logs.sh
-audit`` reproduces at any time. The daily backup checks free space first. A full
-copy must leave 512 MB free, above the monitor's 200 MB low-disk STOP. It first
-deletes the snapshots its rotation would delete anyway, but only when that makes
-enough room. Otherwise it skips the backup without deleting any snapshot, and
-the monitor sends a ``backup_skipped`` notice.
+audit`` reproduces at any time. Before pruning snapshots, the daily backup checks
+the source journal's SQLite integrity and rejects an existing destination. A
+full copy must leave 512 MB free, above the monitor's 200 MB low-disk STOP. It may
+delete snapshots its rotation would delete anyway, but retains at least the
+newest completed copy until its replacement succeeds. When that cannot free
+enough space, it skips without deleting any snapshot and the monitor sends a
+``backup_skipped`` notice. This also applies to ``--keep 1``: the last copy is
+never spent to make room for its replacement. SQLite connections close on
+success and failure; failed copies are removed, and directories marked
+``.incomplete`` after a hard interruption are not counted as completed backups.
 
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
