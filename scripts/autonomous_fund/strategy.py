@@ -2166,6 +2166,32 @@ class AutonomousFund(Strategy):
         self._scorecard_cache = (key, result)
         return result
 
+    def _attribution_marks(self, day, now, zone):
+        """The last usable account mark before session `day` and the last one of it, as review._events rows.
+
+        A mark belongs to its close's day when it is a closing valuation. Only
+        light fields of the other marks are read (one is written about every 30
+        seconds of market time); inconsistent marks, or all of them after a
+        failed reconciliation, are withheld as review._events withholds them.
+        """
+        from .evaluation import event_bodies, nav_marks
+        from .ledger_audit import audit_connection
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            integrity = audit_connection(db)
+            if integrity["status"] == "failed":
+                return None, None
+            before = ending = None
+            for mark in nav_marks(db, until=instant(now), excluded=set(integrity.get("invalid_account_sequences", []))):
+                mark_day = instant(mark[4] or mark[1]).astimezone(zone).date().isoformat()
+                if mark_day < day:
+                    before = mark
+                elif mark_day == day:
+                    ending = mark
+            bodies = event_bodies(db, [mark[0] for mark in (before, ending) if mark])
+        return tuple(None if mark is None else {"sequence": mark[0], "at": mark[1], "kind": "account",
+                                                "body": bodies[mark[0]]} for mark in (before, ending))
+
     def _attribution(self, session, now):
         """Code-computed attribution of a completed session (attribution.py) for the review; never raises."""
         from .attribution import attribute
@@ -2175,18 +2201,16 @@ class AutonomousFund(Strategy):
             if getattr(self, "quant", None) is None:
                 return {"status": "unavailable", "session_date": day, "reason": "quantitative risk history is off"}
             zone = ZoneInfo("America/New_York")
-            rows = _events(self.journal, instant(now), kinds=("account", "fill", "fill_reconciled", "order_submitted"))
+            rows = _events(self.journal, instant(now), kinds=("fill", "fill_reconciled", "order_submitted"))
 
             def local_day(row):
                 closed = (row["body"].get("valuation") or {}).get("session_close") if row["kind"] == "account" else None
                 return instant(closed or row["at"]).astimezone(zone).date().isoformat()
-            accounts = [r for r in rows if r["kind"] == "account"]
-            before = [r for r in accounts if local_day(r) < day]
-            ending = [r for r in accounts if local_day(r) == day]
-            if not before or not ending:
+            before, ending = self._attribution_marks(day, now, zone)
+            if before is None or ending is None:
                 return {"status": "unavailable", "session_date": day,
                         "reason": "needs an account mark before the session and one during it"}
-            start, end = before[-1]["body"], ending[-1]["body"]
+            start, end = before["body"], ending["body"]
             submitted = {str(r["body"].get("broker_id")): r["body"] for r in rows if r["kind"] == "order_submitted"}
             try:
                 with self.journal.connection() as db:
@@ -2212,7 +2236,7 @@ class AutonomousFund(Strategy):
             for name, _, members in self.quant.groups:
                 for member in members:
                     groups.setdefault(member, name)
-            return attribute(start, end, fills, closes, local_day(before[-1]), day, groups)
+            return attribute(start, end, fills, closes, local_day(before), day, groups)
         except Exception as exc:
             return {"status": "unavailable", "session_date": day,
                     "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}

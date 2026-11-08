@@ -16,6 +16,9 @@ def _rows(db, sql):
     return [dict(zip(names, row)) for row in cursor]
 
 
+_ZERO, _CENT_MILLIONTH = Decimal(0), Decimal("0.00000001")
+
+
 def account_observation(sequence, at, body):
     """Validate one derived NAV snapshot without scanning unrelated history.
 
@@ -27,20 +30,18 @@ def account_observation(sequence, at, body):
         warnings.append({"code": code, "sequence": sequence})
     try:
         body = json.loads(body) if isinstance(body, (str, bytes)) else body
-        number(body["cash"])
-        number(body["equity"])
+        # Each value is converted once: full audits run this for every NAV mark.
+        cash, equity = number(body["cash"]), number(body["equity"])
         instant(body.get("as_of") or at)
-        for quantity in body["positions"].values():
-            number(quantity)
+        quantities = {symbol: number(quantity) for symbol, quantity in body["positions"].items()}
         if body.get("valuation") is not None:
             marks = body["valuation"].get("quotes") or {}
-            held = body.get("positions") or {}
-            if not all(symbol in marks for symbol in held):
+            if not all(symbol in marks for symbol in quantities):
                 warn("account_mark_missing")
             else:
-                expected = number(body["cash"]) + number(body.get("receivables", 0)) + sum(
-                    (number(qty) * number(marks[symbol]["price"]) for symbol, qty in held.items()), number(0))
-                if abs(number(body["equity"]) - expected) > Decimal("0.00000001"):
+                expected = cash + number(body.get("receivables", 0)) + sum(
+                    (quantity * number(marks[symbol]["price"]) for symbol, quantity in quantities.items()), _ZERO)
+                if abs(equity - expected) > _CENT_MILLIONTH:
                     warn("account_nav_arithmetic_mismatch")
     except (ValueError, TypeError, KeyError, AttributeError, ArithmeticError):
         warn("invalid_account_observation")

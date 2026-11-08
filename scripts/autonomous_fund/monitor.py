@@ -12,7 +12,7 @@ from uuid import uuid4
 import requests
 
 from .execution import EXECUTION_REVISION, approval_code, operator_connection, resolve_approval
-from .journal import encode
+from .journal import NOTIFICATION_KIND, encode, notification_body
 from .risk import RiskError, instant
 
 
@@ -310,7 +310,7 @@ class Monitor:
             # One indexed pass per poll; never a full-table scan per review.
             notified = {row[0] for row in db.execute(
                 "SELECT json_extract(body,'$.details.review_sequence') FROM events WHERE kind='notification' "
-                "AND json_extract(body,'$.kind')='postmarket_report'")}
+                f"AND {NOTIFICATION_KIND}='postmarket_report'")}
             reviews = db.execute("SELECT sequence,at FROM events WHERE kind='postmarket_review'").fetchall()
             for review in reviews:
                 if review["sequence"] in notified:
@@ -336,7 +336,13 @@ class Monitor:
                 exists = db.execute("SELECT 1 FROM fund_deliveries WHERE sequence=?", (row["sequence"],)).fetchone()
                 if exists:
                     continue
-                body = json.loads(row["body"])
+                body = notification_body(row["body"])
+                if body is None:
+                    # One corrupt row must not stop every later notice: the failed poll
+                    # rolled back its cursor, so it would fail on this row forever.
+                    db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,?,NULL)", (
+                        row["sequence"], "suppressed", 0, now.isoformat(), "malformed_notification_body"))
+                    continue
                 duplicate = False
                 prior_rows = [] if body.get("kind") in {"watchdog_stop", "watchdog_recovered", "approval_required"} else db.execute(
                     "SELECT e.at,e.body FROM events e JOIN fund_deliveries d ON e.sequence=d.sequence WHERE d.state!='suppressed' AND e.sequence<? ORDER BY e.sequence DESC LIMIT 30", (row["sequence"],))
@@ -456,9 +462,12 @@ class Monitor:
         from .notifications import week_of
         sent = {row[0] for row in db.execute(
             "SELECT json_extract(body,'$.details.week') FROM events WHERE kind='notification' "
-            "AND json_extract(body,'$.kind')='weekly_report'")}
+            f"AND {NOTIFICATION_KIND}='weekly_report'")}
         for review in reviews[-7:]:
-            packet = json.loads(db.execute("SELECT body FROM events WHERE sequence=?", (review["sequence"],)).fetchone()[0])
+            # Two fields of a packet that can hold 100 KB of session evidence, read on every poll.
+            packet = dict(zip(("completed_at", "session_date"), db.execute(
+                "SELECT json_extract(body,'$.completed_at'),json_extract(body,'$.session_date') FROM events "
+                "WHERE sequence=?", (review["sequence"],)).fetchone()))
             completed = instant(packet["completed_at"])
             if completed > now or now - completed > timedelta(days=7):
                 continue
@@ -524,7 +533,7 @@ class Monitor:
         for row in db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200"):
             if instant(row["at"]) < opened:
                 break
-            if json.loads(row["body"]).get("kind") in LEGITIMATE_PAUSES:
+            if (notification_body(row["body"]) or {}).get("kind") in LEGITIMATE_PAUSES:
                 return  # The day's model budget is spent: deciding nothing is the configured behavior.
         failures = sum(instant(r[0]) >= opened for r in db.execute(
             "SELECT at FROM events WHERE kind='decision_backoff' ORDER BY sequence DESC LIMIT 100"))

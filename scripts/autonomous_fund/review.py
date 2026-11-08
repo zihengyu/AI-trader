@@ -63,7 +63,8 @@ def _events(journal, now, kinds=None):
     with journal.connection() as db:
         db.execute("BEGIN")
         from .ledger_audit import audit_connection
-        integrity = audit_connection(db)
+        # The audit only decides which account marks to withhold, and it reads every one of them.
+        integrity = audit_connection(db) if not kinds or "account" in kinds else {"status": "not_needed"}
         invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         if kinds:
             rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence"

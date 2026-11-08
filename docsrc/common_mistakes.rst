@@ -289,6 +289,18 @@ rehearsals read only the events their own run wrote. The monitor's metrics
 reconcile the ledger again when cash, fills, orders or corporate actions change,
 and otherwise at most once a minute instead of on every ten-second poll.
 
+Notification lookups by type use the ``events_notification_kind`` index, which
+the runner creates at its next start, and the daily report reads only the event
+kinds it lists. A notification whose stored body is not valid JSON used to make
+every monitor poll fail, so no later notice (a STOP alert included) was sent. It
+is now recorded as ``suppressed`` with ``last_error`` set to
+``malformed_notification_body``, and later notices are delivered.
+
+Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
+no longer audit every NAV mark, and the daily attribution reads the bodies of
+only the two marks it compares. A full NAV-mark check converts each value once
+(100,000 marks: about 1.9 s to 1.0 s, same findings).
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

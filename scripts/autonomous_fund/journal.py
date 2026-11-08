@@ -14,6 +14,26 @@ def encode(value):
     return json.dumps(value, default=str, ensure_ascii=False, allow_nan=False)
 
 
+# A notification's own kind, as an indexed expression (see events_notification_kind).
+# Lookups must use this exact text to use the index. json_valid keeps a malformed
+# body from failing its own insert. The monitor otherwise re-read every notification
+# body on each 10-second poll to find the few of one kind.
+NOTIFICATION_KIND = "(CASE WHEN json_valid(body) THEN json_extract(body,'$.kind') END)"
+
+
+def notification_body(text):
+    """A stored notification body as a dict, or None when it is not a JSON object.
+
+    Readers that scan notices skip such a row instead of failing on it: one
+    corrupt row must not stop supervision or later notices.
+    """
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
 class Journal:
     def __init__(self, root, binding, legacy_bindings=(), migrate_any_legacy=None):
         """Open the account journal bound to `binding`.
@@ -38,8 +58,9 @@ class Journal:
                     sequence INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL,
                     kind TEXT NOT NULL, body TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS events_kind_sequence ON events(kind, sequence);
+                CREATE INDEX IF NOT EXISTS events_notification_kind ON events(%s, sequence) WHERE kind='notification';
                 CREATE INDEX IF NOT EXISTS intents_day ON intents(day);
-            """)
+            """ % NOTIFICATION_KIND)
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
             if old and old[0] != binding:

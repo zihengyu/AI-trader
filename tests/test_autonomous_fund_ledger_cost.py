@@ -313,3 +313,49 @@ def test_metrics_reconcile_on_money_changes_and_once_a_minute_not_every_poll(tmp
     monkeypatch.setattr(monitor, "METRICS_AUDIT_SECONDS", 0)  # Once the minute has passed, anything is re-checked.
     monitor.metrics_text(tmp_path, status)
     assert len(calls) == 3
+
+
+def test_notification_kind_lookups_use_their_index_and_tolerate_a_bad_body(tmp_path):
+    from scripts.autonomous_fund.journal import NOTIFICATION_KIND
+    _, _, journal, _, _ = traded_book(tmp_path)
+    with journal.connection() as db:
+        for kind in ("postmarket_report", "weekly_report"):
+            plan = db.execute("EXPLAIN QUERY PLAN SELECT json_extract(body,'$.details.week') FROM events WHERE "
+                              f"kind='notification' AND {NOTIFICATION_KIND}=?", (kind,)).fetchall()
+            plan = [tuple(row) for row in plan]
+            assert "events_notification_kind" in str(plan)  # Not a scan of every notification body.
+        db.execute("INSERT INTO events(at,kind,body) VALUES('2026-11-02T15:00:00+00:00','notification','not json')")
+    from scripts.autonomous_fund.monitor import Monitor
+    now = datetime(2026, 11, 2, 15, 30, tzinfo=timezone.utc)
+    journal.event(now, "startup", {"mode": "local"})
+    journal.event(now, "notification", {"kind": "synthetic_after_bad_row", "details": {}})
+    monitor = Monitor(tmp_path)
+    monitor.poll(now)  # A malformed notice neither failed its own insert nor the poll.
+    with journal.connection() as db:
+        states = {kind: state for kind, state, error in db.execute(
+            "SELECT e.body,d.state,d.last_error FROM fund_deliveries d JOIN events e ON e.sequence=d.sequence")
+            for kind in [error or json.loads(kind)["kind"]]}
+    assert states["malformed_notification_body"] == "suppressed"  # Recorded, not delivered, not silently lost.
+    assert states["synthetic_after_bad_row"] == "pending"  # Later notices still reach the operator.
+    monitor.poll(now)
+    from scripts.autonomous_fund.status import resumes_exhausted
+    assert resumes_exhausted(tmp_path, {"at": "2026-11-02T14:00:00+00:00"}) is False  # Restart checks skip it too.
+
+
+def test_the_daily_document_does_not_parse_nav_marks(tmp_path, monkeypatch):
+    from tests.test_autonomous_fund_review import events, review_harness
+    from scripts.autonomous_fund.notifications import daily_document
+    strategy, _ = review_harness(tmp_path)
+    strategy.after_market_closes()
+    with strategy.journal.connection() as db:
+        sequence = db.execute("SELECT sequence FROM events WHERE kind='postmarket_review'").fetchone()[0]
+        at = db.execute("SELECT at FROM events WHERE sequence=?", (sequence,)).fetchone()[0]
+        db.executemany("INSERT INTO events(at,kind,body) VALUES(?,'account',?)",
+                       [(at, json.dumps({"equity": "1", "cash": "1", "positions": {}, "cost_marker": True}))] * 200)
+    reads = []
+    original = json.loads
+    monkeypatch.setattr(json, "loads", lambda body, *a, **k: (
+        reads.append(1) if isinstance(body, str) and '"cost_marker"' in body else None) or original(body, *a, **k))
+    text = daily_document(tmp_path, sequence)
+    assert "日报" in (text[1] if isinstance(text, tuple) else text)
+    assert len(reads) <= 2  # The report reads its first and latest marks; the document reads none.

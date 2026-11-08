@@ -147,6 +147,11 @@ def _percent(value):
     return "暂无" if value is None else f"{value * 100:.2f}%"
 
 
+TRADE_KINDS = ("order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval")
+WATCH_KINDS = ("protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit")
+DAILY_KINDS = TRADE_KINDS + WATCH_KINDS + ("notification",)
+
+
 def daily_document(root, sequence):
     # The AI supplies neither a file path nor an upload URL. Render one exact
     # journal row in memory, so a prompt cannot turn reports into file exfiltration.
@@ -156,8 +161,11 @@ def daily_document(root, sequence):
             raise RiskError("Daily report has no matching completed review")
         packet = json.loads(row[0])
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
+        # Only the kinds this document lists; the journal also holds a NAV mark
+        # and a benchmark about every 30 seconds of market time.
         events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-            "SELECT at,kind,body FROM events ORDER BY sequence") if instant(at) <= cutoff]
+            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(DAILY_KINDS)),
+            DAILY_KINDS) if instant(at) <= cutoff]
         # The scorecard and factor tests are written just after the review itself
         # (a live clock has moved on), so select them by session, not by time.
         related = [(kind, json.loads(body)) for kind, body in db.execute(
@@ -168,11 +176,9 @@ def daily_document(root, sequence):
     review, session = packet["review"], packet["session"]
     zone = ZoneInfo("America/New_York")
     day_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
-                  if instant(at).astimezone(zone).date().isoformat() == day and
-                  kind in {"order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval"}]
+                  if instant(at).astimezone(zone).date().isoformat() == day and kind in TRADE_KINDS]
     watch_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
-                    if instant(at).astimezone(zone).date().isoformat() == day and
-                    kind in {"protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit"}]
+                    if instant(at).astimezone(zone).date().isoformat() == day and kind in WATCH_KINDS]
     lines = [f"# {day} 模拟账户日报及盘后复盘", "",
              f"报告截止：{packet['completed_at']}；模式：{snapshot['mode']}；Mock：{packet['mock']}",
              f"模型：{encode(packet['models'])}；策略备忘版本：{packet['version']}", "",

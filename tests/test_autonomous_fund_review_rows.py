@@ -13,6 +13,7 @@ import pytest
 
 from scripts.autonomous_fund import review
 from scripts.autonomous_fund.review import _available, _events, _inputs, _review_rows, _session
+from scripts.autonomous_fund.risk import instant
 from .test_autonomous_fund_closed_ledger import traded_book
 from .test_autonomous_fund_report_memory import history
 
@@ -198,3 +199,45 @@ def test_the_review_and_weekly_loads_do_not_hold_every_mark(tmp_path):
     assert after * 5 < before, (after, before)  # The marks hold about 6 MB of text.
     before, after = peak(weekly_every), peak(weekly_light)
     assert after * 5 < before, (after, before)
+
+
+def test_event_reads_without_account_marks_skip_the_nav_audit(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import ledger_audit
+    _, _, journal, _, _ = traded_book(tmp_path)
+    history(tmp_path, 1)
+    more_history(tmp_path, 1)
+    now = datetime(2026, 12, 20, tzinfo=timezone.utc)
+    kinds = ("postmarket_review", "decision_validated", "order_submitted", "research_idea")
+    expected = [r for r in _events(journal, now) if r["kind"] in kinds]
+    calls = []
+    original = ledger_audit.audit_connection
+    monkeypatch.setattr(ledger_audit, "audit_connection", lambda db, **k: calls.append(1) or original(db, **k))
+    assert _events(journal, now, kinds=kinds) == expected and calls == []  # It only withholds account marks.
+    _events(journal, now, kinds=("account",))
+    assert calls == [1]
+
+
+@pytest.mark.parametrize("seed", [1, 2])
+def test_attribution_marks_equal_those_from_every_account_event(tmp_path, seed):
+    from zoneinfo import ZoneInfo
+    from types import SimpleNamespace
+    from scripts.autonomous_fund.strategy import AutonomousFund
+    _, _, journal, _, _ = traded_book(tmp_path)
+    history(tmp_path, seed)
+    zone, fund = ZoneInfo("America/New_York"), SimpleNamespace(journal=journal)
+
+    def local_day(row):
+        closed = (row["body"].get("valuation") or {}).get("session_close")
+        return instant(closed or row["at"]).astimezone(zone).date().isoformat()
+    compared = 0
+    for offset in range(1, 30, 3):
+        now = datetime(2026, 11, 3, 23, tzinfo=timezone.utc) + timedelta(days=offset)
+        day = (now - timedelta(days=offset % 2)).astimezone(zone).date().isoformat()
+        accounts = [r for r in _events(journal, now, kinds=("account",))]
+        before = [r for r in accounts if local_day(r) < day]
+        ending = [r for r in accounts if local_day(r) == day]
+        light = AutonomousFund._attribution_marks(fund, day, now, zone)
+        assert light == ((before[-1] if before else None), (ending[-1] if ending else None)), now
+        compared += bool(before and ending)
+    assert compared >= 3
+

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import stops
+from .journal import notification_body
 from .risk import instant
 
 CLASSES = {"operator": "人工停止", "watchdog": "监控停止", "service": "服务重启／异常退出"}
@@ -57,7 +58,8 @@ def resumes_exhausted(root, record):
     with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         rows = db.execute("SELECT at, body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 200")
         for at, body in rows:
-            if json.loads(body).get("kind") == "auto_resume_exhausted" and (since is None or instant(at) >= since):
+            if (notification_body(body) or {}).get("kind") == "auto_resume_exhausted" and (
+                    since is None or instant(at) >= since):
                 return True
     return False
 
