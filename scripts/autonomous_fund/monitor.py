@@ -783,10 +783,9 @@ def metrics_text(root, status):
     if book.is_file():
         with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             db.execute("BEGIN")
-            from .ledger_audit import account_observation, audit_connection
-            integrity = audit_connection(db, include_observations=False)
+            from .ledger_audit import account_observation
             account = None
-            if integrity["status"] != "failed":
+            if _metrics_ledger_status(db, book) != "failed":
                 for sequence, at, body in db.execute(
                         "SELECT sequence,at,body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 200"):
                     account, _ = account_observation(sequence, at, body)
@@ -812,6 +811,32 @@ def metrics_text(root, status):
                 lines += ["# TYPE fund_drawdown gauge", f"fund_drawdown {max(0.0, 1 - equity / high):.6f}"]
         lines += ["# TYPE fund_pending_approvals gauge", f"fund_pending_approvals {pending}"]
     return "\n".join(lines) + "\n"
+
+
+# The metrics only decide whether to publish the equity gauges, every 10-second
+# poll. Reconcile again when the ledger's money facts visibly change, and at
+# least once a minute; the runner reconciles before every submission and fill.
+METRICS_AUDIT_SECONDS = 60
+_metrics_audits = {}
+
+
+def _metrics_ledger_status(db, book):
+    from .ledger_audit import audit_connection
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    fingerprint = db.execute(
+        "SELECT (SELECT cash||'/'||receivables FROM local_account WHERE id=1),"
+        "(SELECT count(*)||'/'||coalesce(max(rowid),0) FROM local_fills),"
+        "(SELECT count(*)||'/'||total(filled)||'/'||coalesce(max(rowid),0) FROM local_orders),"
+        "(SELECT count(*) FROM local_actions),"
+        "(SELECT coalesce(max(sequence),0) FROM events WHERE kind IN "
+        "('fill','local_corporate_action','local_ledger_origin','startup'))").fetchone() \
+        if {"local_account", "local_fills", "local_orders", "local_actions"} <= tables else None
+    key, now = str(book.resolve()), time.monotonic()
+    cached = _metrics_audits.get(key)
+    if cached is None or cached[1] != fingerprint or now - cached[0] >= METRICS_AUDIT_SECONDS:
+        cached = (now, fingerprint, audit_connection(db, include_observations=False)["status"])
+        _metrics_audits[key] = cached
+    return cached[2]
 
 
 def write_metrics(root, status):

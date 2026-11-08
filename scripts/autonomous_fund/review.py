@@ -109,11 +109,16 @@ def _event_day(row, zone):
     return instant(closing or row["at"]).astimezone(zone).date()
 
 
+SESSION_KINDS = ("account", "decision_validated", "fill", "fill_reconciled")
+
+
 def _session(rows, now):
     # Never invent a review of a day before the owned account was observed.
     zone = ZoneInfo("America/New_York")
-    days = {_event_day(row, zone) for row in rows
-            if row["kind"] in {"account", "decision_validated", "fill", "fill_reconciled"}}
+    return _session_from_days({_event_day(row, zone) for row in rows if row["kind"] in SESSION_KINDS}, now)
+
+
+def _session_from_days(days, now):
     if not days:
         return None
     calendar = mcal.get_calendar("NYSE")
@@ -123,6 +128,121 @@ def _session(rows, now):
             return {"session_date": str(day.date()), "market_open": market.market_open.isoformat(),
                     "market_close": market.market_close.isoformat()}
     return None
+
+
+# Light per-event fields: enough to place every event on its New York day
+# (_event_day) and to find a day's saved review stages, without its body.
+_LIGHT_EVENT = (
+    "SELECT sequence,kind,at,"
+    "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.valuation.session_close') END,"
+    "CASE WHEN kind='account' AND json_valid(body) THEN json_type(body,'$.valuation.book_existed_at_close') END,"
+    "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.valuation.book_existed_at_close') END,"
+    "CASE WHEN kind IN ('postmarket_review','postmarket_research') AND json_valid(body) "
+    "THEN json_extract(body,'$.session_date') END,"
+    "CASE WHEN kind='premarket_research' AND json_valid(body) THEN json_extract(body,'$.session_open') END "
+    "FROM events")
+
+
+def _light_day(kind, at, close, existed_type, existed, zone):
+    """_event_day from light fields: a closing mark belongs to its close's day unless the book did not exist yet."""
+    closing = close if kind == "account" and (existed_type is None or existed) else None
+    return instant(closing or at).astimezone(zone).date()
+
+
+def _review_rows(journal, now):
+    """(session, rows) for the review at `now`, rows shaped and filtered as _events(journal, now) returns them.
+
+    The rows are only those the review reads: every event of the session's day,
+    the last account mark before it, for each benchmark symbol the last
+    observation at or before the baseline and ending marks, that day's
+    premarket research and saved review stages, and one event for each other
+    day with account, decision or fill events (they locate the session). If the
+    day is already reviewed only its review is returned. The journal holds a NAV
+    mark and a benchmark about every 30 seconds of market time; loading all of
+    them at every startup, open and close took memory in proportion to the
+    fund's history (about 630 MB at 100,000 marks).
+    """
+    from .ledger_audit import audit_connection
+    from .evaluation import event_bodies
+    zone, now = ZoneInfo("America/New_York"), instant(now)
+    with journal.connection() as db:
+        db.execute("BEGIN")
+        integrity = audit_connection(db)
+        invalid = set(integrity.get("invalid_account_sequences", []))
+        failed = integrity["status"] == "failed"
+
+        def visible(sequence, kind, at):
+            moment = instant(at)
+            return moment <= now and not (kind == "account" and (sequence in invalid or failed)), moment
+
+        representatives = {}  # day -> the last event that places a session-kind event on it
+        for sequence, kind, at, close, existed_type, existed, _, _ in db.execute(
+                _LIGHT_EVENT + " WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(SESSION_KINDS)),
+                SESSION_KINDS):
+            if visible(sequence, kind, at)[0]:
+                representatives[_light_day(kind, at, close, existed_type, existed, zone)] = sequence
+        session = _session_from_days(set(representatives), now)
+        if not session:
+            return None, []
+        day = session["session_date"]
+        reviewed = [sequence for sequence, at in db.execute(
+            "SELECT sequence,at FROM events WHERE kind='postmarket_review' AND json_valid(body) AND "
+            "json_extract(body,'$.session_date')=? ORDER BY sequence", (day,)) if instant(at) <= now]
+        wanted = set(reviewed) | set(representatives.values())
+        if not reviewed:
+            prior = None  # The last account mark before the session's day.
+            for sequence, kind, at, close, existed_type, existed, stage_day, session_open in db.execute(
+                    _LIGHT_EVENT + " ORDER BY sequence"):
+                shown, moment = visible(sequence, kind, at)
+                if not shown:
+                    continue
+                event_day = str(_light_day(kind, at, close, existed_type, existed, zone))
+                if (event_day == day or (stage_day == day and kind in ("postmarket_review", "postmarket_research"))
+                        or (session_open and str(instant(session_open).astimezone(zone).date()) == day)):
+                    wanted.add(sequence)
+                elif kind == "account" and event_day < day:
+                    prior = sequence
+            if prior is not None:
+                wanted.add(prior)
+        bodies = event_bodies(db, wanted)
+        rows = [{"sequence": sequence, "at": at, "kind": kind, "body": bodies[sequence]}
+                for sequence, at, kind in _rows_at(db, wanted)]
+        if not reviewed:
+            # The benchmarks _inputs compares: per symbol, the last one at or before each anchor mark.
+            accounts = [row for row in rows if row["kind"] == "account"]
+            prior = [row for row in accounts if str(_event_day(row, zone)) < day]
+            today = [row for row in accounts if str(_event_day(row, zone)) == day]
+            anchors = [row for row in (prior[-1] if prior else (today[0] if today else None),
+                                       today[-1] if today else None) if row]
+            last = {}
+            for sequence, at, has_spy, has_qqq in db.execute(
+                    "SELECT sequence,at,json_type(body,'$.SPY') IS NOT NULL,json_type(body,'$.QQQ') IS NOT NULL "
+                    "FROM events WHERE kind='benchmark' AND json_valid(body) ORDER BY sequence"):
+                moment = instant(at)
+                if moment > now:
+                    continue
+                for anchor in anchors:
+                    if moment <= instant(anchor["at"]):
+                        for symbol, present in (("SPY", has_spy), ("QQQ", has_qqq)):
+                            if present:
+                                last[(anchor["sequence"], symbol)] = sequence
+            extra = set(last.values()) - wanted
+            if extra:
+                bodies = event_bodies(db, extra)
+                rows += [{"sequence": sequence, "at": at, "kind": kind, "body": bodies[sequence]}
+                         for sequence, at, kind in _rows_at(db, extra)]
+                rows.sort(key=lambda row: row["sequence"])
+    return session, rows
+
+
+def _rows_at(db, sequences):
+    """(sequence, at, kind) for the given sequences, in sequence order."""
+    sequences, found = sorted(sequences), []
+    for start in range(0, len(sequences), 500):
+        batch = sequences[start:start + 500]
+        found += db.execute("SELECT sequence,at,kind FROM events WHERE sequence IN (%s) ORDER BY sequence"
+                            % ",".join("?" * len(batch)), batch).fetchall()
+    return [tuple(row) for row in found]
 
 
 def _inputs(rows, session, now):
@@ -254,8 +374,7 @@ def review_after_close(strategy):
     end = getattr(getattr(strategy.broker, "data_source", None), "datetime_end", None)
     if historical and end is not None and now > instant(end):
         return  # Native end-of-backtest cleanup can occur beyond the requested cutoff.
-    rows = _events(strategy.journal, now)
-    session = _session(rows, now)
+    session, rows = _review_rows(strategy.journal, now)
     if not session:
         return
     day = session["session_date"]

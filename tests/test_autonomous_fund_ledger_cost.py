@@ -293,3 +293,23 @@ def test_the_monitor_replays_the_ledger_only_when_fills_are_new(tmp_path, monkey
     with operator_connection(tmp_path) as db:
         monitor._queue_fill_updates(db, now)
     assert len(calls) == 1  # No new fill: no replay.
+
+
+def test_metrics_reconcile_on_money_changes_and_once_a_minute_not_every_poll(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import monitor
+    _, _, journal, _, _ = traded_book(tmp_path)
+    calls = []
+    original = ledger_audit.audit_connection
+    monkeypatch.setattr(ledger_audit, "audit_connection", lambda db, **k: calls.append(1) or original(db, **k))
+    status = {"at": datetime.now(timezone.utc).isoformat()}
+    for _ in range(5):  # Consecutive polls with an unchanged ledger.
+        assert "fund_equity_usd" in monitor.metrics_text(tmp_path, status)
+    assert len(calls) == 1
+    with journal.connection() as db:
+        db.execute("UPDATE local_account SET cash='1'")  # A visible money change is checked at once.
+    assert "fund_equity_usd" not in monitor.metrics_text(tmp_path, status) and len(calls) == 2
+    monitor.metrics_text(tmp_path, status)
+    assert len(calls) == 2
+    monkeypatch.setattr(monitor, "METRICS_AUDIT_SECONDS", 0)  # Once the minute has passed, anything is re-checked.
+    monitor.metrics_text(tmp_path, status)
+    assert len(calls) == 3

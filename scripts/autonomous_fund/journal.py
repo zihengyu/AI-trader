@@ -307,6 +307,28 @@ class Journal:
             row["body"] = json.loads(row["body"])
         return rows
 
+    def events(self, kinds=None, *, after=0, latest=None):
+        """all_events() restricted to `kinds` and sequences after `after`; `latest` keeps only the last n.
+
+        A long-running account holds a NAV mark and a benchmark about every 30
+        seconds of market time, so reading every event is for small books only.
+        """
+        where, arguments = ["sequence>?"], [after]
+        if kinds:
+            where.append("kind IN (%s)" % ",".join("?" * len(kinds)))
+            arguments += list(kinds)
+        sql = "SELECT * FROM events WHERE " + " AND ".join(where)
+        if latest is not None:
+            sql = f"SELECT * FROM ({sql} ORDER BY sequence DESC LIMIT ?) ORDER BY sequence"
+            arguments.append(int(latest))
+        else:
+            sql += " ORDER BY sequence"
+        with self.connection() as db:
+            rows = [dict(r) for r in db.execute(sql, arguments)]
+        for row in rows:
+            row["body"] = json.loads(row["body"])
+        return rows
+
     def recent_trades(self, as_of):
         from .holdings import recent_trades
         with self.connection() as db:

@@ -521,6 +521,41 @@ def _weekly_facts(events, monday, sunday, zone):
     return facts
 
 
+def _weekly_events(db, cutoff, zone):
+    """WEEKLY_KINDS events up to `cutoff`, as _weekly_facts reads them, without every NAV mark and benchmark.
+
+    _weekly_facts keeps the last equity of each New York date and, per symbol,
+    the last positive benchmark price of each date. Those are the only account
+    and benchmark facts kept here (one event each per date); a NAV mark and a
+    benchmark are written about every 30 seconds of market time.
+    """
+    events, marks, prices = [], {}, {}
+    for at, kind, body, equity in db.execute(
+            "SELECT at,kind,CASE WHEN kind='account' THEN NULL ELSE body END,"
+            "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.equity') END "
+            "FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)), WEEKLY_KINDS):
+        moment = instant(at)
+        if moment > cutoff:
+            continue
+        day = moment.astimezone(zone).date()
+        if kind == "account":
+            marks[day] = (at, equity)
+        elif kind == "benchmark":
+            latest = prices.setdefault(day, [at, {}])
+            latest[0] = at
+            for symbol, value in json.loads(body).items():
+                try:
+                    if float(value) > 0:
+                        latest[1][symbol] = float(value)
+                except (TypeError, ValueError):
+                    pass
+        else:
+            events.append((at, kind, json.loads(body)))
+    events += [(at, "account", {"equity": equity}) for at, equity in marks.values()]
+    events += [(at, "benchmark", values) for at, values in prices.values()]
+    return events
+
+
 def weekly_document(root, sequence):
     """The week's report ending with one completed post-market review: (filename, markdown).
 
@@ -536,9 +571,7 @@ def weekly_document(root, sequence):
         packet = json.loads(row[0])
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         monday, sunday, label = week_of(day)
-        events = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-            "SELECT at,kind,body FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)),
-            WEEKLY_KINDS) if instant(at) <= cutoff]
+        events = _weekly_events(db, cutoff, zone)
         # Written just after each review, so selected by session date like the daily report.
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "

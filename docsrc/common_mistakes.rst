@@ -280,6 +280,15 @@ ordering, closing-mark rule, daily curve and observed drawdown; full bodies are
 read only for the marks shown, and the follow-up uses each New York day's last
 mark. The results are unchanged.
 
+The post-market review returns as soon as it finds that the session is already
+reviewed. Otherwise it reads that session's events, the previous session's last
+NAV mark, the benchmark observations aligned with those marks, the day's
+premarket research and saved review stages, instead of the whole journal. The
+weekly report keeps each day's last NAV mark and last valid benchmark price, and
+rehearsals read only the events their own run wrote. The monitor's metrics
+reconcile the ledger again when cash, fills, orders or corporate actions change,
+and otherwise at most once a minute instead of on every ten-second poll.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees
