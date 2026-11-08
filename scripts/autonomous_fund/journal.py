@@ -313,13 +313,35 @@ class Journal:
         with self.connection() as db:
             db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, encode(value)))
 
-    def export(self):
-        """Append new events to the rebuildable JSONL export; rebuild if it was altered."""
+    def export(self, now=None):
+        """Append new events to the rebuildable JSONL export; rebuild if it was altered.
+
+        The file holds one UTC calendar month of exports. At a new month it is
+        compressed to events-YYYY-MM.jsonl.gz and the export continues in an
+        empty file, instead of one text copy of the whole journal growing
+        forever; retention.prune removes archives after a year. The SQLite
+        journal still holds every event.
+        """
         target = self.root / "events.jsonl"
+        month = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m")
         with self.connection() as db:
-            state = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('jsonl_sequence','jsonl_bytes')"))
+            state = dict(db.execute("SELECT key,value FROM meta WHERE key IN "
+                                    "('jsonl_sequence','jsonl_bytes','jsonl_month')"))
         last, size = int(state.get("jsonl_sequence", 0)), int(state.get("jsonl_bytes", -1))
         append = last > 0 and target.is_file() and target.stat().st_size == size
+        started = state.get("jsonl_month")
+        if append and started and started != month:
+            import gzip
+            import shutil
+            archive = self.root / f"events-{started}.jsonl.gz"
+            if not archive.exists():  # A crash after compressing and before truncating repeats nothing.
+                partial = archive.with_name(archive.name + ".partial")
+                with target.open("rb") as source, gzip.open(partial, "wb") as out:
+                    shutil.copyfileobj(source, out)
+                partial.replace(archive)
+            with self.connection() as db:
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_bytes','0')")
+            target.write_bytes(b"")
         with self.connection() as db:
             rows = [dict(r) for r in db.execute("SELECT * FROM events WHERE sequence>? ORDER BY sequence",
                                                 (last if append else 0,))]
@@ -328,10 +350,11 @@ class Journal:
             for row in rows:
                 row["body"] = event_body(row["kind"], row["body"])
                 out.write(encode(row) + "\n")
-        if rows or not append:
+        if rows or not append or started != month:
             with self.connection() as db:
                 db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_sequence',?)", (str(rows[-1]["sequence"] if rows else last),))
                 db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_bytes',?)", (str(target.stat().st_size),))
+                db.execute("INSERT OR REPLACE INTO meta VALUES ('jsonl_month',?)", (month,))
         return rows
 
     def all_events(self):

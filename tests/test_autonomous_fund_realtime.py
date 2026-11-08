@@ -127,6 +127,7 @@ def test_status_command_reports_pending_requests_and_the_sleeve(tmp_path):
     # currency and source-snapshot age, rather than reading a raw journal row.
     assert "待审批请求：1" in bot.sent[-1][0] and "$10,000.00" in bot.sent[-1][0]
     assert "$9,000.00" in bot.sent[-1][0] and "（1分钟前）" in bot.sent[-1][0]
+    assert "周报：" in bot.sent[-1][0] and "下一份" in bot.sent[-1][0]  # Where the weekly report stands.
 
 
 def test_replies_can_be_disabled_by_the_operator(tmp_path, monkeypatch):

@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Maintenance and logs for the AI paper fund on Ubuntu.
-# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]]
+# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]|weekly|prune [--apply]]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
 #   errors     last 80 warning/error records in 24 hours, including complete tracebacks
 #   report     account report: return, drawdown, fills, model usage
 #   approvals  purchase plans waiting for approval
 #   decisions [YYYY-MM-DD]  read-only decision/execution/Telegram timeline for a New York date
+#   weekly     this week's report so far, from the latest post-market review (printed, not sent)
+#   prune [--apply]  old headlines, model-call traces and export archives: preview, or delete with --apply
+#                    (also runs daily after the backup; the ledger, decisions and reviews are never deleted)
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd -- "$repo"
@@ -48,6 +51,13 @@ case "${1:-status}" in
     fi
     if [[ $# -eq 2 ]]; then args+=(--session-date "$2"); fi
     fund "${args[@]}" ;;
+  weekly)
+    fund weekly ;;
+  prune)
+    if [[ $# -gt 2 || ( $# -eq 2 && "$2" != "--apply" ) ]]; then
+      echo "用法：bash scripts/fund-logs.sh prune [--apply]" >&2; exit 2
+    fi
+    if [[ $# -eq 2 ]]; then fund prune --apply; else fund prune; fi ;;
   *)
-    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]]" >&2; exit 2 ;;
+    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD]|weekly|prune [--apply]]" >&2; exit 2 ;;
 esac

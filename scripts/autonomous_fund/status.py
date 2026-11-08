@@ -29,6 +29,63 @@ MONITOR_FRESH_SECONDS = 90
 RUNNER_FRESH_SECONDS = 180
 
 
+DELIVERY_STATES = {"sent": "已发送", "pending": "等待发送", "sending": "正在发送", None: "已生成，等待独立监控发送"}
+
+
+def weekly_lines(db, now, stopped=False):
+    """Where the weekly report stands: the latest one, why the last week has none yet, and the next one."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    from .journal import NOTIFICATION_KIND
+    from .notifications import week_of, week_sessions
+    today = instant(now).astimezone(ZoneInfo("America/New_York")).date()
+    weeks = sorted(week_sessions(today - timedelta(days=10), today + timedelta(days=17)).items())
+    done = [(week, day) for week, (day, close) in weeks if close <= now]
+    upcoming = [(week, day) for week, (day, close) in weeks if close > now]
+    tracked = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_deliveries'").fetchone()
+    latest = db.execute(
+        "SELECT json_extract(e.body,'$.details.week'),json_extract(e.body,'$.details.session_date')," +
+        ("d.state,d.last_error " if tracked else "NULL,NULL ") + "FROM events e " +
+        ("LEFT JOIN fund_deliveries d ON d.sequence=e.sequence " if tracked else "") +
+        f"WHERE e.kind='notification' AND {NOTIFICATION_KIND.replace('body', 'e.body')}='weekly_report' "
+        "ORDER BY e.sequence DESC LIMIT 1").fetchone()
+    lines = []
+    if latest:
+        week, day, state, error = latest
+        if state == "sent" and error:
+            text = "报告生成失败，已发提醒；原因见 bash scripts/fund-logs.sh errors"
+        elif state == "retry":
+            text = f"发送失败，正在重试（{error}）"
+        elif state == "suppressed":
+            text = f"未发送（{error or '重复或过期'}）"
+        else:
+            text = DELIVERY_STATES.get(state, state)
+        lines.append(f"周报：最近一份 {week}（{day} 收盘后，{text}）")
+    else:
+        lines.append("周报：还没有生成过")
+    first = db.execute("SELECT at FROM events ORDER BY sequence LIMIT 1").fetchone()
+    if first:  # A week that ended before the account existed has nothing to report.
+        done = [(week, day) for week, day in done if dict(weeks)[week][1] > instant(first[0])]
+    if done and (not latest or latest[0] != done[-1][0]):
+        week, day = done[-1]
+        monday, sunday, _ = week_of(day)
+        reviews = dict(db.execute(
+            "SELECT json_extract(body,'$.session_date'),1 FROM events WHERE kind='postmarket_review' AND json_valid(body) "
+            "AND json_extract(body,'$.session_date') BETWEEN ? AND ?", (monday, sunday)).fetchall())
+        if day in reviews:
+            lines.append(f"  {week}：{day} 已复盘，等待独立监控生成周报（监控每 10 秒检查一次）")
+        else:
+            why = "STOP 期间不做复盘。" if stopped else ""
+            later = (f"本周有 {len(reviews)} 次复盘，下周第一个交易日开盘后用其中最近一次发周报。" if reviews else
+                     "本周没有任何复盘，这一周不会有周报。")
+            lines.append(f"  {week}：本周最后一个交易日 {day} 还没有盘后复盘。{why}如果那天有交易记录，"
+                         f"交易进程会在下次启动或开盘前一小时补做复盘；否则{later}")
+    if upcoming:
+        week, day = upcoming[0]
+        lines.append(f"  下一份 {week}：{day}（纽约）收盘复盘完成后发送")
+    return lines
+
+
 def _age(at, now):
     try:
         return (now - instant(at)).total_seconds()
@@ -311,6 +368,10 @@ def summary(root, mode, now=None):
         retries = {key: json.loads(value) for key, value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
+        try:
+            lines += weekly_lines(db, now, stopped=record is not None)
+        except Exception as exc:  # A status line, never a reason to hide the rest of the summary.
+            lines.append(f"周报：状态暂不可用（{type(exc).__name__}）")
     from zoneinfo import ZoneInfo
     from .decision_activity import activity, lines as activity_lines
     audit = activity(root, now=now)

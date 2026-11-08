@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from scripts.autonomous_fund import ledger_audit
+from scripts.autonomous_fund.risk import RiskError
 from scripts.autonomous_fund.journal import Journal
 from .test_autonomous_fund_closed_ledger import CLOSE, closing_feed, traded_book
 from .test_autonomous_fund_live_observations import configure
@@ -190,13 +191,73 @@ def count_replays(monkeypatch):
     return calls
 
 
-def test_a_balance_read_replays_the_ledger_once(tmp_path, monkeypatch):
-    _, _, _, broker, _ = traded_book(tmp_path)
-    calls = count_replays(monkeypatch)
+def count_ledger_replays(monkeypatch):
+    calls = []
+    original = ledger_audit._audit_connection
+    monkeypatch.setattr(ledger_audit, "_audit_connection", lambda db, **k: calls.append(1) or original(db, **k))
+    return calls
+
+
+def test_reads_reuse_one_replay_until_a_committed_ledger_change(tmp_path, monkeypatch):
+    _, _, journal, broker, _ = traded_book(tmp_path)
+    broker.ledger_audit()
+    calls = count_ledger_replays(monkeypatch)
+    broker._get_balances_at_broker(None, "LocalTest")
+    broker._pull_positions("LocalTest")
+    for _ in range(5):
+        broker.ledger_audit()
+    assert calls == []  # About 50 such reads per iteration replayed every fill each time.
+    journal.event(datetime.now(timezone.utc), "notification", {"kind": "synthetic"})  # Not a ledger fact.
+    broker.ledger_audit()
+    assert calls == []
+    with sqlite3.connect(tmp_path / "state.sqlite3") as db:  # Another connection, as a tool or a bug would.
+        db.execute("INSERT INTO fund_order_quotes VALUES('nobody','1','1','2026-11-02T15:00:00+00:00',"
+                   "'2026-11-02T15:00:00+00:00')")
+    broker.ledger_audit()
+    assert len(calls) == 1  # A changed input is replayed.
+
+
+@pytest.mark.parametrize("tamper", [
+    "UPDATE local_fills SET fee='0'",
+    "UPDATE events SET body=replace(body,'\"trade_cost\": \"','\"trade_cost\": \"9') WHERE kind='fill'",
+    "UPDATE local_positions SET average='1'",
+])
+def test_any_committed_change_to_the_ledger_is_still_caught_on_the_next_read(tmp_path, tamper):
+    _, _, journal, broker, _ = traded_book(tmp_path)
+    broker.ledger_audit()
+    broker.ledger_audit()  # Reused: nothing changed.
+    with sqlite3.connect(tmp_path / "state.sqlite3") as db:
+        assert db.execute(tamper).rowcount == 1
+    with pytest.raises(RiskError, match="reconciliation failed"):
+        broker.ledger_audit()
+    with pytest.raises(RiskError, match="reconciliation failed"):
+        broker.ledger_audit()  # A failure is never reused as a pass.
+
+
+def test_without_its_triggers_every_read_replays_the_ledger(tmp_path, monkeypatch):
+    _, _, journal, broker, _ = traded_book(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as db:
+        db.execute("DROP TRIGGER ledger_version_local_fills_update")
+        db.execute("UPDATE local_fills SET fee='0'")
+    calls = count_ledger_replays(monkeypatch)
+    with pytest.raises(RiskError, match="reconciliation failed"):
+        broker.ledger_audit()
+    with pytest.raises(RiskError):
+        broker.ledger_audit()
+    assert len(calls) == 2
+
+
+def test_a_balance_read_replays_the_ledger_at_most_once(tmp_path, monkeypatch):
+    _, _, journal, broker, _ = traded_book(tmp_path)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as db:
+        db.execute("UPDATE meta SET value=value WHERE key='peak'")  # Unrelated: the version is unchanged.
+        db.execute("INSERT INTO fund_order_quotes VALUES('other','1','1','2026-11-02T15:00:00+00:00',"
+                   "'2026-11-02T15:00:00+00:00')")
+    calls = count_ledger_replays(monkeypatch)
     broker._get_balances_at_broker(None, "LocalTest")
     assert len(calls) == 1
-    broker._pull_positions("LocalTest")  # The native hook keeps its own check.
-    assert len(calls) == 2
+    broker._pull_positions("LocalTest")  # The native hook's own check reuses that replay.
+    assert len(calls) == 1
 
 
 def test_a_poll_replays_the_ledger_only_when_a_valuation_is_due(tmp_path, monkeypatch):

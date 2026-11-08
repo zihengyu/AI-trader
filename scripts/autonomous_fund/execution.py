@@ -146,6 +146,8 @@ class ExecutionState:
                     decision_id TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT NOT NULL,
                     at TEXT NOT NULL, PRIMARY KEY(decision_id, symbol));
             """)
+            from .ledger_audit import install_version_triggers
+            install_version_triggers(db)  # fund_orders and fund_order_quotes are read by the ledger audit.
 
     def latest(self, now, db=None):
         if db is None:

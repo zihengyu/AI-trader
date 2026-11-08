@@ -253,3 +253,48 @@ def test_due_filter_and_explicit_selection_apply_before_the_batch_limit(tmp_path
         sent = [row[0] for row in db.execute("SELECT sequence FROM fund_deliveries WHERE state='sent' ORDER BY sequence")]
     assert sent == ([3, 4] if only is None else [4])
     assert len(transport.messages) == len(sent)
+
+
+def test_monthly_rollover_preserves_bad_notice_diagnostics_and_the_export_cursor(tmp_path):
+    """The monthly archive and corrupt-notice projection must compose without replaying rows."""
+    import gzip
+
+    journal = Journal(tmp_path, "synthetic-archive-notice")
+    with journal.connection() as db:
+        db.execute("INSERT INTO events(at,kind,body) VALUES(?,'notification','{broken')", (NOW.isoformat(),))
+    journal.event(NOW, "notification", {"kind": "synthetic_before_rollover", "details": {}})
+    assert len(journal.export(NOW)) == 2
+    later = NOW.replace(month=12)
+    journal.event(later, "notification", {"kind": "synthetic_after_rollover", "details": {}})
+    assert len(journal.export(later)) == 1
+    archive = tmp_path / "events-2026-11.jsonl.gz"
+    archived = [json.loads(line) for line in gzip.decompress(archive.read_bytes()).decode("utf-8").splitlines()]
+    current = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["body"]["kind"] for row in archived + current] == [
+        "malformed_notification_body", "synthetic_before_rollover", "synthetic_after_rollover"]
+    assert [row["sequence"] for row in archived + current] == [1, 2, 3]
+    assert journal.export(later) == []
+    with journal.connection() as db:
+        assert db.execute("SELECT body FROM events WHERE sequence=1").fetchone()[0] == "{broken"
+
+
+def test_bounded_delivery_does_not_let_build_failures_hide_later_due_notices(tmp_path, monkeypatch):
+    """Per-notice build backoff must still allow later rows through the bounded due query."""
+    journal, monitor, transport = delivery_queue(tmp_path, 3)
+    original = monitor._outgoing
+
+    def outgoing(body, sequence, text, now):
+        if sequence in (1, 2):
+            raise KeyError("synthetic build failure")
+        return original(body, sequence, text, now)
+
+    monkeypatch.setattr(monitor, "_outgoing", outgoing)
+    monitor._deliver(NOW)
+    monitor._deliver(NOW + timedelta(seconds=1))
+    with journal.connection() as db:
+        states = [tuple(row) for row in db.execute("SELECT state,last_error FROM fund_deliveries ORDER BY sequence")]
+        gate = db.execute("SELECT value FROM fund_monitor_meta WHERE key='next_delivery_at'").fetchone()
+    assert states == [("retry", "message_unavailable_KeyError"), ("retry", "message_unavailable_KeyError"),
+                      ("sent", None)]
+    assert gate is None
+    assert len(transport.messages) == 1

@@ -530,6 +530,8 @@ Every agent run emits a compact summary log line with the agent name, model, cac
 
 A backtest writes ``*_agent_detail.parquet`` next to the tear sheet. Live and paper files are under ``~/Library/Caches/lumibot/1.0/agent_runtime/`` on macOS. Set ``LUMIBOT_CACHE_FOLDER`` before importing lumibot to move that folder. The per-call JSON path is ``(result.payload or {}).get("trace_path")``. Summaries are also written to ``agent_run_summaries.jsonl``. ``LUMIBOT_LOG_LEVEL`` does not change either location.
 
+A live or paper run without a stats file has no end, so its per-agent ``*_agent_detail.parquet`` keeps the newest 1,000 rows. Before, the process held every row in memory and rewrote all of them on each call. Such a run also re-exports the memory artifacts at most every 15 minutes instead of on every call. Backtests and runs with a stats file keep the complete run as before. LumiBot does not delete the per-call JSON traces, so remove old ones with your own retention if a long-running bot needs the disk space.
+
 **How do I debug a bad trade?**
 
 Open ``*_agent_detail.parquet`` for that run and read ``effective_system_prompt``, the tool rows, and the summary. Look for warnings (future-dated data, no tools called, unsupported orders). Compare the summary to the trade. See :doc:`agents_observability`. Raising ``LUMIBOT_LOG_LEVEL`` will not add this record.

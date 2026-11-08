@@ -306,10 +306,37 @@ requested) before loading at most two bodies. A large outage backlog therefore
 does not load every queued body into Python on each poll. Due-time comparisons
 preserve UTC offsets and microsecond precision, including in-flight leases.
 
+A notice whose message could not be built (a daily or weekly report, an
+approval or an ordinary notice) used to stay at the head of the delivery queue
+and retry forever, so every later notice waited behind it. Build failures now
+back off only that notice. After three attempts the operator receives a short
+notice instead, and the traceback goes to the service log
+(``bash scripts/fund-logs.sh errors``). Telegram rate limits and outages still
+pause the whole queue.
+
+**The weekly report did not arrive.** It is sent after the post-market review
+of the ISO week's last NYSE session, normally Friday after the close.
+``bash scripts/fund-logs.sh status`` shows the latest weekly report and its
+delivery state, why the last week has none yet, and when the next one is due.
+If the week's last session has no review (the runner was down, a STOP lasted
+through it, or the review failed), the week is reported from its latest review
+once the next week's first session opens. ``bash scripts/fund-logs.sh weekly``
+prints this week's report so far without sending it.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
 (100,000 marks: about 1.9 s to 1.0 s, same findings).
+
+Account reads (LumiBot makes dozens each iteration) used to replay every fill
+since the account opened. SQLite triggers on the audited tables and event kinds
+now bump ``ledger_version`` on any insert, update or delete, from any connection
+or tool. A read reuses the last replay while the version is unchanged, so 43
+replays for a startup and one iteration became 5. The verdict is the same: a
+change made through another connection is still caught on the next read,
+failures are never reused, and a missing trigger disables reuse. Uncommitted
+writes inside an order or fill transaction are still checked directly in that
+transaction.
 
 NAV marks store the audit's verdict (status, scope, counts, missing evidence,
 error and warning codes), not the full replayed book, which ``fund-logs.sh
@@ -323,6 +350,13 @@ enough space, it skips without deleting any snapshot and the monitor sends a
 never spent to make room for its replacement. SQLite connections close on
 success and failure; failed copies are removed, and directories marked
 ``.incomplete`` after a hard interruption are not counted as completed backups.
+
+After the daily backup, the fund removes data that nothing reads any more:
+ordinary headlines after 30 days, material ones after 180, LumiBot's per-call
+agent traces after 30 days, and monthly ``events-YYYY-MM.jsonl.gz`` export
+archives after 12 months. The ledger, orders, fills, decisions, research,
+reviews, scorecards, factor tests, notices and NAV marks are never removed.
+Preview with ``bash scripts/fund-logs.sh prune``, and delete with ``--apply``.
 
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded

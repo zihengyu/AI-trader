@@ -43,6 +43,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._next_valuation = None
         self._valuation_book_key = None
         self._closing_searched = None  # The session close whose saved closing valuation was looked up.
+        self._ledger_cache = {}  # The last consistent ledger audit and the ledger_version it read.
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
@@ -65,6 +66,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                     PRIMARY KEY(order_id,bar_start));
                 CREATE TABLE IF NOT EXISTS local_actions (id TEXT PRIMARY KEY, amount TEXT NOT NULL);
             """ % str(number(starting_cash)))
+            from .ledger_audit import install_version_triggers
+            install_version_triggers(db)
         super().__init__(name="local-paper", data_source=data_source, config={"MARKET": "NYSE"},
                          connect_stream=connect_stream, start_orders_thread=False)
         # A crash before local order creation is provably a non-submission: all
@@ -164,17 +167,23 @@ class LocalPaperBroker(CachedMarketHours, Broker):
     def ledger_audit(self, *, strict=True):
         """Trade guards reconcile money facts; non-strict research audits include NAV history.
 
-        The money facts are replayed in full on every call. NAV marks are
+        The money facts are replayed in full whenever any committed change
+        reached them since the last replay; ledger_version, kept by triggers
+        that fire for every connection and tool, says so exactly. NAV marks are
         append-only projections, so this process checks each one once and then
         only the marks added since; the explicit audit, reports and the daily
         review still check every mark.
         """
-        from .ledger_audit import audit_connection, observation_findings, require_consistent, with_observations
+        from .ledger_audit import failed_message, ledger_result, observation_findings, with_observations
         with self.journal.connection() as db:
             db.execute("BEGIN")
+            # A read transaction: the replay is reused while no committed change touched the
+            # ledger (any connection's insert, update or delete bumps ledger_version).
+            ledger = ledger_result(db, self._ledger_cache)
             if strict:
-                return require_consistent(db)
-            ledger = audit_connection(db, include_observations=False)
+                if ledger["status"] == "failed":
+                    raise RiskError(failed_message(ledger))
+                return ledger
             last, known, invalid = getattr(self, "_observations_checked", (0, [], set()))
             warnings, flagged, last = observation_findings(db, after=last)
             self._observations_checked = (last, known + warnings, invalid | flagged)
