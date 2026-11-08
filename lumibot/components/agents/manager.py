@@ -475,6 +475,14 @@ def _usage_breakdown(payload: Any, *, cache_hit: bool) -> dict[str, int]:
     }
 
 
+# A live run without a stats file has no end. Its per-agent detail artifact keeps
+# the newest rows instead of every row of the process lifetime (held in memory and
+# rewritten on every call), and memory artifacts are exported at most this often.
+# Backtests and runs with a stats file keep complete artifacts.
+LIVE_DETAIL_MAX_ROWS = 1000
+LIVE_MEMORY_EXPORT_SECONDS = 900
+_monotonic = time.monotonic
+
 _AGENT_DETAIL_COLUMNS = [
     "timestamp",
     "call_index",
@@ -2554,6 +2562,7 @@ class AgentManager:
         self._observability_call_index: dict[str, int] = {}
         self._observability_rows: dict[str, list[dict[str, Any]]] = {}
         self._observability_all_rows: list[dict[str, Any]] = []
+        self._memory_exported_at: dict[str, float] = {}
         self._tool_result_cache: dict[str, Any] = {}
         # Bars where an agent call failed and the strategy continued without a
         # decision. Surfaced in parameters and settings.json "agent_health".
@@ -2787,6 +2796,21 @@ class AgentManager:
         fallback_dir.mkdir(parents=True, exist_ok=True)
         return fallback_dir / f"{agent_name}{suffix}"
 
+    def _complete_artifacts(self) -> bool:
+        """Backtests and runs with a stats file keep every row; an open-ended live run keeps recent ones."""
+        stats_file = getattr(self.strategy, "stats_file", None) or getattr(self.strategy, "_stats_file", None)
+        # The same test _write_detail_rows uses to choose the combined artifact.
+        return bool(getattr(self.strategy, "is_backtesting", False)) or (isinstance(stats_file, str) and bool(stats_file))
+
+    def _memory_export_due(self, prefix: str) -> bool:
+        if self._complete_artifacts():
+            return True
+        now, last = _monotonic(), self._memory_exported_at.get(prefix)
+        if last is not None and now - last < LIVE_MEMORY_EXPORT_SECONDS:
+            return False  # Each export reads every memory table; a live run refreshes them periodically.
+        self._memory_exported_at[prefix] = now
+        return True
+
     def _write_detail_rows(
         self,
         *,
@@ -2938,10 +2962,13 @@ class AgentManager:
             )
         agent_rows = self._observability_rows.setdefault(handle.name, [])
         agent_rows.extend(rows)
-        self._observability_all_rows.extend(rows)
         configured_stats_file = getattr(self.strategy, "stats_file", None) or getattr(
             self.strategy, "_stats_file", None
         )
+        if self._complete_artifacts():
+            self._observability_all_rows.extend(rows)
+        else:
+            del agent_rows[:-LIVE_DETAIL_MAX_ROWS]
         if isinstance(configured_stats_file, str) and configured_stats_file:
             detail_rows = self._observability_all_rows
         else:
@@ -3110,7 +3137,8 @@ class AgentManager:
                     prefix = detail_stem[: -len("_agent_detail")] + "_agent_memory"
                 else:
                     prefix = f"{handle.name}_agent_memory"
-                memory.export_artifacts(detail_parquet_path.parent, prefix=prefix)
+                if self._memory_export_due(prefix):
+                    memory.export_artifacts(detail_parquet_path.parent, prefix=prefix)
             except Exception as exc:
                 self._log_warning(f"Could not export agent memory artifacts: {exc}")
         self._update_strategy_parameters_for_agent(
