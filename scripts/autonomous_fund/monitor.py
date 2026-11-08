@@ -22,6 +22,34 @@ LEGITIMATE_PAUSES = ("model_budget_exhausted", "model_cost_budget_exhausted")
 EXECUTION_MONITOR_MAX_AGE_SECONDS = 45
 POLL_SECONDS = 10
 NOTIFICATION_BUDGET_SECONDS = 20  # One in-flight ten-second request may finish after this budget.
+MESSAGE_BUILD_ATTEMPTS = 3  # Then a short notice goes out in place of a report that cannot be built.
+
+
+def _disclose_build_failure(kind, sequence):
+    """The traceback goes to the service log (`fund-logs.sh errors`); the database keeps only the type."""
+    import sys
+    import traceback
+    print(f"FUND notification_build_error: {kind} #{sequence}", file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+    sys.stderr.flush()
+
+
+def unavailable_message(body, sequence, error, attempts):
+    """What the operator receives when a notice's full message cannot be built."""
+    details = body.get("details") if isinstance(body.get("details"), dict) else {}
+    kind = body.get("kind")
+    if kind == "weekly_report":
+        what = f"{details.get('week', '')} 周报（{details.get('session_date', '')} 收盘后）"
+        retry = "\n手动生成：bash scripts/fund-logs.sh weekly"
+    elif kind == "postmarket_report":
+        what, retry = f"{details.get('session_date', '')} 盘后日报", ""
+        if details.get("summary"):
+            retry = "\n复盘摘要：" + str(details["summary"])[:1500]
+    else:
+        what, retry = f"通知 {kind}", "\n原始内容：" + encode(details)[:2500]
+    return (f"LumiBot 模拟账户 · 事件 #{sequence}\n{what}无法生成（{error.removeprefix('message_unavailable_')}），"
+            f"已试 {attempts} 次。先发这条提醒，后面的通知照常发送；账本、交易和复盘记录不受影响。\n"
+            f"查看原因：bash scripts/fund-logs.sh errors{retry}")
 
 
 def require_monitor(root, now):
@@ -382,18 +410,17 @@ class Monitor:
             pass
         return status
 
-    def _week_ends(self, day):
-        """True when `day` is the last NYSE session of its ISO week (cached; holidays and early weeks included)."""
+    def _week_calendar(self, day):
+        """notifications.week_calendar(day), cached per session date."""
         cache = self.__dict__.setdefault("_week_end_cache", {})
         if day not in cache:
-            import pandas_market_calendars as mcal
-            from datetime import date
-            session = date.fromisoformat(day)
-            schedule = mcal.get_calendar("NYSE").schedule(start_date=session + timedelta(days=1),
-                                                          end_date=session + timedelta(days=10))
-            following = schedule.index[0].date() if len(schedule) else None
-            cache[day] = following is None or following.isocalendar()[:2] != session.isocalendar()[:2]
+            from .notifications import week_calendar
+            cache[day] = week_calendar(day)
         return cache[day]
+
+    def _week_ends(self, day):
+        """True when `day` is the last NYSE session of its ISO week (cached; holidays and early weeks included)."""
+        return self._week_calendar(day)[0]
 
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""
@@ -460,11 +487,19 @@ class Monitor:
             db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('fill_notification_cursor',?)", (str(cursor),))
 
     def _queue_weekly(self, db, reviews, now):
-        """One weekly report per ISO week, after the review of the week's last session (recent reviews only)."""
+        """One weekly report per ISO week, after the review of the week's last session (recent reviews only).
+
+        When that last session has no review (the trader was down, a STOP lasted
+        through it, or the review failed), the week is reported from its latest
+        review once the next week's first session opens. Until then the missing
+        review can still be made up: the trader reviews at startup and an hour
+        before each open.
+        """
         from .notifications import week_of
         sent = {row[0] for row in db.execute(
             "SELECT json_extract(body,'$.details.week') FROM events WHERE kind='notification' "
             f"AND {NOTIFICATION_KIND}='weekly_report'")}
+        unfinished = {}  # week -> its latest recent review that is not the week's last session
         for review in reviews[-7:]:
             # Two fields of a packet that can hold 100 KB of session evidence, read on every poll.
             packet = dict(zip(("completed_at", "session_date"), db.execute(
@@ -477,14 +512,23 @@ class Monitor:
             if week in sent:
                 continue
             try:
-                last = self._week_ends(packet["session_date"])
+                last, later_open = self._week_calendar(packet["session_date"])
             except Exception:
                 continue  # Without the calendar the week's end is unknown: no guessed report.
             if last:
                 sent.add(week)
+                unfinished.pop(week, None)
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
                     "kind": "weekly_report", "details": {"review_sequence": review["sequence"], "week": week,
                                                          "session_date": packet["session_date"]}})))
+            elif later_open is not None:
+                unfinished[week] = (review, packet["session_date"], later_open)
+        for week, (review, day, later_open) in unfinished.items():
+            if now >= later_open:
+                sent.add(week)
+                db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
+                    "kind": "weekly_report", "details": {"review_sequence": review["sequence"], "week": week,
+                                                         "session_date": day, "last_session_reviewed": False}})))
 
     def _note_decision_drought(self, db, now):
         """Alert once a day when the session runs without a valid decision and nothing explains it.
@@ -594,50 +638,68 @@ class Monitor:
                     ((now + timedelta(seconds=60)).isoformat(), row["sequence"], row["next_at"]))
                 if claimed.rowcount != 1:
                     continue  # Another monitor/test sender already claimed it.
+            built = None
             try:
-                from .notifications import approval_message, daily_document
-                if body.get("kind") == "postmarket_report":
-                    filename, document = daily_document(self.root, body["details"]["review_sequence"])
-                    result = self.transport.send_document(
-                        f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
-                        filename, document)
-                elif body.get("kind") == "weekly_report":
-                    from .notifications import weekly_document
-                    filename, document = weekly_document(self.root, body["details"]["review_sequence"])
-                    result = self.transport.send_document(
-                        f"LumiBot 模拟账户 · {body['details']['week']} 周报（{body['details']['session_date']} 收盘后）",
-                        filename, document)
-                elif body.get("kind") == "approval_required" and (
-                        "side" in body.get("details", {}) or "buys" in body.get("details", {})):
-                    message = approval_message(body["details"])
-                    result = (self.transport.send(message) if len(message) <= 4000 else
-                              self.transport.send_document(message[:900] + "\n完整理由见附件。",
-                                  f"approval-{body['details']['id']}.txt", message))
+                outgoing = self._outgoing(body, row["sequence"], text, now)
+            except Exception as exc:
+                # Building the message is local work (a report read from the journal).
+                # A failure here is about this one notice, so it must not hold back the
+                # notices behind it, a STOP alert included (2026-11-08: a failing weekly
+                # report retried for a day while every later notice waited).
+                built = f"message_unavailable_{type(exc).__name__}"
+                _disclose_build_failure(body.get("kind"), row["sequence"])
+                if row["attempts"] + 1 < MESSAGE_BUILD_ATTEMPTS:
+                    with operator_connection(self.root) as db:
+                        db.execute("UPDATE fund_deliveries SET state='retry',next_at=?,last_error=? WHERE sequence=?", (
+                            (now + timedelta(seconds=30 * 2 ** row["attempts"])).isoformat(), built, row["sequence"]))
+                    continue
+                outgoing = ("text", unavailable_message(body, row["sequence"], built, row["attempts"] + 1))
+            try:
+                if outgoing[0] == "text":
+                    result = self.transport.send(outgoing[1])
                 else:
-                    from .notifications import LONG_MESSAGE, readable
-                    message = readable(body.get("kind"), body.get("details"), row["sequence"], now=now) or text
-                    if len(message) <= LONG_MESSAGE:
-                        result = self.transport.send(message)
-                    else:  # A long research text arrives whole, as a document.
-                        # Keep holdings visible; the attachment retains the complete rationale.
-                        caption = (message.split("\n理由：", 1)[0] if body.get("kind") == "decision_changed" else
-                                   message.split("\n", 1)[0])
-                        result = self.transport.send_document(caption[:900] + "\n内容较长，完整内容见附件。",
-                                                              f"{body.get('kind')}-{row['sequence']}.txt", message)
+                    result = self.transport.send_document(*outgoing[1:])
             except Exception:
                 # Never persist third-party exceptions (may contain credentials).
                 result = {"ok": False, "error": "report_or_delivery_error", "retry_after": 30}
             delay = max(result.get("retry_after", 0), min(1800, 5 * 2 ** min(row["attempts"], 8)))
             with operator_connection(self.root) as db:
+                # A notice sent in place of its report keeps the build error, for status and audit.
                 db.execute("UPDATE fund_deliveries SET state=?,next_at=?,last_error=?,message_id=? WHERE sequence=?", (
                     "sent" if result["ok"] else "retry", (now + timedelta(seconds=delay)).isoformat(),
-                    None if result["ok"] else result["error"], str(result.get("message_id", "")), row["sequence"]))
+                    built if result["ok"] else result["error"], str(result.get("message_id", "")), row["sequence"]))
                 if not result["ok"]:
                     db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('next_delivery_at',?)",
                                ((now + timedelta(seconds=delay)).isoformat(),))
             if not result["ok"]:
                 break  # Respect rate limits and outages across the whole batch.
 
+    def _outgoing(self, body, sequence, text, now):
+        """("text", message) or ("document", caption, filename, document) for one notice."""
+        from .notifications import approval_message, daily_document
+        if body.get("kind") == "postmarket_report":
+            filename, document = daily_document(self.root, body["details"]["review_sequence"])
+            return ("document", f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
+                    filename, document)
+        if body.get("kind") == "weekly_report":
+            from .notifications import weekly_document
+            filename, document = weekly_document(self.root, body["details"]["review_sequence"])
+            partial = "；本周最后一个交易日没有复盘" if body["details"].get("last_session_reviewed") is False else ""
+            return ("document", f"LumiBot 模拟账户 · {body['details']['week']} 周报（{body['details']['session_date']} "
+                                f"收盘后{partial}）", filename, document)
+        if body.get("kind") == "approval_required" and (
+                "side" in body.get("details", {}) or "buys" in body.get("details", {})):
+            message = approval_message(body["details"])
+            return (("text", message) if len(message) <= 4000 else
+                    ("document", message[:900] + "\n完整理由见附件。", f"approval-{body['details']['id']}.txt", message))
+        from .notifications import LONG_MESSAGE, readable
+        message = readable(body.get("kind"), body.get("details"), sequence, now=now) or text
+        if len(message) <= LONG_MESSAGE:
+            return ("text", message)
+        # A long research text arrives whole, as a document.
+        # Keep holdings visible; the attachment retains the complete rationale.
+        caption = message.split("\n理由：", 1)[0] if body.get("kind") == "decision_changed" else message.split("\n", 1)[0]
+        return ("document", caption[:900] + "\n内容较长，完整内容见附件。", f"{body.get('kind')}-{sequence}.txt", message)
 
     def _commands(self, now, *, deadline=None):
         """Telegram replies as an approval channel: authenticated, request-bound, auditable.
@@ -756,6 +818,12 @@ class Monitor:
             if status.get("valuation_error"):
                 lines.append(f"账户估值暂未更新：{status['valuation_error']}；保留上次成功快照及其时间。")
         except (OSError, ValueError):
+            pass
+        try:
+            from .status import weekly_lines
+            with operator_connection(self.root) as db:
+                lines += weekly_lines(db, now, stopped=(self.root / "STOP").exists())
+        except Exception:  # The weekly line is a convenience; the account lines above still answer.
             pass
         return "\n".join(lines)
 

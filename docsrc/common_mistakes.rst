@@ -296,6 +296,23 @@ every monitor poll fail, so no later notice (a STOP alert included) was sent. It
 is now recorded as ``suppressed`` with ``last_error`` set to
 ``malformed_notification_body``, and later notices are delivered.
 
+A notice whose message could not be built (a daily or weekly report, an
+approval or an ordinary notice) used to stay at the head of the delivery queue
+and retry forever, so every later notice waited behind it. Build failures now
+back off only that notice. After three attempts the operator receives a short
+notice instead, and the traceback goes to the service log
+(``bash scripts/fund-logs.sh errors``). Telegram rate limits and outages still
+pause the whole queue.
+
+**The weekly report did not arrive.** It is sent after the post-market review
+of the ISO week's last NYSE session, normally Friday after the close.
+``bash scripts/fund-logs.sh status`` shows the latest weekly report and its
+delivery state, why the last week has none yet, and when the next one is due.
+If the week's last session has no review (the runner was down, a STOP lasted
+through it, or the review failed), the week is reported from its latest review
+once the next week's first session opens. ``bash scripts/fund-logs.sh weekly``
+prints this week's report so far without sending it.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

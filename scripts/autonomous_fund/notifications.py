@@ -413,6 +413,13 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
     elif kind == "bookkeeping_error":
         text = f"⚠️ 记账步骤出错，下一轮自动重试：{details}"
+    elif kind == "postmarket_review_error":
+        text = (f"⚠️ 盘后复盘失败：{details}\n这次的盘后日报暂不生成；原有策略备忘继续有效，交易不受影响。"
+                "下一个开盘前约 1 小时自动重试复盘。本周最后一个交易日仍没有复盘时，周报在下周第一个交易日开盘后"
+                "用本周最近一次复盘发出。\n原因：bash scripts/fund-logs.sh errors")
+    elif kind == "premarket_research_error":
+        text = (f"⚠️ 盘前研究失败：{details}\n开盘后基金经理照常复核和决策，只是缺少这次的盘前研究摘要。\n"
+                "原因：bash scripts/fund-logs.sh errors")
     elif kind == "model_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型调用预算已用完（{details.get('runs')}/{details.get('limit')}）："
                 "已有目标继续执行，止损照常，明天恢复研究。")
@@ -457,6 +464,31 @@ def week_of(day):
     monday = session - timedelta(days=session.weekday())
     year, week, _ = session.isocalendar()
     return monday.isoformat(), (monday + timedelta(days=6)).isoformat(), f"{year}-W{week:02d}"
+
+
+def week_sessions(start, end):
+    """{"YYYY-Www": (last NYSE session date, its UTC close)} for ISO weeks with a session in [start, end]."""
+    import pandas_market_calendars as mcal
+    weeks = {}
+    for index, market in mcal.get_calendar("NYSE").schedule(start_date=start, end_date=end).iterrows():
+        day = index.date().isoformat()
+        weeks[week_of(day)[2]] = (day, market.market_close.to_pydatetime())  # Later sessions replace earlier ones.
+    return weeks
+
+
+def week_calendar(day):
+    """For New York session date `day`: (is it the last NYSE session of its ISO week,
+    UTC open of the first session of a later ISO week or None)."""
+    from datetime import date, timedelta
+    import pandas_market_calendars as mcal
+    session = date.fromisoformat(day)
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=session + timedelta(days=1),
+                                                  end_date=session + timedelta(days=17))
+    week = session.isocalendar()[:2]
+    later = [market.market_open.to_pydatetime() for index, market in schedule.iterrows()
+             if index.date().isocalendar()[:2] != week]
+    ends = not len(schedule) or schedule.index[0].date().isocalendar()[:2] != week
+    return ends, (later[0] if later else None)
 
 
 def _weekly_facts(events, monday, sunday, zone):
@@ -563,6 +595,18 @@ def _weekly_events(db, cutoff, zone):
     events += [(at, "account", {"equity": equity}) for at, equity in marks.values()]
     events += [(at, "benchmark", values) for at, values in prices.values()]
     return events
+
+
+def latest_weekly(root):
+    """The weekly report so far, from the latest completed post-market review: (filename, markdown).
+
+    For the operator on demand (`fund-logs.sh weekly`); it is printed, never sent.
+    """
+    with operator_connection(root) as db:
+        row = db.execute("SELECT sequence FROM events WHERE kind='postmarket_review' ORDER BY sequence DESC LIMIT 1").fetchone()
+    if not row:
+        raise RiskError("还没有盘后复盘，周报没有内容：第一个交易日收盘复盘完成后再试")
+    return weekly_document(root, row[0])
 
 
 def weekly_document(root, sequence):
