@@ -264,6 +264,15 @@ validate up to 200 recent candidate snapshots; without a valid candidate they
 leave the account update pending or omit its metrics. Trade-guard work therefore
 does not grow with NAV history, but still grows with actual orders and fills.
 
+That growth is linear: each order and fill record is parsed once, and dividend
+entitlements use per-symbol share changes instead of re-reading every fill for
+every dividend. The replay runs when a valuation is due, when a minute bar could
+fill an order (before and after the fill), when a fill is new to the monitor and
+before a submission, not on every five-second poll. NAV marks are streamed one
+at a time instead of loaded together; the agent-context audit checks each mark
+once per process and then only new marks, while the explicit audit, reports and
+the daily review still check every mark.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

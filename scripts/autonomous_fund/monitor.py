@@ -390,9 +390,6 @@ class Monitor:
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""
         from .ledger_audit import account_observation, audit_connection
-        integrity = audit_connection(db, include_observations=False)
-        if integrity["status"] == "failed":
-            return
         startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not startup or json.loads(startup[0]).get("mode") not in {"local", "paper"}:
             return
@@ -400,6 +397,11 @@ class Monitor:
         cursor = int(saved[0]) if saved else 0
         rows = db.execute("SELECT sequence,at,kind,body FROM events WHERE sequence>? "
                           "AND kind IN ('fill','fill_reconciled') ORDER BY sequence LIMIT 200", (cursor,)).fetchall()
+        if not rows:
+            return  # Nothing to announce: no full ledger replay on every 10-second poll.
+        integrity = audit_connection(db, include_observations=False)
+        if integrity["status"] == "failed":
+            return
         visible = []
         for row in rows:
             if instant(row["at"]) > now:

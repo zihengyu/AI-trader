@@ -42,6 +42,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._last_valuation = None
         self._next_valuation = None
         self._valuation_book_key = None
+        self._closing_searched = None  # The session close whose saved closing valuation was looked up.
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
@@ -139,6 +140,10 @@ class LocalPaperBroker(CachedMarketHours, Broker):
 
     def _pull_positions(self, strategy):
         self.ledger_audit()
+        return self._book_positions(strategy)
+
+    def _book_positions(self, strategy):
+        """Positions from the durable book; callers reconcile the ledger first."""
         name = self._strategy_name_from_input(strategy)
         with self.journal.connection() as db:
             return [Position(name, Asset(row["symbol"], asset_type="stock"), row["quantity"],
@@ -157,16 +162,28 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return self._read_balances(quote_asset, strategy)
 
     def ledger_audit(self, *, strict=True):
-        """Trade guards reconcile money facts; non-strict research audits include NAV history."""
-        from .ledger_audit import audit_connection, require_consistent
+        """Trade guards reconcile money facts; non-strict research audits include NAV history.
+
+        The money facts are replayed in full on every call. NAV marks are
+        append-only projections, so this process checks each one once and then
+        only the marks added since; the explicit audit, reports and the daily
+        review still check every mark.
+        """
+        from .ledger_audit import audit_connection, observation_findings, require_consistent, with_observations
         with self.journal.connection() as db:
             db.execute("BEGIN")
-            return require_consistent(db) if strict else audit_connection(db)
+            if strict:
+                return require_consistent(db)
+            ledger = audit_connection(db, include_observations=False)
+            last, known, invalid = getattr(self, "_observations_checked", (0, [], set()))
+            warnings, flagged, last = observation_findings(db, after=last)
+            self._observations_checked = (last, known + warnings, invalid | flagged)
+            return with_observations(ledger, self._observations_checked[1], self._observations_checked[2])
 
     def _read_balances(self, quote_asset, strategy):
         self.ledger_audit()
         self._corporate_actions()
-        positions = self._pull_positions(strategy)
+        positions = self._book_positions(strategy)  # Reconciled just above; one replay per read.
         with self.journal.connection() as db:
             row = db.execute("SELECT cash,receivables FROM local_account WHERE id=1").fetchone()
             cash, receivables = number(row[0]), number(row[1])
@@ -241,26 +258,33 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         closed_at = None if self.is_market_open() else self.data_source.session.last_close()
         book_existed = True
         if closed_at is not None:
+            if (self._closing_searched == closed_at and self._last_valuation is not None
+                    and (self._last_valuation.get("valuation") or {}).get("session_close") == str(closed_at)):
+                return  # Already published or recovered for this close.
             # A closing observation is durable, including all-cash books. Reuse
             # it across polls, pre-open research and restarts until another close.
             with self.journal.connection() as db:
                 origin = db.execute("SELECT at FROM events WHERE kind IN ('local_ledger_origin','startup') ORDER BY sequence LIMIT 1").fetchone()
                 book_existed = origin is not None and instant(origin[0]) <= closed_at
-                saved = db.execute("SELECT body FROM events WHERE kind='account' AND "
-                                   "json_extract(body,'$.valuation.session_close')=? ORDER BY sequence DESC LIMIT 1",
-                                   (str(closed_at),)).fetchone()
+                # Searching every account mark is done once per close and process; while the closing
+                # minute is unavailable, later polls retry the valuation (throttled below), not the search.
+                saved = None if self._closing_searched == closed_at else db.execute(
+                    "SELECT body FROM events WHERE kind='account' AND "
+                    "json_extract(body,'$.valuation.session_close')=? ORDER BY sequence DESC LIMIT 1",
+                    (str(closed_at),)).fetchone()
+            self._closing_searched = closed_at
             if saved:
                 self._last_valuation = json.loads(saved[0])
                 self._valuation_error = None
                 return
         with self.journal.connection() as db:
             db.execute("BEGIN")
-            from .ledger_audit import require_consistent
-            integrity = require_consistent(db)
             book = self._valuation_book(db)
-        key = encode(book)
-        if self._next_valuation is not None and start < self._next_valuation and key == self._valuation_book_key:
-            return
+            key = encode(book)
+            if self._next_valuation is not None and start < self._next_valuation and key == self._valuation_book_key:
+                return  # Not due and the book is unchanged: no replay on every 5-second poll.
+            from .ledger_audit import require_consistent
+            integrity = require_consistent(db)  # Same read transaction as the book it vouches for.
         self._next_valuation = start + timedelta(seconds=policy["interval_seconds"])
         self._valuation_book_key = key
         mandate, meta = policy["mandate"], book["meta"]
@@ -481,6 +505,20 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 self.journal.event(self.data_source.get_datetime(), "local_risk_canceled", {"broker_id": row["id"]})
                 return
 
+    def _matchable(self, db, identifier, start):
+        """The order row while this completed bar may still be applied to it, otherwise None."""
+        row = db.execute("SELECT * FROM local_orders WHERE id=?", (identifier,)).fetchone()
+        if row["status"] not in {"new", "partial_fill"} or (row["last_bar"] and start <= instant(row["last_bar"])):
+            return None
+        if (self.journal.root / "STOP").exists():
+            return None
+        if not self.is_market_open() or self.data_source.get_datetime() >= instant(row["expires_at"]):
+            return None
+        age = (self.data_source.get_datetime() - (start + timedelta(minutes=1))).total_seconds()
+        if not 0 <= age <= self.limits.quote_max_seconds:
+            return None
+        return row
+
     def _fill_bar(self, identifier, order, start, bar):
         if self.require_monitor:
             from .monitor import require_monitor
@@ -493,6 +531,22 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         friction = self.slippage + self.data_source.spread / 2
         raw = number(bar.high) * (1 + friction) if buy else number(bar.low) * (1 - friction)
         price = raw.quantize(Decimal("0.01"), rounding=ROUND_CEILING if buy else ROUND_FLOOR)
+        if not buy:
+            # A risk-reducing sale never waits on OTHER holdings' marks. Its own bar
+            # must still postdate an applied split, or the sale would be mispriced.
+            with self.journal.connection() as db:
+                splits = [row[0].rsplit(":", 2)[1] for row in db.execute(
+                    "SELECT id FROM local_actions WHERE id LIKE ?", (f"{order.asset.symbol}:%:split",))]
+            if splits and trading_day(start) < max(splits):
+                raise MarketDataUnavailable("Price predates applied split; virtual fills paused")
+        if (buy and price > number(order.limit_price)) or (not buy and price < number(order.limit_price)):
+            # Most bars of a resting limit order cannot fill. Mark the bar consumed, as the full path
+            # below does, without valuing the book or replaying the ledger; no cash, lot or fill changes.
+            with self.journal.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if self._matchable(db, identifier, start) is not None:
+                    db.execute("UPDATE local_orders SET last_bar=? WHERE id=?", (start.isoformat(), identifier))
+            return
         # Fill-time checks use the operator's capital sleeve, never reserved cash.
         reserve = self.journal.reserve_cash()
         paused, marks, equity = False, {}, number(0)
@@ -501,33 +555,18 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             _, _, equity = self._get_balances_at_broker(None, order.strategy)
             equity = number(equity) - reserve
             paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
-            for position in self._pull_positions(order.strategy):
+            for position in self._book_positions(order.strategy):  # Reconciled by the balance read above.
                 quote = self.data_source.get_quote(position.asset)
                 age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
                 if not 0 <= age <= self.limits.quote_max_seconds:
                     raise MarketDataUnavailable("Stale holding mark; virtual fills paused")
                 marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
-        else:
-            # A risk-reducing sale never waits on OTHER holdings' marks. Its own bar
-            # must still postdate an applied split, or the sale would be mispriced.
-            with self.journal.connection() as db:
-                splits = [row[0].rsplit(":", 2)[1] for row in db.execute(
-                    "SELECT id FROM local_actions WHERE id LIKE ?", (f"{order.asset.symbol}:%:split",))]
-            if splits and trading_day(start) < max(splits):
-                raise MarketDataUnavailable("Price predates applied split; virtual fills paused")
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             from .ledger_audit import require_consistent
             require_consistent(db)
-            row = db.execute("SELECT * FROM local_orders WHERE id=?", (identifier,)).fetchone()
-            if row["status"] not in {"new", "partial_fill"} or (row["last_bar"] and start <= instant(row["last_bar"])):
-                return
-            if (self.journal.root / "STOP").exists():
-                return
-            if not self.is_market_open() or self.data_source.get_datetime() >= instant(row["expires_at"]):
-                return
-            age = (self.data_source.get_datetime() - (start + timedelta(minutes=1))).total_seconds()
-            if not 0 <= age <= self.limits.quote_max_seconds:
+            row = self._matchable(db, identifier, start)
+            if row is None:
                 return
             db.execute("UPDATE local_orders SET last_bar=? WHERE id=?", (start.isoformat(), identifier))
             if (buy and price > number(order.limit_price)) or (not buy and price < number(order.limit_price)):
