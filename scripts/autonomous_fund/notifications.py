@@ -835,11 +835,19 @@ def weekly_document(root, sequence):
     lines += ["", "## 三、本周归因合计【事实，代码按收盘价计算】", ""]
     usable = [r.get("attribution") for r in reviews if (r.get("attribution") or {}).get("status") in {"complete", "partial"}]
     if usable:
-        totals = {}
+        totals, unknown = {}, {}
         for item in usable:
             for key, value in item["components"].items():
-                totals[key] = totals.get(key, 0.0) + value
-        lines += [f"- {ATTRIBUTION_LABELS[key]}：{_percent(value)}" for key, value in totals.items()]
+                totals.setdefault(key, 0.0)
+                if value is None:
+                    # A day whose part is unknown (a fill without an arrival quote or a fee): never summed as zero.
+                    unknown[key] = unknown.get(key, 0) + 1
+                else:
+                    totals[key] += value
+        lines += [f"- {ATTRIBUTION_LABELS[key]}："
+                  + ("未知（每天都缺数据）" if unknown.get(key) == len(usable) else _percent(value)
+                     + (f"（{unknown[key]} 天未知，未计入）" if key in unknown else ""))
+                  for key, value in totals.items()]
         lines.append(f"- 未解释：{_percent(sum(i['unexplained'] for i in usable))}（{len(usable)} 个交易日相加，"
                      f"其中不完整 {sum(i['status'] == 'partial' for i in usable)} 天）")
     else:
@@ -910,7 +918,9 @@ def weekly_document(root, sequence):
     for r in reviews:
         item = r.get("attribution") or {}
         if item.get("status") in {"unavailable", "partial", None}:
-            detail = item.get("reason") or "、".join(item.get("unavailable", []) + item.get("fees_unknown", []))
+            detail = item.get("reason") or "、".join(
+                list(item.get("unavailable") or []) + [f"{s} 费用未知" for s in item.get("fees_unknown") or []]
+                + [f"{s} 缺到达报价（择时／滑点未知）" for s in item.get("arrival_unknown") or []])
             gaps.append(f"{r['session_date']}：{detail or '这次复盘没有归因'}")
     lines.append("- 归因缺数据：" + ("；".join(gaps) if gaps else "无"))
     data_gaps = [g for r in reviews for g in (r.get("review") or {}).get("data_gaps", [])]

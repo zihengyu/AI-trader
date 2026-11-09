@@ -339,12 +339,12 @@ def _decision_case():
               f"as_of 必须是 {as_of}，expires_at 必须是 {expires}，next_review_at 必须是 {review}；"
               "rationale 用中文一句话说明这是接口测试；targets 只有一条：symbol SPY，weight 0.1，entry_limit 100，"
               "stop_loss 90，take_profit 120，take_profit_weight 0.5；alerts 一条：symbol SPY，above 130，below null，"
-              "reason 说明是测试；news_watch 一条：query 为 interface test，reason 说明是测试；idea_refs 为空列表。")
+              "reason 说明是测试；news_watch 一条：query 为 interface test，reason 说明是测试；idea_refs 和 factual_claims 为空列表。")
     offline = {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "这是接口测试。",
                "targets": [{"symbol": "SPY", "weight": 0.1, "entry_limit": 100.0, "stop_loss": 90.0,
                             "take_profit": 120.0, "take_profit_weight": 0.5}],
                "alerts": [{"symbol": "SPY", "above": 130.0, "below": None, "reason": "测试提醒"}],
-               "news_watch": [{"query": "interface test", "reason": "测试"}], "idea_refs": []}
+               "news_watch": [{"query": "interface test", "reason": "测试"}], "idea_refs": [], "factual_claims": []}
 
     def check(answer):
         if not all(_same_instant(answer[key], value) for key, value in (
@@ -453,10 +453,11 @@ async def exercise_constraints(c, args, model, case, checkpoint):
         "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
         f"as_of 为 {as_of}，expires_at 为 {expires}，next_review_at 为 {review}，rationale 写“约束测试”；"
         "targets 只有一条：symbol SPY，weight 必须是 1.5，entry_limit 必须是 0，stop_loss、take_profit、"
-        "take_profit_weight 为 null；alerts、news_watch、idea_refs 为空列表。"),
+        "take_profit_weight 为 null；alerts、news_watch、idea_refs、factual_claims 为空列表。"),
         {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "约束测试",
          "targets": [{"symbol": "SPY", "weight": 1.0, "entry_limit": 0.01, "stop_loss": None, "take_profit": None,
-                      "take_profit_weight": None}], "alerts": [], "news_watch": [], "idea_refs": []}, validate=False)
+                      "take_profit_weight": None}], "alerts": [], "news_watch": [], "idea_refs": [],
+         "factual_claims": []}, validate=False)
     targets = decision.get("targets") if isinstance(decision.get("targets"), list) else []
     first = targets[0] if targets and isinstance(targets[0], dict) else {}
     weight, entry = first.get("weight"), first.get("entry_limit")
