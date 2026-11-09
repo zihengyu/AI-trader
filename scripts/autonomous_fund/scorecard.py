@@ -172,7 +172,12 @@ def score_ideas(ideas, closes):
         "pending": sum(i["status"] == "pending" for i in items),
         "unavailable": sum(i["status"] == "unavailable" for i in items),
         "brier": brier, "brier_skill_vs_coin": 1 - brier / 0.25 if brier is not None else None,
+        # How far a scored idea's symbol moved over its horizon (relative ideas: beyond the benchmark).
+        "mean_abs_move": (sum(abs(i["symbol_return"] - i["benchmark_return"]
+                                  if i["direction"] in {"outperform", "underperform"} else i["symbol_return"])
+                              for i in scored) / count) if count else None,
         "by_confidence": buckets,
+        "confidence_bounds": {f"{low:.1f}-{min(high, 0.95):.2f}": [low, high] for low, high in CONFIDENCE_BUCKETS},
         "baselines": {
             "coin": {"hit_rate": 0.5, "brier": 0.25, "p_value": versus_coin},
             "always_up": {"hit_rate": sum(up) / count if count else None, "ideas_where_different": wins + losses,

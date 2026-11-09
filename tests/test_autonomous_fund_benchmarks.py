@@ -98,7 +98,7 @@ def test_unknown_costs_leave_the_system_return_unknown_never_zero():
 
 
 def test_acceptance_reports_net_returns_and_every_benchmark_definition(tmp_path):
-    from scripts.autonomous_fund.validation import acceptance, acceptance_markdown
+    from scripts.autonomous_fund.validation import acceptance, investment_markdown
     journal = Journal(tmp_path, "synthetic-benchmark-account")
     start = datetime(2026, 7, 6, 19, 0, tzinfo=timezone.utc)
     old = {"benchmarks": [{"id": "risk_matched-old00000", "name": "risk_matched", "weights": {"SPY": "0.5", "SGOV": "0.5"}}],
@@ -136,14 +136,14 @@ def test_acceptance_reports_net_returns_and_every_benchmark_definition(tmp_path)
     # 60% SPY + 40% SGOV, whose only return is the recorded 0.4% distribution.
     growth = 1.0006 ** 10 * (1.0006 + 0.4 * 0.004)
     assert matched["benchmark"]["annual_return"] == pytest.approx(growth ** (252 / 11) - 1)
-    text = acceptance_markdown(result)
+    text = investment_markdown(result)  # The investment report (V2 4.4) holds the return evidence.
     assert "## 净收益口径" in text and "## 事先定义的基准" in text and "旧定义" in text
     # One unpriced call makes the system return unknown rather than ignoring the cost.
     journal.event(day + timedelta(hours=1), "agent", {"name": "manager", "model": "unpriced", "usage": {"prompt_tokens": 9},
                                                        "cost_usd": None})
     journal.event(day + timedelta(hours=2), "account", {"as_of": "x", "cash": "0", "equity": str(equity), "positions": {}})
     later = acceptance(tmp_path, now=day + timedelta(days=2))
-    assert later["net_returns"]["system"]["status"] == "unknown_costs" and "未知" in acceptance_markdown(later)
+    assert later["net_returns"]["system"]["status"] == "unknown_costs" and "未知" in investment_markdown(later)
 
 
 def test_the_runner_records_benchmark_dividends_once_a_day(tmp_path):

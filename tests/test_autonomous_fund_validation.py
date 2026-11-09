@@ -314,3 +314,9 @@ def test_acceptance_command_writes_json_and_markdown(tmp_path, capsys):
     run.main(["acceptance", "--run-dir", str(tmp_path)])
     assert json.loads((tmp_path / "acceptance.json").read_text(encoding="utf-8"))["verdict"] == "not_ready"
     assert "运行验收报告" in (tmp_path / "acceptance.md").read_text(encoding="utf-8")
+    # V2 4.4: a separate investment report, and each says that passing one does not pass the other.
+    investment = (tmp_path / "investment_acceptance.md").read_text(encoding="utf-8")
+    assert investment.startswith("# 投资能力验收报告") and "样本不足，尚不能判断" in investment
+    assert "运行验收通过不代表投资能力验收通过" in investment
+    assert "运行验收通过不代表投资能力验收通过" in (tmp_path / "acceptance.md").read_text(encoding="utf-8")
+    assert json.loads(capsys.readouterr().out)["investment_verdict"] == "insufficient_evidence"

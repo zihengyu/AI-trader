@@ -110,6 +110,7 @@ def critic_strategy(tmp_path, run=None, runs_used=0):
     fake._record_agent = lambda name, result, phase=None: AutonomousFund._record_agent(fake, name, result, phase)
     fake._agent_call = lambda name, **kw: AutonomousFund._agent_call(fake, name, **kw)
     fake._cost_exhausted = lambda now, step: AutonomousFund._cost_exhausted(fake, now, step)
+    fake._call_outcome = lambda **fields: AutonomousFund._call_outcome(fake, **fields)
     return fake, ModelBudget(), NOW
 
 
@@ -118,6 +119,8 @@ def test_the_critique_reaches_the_manager_context(tmp_path):
     fake, budget, now = critic_strategy(tmp_path)
     critique = AutonomousFund._critique(fake, {"as_of": now.isoformat()}, {"summary": "r", "evidence": []}, budget, now)
     assert critique["concerns"][0]["symbol"] == "ALFA" and critique["summary"].startswith("The momentum")
+    outcome = [row["body"] for row in fake.journal.all_events() if row["kind"] == "agent_outcome"]
+    assert [(o["role"], o["purpose"], o["valid"]) for o in outcome] == [("critic", "critique", True)]  # V2 4.3.
 
 
 def test_a_failed_or_unaffordable_critique_never_blocks_the_decision(tmp_path):

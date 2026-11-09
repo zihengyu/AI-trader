@@ -445,6 +445,37 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"{names.get(details.get('to'), details.get('to'))}。依据 {test.get('pairs')} 个交易日的配对比较，"
                 f"日均超额差 {mean * 100:.3f}%，t = {test.get('t_stat'):.2f}。风控上限不变。" if mean is not None and
                 test.get("t_stat") is not None else "🔁 组合构建方式切换：" + str(details))
+        if str(details.get("reason") or "").startswith("degradation"):
+            text += "\n这是退化回滚：最近 20 个交易日的配对比较转为不利于原方式，换回另一种方式。"
+    elif kind == "learning_champion_switched" and isinstance(details, dict):
+        names = {"memo": "看复盘备忘的基金经理", "baseline": "不看备忘的对照组"}
+        rollback = str(details.get("reason") or "").startswith("degradation")
+        text = (f"🔁 学习对照切换：{names.get(details.get('from'), details.get('from'))} → "
+                f"{names.get(details.get('to'), details.get('to'))} 开始交易。"
+                + ("这是退化回滚：最近 20 个交易日的配对比较转为不利于原来交易的一组。" if rollback else
+                   f"依据全部 {details.get('pairs')} 个交易日的配对比较，t = {details.get('t_stat')}。")
+                + "风控上限不变；另一组继续在影子里打分，证据反转时会再切回。")
+    elif kind == "degradation_detected" and isinstance(details, dict):
+        text = (f"⚠️ 换手偏高：最近 {details.get('recent_sessions')} 个交易日的日均换手 {_percent(details.get('recent_mean'))}，"
+                f"高于之前 {details.get('earlier_sessions')} 个交易日的 95% 分位 {_percent(details.get('p95'))}。"
+                f"基金经理的最短复核间隔加倍为 {details.get('min_review_minutes')} 分钟，少做调整；止损、止盈照常。"
+                "换手回到之前的中位数后自动恢复。")
+    elif kind == "unaffordable_symbols" and isinstance(details, dict):
+        rows = details.get("unaffordable") or []
+        if rows:
+            text = (f"ℹ️ 按当前账户净值 {details.get('equity'):,.2f} 美元，下面这些证券一股的价格就超过了它最多能占的仓位。"
+                    "系统只买整股，所以买不进：\n"
+                    + "\n".join(f"- {r['symbol']}：一股约 {r['share_price']:,.2f} 美元"
+                                 + ("（实时报价）" if r.get("basis") == "live_quote" else "")
+                                 + f"，占净值 {r['one_share_weight'] * 100:.1f}%，上限 {r['max_weight'] * 100:.1f}%"
+                                 + ("（已持有，可以继续持有或卖出）" if r.get("held") else "")
+                                 for r in rows[:20])
+                    + "\nAI 已被告知不要计划买入它们，研究照常。要交易它们，需要提高授权资金或单只／分组上限。")
+        else:
+            text = "ℹ️ 投资范围里的证券现在都至少买得起一股了。"
+    elif kind == "degradation_cleared" and isinstance(details, dict):
+        text = (f"✅ 换手已回到正常：最近日均 {_percent(details.get('recent_mean'))}，不高于之前的中位数 "
+                f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")
     if text is None:
         return None
     return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")
@@ -453,6 +484,7 @@ def readable(kind, details, sequence=None, *, now=None):
 # ----- Weekly report (V2 3.6) ---------------------------------------------------------------------
 
 WEEKLY_KINDS = ("account", "benchmark", "benchmark_action", "fill", "fill_reconciled", "agent", "notification",
+                "agent_outcome", "review_skipped", "critic_reused",
                 "postmarket_review", "learning_evaluation", "startup", "factor_negative_control")
 NO_DATA = "无数据"
 
@@ -629,6 +661,14 @@ def weekly_document(root, sequence):
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
             "json_extract(body,'$.session_date') BETWEEN ? AND ? ORDER BY sequence", (monday, day))]
+        # Experiment registry (V2 4.1): this week's state changes. The registry syncs just after
+        # each review is saved, so like the scorecard they are selected by date, not by the cutoff.
+        changes = []
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_experiment_history'").fetchone():
+            for experiment, at, before, after, reason in db.execute(
+                    "SELECT id,at,from_state,to_state,reason FROM fund_experiment_history ORDER BY rowid"):
+                if monday <= instant(at).astimezone(zone).date().isoformat() <= sunday:
+                    changes.append((experiment, before, after, reason))
     facts = _weekly_facts(events, monday, sunday, zone)
     reviews = [b for _, k, b in events if k == "postmarket_review" and monday <= b["session_date"] <= sunday]
     lines = [f"# {label} 模拟账户周报（{monday} 至 {sunday}）", "",
@@ -656,6 +696,12 @@ def weekly_document(root, sequence):
                + (f"（另有 {model['unpriced']} 次未定价，不按 0 计）" if model["unpriced"] else "")
                + ("；按角色：" + "、".join(f"{r} {v:.4f}" for r, v in sorted(model["by_role"].items()))
                   if model["by_role"] else "")) if model["calls"] else f"- 模型调用：{NO_DATA}"]
+    from .call_value import from_events, lines as value_lines
+    week = [(at, kind, body) for at, kind, body in events if kind in {"agent", "agent_outcome", "review_skipped",
+            "critic_reused"} and monday <= instant(at).astimezone(zone).date().isoformat() <= sunday]
+    value = value_lines(from_events(week))
+    if value:
+        lines += ["", "AI 调用价值（被采用＝结果通过校验并被使用；改变目标组合＝增删证券或权重变动至少 1 个百分点）："] + value
     lines += ["", "## 三、本周归因合计【事实，代码按收盘价计算】", ""]
     usable = [r.get("attribution") for r in reviews if (r.get("attribution") or {}).get("status") in {"complete", "partial"}]
     if usable:
@@ -710,6 +756,13 @@ def weekly_document(root, sequence):
                      f"t = {stats.get('t_stat')}")
     else:
         lines.append(f"- 学习对照（影子 A/B）：{NO_DATA}")
+    from .experiments import STATE_LABELS
+    if changes:
+        lines.append(f"- 实验登记本周的状态变化（{len(changes)} 条，完整列表：bash scripts/fund-logs.sh experiments）：")
+        lines += [f"  - {experiment}：{STATE_LABELS.get(before, '新登记') if before else '新登记'} → "
+                  f"{STATE_LABELS.get(after, after)}（{reason}）" for experiment, before, after, reason in changes[:12]]
+    else:
+        lines.append("- 实验登记本周没有状态变化")
     lines += ["", "## 七、异常和缺失数据【事实】", ""]
     health = facts["health"]
     lines.append("- 运行异常：" + ("；".join(f"{k} × {v}" for k, v in sorted(health.items())) if health else "本周没有记录"))

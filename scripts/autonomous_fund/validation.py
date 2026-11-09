@@ -341,7 +341,7 @@ def acceptance(root, criteria=None, now=None):
                        "order_reprice_cancel", "buy_chase_limit", "protective_trigger", "agent", "decision_backoff",
                        "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation",
                        "auto_resume", "benchmark", "decision_validated", "benchmark_action",
-                       "benchmark_actions_checked"))
+                       "benchmark_actions_checked", "scorecard", "agent_outcome", "review_skipped", "critic_reused"))
     zone = ZoneInfo("America/New_York")
     startups = [b for _, k, b in events if k == "startup"]
     interval = ((startups[-1].get("execution") or {}).get("iteration_seconds") or 60) if startups else 60
@@ -446,12 +446,80 @@ def acceptance(root, criteria=None, now=None):
     net = benchmark_report(events, pairs, marks, startups)
     limit = ((startups[-1].get("limits") or {}).get("drawdown")) if startups else None
     stage = capital_stage(verdict, stats, drawdown, float(limit) if limit is not None else None)
+    from .call_value import from_events
+    card = next((b for _, k, b in reversed(events) if k == "scorecard"), None)
+    investment = investment_acceptance(stats, returns, market if aligned else None, net, learning,
+                                       (card or {}).get("ideas"), from_events(events))
     return {"as_of": now.isoformat(), "mode": mode, "verdict": verdict,
             "criteria": results, "metrics": metrics, "performance_evidence": stats, "capital_stage": stage,
             "net_returns": net["returns"], "benchmarks": net["benchmarks"],
-            "data_costs_usd_per_month": net["data_costs_usd_per_month"],
+            "data_costs_usd_per_month": net["data_costs_usd_per_month"], "investment": investment,
             "limitations": "Operational readiness evidence from this journal only. It does not prove profitability; "
                            "a local virtual book is not broker evidence, and live trading needs separate approval."}
+
+
+INVESTMENT_MIN_SESSIONS = 60
+SEPARATION = ("运行验收通过不代表投资能力验收通过，反过来也一样。投资能力验收通过也只是初步判断："
+              "模拟盘的成交偏理想，样本仍短，不保证未来盈利。")
+
+
+def _smaller_t(regression):
+    values = [t for t in ((regression or {}).get("alpha_t"), (regression or {}).get("alpha_t_newey_west")) if t is not None]
+    return min(values) if values else None
+
+
+def investment_acceptance(stats, returns, market, net, learning, ideas, call_value):
+    """Investment-capability acceptance (V2 4.4), separate from the operational verdict.
+
+    Required: enough sessions; beta-adjusted alpha against SPY; beating the predefined
+    risk-matched benchmark, before and after model and data costs; the deflated Sharpe
+    after every configuration tried; and a positive beta-adjusted return in both halves
+    of the record (one lucky stretch is not stability). Reported but not required: the
+    learning comparison (gate 4) and the research ideas' calibration.
+    """
+    from .performance import Z95, regression_hac
+    sessions = stats.get("sessions") or 0
+    regression = stats.get("benchmark_regression") or {}
+    matched = next((row for row in net["benchmarks"] if row.get("current") and row.get("name") == "risk_matched"), None)
+    computed = matched is not None and matched.get("status") == "computed"
+    system = net["returns"].get("system") or {}
+    halves = None
+    if market is not None and len(returns) >= 4:
+        fit = regression_hac(returns, market)
+        if fit is not None:
+            residual = [r - fit["beta"] * m for r, m in zip(returns, market)]
+            middle = len(residual) // 2
+            halves = [sum(part) / len(part) for part in (residual[:middle], residual[middle:])]
+    stats_matched = (matched or {}).get("regression") if computed else None
+    benchmark_annual = ((matched or {}).get("benchmark") or {}).get("annual_return") if computed else None
+    system_excess = (system["annual_return"] - benchmark_annual
+                     if system.get("status") == "computed" and benchmark_annual is not None else None)
+    evaluation = (learning or {}).get("memo_minus_baseline_1d_excess") or {}
+    checks = [
+        ("min_sessions", sessions, INVESTMENT_MIN_SESSIONS, sessions >= INVESTMENT_MIN_SESSIONS, True),
+        ("alpha_t_vs_spy", _smaller_t(regression), round(Z95, 2),
+         (_smaller_t(regression) or 0) >= Z95, True),
+        ("risk_matched_excess_annual", (matched or {}).get("annual_excess_return") if computed else None, "> 0 and alpha t ≥ 1.65",
+         computed and matched["annual_excess_return"] > 0 and (_smaller_t(stats_matched) or 0) >= Z95, True),
+        ("system_net_excess_annual", system_excess if system.get("status") != "unknown_costs" else "unknown_costs", "> 0",
+         system_excess is not None and system_excess > 0, True),
+        ("deflated_sharpe", stats.get("deflated_sharpe"), 0.90, (stats.get("deflated_sharpe") or 0) >= 0.90, True),
+        ("both_halves_beta_adjusted_positive", halves, "> 0 in each half",
+         halves is not None and all(h > 0 for h in halves), True),
+        ("learning_beats_baseline_t", evaluation.get("t_stat"), 2.0,
+         bool(evaluation.get("sufficient")) and (evaluation.get("t_stat") or 0) >= 2.0, False),
+        ("research_ideas_informative", (ideas or {}).get("verdict"), "informative",
+         (ideas or {}).get("verdict") == "informative", False),
+    ]
+    criteria = [{"criterion": name, "value": value, "threshold": threshold, "passed": bool(passed), "required": required}
+                for name, value, threshold, passed, required in checks]
+    if sessions < INVESTMENT_MIN_SESSIONS or stats.get("status") != "computed":
+        verdict = "insufficient_evidence"
+    elif all(c["passed"] for c in criteria if c["required"]):
+        verdict = "preliminary_edge"
+    else:
+        verdict = "edge_not_shown"
+    return {"verdict": verdict, "criteria": criteria, "call_value": call_value, "notice": SEPARATION}
 
 
 def _number(value, digits=2):
@@ -478,18 +546,51 @@ TRIAL_LABELS = {"prompt_versions_x_risk_policies": "提示词版本×风控配�
                 "construction_alternative": "组合构建对照", "learning_control_arm": "学习对照组"}
 
 
+VERDICT_LABELS = {"ready": "通过", "not_ready": "未通过", "insufficient_evidence": "样本不足，尚不能判断",
+                  "edge_not_shown": "尚未证明有扣费后的超额收益", "preliminary_edge": "初步显示扣费后的超额收益"}
+INVESTMENT_LABELS = {"min_sessions": "交易日数", "alpha_t_vs_spy": "相对 SPY 的 alpha t（普通与 Newey-West 取小）",
+                     "risk_matched_excess_annual": "相对风险匹配基准的年化超额",
+                     "system_net_excess_annual": "扣模型和数据费后相对风险匹配基准的年化超额",
+                     "deflated_sharpe": "去试错夏普（DSR）", "both_halves_beta_adjusted_positive": "前后两半的 beta 调整后日均收益",
+                     "learning_beats_baseline_t": "学习对照：看备忘组减对照组的 t",
+                     "research_ideas_informative": "研究想法的预测能力"}
+
+
+def _shown(value):
+    if isinstance(value, float):
+        return f"{value:.4g}"
+    if isinstance(value, list):
+        return "、".join(_shown(v) for v in value)
+    return "—" if value is None else str(value)
+
+
 def acceptance_markdown(result):
-    lines = [f"# 运行验收报告（{result['mode']}）", "", f"截止：{result['as_of']}；结论：**{result['verdict']}**", "",
-             "| 标准 | 实际值 | 阈值 | 结果 |", "|---|---|---|---|"]
+    """The operational acceptance report (acceptance.md): is the system running reliably?"""
+    lines = [f"# 运行验收报告（{result['mode']}）", "",
+             f"截止：{result['as_of']}；结论：**{result['verdict']}**（{VERDICT_LABELS.get(result['verdict'], '')}）", "",
+             "只回答“系统是否可靠地运行”。是否有投资能力见投资能力验收报告（`investment_acceptance.md`）。"
+             + SEPARATION, "", "| 标准 | 实际值 | 阈值 | 结果 |", "|---|---|---|---|"]
     for row in result["criteria"]:
-        value = row["value"]
-        shown = f"{value:.4g}" if isinstance(value, float) else str(value)
-        lines.append(f"| {row['criterion']} | {shown} | {row['threshold']} | {'通过' if row['passed'] else '未通过'} |")
-    metrics = result["metrics"]
+        lines.append(f"| {row['criterion']} | {_shown(row['value'])} | {row['threshold']} | {'通过' if row['passed'] else '未通过'} |")
+    lines += ["", "## 关键指标", "", "```json", json_dump(result["metrics"]), "```", "", result["limitations"], ""]
+    return "\n".join(lines)
+
+
+def investment_markdown(result):
+    """The investment-capability acceptance report (investment_acceptance.md)."""
+    investment = result.get("investment") or {}
     stats, stage = result.get("performance_evidence") or {}, result.get("capital_stage") or {}
     regression = stats.get("benchmark_regression") or {}
     def pct(value):
         return f"{value * 100:.1f}%" if isinstance(value, (int, float)) else "—"
+    verdict = investment.get("verdict")
+    lines = [f"# 投资能力验收报告（{result['mode']}）", "",
+             f"截止：{result['as_of']}；结论：**{verdict}**（{VERDICT_LABELS.get(verdict, '')}）", "",
+             investment.get("notice", SEPARATION), "",
+             "| 标准 | 实际值 | 阈值 | 结果 | 是否必需 |", "|---|---|---|---|---|"]
+    for row in investment.get("criteria", []):
+        lines.append(f"| {INVESTMENT_LABELS.get(row['criterion'], row['criterion'])} | {_shown(row['value'])} | "
+                     f"{row['threshold']} | {'通过' if row['passed'] else '未通过'} | {'必需' if row['required'] else '参考'} |")
     lines += ["", "## 业绩证据（是能力还是运气）", "",
               f"- 交易日：{stats.get('sessions')}；年化夏普：{stats.get('sharpe_annualized')}",
               f"- 真实夏普 > 0 的概率（PSR）：{pct(stats.get('probabilistic_sharpe'))}；"
@@ -511,10 +612,12 @@ def acceptance_markdown(result):
         lines.append(f"| {row['id']} | {weights} | {'是' if row['current'] else '旧定义'} | {row['sessions']} | "
                      f"{pct(row.get('annual_excess_return'))} | {_number(row.get('information_ratio'))} | "
                      f"{_number(reg.get('alpha_t'))}／{_number(reg.get('alpha_t_newey_west'))} | {row.get('dividends')} |")
+    from .call_value import lines as value_lines
+    value = value_lines(investment.get("call_value") or {"by_purpose": {}, "calls_saved": {}})
+    lines += ["", "## AI 调用价值（全部记录）", ""] + (value or ["- 还没有带调用编号的记录"])
     lines += ["", f"## 分阶段资金就绪度：**{stage.get('stage')}**", ""]
     lines += [f"- {reason}" for reason in stage.get("reasons", [])] or ["- 全部条件满足"]
-    lines += ["", stage.get("notice", ""),
-              "", "## 关键指标", "", "```json", json_dump(metrics), "```", "", result["limitations"], ""]
+    lines += ["", stage.get("notice", ""), ""]
     return "\n".join(lines)
 
 

@@ -454,6 +454,8 @@ def review_after_close(strategy):
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
             **session, "completed_at": strategy.get_datetime().isoformat(), "context": context,
             "research": research, "model": result.model, "mock": strategy.scripted})
+        if hasattr(strategy, "_call_outcome"):
+            strategy._call_outcome()  # This researcher call's answer is the review's saved research.
     # Persist the successful Flash stage: a Pro error/restart does not pay to
     # repeat that work. Its original as_of and evidence remain visible.
     now = instant(strategy.get_datetime())
@@ -532,6 +534,10 @@ def review_after_close(strategy):
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)
+    if hasattr(strategy, "_call_outcome"):
+        strategy._call_outcome(predictions=len(review.get("predictions") or []),
+                               memo_changed=review.get("strategy_memo") != ((memory or {}).get("review") or {}).get(
+                                   "strategy_memo"))
     lab = getattr(strategy, "factor_lab", None)
     if lab is not None and review["factor_proposals"]:
         try:

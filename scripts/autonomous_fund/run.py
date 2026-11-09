@@ -304,7 +304,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -437,6 +437,10 @@ def main(argv=None):
     if args.mode == "prune":
         from .retention import lines, prune
         print("\n".join(lines(prune(args.run_dir, apply=args.apply))))
+        return
+    if args.mode == "experiments":
+        from .experiments import report
+        print("\n".join(report(args.run_dir)))
         return
     if args.mode == "weekly":
         from .notifications import latest_weekly
@@ -591,12 +595,16 @@ def main(argv=None):
         print(json.dumps(factor_lab(args, config), indent=2, ensure_ascii=False, default=str))
         return
     if args.mode == "acceptance":
-        from .validation import ValidationSettings, acceptance, acceptance_markdown
+        from .validation import ValidationSettings, acceptance, acceptance_markdown, investment_markdown
         result = acceptance(args.run_dir, ValidationSettings.from_config(config.get("validation")).acceptance)
         (args.run_dir / "acceptance.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
                                                       encoding="utf-8")
+        # Two reports (V2 4.4): passing one never implies the other.
         (args.run_dir / "acceptance.md").write_text(acceptance_markdown(result), encoding="utf-8")
-        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"]}, indent=2,
+        (args.run_dir / "investment_acceptance.md").write_text(investment_markdown(result), encoding="utf-8")
+        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"],
+                          "investment_verdict": result["investment"]["verdict"],
+                          "investment_criteria": result["investment"]["criteria"]}, indent=2,
                          ensure_ascii=False, default=str))
         return
     with FileLock(str(args.run_dir / "runner.lock"), timeout=0):

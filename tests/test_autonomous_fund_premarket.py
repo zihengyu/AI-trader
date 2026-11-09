@@ -62,6 +62,12 @@ def test_weekend_research_is_recorded_without_order_or_manager(tmp_path):
     assert result["validated_decisions"] == result["fills_observed"] == 0
     assert result["model_usage"]["input_tokens"] == 10
     assert json.loads((tmp_path / "premarket_research.json").read_text())["research"]["summary"].startswith("SCRIPTED")
+    # V2 4.3: the call is a premarket research call, and its saved research is its outcome.
+    rows = strategy.journal.all_events()
+    agent = next(r["body"] for r in rows if r["kind"] == "agent")
+    outcome = next(r["body"] for r in rows if r["kind"] == "agent_outcome")
+    assert agent["purpose"] == "premarket_research" and outcome["call_id"] == agent["call_id"]
+    assert outcome["new_ideas"] == 0
 
 
 def test_research_deduplicates_session_phase_but_refreshes_before_open(tmp_path):

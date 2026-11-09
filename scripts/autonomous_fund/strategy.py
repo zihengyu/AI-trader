@@ -28,6 +28,23 @@ POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
                    "construction", "critic", "data_desk", "manager_run_timeout_seconds")
 NOTICE_WINDOWS = {"stop_active": 21600}
+# Assumed per-side slippage when the broker states none (Alpaca paper), for the trade value check (V2 4.5).
+DEFAULT_SLIPPAGE = 0.0005
+# A call's purpose (V2 4.3), from its context phase, else from its role.
+CALL_PURPOSES = {"postmarket_review": "postmarket_review", "before_market_opens": "premarket_research",
+                 "closed_startup": "premarket_research"}
+DEFAULT_PURPOSES = {"manager": "decision", "researcher": "research", "critic": "critique"}
+
+
+def targets_changed(previous, decision):
+    """Whether a decision changes the target portfolio: a symbol added or removed, or a weight moved by
+    at least one point (the rule of the Telegram adjustment notice). The first decision is a change."""
+    def weights(body):
+        return {t["symbol"]: number(t["weight"]) for t in (body or {}).get("targets", []) if number(t["weight"]) > 0}
+    if not previous:
+        return True
+    old, new = weights(previous), weights(decision)
+    return set(old) != set(new) or any(abs(new[s] - old[s]) >= number("0.01") for s in new)
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
@@ -934,6 +951,119 @@ class AutonomousFund(Strategy):
                     self.journal.set_meta("learning_evaluated_session", session)
         except Exception as exc:
             self._notify_fund("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        try:
+            self._check_degradation(self.get_datetime())
+        except Exception as exc:  # A guard that cannot evaluate keeps its last state.
+            self._disclose_failure("degradation_check_error", exc, phase="postmarket_review")
+        try:
+            self._sync_experiments(self.get_datetime())
+        except Exception as exc:  # The registry records the experiments; it never stops them.
+            self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
+
+    def _affordability(self, equity, positions, now):
+        """Symbols one share of which is above their position ceiling at this equity (whole shares only).
+
+        The operator hears once per New York day when that list changes: the AI is told not to
+        target them, and trading them needs more authorized capital or a higher cap.
+        """
+        from .trade_value import affordability
+        try:
+            snapshot = self._market_snapshot(now) or {}
+            closes = {s: v.get("last_close") for s, v in (snapshot.get("symbols") or {}).items() if s in self.universe}
+            groups = getattr(getattr(self, "quant", None), "groups", ())
+            held = {s for s, q in (positions or {}).items() if number(q) != 0}
+            # Near its ceiling a symbol is re-checked with a current quote, so a move during the
+            # session counts at the next decision. Replays keep the completed close.
+            live = (lambda symbol: self._alert_price(symbol).price) if self.mode in {"local", "paper"} else None
+            result = affordability(closes, equity, self.limits.max_position, groups, held, live=live)
+        except Exception as exc:  # Context for the AI: never costs the decision or the research.
+            return {"unavailable": type(exc).__name__}
+        names = sorted(row["symbol"] for row in result["unaffordable"])
+        noted = self.journal.get_meta("unaffordable_notified") or {}
+        if names != noted.get("symbols", []) and noted.get("day") != trading_day(now):
+            self.journal.set_meta("unaffordable_notified", {"day": trading_day(now), "symbols": names})
+            if names or noted.get("symbols"):
+                self._notify_fund("unaffordable_symbols", result)
+        return result
+
+    def _trade_value_model(self, now):
+        """V2 4.5, built once per decision: round-trip costs for the manager, and once the research
+        ideas are calibrated, what the allocation uses to decline purchases that do not cover them."""
+        from .local_broker import LocalPaperBroker
+        from .trade_value import model
+        try:
+            cards = self._scorecards(now) if getattr(self, "quant", None) is not None else None
+            broker = getattr(self, "broker", None)
+            # The local book states its own fee and slippage; a broker's fills are not modeled here.
+            fee, slippage = ((broker.fee_rate, broker.slippage) if isinstance(broker, LocalPaperBroker)
+                             else (0, DEFAULT_SLIPPAGE))
+            current = model((cards or {}).get("ideas"), fee, slippage)
+        except Exception as exc:  # Evidence tooling never costs the decision: nothing is declined.
+            current = {"active": False, "reason": f"unavailable: {type(exc).__name__}"}
+        self.journal.set_meta("trade_value_model", current)
+        return current
+
+    def _min_review_minutes(self, budget):
+        """The manager's minimum review interval: doubled while the turnover guard (V2 4.2) is on."""
+        guard = self.journal.get_meta("turnover_guard") or {}
+        return budget.min_review_minutes * (2 if guard.get("active") else 1)
+
+    def _check_degradation(self, now):
+        """V2 4.2 turnover guard, once per completed review: turnover far above its own history slows reviews."""
+        import pandas_market_calendars as mcal
+        from zoneinfo import ZoneInfo
+        from .degradation import daily_turnover, turnover_check
+        from .evaluation import nav_marks
+        from .ledger_audit import audit_connection
+        zone, now = ZoneInfo("America/New_York"), instant(now)
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            integrity = audit_connection(db)
+            if integrity["status"] == "failed":
+                return None  # A disputed book is no basis for a decision about trading activity.
+            equity = {}
+            for mark in nav_marks(db, until=now, excluded=set(integrity.get("invalid_account_sequences", []))):
+                equity[instant(mark[4] or mark[1]).astimezone(zone).date().isoformat()] = float(mark[3])
+            fills = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+                "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")
+                if instant(at) <= now]
+        if equity:
+            schedule = mcal.get_calendar("NYSE").schedule(start_date=min(equity), end_date=max(equity))
+            sessions = {index.date().isoformat() for index, market in schedule.iterrows() if market.market_close <= now}
+            equity = {day: value for day, value in equity.items() if day in sessions}  # Completed sessions only.
+        state = self.journal.get_meta("turnover_guard") or {}
+        result = turnover_check(daily_turnover(fills, equity), bool(state.get("active")))
+        if result["active"] != bool(state.get("active")):
+            self.journal.set_meta("turnover_guard", {**result, "since": now.isoformat()} if result["active"] else None)
+            self.journal.event(now, "degradation", {"guard": "turnover", **result})
+            budget = getattr(self, "model_budget", None) or ModelBudget()
+            self._notify_fund("degradation_detected" if result["active"] else "degradation_cleared",
+                              {**result, "min_review_minutes": budget.min_review_minutes * (2 if result["active"] else 1)})
+        return result
+
+    def _sync_experiments(self, now):
+        """Record every experiment's current state in the registry (V2 4.1), once per completed review."""
+        from .experiments import Registry, observations
+        registry = getattr(self, "_registry", None) or Registry(self.journal)
+        self._registry = registry
+        settings = getattr(self, "validation", None)
+        learning = None
+        if settings is not None:
+            learning = {"enabled": settings.shadow_enabled and getattr(self, "memory_mode", "rolling") == "rolling",
+                        "champion": self._champion(), "evaluation": self.journal.get_meta("learning_evaluation"),
+                        "version_config": {"prompt_version": getattr(self, "prompt_version", None),
+                                           "min_pairs": settings.min_pairs, "switch_t_stat": settings.switch_t_stat}}
+        construction = None
+        cards = self._scorecards(now) if getattr(self, "quant", None) is not None else None
+        if getattr(self, "construction", None) is not None and getattr(self, "quant", None) is not None:
+            options = self.construction
+            construction = {"trading": self._construction_arm(), "evaluation": (cards or {}).get("construction"),
+                            "config": {"mode": options.mode, "min_pairs": options.min_pairs,
+                                       "switch_t_stat": options.switch_t_stat}}
+        lab = getattr(self, "factor_lab", None)
+        return registry.observe(now, observations(
+            factors=lab.rows() if lab is not None else (), learning=learning, construction=construction,
+            scorecards=cards, previous=registry.state))
 
     def _announce_decision(self, decision, now, account=None, decision_id=None):
         """Tell the operator when the AI changes the target portfolio, and its first plan
@@ -1039,6 +1169,8 @@ class AutonomousFund(Strategy):
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
+                       "affordability": self._affordability((account or {}).get("equity"), (account or {}).get("positions")
+                                                            or {}, now) if "unavailable" not in account else None,
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
@@ -1060,6 +1192,7 @@ class AutonomousFund(Strategy):
                 packet["idea_ids"] = []
                 self._disclose_failure("idea_registration_error", exc, phase="premarket_research")
             self.journal.event(self.get_datetime(), "premarket_research", packet)
+            self._call_outcome(new_ideas=len(packet["idea_ids"]))
             self.premarket_research = packet
             # The operator reads the research on Telegram before the session.
             self._disclose("premarket_research", {
@@ -1426,7 +1559,9 @@ class AutonomousFund(Strategy):
                 from .review import PostmarketReview
                 schema = PostmarketReview
             diagnostic = structured_answer_diagnostic(result, schema)
+        call = getattr(self, "_current_call", None) or {}
         self.journal.event(now, "agent", {
+            **({"call_id": call["call_id"], "purpose": call["purpose"]} if call.get("role") == name else {}),
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
             "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
             "mock": self.scripted, "phase": phase, "tokens": tokens,
@@ -1447,15 +1582,29 @@ class AutonomousFund(Strategy):
         # research evidence keeps its explicit (nullable) publication time.
         return parsed.model_dump(exclude_none=isinstance(parsed, Decision))
 
-    def _agent_call(self, name, **kwargs):
+    def _call_outcome(self, **fields):
+        """The latest call's result was used (V2 4.3); never raises into the trading path."""
+        call = getattr(self, "_current_call", None)
+        if not call:
+            return
+        try:
+            self.journal.event(self.get_datetime(), "agent_outcome", {**call, "valid": True, **fields})
+        except Exception:
+            pass
+
+    def _agent_call(self, name, purpose=None, **kwargs):
         if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
             kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
         key = uuid4().hex
+        # What the call is for (V2 4.3): its agent event and, once its result is used, its outcome share the id.
+        phase = (kwargs.get("context") or {}).get("phase")
+        purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
+        self._current_call = {"call_id": key, "role": name, "purpose": purpose}
         self.journal.counter("agent_runs", self.get_datetime(), 1)
         self.journal.event(self.get_datetime(), "agent_call_started", {
-            "id": key, "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown")})
+            "id": key, "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "purpose": purpose})
         try:
             return self.agents[name].run(**kwargs)
         except BaseException as exc:
@@ -1464,7 +1613,7 @@ class AutonomousFund(Strategy):
             self.journal.event(self.get_datetime(), "agent", {
                 "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "cache_hit": False, "usage": None,
                 "summary": "Agent attempt failed; provider usage unknown.", "parse_error": type(exc).__name__,
-                "mock": self.scripted, "phase": (kwargs.get("context") or {}).get("phase")})
+                "mock": self.scripted, "phase": phase, "call_id": key, "purpose": purpose})
             raise
         finally:
             self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
@@ -1691,6 +1840,8 @@ class AutonomousFund(Strategy):
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
+                   "trade_value": self._trade_value_model(now),
+                   "affordability": self._affordability(account.equity, account.positions, now),
                    "factor_lab": self._factor_context(now),
                    "macro": self._macro_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
@@ -1700,7 +1851,8 @@ class AutonomousFund(Strategy):
                        "take_profit": "reduce to take_profit_weight (default 0) when the bid reaches this price",
                        "alerts": "wake you for an early review when a price crosses above/below a level",
                        "news_watch": "search phrases; a new matching headline wakes you for an early review"},
-                   "model_budget": {"min_review_minutes": budget.min_review_minutes,
+                   "model_budget": {"min_review_minutes": self._min_review_minutes(budget),
+                                    "turnover_guard": self.journal.get_meta("turnover_guard"),
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day,
                                     "cost_today_usd": round(self.journal.counter("model_cost_microusd", now) / 1e6, 4),
                                     "max_daily_cost_usd": budget.max_daily_cost_usd,
@@ -1731,7 +1883,7 @@ class AutonomousFund(Strategy):
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
             validate_decision(decision, now, self.universe, self.limits)
-            minimum = timedelta(minutes=budget.min_review_minutes)
+            minimum = timedelta(minutes=self._min_review_minutes(budget))
             accepted_id = self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
             # What this decision saw: a later scheduled review with nothing new can skip the model call.
             self.journal.set_meta("last_model_decision", {"at": now.isoformat(), "day": trading_day(now),
@@ -1745,6 +1897,7 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_failure_role", None)
         self.journal.event(now, "decision_validated", {
             **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None)})
+        self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
         self._record_construction_variant(decision, now)
         self._triggers = []
         self.last_decision = decision
@@ -1848,6 +2001,7 @@ class AutonomousFund(Strategy):
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
                 context={**context, "research": research}), phase="critique")
             self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
+            self._call_outcome()
             return critique
         except Exception as exc:
             self.journal.event(self.get_datetime(), "critic_unavailable",
@@ -1905,12 +2059,13 @@ class AutonomousFund(Strategy):
         record = {"arm": arm, "trading_arm": champion, "decided_at": decision["as_of"], "trading_decision": decision,
                   "memo_version": (context.get("strategy_memory") or {}).get("version")}
         try:
-            shadow = self._record_agent("manager", self._agent_call("manager",
+            shadow = self._record_agent("manager", self._agent_call("manager", purpose="shadow",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
                 context=self._arm_context(context, arm)), phase="shadow")
             # Structural validation at its own as_of: this answer is scored, never executed.
             validate_decision(shadow, instant(shadow["as_of"]), self.universe, self.limits)
             self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": shadow, "valid": True})
+            self._call_outcome()
         except Exception as exc:
             self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": None, "valid": False,
                                "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
@@ -1926,23 +2081,32 @@ class AutonomousFund(Strategy):
         symbols = {"SPY"} | {t["symbol"] for row in rows for body in (row["decision"], row["trading_decision"])
                              for t in body["targets"]}
         closes = {s: self._daily_closes(s, now) for s in sorted(symbols & (set(self.universe) | {"SPY"}))}
-        stats = paired_test(shadow_pairs(rows, closes), settings.min_pairs)
+        differences = shadow_pairs(rows, closes)
+        stats = paired_test(differences, settings.min_pairs)
         champion = self._champion()
-        switch = None
+        switch, reason = None, None
         if stats["sufficient"] and stats["t_stat"] is not None:
             if champion == "memo" and stats["t_stat"] <= -settings.switch_t_stat:
                 switch = "baseline"
             elif champion == "baseline" and stats["t_stat"] >= settings.switch_t_stat:
                 switch = "memo"
+            if switch:
+                reason = f"full record: t = {stats['t_stat']:.2f} over {stats['pairs']} sessions"
+        from .degradation import WINDOW, rolling_rollback
+        rollback, recent = rolling_rollback(differences, champion, "memo", "baseline", settings.switch_t_stat)
+        if switch is None and rollback:
+            # V2 4.2: the last WINDOW sessions turned against the trading arm; the previous one trades again.
+            switch, reason = rollback, f"degradation: last {WINDOW} sessions t = {recent['t_stat']:.2f}"
         evaluation = {"as_of": str(now), "champion": switch or champion, "previous_champion": champion,
                       "memo_minus_baseline_1d_excess": stats, "switch_t_stat": settings.switch_t_stat,
+                      "recent": recent, "reason": reason,
                       "interpretation": "Paired next-session excess returns of the memo-informed and baseline "
                                         "decisions made from the same research. A switch needs at least min_pairs "
                                         "sessions and |t| >= switch_t_stat; otherwise the current arm keeps trading."}
         if switch:
             self.journal.set_meta("learning_champion", switch)
             self._notify_fund("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
-                                                       "pairs": stats["pairs"]})
+                                                       "pairs": stats["pairs"], "reason": reason})
         self.journal.set_meta("learning_evaluation", evaluation)
         self.journal.event(now, "learning_evaluation", evaluation)
         return evaluation
@@ -2169,7 +2333,7 @@ class AutonomousFund(Strategy):
             if settings.mode == "auto" and construction["champion"] != current:
                 self.journal.set_meta("construction_champion", construction["champion"])
                 self._notify_fund("construction_switched", {"from": current, "to": construction["champion"],
-                                                      "test": construction["test"]})
+                                                      "test": construction["trigger"], "reason": construction["reason"]})
         self._scorecard_cache = (key, result)
         return result
 
@@ -2968,6 +3132,25 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
 
+    def _limit_uncovered_adds(self, active, weights, current, prices, now, overlay):
+        """V2 4.5: hold at the current weight each purchase whose calibrated edge does not cover its cost."""
+        from .trade_value import limit_adds
+        model = self.journal.get_meta("trade_value_model")
+        if not model or not model.get("active"):
+            return weights
+        packet = getattr(self, "premarket_research", None)
+        ideas = self._session_ideas(packet["session_open"]) if isinstance(packet, dict) and packet.get("session_open") else []
+        limited, held = limit_adds(weights, current, ideas, prices, model)
+        noted = self.__dict__.setdefault("_trade_value_noted", set())
+        for symbol, verdict in sorted(held.items()):
+            if (active["id"], symbol) not in noted:
+                noted.add((active["id"], symbol))
+                self.journal.event(now, "trade_value_held", {"decision_id": active["id"], "symbol": symbol,
+                                   "target_weight": str(weights[symbol]), "held_at": str(limited[symbol]), **verdict})
+        if held:
+            overlay["binding"] = [f"trade_value:{s}" for s in sorted(held)] + overlay["binding"]
+        return limited
+
     def _candidates(self, active, account, prices, now):
         """The single deterministic path from accepted AI targets to the next order.
 
@@ -3001,6 +3184,7 @@ class AutonomousFund(Strategy):
         requested = {s: min(w, caps.get(s, w)) for s, w in requested.items()}
         weights, overlay = construct(requested, current, estimate, self.quant, self.limits,
                                      self.limits.max_exposure * scale)
+        weights = self._limit_uncovered_adds(active, weights, current, prices, now, overlay)
         if capped:
             overlay["binding"] = [f"earnings:{s}" for s in capped] + overlay["binding"]
             overlay["event_caps"] = {s: str(caps[s]) for s in capped}

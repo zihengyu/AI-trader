@@ -66,7 +66,7 @@ def test_capital_stage_requires_every_test_and_never_claims_a_live_path():
 
 def test_acceptance_report_includes_the_evidence_and_ignores_reserve_moves(tmp_path):
     from scripts.autonomous_fund.journal import Journal
-    from scripts.autonomous_fund.validation import acceptance, acceptance_markdown
+    from scripts.autonomous_fund.validation import acceptance, acceptance_markdown, investment_markdown
     journal = Journal(tmp_path, "synthetic-performance")
     start = datetime(2026, 7, 6, 19, 0, tzinfo=timezone.utc)  # 15:00 New York; July 6-31 has no NYSE holiday.
     journal.event(start, "startup", {"mode": "local", "limits": {"drawdown": "0.08"}, "risk_policy_digest": "p1",
@@ -90,5 +90,6 @@ def test_acceptance_report_includes_the_evidence_and_ignores_reserve_moves(tmp_p
     assert stats["sessions"] == 18  # 19 consecutive pairs minus the one spanning the reserve move.
     assert stats["configurations_tried"] == 2 and stats["mean_return"] == pytest.approx(0.002, abs=1e-9)
     assert result["capital_stage"]["stage"] == "paper_only"
-    text = acceptance_markdown(result)
+    text = investment_markdown(result)
     assert "业绩证据" in text and "分阶段资金就绪度" in text
+    assert "业绩证据" not in acceptance_markdown(result)  # Operational and investment acceptance are separate.

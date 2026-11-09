@@ -323,6 +323,60 @@ through it, or the review failed), the week is reported from its latest review
 once the next week's first session opens. ``bash scripts/fund-logs.sh weekly``
 prints this week's report so far without sending it.
 
+**Which experiments are in effect.** ``bash scripts/fund-logs.sh experiments``
+lists every experiment version the fund runs: factors, the learning and
+construction comparisons, and the prediction statistics. For each it shows the
+state (in effect on the paper account, scored in the shadow, rejected or retired)
+and the history of state changes with their evidence. A changed configuration
+is a new version and never overwrites the old one. The registry only records:
+switching and retirement rules are unchanged.
+
+**Whether the AI calls are worth their cost.** Each model call is journaled with
+a ``call_id`` and a purpose, and an ``agent_outcome`` is written when its result
+is actually used. That is a validated decision (and whether it changed the
+target portfolio), saved research (and its ideas), a saved review (and its
+predictions), a scored shadow decision or a critique the manager saw. The
+weekly report lists, per purpose, the calls, how many were used, how many
+changed the portfolio, and the cost per used call and per change. Unpriced calls
+make the cost ratios unknown rather than zero.
+
+**Reading the acceptance reports.** ``acceptance`` writes two independent
+reports. ``acceptance.md`` says whether the system runs reliably.
+``investment_acceptance.md`` says whether there is an excess return after
+costs: at least 60 sessions, beta-adjusted alpha against SPY, beating the
+predefined risk-matched benchmark before and after model and data costs, a
+deflated Sharpe ratio of at least 0.90, and a positive result in both halves of
+the record. Its best verdict is ``preliminary_edge``. Passing the operational
+report does not pass the investment report.
+
+**When what is in effect gets worse.** After each review the fund checks fixed
+thresholds. The learning and construction comparisons keep their full-record
+switch rule. They also roll back to the other arm when the last 20 paired
+sessions turn against the arm that trades with ``|t| >= 2``. When the mean
+turnover of the last five sessions is above the 95th percentile of at least 40
+earlier sessions, the manager's minimum review interval doubles. Protective
+exits are unaffected, and the interval returns to normal at the earlier
+median. Short-term profit or loss alone never triggers anything.
+
+**Why a purchase was declined as not worth its cost.** The manager always sees the
+round-trip cost of a trade (fee, slippage and the quoted spread). Once the
+research ideas' scorecard verdict is ``informative``, an add of a symbol with an
+idea for that day is held at the current weight when the idea's calibrated
+edge does not cover that cost. The journal records it as ``trade_value_held``.
+Reductions, sells and protective exits are never limited.
+
+**A symbol the AI never buys.** The fund buys whole shares. When one share at
+the last close is worth more than the symbol's ceiling, no target can buy it.
+The ceiling is the smallest of the single-position limit and the caps of its
+groups, such as 5% for a leveraged ETF. The AI's context lists such symbols, and
+Telegram says when the list changes. Raise the authorized capital or the cap to
+trade them. The list is recomputed at every pre-market research and decision
+from the current equity. A symbol whose share weight is within 10% of its
+ceiling is re-checked with a live quote in local and paper mode, so a move
+during the session counts at the next decision. The context also lists
+affordable symbols of which at most four shares fit, because a target is
+rounded down to whole shares.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
