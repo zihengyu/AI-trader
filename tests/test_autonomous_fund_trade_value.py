@@ -128,7 +128,7 @@ def test_a_share_above_its_ceiling_is_unaffordable_and_group_caps_count():
     rows = {row["symbol"]: row for row in result["unaffordable"]}
     assert set(rows) == {"SNDK", "SQQQ"}  # NVDA (9%) and SPY (6%) fit under 10%; SQQQ's own cap is 5%.
     assert rows["SNDK"] == {"symbol": "SNDK", "share_price": 1500.0, "one_share_weight": 0.15, "max_weight": 0.1,
-                            "held": True}
+                            "basis": "last_close", "held": True}
     assert rows["SQQQ"]["max_weight"] == 0.05 and "Whole shares only" in result["meaning"]
     assert affordability({"SNDK": 1500.0}, 0, Decimal("0.10"), ())["unaffordable"] == []
 
@@ -170,3 +170,44 @@ def test_the_manager_sees_which_symbols_it_cannot_buy(tmp_path):
     strategy._agent_call = call
     strategy._decide(account(), NOW, False)
     assert "affordability" in seen["manager"] and "unaffordable" in seen["manager"]["affordability"]
+
+
+def test_a_symbol_near_its_ceiling_is_rechecked_with_a_live_quote_and_can_become_affordable():
+    from scripts.autonomous_fund.trade_value import affordability
+    asked = []
+
+    def live(symbol):
+        asked.append(symbol)
+        if symbol == "BROKEN":
+            raise RuntimeError("synthetic quote outage")
+        return {"SNDK": 980.0, "RISEN": 1060.0}[symbol]
+    closes = {"SNDK": 1050.0, "RISEN": 990.0, "BROKEN": 1020.0, "BKNG": 5000.0, "SPY": 600.0}
+    result = affordability(closes, 10000, Decimal("0.10"), (), live=live)
+    assert sorted(asked) == ["BROKEN", "RISEN", "SNDK"]  # Far from the ceiling (BKNG 50%, SPY 6%): no quote needed.
+    unaffordable = {row["symbol"]: row for row in result["unaffordable"]}
+    coarse = {row["symbol"]: row for row in result["coarse"]}
+    assert "SNDK" not in unaffordable and coarse["SNDK"]["basis"] == "live_quote" and coarse["SNDK"]["max_shares"] == 1
+    assert unaffordable["RISEN"]["basis"] == "live_quote"  # Rose above its ceiling during the session.
+    assert unaffordable["BROKEN"]["basis"] == "last_close (live quote unavailable)"
+    assert unaffordable["BKNG"]["basis"] == "last_close" and coarse["SPY"]["max_shares"] == 1
+
+
+def test_affordable_symbols_that_fit_only_a_few_shares_are_listed_as_coarse():
+    from scripts.autonomous_fund.trade_value import affordability
+    result = affordability({"NVDA": 300.0, "SPY": 60.0, "AVGO": 450.0}, 10000, Decimal("0.10"), ())
+    coarse = {row["symbol"]: row["max_shares"] for row in result["coarse"]}
+    assert coarse == {"NVDA": 3, "AVGO": 2} and result["unaffordable"] == []  # SPY fits 16 shares: not coarse.
+    assert "rounded down to whole shares" in result["meaning"]
+
+
+def test_live_rechecks_run_in_local_and_paper_mode_only(tmp_path):
+    from tests.test_autonomous_fund_quant import NOW, harness
+    strategy = harness(tmp_path)
+    strategy._market_snapshot = lambda now: {"symbols": {"ALFA": {"last_close": 1020.0}}}
+    quoted = []
+    strategy._alert_price = lambda symbol: quoted.append(symbol) or SimpleNamespace(price=Decimal("990"))
+    replay = strategy._affordability(Decimal("10000"), {}, NOW)
+    assert quoted == [] and [r["symbol"] for r in replay["unaffordable"]] == ["ALFA"]  # Replays keep the close.
+    strategy.mode = "local"
+    live = strategy._affordability(Decimal("10000"), {}, NOW)
+    assert quoted == ["ALFA"] and live["unaffordable"] == [] and live["coarse"][0]["basis"] == "live_quote"

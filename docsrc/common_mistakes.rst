@@ -370,7 +370,12 @@ the last close is worth more than the symbol's ceiling, no target can buy it.
 The ceiling is the smallest of the single-position limit and the caps of its
 groups, such as 5% for a leveraged ETF. The AI's context lists such symbols, and
 Telegram says when the list changes. Raise the authorized capital or the cap to
-trade them.
+trade them. The list is recomputed at every pre-market research and decision
+from the current equity. A symbol whose share weight is within 10% of its
+ceiling is re-checked with a live quote in local and paper mode, so a move
+during the session counts at the next decision. The context also lists
+affordable symbols of which at most four shares fit, because a target is
+rounded down to whole shares.
 
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of

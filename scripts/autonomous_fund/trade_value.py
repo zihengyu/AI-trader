@@ -77,27 +77,57 @@ def limit_adds(weights, current_weights, ideas, prices, current):
     return result, held
 
 
-def affordability(last_closes, equity, max_position, groups, held=()):
-    """Symbols whose single share costs more than the fund may ever hold of them.
+NEAR_CEILING = 0.10  # Share weights within this fraction of the ceiling are re-checked with a live quote.
+COARSE_SHARES = 4  # An affordable symbol of which at most this many whole shares fit is listed as coarse.
+
+
+def affordability(last_closes, equity, max_position, groups, held=(), live=None):
+    """Symbols whose single share costs more than the fund may hold of them, and those that fit only a few shares.
 
     The fund buys whole shares. A symbol's ceiling is the smallest of the single-position
     limit and the cap of every risk group it belongs to (a leveraged ETF's own cap, a
-    sector's combined cap); when one share at the last completed close is above that
-    ceiling, no target can ever buy it. A held symbol can still be held or sold.
+    sector's combined cap). Prices are the last completed close; a symbol whose share
+    weight there is within NEAR_CEILING of its ceiling is re-checked with `live(symbol)`
+    (a current quote) when given, so a move during the session counts at once. A live
+    quote that cannot be read leaves the close in use.
+
+    - unaffordable: one share is above the ceiling; no target can buy it.
+    - coarse: affordable, but at most COARSE_SHARES whole shares fit under the ceiling; a
+      target is rounded down to whole shares, so one below one share's weight buys none.
+    A held symbol can still be held or sold.
     """
     equity = float(equity or 0)
     if equity <= 0:
-        return {"equity": equity, "unaffordable": []}
-    rows = []
+        return {"equity": equity, "unaffordable": [], "coarse": []}
+    unaffordable, coarse = [], []
     for symbol, price in sorted(last_closes.items()):
         if price is None or float(price) <= 0:
             continue
         ceiling = min([float(max_position)] + [float(cap) for _, cap, members in groups if symbol in members])
-        weight = float(price) / equity
+        if ceiling <= 0:
+            continue
+        price, basis = float(price), "last_close"
+        if live is not None and abs(price / equity / ceiling - 1) <= NEAR_CEILING:
+            try:
+                quoted = float(live(symbol))
+                if quoted > 0:
+                    price, basis = quoted, "live_quote"
+            except Exception:
+                basis = "last_close (live quote unavailable)"
+        weight = price / equity
+        row = {"symbol": symbol, "share_price": round(price, 2), "one_share_weight": round(weight, 4),
+               "max_weight": round(ceiling, 4), "basis": basis}
         if weight > ceiling:
-            rows.append({"symbol": symbol, "share_price": round(float(price), 2), "one_share_weight": round(weight, 4),
-                         "max_weight": round(ceiling, 4), "held": symbol in held})
-    return {"equity": round(equity, 2), "unaffordable": rows,
-            "meaning": "Whole shares only: one share of each listed symbol is worth more than the most this account "
-                       "may hold of it, so a target cannot buy it at all. Do not target these for purchase; holding "
-                       "or selling an existing position is unaffected. Research on them remains useful."}
+            unaffordable.append({**row, "held": symbol in held})
+        else:
+            shares = int(ceiling / weight + 1e-9)
+            if shares <= COARSE_SHARES:
+                coarse.append({**row, "max_shares": shares})
+    return {"equity": round(equity, 2), "unaffordable": unaffordable, "coarse": coarse,
+            "meaning": "Whole shares only. unaffordable: one share is worth more than the most this account may hold "
+                       "of the symbol, so a target cannot buy it at all; do not target these for purchase. coarse: at "
+                       "most max_shares whole shares fit under the ceiling; a target weight is rounded down to whole "
+                       "shares, so a target below one_share_weight buys nothing and one between steps buys the lower "
+                       "step. Holding or selling an existing position is unaffected, and research on these symbols "
+                       "remains useful. Prices are the last completed close, or a live quote (basis live_quote) for "
+                       "symbols near their ceiling, re-checked at every decision."}
