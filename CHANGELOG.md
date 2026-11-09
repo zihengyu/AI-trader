@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Fixed
+- The optional autonomous fund's weekly report could not be built for a week with a fill that had no arrival quote or fee. That day's attribution marks timing, slippage or fees as unknown, and the weekly sum added the unknown value and raised `TypeError`. After three attempts the monitor sent only a short notice. Unknown parts are now left out of the weekly total and labeled with how many days were unknown, never summed as zero. The missing-data section names fills without an arrival quote.
 - The optional autonomous fund retries transient Windows sharing failures when publishing a complete cache file. A failed publication preserves the previous cache entry.
 - The optional autonomous fund uses the NYSE calendar for scorecard deadlines, regime lookbacks and investment acceptance. Late decisions start after acceptance, A/B comparisons count each start session once, and missing price or account marks cannot be collapsed into one-day returns.
 - The autonomous fund's data desk and prefetch cross-check recent split ratios and cash dividends on the same share basis. Material contradictions withhold research history; missing and one-sided evidence are reported separately.

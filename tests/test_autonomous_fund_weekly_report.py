@@ -152,3 +152,36 @@ def test_the_week_end_follows_the_exchange_calendar(tmp_path):
     assert monitor._week_ends("2026-11-06") and not monitor._week_ends("2026-11-04")
     assert monitor._week_ends("2026-04-02")  # Good Friday 2026: Thursday ends the week.
     assert not monitor._week_ends("2026-04-01")
+
+
+def test_a_day_with_unknown_attribution_parts_is_summed_without_them_and_says_so(tmp_path):
+    """2026-11-09 server incident: a fill without an arrival quote made the day's timing and slippage
+    unknown (None), and the weekly sum raised TypeError, so the W45 report could not be built."""
+    journal, _ = ledger(tmp_path)
+    partial = attribution("2026-11-05", 0.001)
+    partial.update(status="partial", arrival_unknown=["ALFA"], fees_unknown=["BETA"])
+    partial["components"].update(timing=None, slippage=None, fees=None)
+    review(journal, "2026-11-05", "周四：一笔成交缺到达报价。", partial)
+    sequence = review(journal, "2026-11-06", "周五：市场贡献为主。", attribution("2026-11-06", -0.001))
+    _, text = weekly_document(tmp_path, sequence)
+    body = text.split("## 三、本周归因合计")[1].split("## 四")[0]
+    # Known parts add up over the four reviews (0.2% - 0.1% + 0.1% - 0.1%); an unknown part is never zero.
+    assert "- 选股：0.10%\n" in body
+    assert "- 当日交易择时（相对收盘）：0.00%（1 天未知，未计入）" in body
+    assert "- 执行滑点（相对到达价）：-0.01%（1 天未知，未计入）" in body  # Three known days of -0.002%.
+    assert "- 费用：-0.00%（1 天未知，未计入）" in body
+    assert "（4 个交易日相加，其中不完整 1 天）" in body
+    # Section 七 names what was missing that day.
+    assert "2026-11-05：BETA 费用未知、ALFA 缺到达报价（择时／滑点未知）" in text.split("## 七")[1]
+
+
+def test_a_part_unknown_on_every_day_is_shown_as_unknown_not_zero(tmp_path):
+    journal = Journal(tmp_path, "synthetic-weekly-unknown")
+    journal.event(close_of("2026-10-30", -600), "startup", {"mode": "local", "execution_revision": EXECUTION_REVISION})
+    partial = attribution("2026-11-04", 0.001)
+    partial.update(status="partial")
+    partial["components"].update(timing=None, slippage=None)
+    sequence = review(journal, "2026-11-04", "周三：缺到达报价。", partial)
+    body = weekly_document(tmp_path, sequence)[1].split("## 三、本周归因合计")[1].split("## 四")[0]
+    assert "- 当日交易择时（相对收盘）：未知（每天都缺数据）" in body and "- 执行滑点（相对到达价）：未知（每天都缺数据）" in body
+    assert "- 选股：0.10%" in body
