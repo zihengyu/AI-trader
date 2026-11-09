@@ -1523,8 +1523,10 @@ Flash 和 Pro 共用的发送层现在递归生成严格 wire schema，明确要
 **盘中决策的格式纠正**（2026-11 起）：基金经理的每次决策请求本来就带着 Decision schema：
 `deepseek/deepseek-flash` 和 `deepseek/deepseek-v4-pro` 走 DeepSeek 原生严格 JSON schema（`strict: true`）；
 其他模型只能把 schema 写进提示词。但提供方并不总是严格执行，偶尔仍会返回不合格的回答。
-例如回答是一段文字，宽松的解析器从文字里取到 `[1]` 这样的方括号，当成列表，就报 `schema_validation: $ (model_type)`
-（`$` 指整个回答，`model_type` 指它不是一个 JSON 对象）。以前这一轮决策直接作废，按 5、15、60 分钟退避重试。
+2026-11 的 `schema_validation: $ (model_type)`（`$` 指整个回答，`model_type` 指它不是一个 JSON 对象）就是这样：
+回答是一段文字，LumiBot 的解析器从文字里取到 `[1]` 这样的方括号，当成了列表。2026-11-10 起解析器只取和 schema
+同类型的值（决策要对象就只取 `{...}`），文字里的方括号不再被误认；文字里没有 JSON 对象时报 `invalid_json`。
+以前这一轮决策直接作废，按 5、15、60 分钟退避重试。
 现在第一次格式不合格时，再发一次真实调用（用途记为 `decision_correction`）：提供出错位置和错误类型（不含任何输入数值）
 和它自己上次的回答（最多 6000 字，标明是不可信的旧输出），要求重新返回完整的决策 JSON 对象。
 `decision_format_retry` 记录纠正原因，两次回答和用量都留在 `agent` 记录里。

@@ -496,8 +496,9 @@ than the skill behind it.
   sessions, the US pattern day trader count. Paper accounts are unaffected.
 
 **"Invalid structured agent answer: manager; schema_validation: $ (model_type)".**
-The manager's answer was not one JSON object; a prose answer whose ``[1]`` was
-read as a list gives exactly this. The decision request already carries the
+The manager's answer was not one JSON object. Before 2026-11-10 a prose answer
+whose ``[1]`` was read as a list gave exactly this; LumiBot now only takes a
+value of the schema's root type from prose. The decision request already carries the
 schema (an enforced JSON schema for ``deepseek/deepseek-flash`` and
 ``deepseek/deepseek-v4-pro``), but providers do not always enforce it. The
 fund now gives such an answer one correction call with the error locations

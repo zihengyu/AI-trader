@@ -54,10 +54,16 @@ def events(strategy, kind):
     return [row["body"] for row in strategy.journal.all_events() if row["kind"] == kind]
 
 
-def test_the_incident_answer_is_diagnosed_as_prose_whose_bracket_was_read_as_a_list():
-    diagnostic = structured_answer_diagnostic(answer(PROSE, Decision), Decision)
-    assert diagnostic == {"kind": "schema_validation", "count": 1, "answer_shape": "prose",
-                          "errors": [{"path": "$", "type": "model_type"}]}
+def test_the_incident_answer_is_no_longer_read_as_a_list():
+    # Before: the lenient scan returned "[1]" from the prose, so "schema_validation: $ (model_type)".
+    assert structured_answer_diagnostic(answer(PROSE, Decision), Decision) == {"kind": "invalid_json",
+                                                                              "answer_shape": "prose"}
+    # Prose around a real decision now parses on the first call, the bracket skipped.
+    wrapped = answer(PROSE + " Final: " + json.dumps(decision([("ALFA", .05)])), Decision)
+    assert wrapped.parse_error is None and wrapped.parsed.targets[0].symbol == "ALFA"
+    # A whole answer of the wrong type is still reported precisely.
+    assert structured_answer_diagnostic(answer("[1]", Decision), Decision) == {
+        "kind": "schema_validation", "count": 1, "answer_shape": "array", "errors": [{"path": "$", "type": "model_type"}]}
     assert [answer_shape(t) for t in ('{"a": 1}', "[1]", '"x"', "3", "true", "null", "```json\n{}\n```",
                                       "note: {}")] == ["object", "array", "string", "number", "boolean", "null",
                                                        "fenced", "prose"]
@@ -71,7 +77,7 @@ def test_a_malformed_decision_gets_one_correction_and_the_round_continues(tmp_pa
     assert managers[1]["purpose"] == "decision_correction"
     correction = managers[1]["context"]["structured_answer_correction"]
     assert correction["previous_answer"] == PROSE and not correction["previous_answer_truncated"]
-    assert correction["diagnostic"]["errors"] == [{"path": "$", "type": "model_type"}]
+    assert correction["diagnostic"] == {"kind": "invalid_json", "answer_shape": "prose"}
     assert "ALFA" not in json.dumps(correction["diagnostic"])  # Locations and types only, never input values.
     [retry] = events(strategy, "decision_format_retry")
     assert retry["answer_diagnostic"]["answer_shape"] == "prose"

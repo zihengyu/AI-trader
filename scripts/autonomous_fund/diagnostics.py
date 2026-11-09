@@ -62,7 +62,7 @@ def structured_answer_diagnostic(result, schema):
     to recover field locations and error codes for operator notifications.
     """
     from pydantic import ValidationError
-    from lumibot.components.agents.structured_output import _extract_json_value
+    from lumibot.components.agents.structured_output import _extract_json_value, root_type
 
     payload = getattr(result, "payload", None)
     payload = payload if isinstance(payload, dict) else {}
@@ -76,7 +76,8 @@ def structured_answer_diagnostic(result, schema):
         return {"kind": "missing_answer"}
     shape = answer_shape(text)
     try:
-        value = _extract_json_value(text)
+        # The same extraction as the agent's own parse, so the diagnostic explains that failure.
+        value = _extract_json_value(text, root_type(schema.model_json_schema()) if schema is not None else None)
     except ValueError:
         return {"kind": "invalid_json", "answer_shape": shape}
     if schema is not None:
