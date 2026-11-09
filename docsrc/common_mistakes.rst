@@ -358,6 +358,13 @@ earlier sessions, the manager's minimum review interval doubles. Protective
 exits are unaffected, and the interval returns to normal at the earlier
 median. Short-term profit or loss alone never triggers anything.
 
+**Why a purchase was declined as not worth its cost.** The manager always sees the
+round-trip cost of a trade (fee, slippage and the quoted spread). Once the
+research ideas' scorecard verdict is ``informative``, an add of a symbol with an
+idea for that day is held at the current weight when the idea's calibrated
+edge does not cover that cost. The journal records it as ``trade_value_held``.
+Reductions, sells and protective exits are never limited.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

@@ -28,6 +28,8 @@ POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
                    "construction", "critic", "data_desk", "manager_run_timeout_seconds")
 NOTICE_WINDOWS = {"stop_active": 21600}
+# Assumed per-side slippage when the broker states none (Alpaca paper), for the trade value check (V2 4.5).
+DEFAULT_SLIPPAGE = 0.0005
 # A call's purpose (V2 4.3), from its context phase, else from its role.
 CALL_PURPOSES = {"postmarket_review": "postmarket_review", "before_market_opens": "premarket_research",
                  "closed_startup": "premarket_research"}
@@ -958,6 +960,23 @@ class AutonomousFund(Strategy):
         except Exception as exc:  # The registry records the experiments; it never stops them.
             self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
 
+    def _trade_value_model(self, now):
+        """V2 4.5, built once per decision: round-trip costs for the manager, and once the research
+        ideas are calibrated, what the allocation uses to decline purchases that do not cover them."""
+        from .local_broker import LocalPaperBroker
+        from .trade_value import model
+        try:
+            cards = self._scorecards(now) if getattr(self, "quant", None) is not None else None
+            broker = getattr(self, "broker", None)
+            # The local book states its own fee and slippage; a broker's fills are not modeled here.
+            fee, slippage = ((broker.fee_rate, broker.slippage) if isinstance(broker, LocalPaperBroker)
+                             else (0, DEFAULT_SLIPPAGE))
+            current = model((cards or {}).get("ideas"), fee, slippage)
+        except Exception as exc:  # Evidence tooling never costs the decision: nothing is declined.
+            current = {"active": False, "reason": f"unavailable: {type(exc).__name__}"}
+        self.journal.set_meta("trade_value_model", current)
+        return current
+
     def _min_review_minutes(self, budget):
         """The manager's minimum review interval: doubled while the turnover guard (V2 4.2) is on."""
         guard = self.journal.get_meta("turnover_guard") or {}
@@ -1793,6 +1812,7 @@ class AutonomousFund(Strategy):
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
+                   "trade_value": self._trade_value_model(now),
                    "factor_lab": self._factor_context(now),
                    "macro": self._macro_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
@@ -3083,6 +3103,25 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
 
+    def _limit_uncovered_adds(self, active, weights, current, prices, now, overlay):
+        """V2 4.5: hold at the current weight each purchase whose calibrated edge does not cover its cost."""
+        from .trade_value import limit_adds
+        model = self.journal.get_meta("trade_value_model")
+        if not model or not model.get("active"):
+            return weights
+        packet = getattr(self, "premarket_research", None)
+        ideas = self._session_ideas(packet["session_open"]) if isinstance(packet, dict) and packet.get("session_open") else []
+        limited, held = limit_adds(weights, current, ideas, prices, model)
+        noted = self.__dict__.setdefault("_trade_value_noted", set())
+        for symbol, verdict in sorted(held.items()):
+            if (active["id"], symbol) not in noted:
+                noted.add((active["id"], symbol))
+                self.journal.event(now, "trade_value_held", {"decision_id": active["id"], "symbol": symbol,
+                                   "target_weight": str(weights[symbol]), "held_at": str(limited[symbol]), **verdict})
+        if held:
+            overlay["binding"] = [f"trade_value:{s}" for s in sorted(held)] + overlay["binding"]
+        return limited
+
     def _candidates(self, active, account, prices, now):
         """The single deterministic path from accepted AI targets to the next order.
 
@@ -3116,6 +3155,7 @@ class AutonomousFund(Strategy):
         requested = {s: min(w, caps.get(s, w)) for s, w in requested.items()}
         weights, overlay = construct(requested, current, estimate, self.quant, self.limits,
                                      self.limits.max_exposure * scale)
+        weights = self._limit_uncovered_adds(active, weights, current, prices, now, overlay)
         if capped:
             overlay["binding"] = [f"earnings:{s}" for s in capped] + overlay["binding"]
             overlay["event_caps"] = {s: str(caps[s]) for s in capped}
