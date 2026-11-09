@@ -173,10 +173,12 @@ python3.12 -m venv .venv
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh check
 ```
 
-`connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 的 HTTP 状态和耗时，
+`connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 和标普 500 成分列表（raw.githubusercontent.com）的 HTTP 状态和耗时，
 `connectivity_summary.blocking` 列出会影响运行的失败项并附中文原因。**服务器在中国大陆地域时 Telegram 和 Yahoo 通常无法直连**，
 请改用香港／新加坡等境外地域，或在 `.env` 设置 `HTTPS_PROXY`。设置了 Alpaca Key 时，local 模式在 Yahoo 拿不到日线时
-会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`）。
+会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`），并且每天用 Alpaca 日线逐只核对 Yahoo 日线：
+有分歧的交易日剔除，严重不一致的证券当天停用，收盘后发一条“日线数据交叉核对”通知（见 `docs/AUTONOMOUS_FUND_DATA_SOURCES.md`）。
+**建议 local 模式也配上免费的 Alpaca Paper Key**，这是目前唯一的免费数据核对手段。
 
 `prepare` 只生成 `artifacts/fund-systemd/` 中的交易、监控、数据员三个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`

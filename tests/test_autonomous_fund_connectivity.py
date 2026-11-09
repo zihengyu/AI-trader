@@ -26,7 +26,8 @@ def fake(blocked=(), status=200):
 def test_every_configured_service_is_probed_once():
     get, calls = fake()
     results = connectivity(ENV, ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"], get=get)
-    assert set(results) == {"yahoo", "telegram", "deepseek", "alpaca_paper", "alpaca_data", "sec", "fred", "finnhub"}
+    assert set(results) == {"yahoo", "telegram", "deepseek", "alpaca_paper", "alpaca_data", "sec", "fred", "finnhub",
+                            "index_membership"}
     assert all(row["ok"] for row in results.values()) and summary(results)["all_ok"]
     assert len(calls) == len(results)  # Two DeepSeek models, one probe.
 
@@ -45,7 +46,7 @@ def test_a_blocked_host_is_explained_and_secrets_never_appear():
 def test_an_http_error_status_is_a_failure_and_unconfigured_services_are_skipped():
     get, _ = fake(status=401)
     results = connectivity({"DEEPSEEK_API_KEY": "k"}, ["deepseek/deepseek-flash"], get=get)
-    assert set(results) == {"yahoo", "deepseek", "fred"}
+    assert set(results) == {"yahoo", "deepseek", "fred", "index_membership"}  # Keyless sources are always probed.
     assert results["deepseek"]["status"] == 401 and not results["deepseek"]["ok"] and "401" in results["deepseek"]["hint"]
 
 

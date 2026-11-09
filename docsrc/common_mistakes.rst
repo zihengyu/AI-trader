@@ -466,7 +466,7 @@ during the session counts at the next decision. The context also lists
 affordable symbols of which at most four shares fit, because a target is
 rounded down to whole shares.
 
-**Biases the review accounts for.** Five things could make the record look better
+**Biases the review accounts for.** Seven things could make the record look better
 than the skill behind it.
 
 - Sector bets: decision excess beyond beta splits exactly into
@@ -479,6 +479,12 @@ than the skill behind it.
   first day the fund also keeps a daily point-in-time universe, so stocks that
   later leave (acquired, delisted) stay in factor tests for their membership
   period. Records before the snapshot began remain biased.
+- Winner selection: today's large caps were picked because they grew. With
+  ``factor_lab.index_membership`` (default on) a stock counts in historical
+  factor cross-sections only from the date it joined the S&P 500, taken from
+  the public constituents list.
+- Optimistic simulated fills: investment acceptance requires the edge to stay
+  positive at twice the realized trading costs, and scorecards show 2x and 3x.
 - Fading results: decision and research-idea scorecards are grouped by market
   regime (SPY trend and volatility, from past closes only) and compare the most
   recent third of the record with the rest. A weaker recent record is flagged
@@ -488,6 +494,13 @@ than the skill behind it.
   weekly reports show it too.
 - Day trades: ``fund-logs.sh`` shows the same-day round trips of the last five
   sessions, the US pattern day trader count. Paper accounts are unaffected.
+
+**Wrong daily bars from a free source (local mode).** Set Alpaca paper keys even
+in local mode: the fund then compares Yahoo's completed daily closes with
+Alpaca's once a day. A session that differs by more than 2% is dropped (never
+replaced or interpolated); a symbol that disagrees on many sessions or on its
+latest close is withheld for the day, and one notice after the close lists
+them. Alpaca's free feed is IEX only, so only gross errors are caught.
 
 **A held stock was acquired or delisted (local book).** Its provider stops
 serving daily bars, so the account cannot be valued and valuation and new
