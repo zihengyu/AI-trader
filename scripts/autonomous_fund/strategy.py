@@ -950,9 +950,51 @@ class AutonomousFund(Strategy):
         except Exception as exc:
             self._notify_fund("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         try:
+            self._check_degradation(self.get_datetime())
+        except Exception as exc:  # A guard that cannot evaluate keeps its last state.
+            self._disclose_failure("degradation_check_error", exc, phase="postmarket_review")
+        try:
             self._sync_experiments(self.get_datetime())
         except Exception as exc:  # The registry records the experiments; it never stops them.
             self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
+
+    def _min_review_minutes(self, budget):
+        """The manager's minimum review interval: doubled while the turnover guard (V2 4.2) is on."""
+        guard = self.journal.get_meta("turnover_guard") or {}
+        return budget.min_review_minutes * (2 if guard.get("active") else 1)
+
+    def _check_degradation(self, now):
+        """V2 4.2 turnover guard, once per completed review: turnover far above its own history slows reviews."""
+        import pandas_market_calendars as mcal
+        from zoneinfo import ZoneInfo
+        from .degradation import daily_turnover, turnover_check
+        from .evaluation import nav_marks
+        from .ledger_audit import audit_connection
+        zone, now = ZoneInfo("America/New_York"), instant(now)
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            integrity = audit_connection(db)
+            if integrity["status"] == "failed":
+                return None  # A disputed book is no basis for a decision about trading activity.
+            equity = {}
+            for mark in nav_marks(db, until=now, excluded=set(integrity.get("invalid_account_sequences", []))):
+                equity[instant(mark[4] or mark[1]).astimezone(zone).date().isoformat()] = float(mark[3])
+            fills = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+                "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")
+                if instant(at) <= now]
+        if equity:
+            schedule = mcal.get_calendar("NYSE").schedule(start_date=min(equity), end_date=max(equity))
+            sessions = {index.date().isoformat() for index, market in schedule.iterrows() if market.market_close <= now}
+            equity = {day: value for day, value in equity.items() if day in sessions}  # Completed sessions only.
+        state = self.journal.get_meta("turnover_guard") or {}
+        result = turnover_check(daily_turnover(fills, equity), bool(state.get("active")))
+        if result["active"] != bool(state.get("active")):
+            self.journal.set_meta("turnover_guard", {**result, "since": now.isoformat()} if result["active"] else None)
+            self.journal.event(now, "degradation", {"guard": "turnover", **result})
+            budget = getattr(self, "model_budget", None) or ModelBudget()
+            self._notify_fund("degradation_detected" if result["active"] else "degradation_cleared",
+                              {**result, "min_review_minutes": budget.min_review_minutes * (2 if result["active"] else 1)})
+        return result
 
     def _sync_experiments(self, now):
         """Record every experiment's current state in the registry (V2 4.1), once per completed review."""
@@ -1760,7 +1802,8 @@ class AutonomousFund(Strategy):
                        "take_profit": "reduce to take_profit_weight (default 0) when the bid reaches this price",
                        "alerts": "wake you for an early review when a price crosses above/below a level",
                        "news_watch": "search phrases; a new matching headline wakes you for an early review"},
-                   "model_budget": {"min_review_minutes": budget.min_review_minutes,
+                   "model_budget": {"min_review_minutes": self._min_review_minutes(budget),
+                                    "turnover_guard": self.journal.get_meta("turnover_guard"),
                                     "runs_today": runs, "max_runs_per_day": budget.max_agent_runs_per_day,
                                     "cost_today_usd": round(self.journal.counter("model_cost_microusd", now) / 1e6, 4),
                                     "max_daily_cost_usd": budget.max_daily_cost_usd,
@@ -1791,7 +1834,7 @@ class AutonomousFund(Strategy):
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
             validate_decision(decision, now, self.universe, self.limits)
-            minimum = timedelta(minutes=budget.min_review_minutes)
+            minimum = timedelta(minutes=self._min_review_minutes(budget))
             accepted_id = self.execution.accept(decision, now, self.universe, self.limits, min_review=minimum)
             # What this decision saw: a later scheduled review with nothing new can skip the model call.
             self.journal.set_meta("last_model_decision", {"at": now.isoformat(), "day": trading_day(now),
@@ -1989,23 +2032,32 @@ class AutonomousFund(Strategy):
         symbols = {"SPY"} | {t["symbol"] for row in rows for body in (row["decision"], row["trading_decision"])
                              for t in body["targets"]}
         closes = {s: self._daily_closes(s, now) for s in sorted(symbols & (set(self.universe) | {"SPY"}))}
-        stats = paired_test(shadow_pairs(rows, closes), settings.min_pairs)
+        differences = shadow_pairs(rows, closes)
+        stats = paired_test(differences, settings.min_pairs)
         champion = self._champion()
-        switch = None
+        switch, reason = None, None
         if stats["sufficient"] and stats["t_stat"] is not None:
             if champion == "memo" and stats["t_stat"] <= -settings.switch_t_stat:
                 switch = "baseline"
             elif champion == "baseline" and stats["t_stat"] >= settings.switch_t_stat:
                 switch = "memo"
+            if switch:
+                reason = f"full record: t = {stats['t_stat']:.2f} over {stats['pairs']} sessions"
+        from .degradation import WINDOW, rolling_rollback
+        rollback, recent = rolling_rollback(differences, champion, "memo", "baseline", settings.switch_t_stat)
+        if switch is None and rollback:
+            # V2 4.2: the last WINDOW sessions turned against the trading arm; the previous one trades again.
+            switch, reason = rollback, f"degradation: last {WINDOW} sessions t = {recent['t_stat']:.2f}"
         evaluation = {"as_of": str(now), "champion": switch or champion, "previous_champion": champion,
                       "memo_minus_baseline_1d_excess": stats, "switch_t_stat": settings.switch_t_stat,
+                      "recent": recent, "reason": reason,
                       "interpretation": "Paired next-session excess returns of the memo-informed and baseline "
                                         "decisions made from the same research. A switch needs at least min_pairs "
                                         "sessions and |t| >= switch_t_stat; otherwise the current arm keeps trading."}
         if switch:
             self.journal.set_meta("learning_champion", switch)
             self._notify_fund("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
-                                                       "pairs": stats["pairs"]})
+                                                       "pairs": stats["pairs"], "reason": reason})
         self.journal.set_meta("learning_evaluation", evaluation)
         self.journal.event(now, "learning_evaluation", evaluation)
         return evaluation
@@ -2232,7 +2284,7 @@ class AutonomousFund(Strategy):
             if settings.mode == "auto" and construction["champion"] != current:
                 self.journal.set_meta("construction_champion", construction["champion"])
                 self._notify_fund("construction_switched", {"from": current, "to": construction["champion"],
-                                                      "test": construction["test"]})
+                                                      "test": construction["trigger"], "reason": construction["reason"]})
         self._scorecard_cache = (key, result)
         return result
 

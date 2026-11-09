@@ -66,12 +66,22 @@ def evaluate(variants, closes, settings, current="ai"):
     observed = pairs(variants, closes)
     test = paired_test([d for _, d in observed], settings.min_pairs)
     champion = current if settings.mode == "auto" else settings.mode
+    reason, trigger = None, test
     if settings.mode == "auto" and test["sufficient"] and test["t_stat"] is not None:
         if test["t_stat"] >= settings.switch_t_stat:
             champion = "risk_budget"
         elif test["t_stat"] <= -settings.switch_t_stat:
             champion = "ai"
-    return {"mode": settings.mode, "champion": champion, "previous": current, "test": test,
+        if champion != current:
+            reason = f"full record: t = {test['t_stat']:.2f} over {test['pairs']} sessions"
+    from .degradation import WINDOW, rolling_rollback
+    rollback, recent = rolling_rollback([d for _, d in observed], current, "risk_budget", "ai", settings.switch_t_stat)
+    if settings.mode == "auto" and champion == current and rollback:
+        # V2 4.2: the last WINDOW sessions turned against the construction that trades; the other trades again.
+        champion, trigger = rollback, recent
+        reason = f"degradation: last {WINDOW} sessions t = {recent['t_stat']:.2f}"
+    return {"mode": settings.mode, "champion": champion, "previous": current, "test": test, "recent": recent,
+            "trigger": trigger, "reason": reason,
             "last_session": observed[-1][0] if observed else None,
             "interpretation": "mean > 0: risk budgets beat the AI's own weights by that much beta-matched excess "
                               "per session. Switching needs min_pairs sessions and |t| >= switch_t_stat."}

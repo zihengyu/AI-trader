@@ -445,6 +445,24 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"{names.get(details.get('to'), details.get('to'))}。依据 {test.get('pairs')} 个交易日的配对比较，"
                 f"日均超额差 {mean * 100:.3f}%，t = {test.get('t_stat'):.2f}。风控上限不变。" if mean is not None and
                 test.get("t_stat") is not None else "🔁 组合构建方式切换：" + str(details))
+        if str(details.get("reason") or "").startswith("degradation"):
+            text += "\n这是退化回滚：最近 20 个交易日的配对比较转为不利于原方式，换回另一种方式。"
+    elif kind == "learning_champion_switched" and isinstance(details, dict):
+        names = {"memo": "看复盘备忘的基金经理", "baseline": "不看备忘的对照组"}
+        rollback = str(details.get("reason") or "").startswith("degradation")
+        text = (f"🔁 学习对照切换：{names.get(details.get('from'), details.get('from'))} → "
+                f"{names.get(details.get('to'), details.get('to'))} 开始交易。"
+                + ("这是退化回滚：最近 20 个交易日的配对比较转为不利于原来交易的一组。" if rollback else
+                   f"依据全部 {details.get('pairs')} 个交易日的配对比较，t = {details.get('t_stat')}。")
+                + "风控上限不变；另一组继续在影子里打分，证据反转时会再切回。")
+    elif kind == "degradation_detected" and isinstance(details, dict):
+        text = (f"⚠️ 换手偏高：最近 {details.get('recent_sessions')} 个交易日的日均换手 {_percent(details.get('recent_mean'))}，"
+                f"高于之前 {details.get('earlier_sessions')} 个交易日的 95% 分位 {_percent(details.get('p95'))}。"
+                f"基金经理的最短复核间隔加倍为 {details.get('min_review_minutes')} 分钟，少做调整；止损、止盈照常。"
+                "换手回到之前的中位数后自动恢复。")
+    elif kind == "degradation_cleared" and isinstance(details, dict):
+        text = (f"✅ 换手已回到正常：最近日均 {_percent(details.get('recent_mean'))}，不高于之前的中位数 "
+                f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")
     if text is None:
         return None
     return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")

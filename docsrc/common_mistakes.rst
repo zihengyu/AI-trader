@@ -349,6 +349,15 @@ deflated Sharpe ratio of at least 0.90, and a positive result in both halves of
 the record. Its best verdict is ``preliminary_edge``. Passing the operational
 report does not pass the investment report.
 
+**When what is in effect gets worse.** After each review the fund checks fixed
+thresholds. The learning and construction comparisons keep their full-record
+switch rule. They also roll back to the other arm when the last 20 paired
+sessions turn against the arm that trades with ``|t| >= 2``. When the mean
+turnover of the last five sessions is above the 95th percentile of at least 40
+earlier sessions, the manager's minimum review interval doubles. Protective
+exits are unaffected, and the interval returns to normal at the earlier
+median. Short-term profit or loss alone never triggers anything.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
