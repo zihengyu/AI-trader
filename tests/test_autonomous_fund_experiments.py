@@ -60,7 +60,8 @@ def factor_row(identifier, status, expression="rank(ret(21))", reason=None):
 def test_observations_map_each_experiment_to_one_state():
     seen = {}
     entries = observations(
-        factors=[factor_row("f1", "validated"), factor_row("f2", "rejected"),
+        factors=[{**factor_row("f1", "validated"), "confirmed_at": "2026-11-09"}, factor_row("f5", "validated"),
+                 factor_row("f2", "rejected"),
                  factor_row("f3", "insufficient_data", "rank(earnings / (close * shares))"), factor_row("f4", "retired")],
         learning={"enabled": True, "champion": "baseline", "version_config": {"prompt_version": "p1"},
                   "evaluation": {"memo_minus_baseline_1d_excess": {"pairs": 22, "t_stat": -2.3}}},
@@ -69,7 +70,9 @@ def test_observations_map_each_experiment_to_one_state():
                     "predictions": {"total": 5, "scored": 2, "hit_rate": 0.5}},
         previous=seen.get)
     states = {item["id"]: item["state"] for item in entries}
-    assert states == {"factor:f1": "paper_active", "factor:f2": "rejected", "factor:f3": "historical_test",
+    # f5 passed the historical tests only: survivorship-exposed, observed in the shadow until its live record agrees.
+    assert states == {"factor:f1": "paper_active", "factor:f5": "shadow", "factor:f2": "rejected",
+                      "factor:f3": "historical_test",
                       "factor:f4": "retired", "learning:memo": "shadow", "learning:baseline": "paper_active",
                       "construction:ai": "paper_active", "construction:risk_budget": "shadow",
                       "predictions:research_ideas": "shadow", "predictions:review": "shadow"}
@@ -109,7 +112,7 @@ def test_each_review_syncs_the_registry_from_the_experiments_own_records(tmp_pat
     strategy = fund(tmp_path)
     written = strategy._sync_experiments(NOW)
     states = {item[0]: item[3] for item in written}
-    assert states["factor:f1"] == "paper_active" and states["learning:memo"] == "paper_active"
+    assert states["factor:f1"] == "shadow" and states["learning:memo"] == "paper_active"  # No live record yet.
     assert states["learning:baseline"] == "shadow" and states["construction:ai"] == "paper_active"
     assert strategy._sync_experiments(NOW + timedelta(days=1)) == []  # Nothing changed.
     strategy.journal.set_meta("learning_champion", "baseline")  # The learning comparison switched.

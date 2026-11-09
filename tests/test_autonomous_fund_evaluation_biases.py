@@ -173,3 +173,23 @@ def test_the_manager_sees_its_reversals_and_day_trades(tmp_path):
     context = seen["manager"]
     assert context["day_trades"]["last_sessions"] == 0 and "25,000 USD" in context["day_trades"]["meaning"]
     assert "consistency" in (context.get("scorecards") or {})
+
+
+def test_a_historically_validated_factor_is_provisional_until_its_live_record_confirms_it(tmp_path):
+    from scripts.autonomous_fund.experiments import observations
+    from scripts.autonomous_fund.factors import FactorLab
+    from scripts.autonomous_fund.journal import Journal
+    from tests.test_autonomous_fund_factors import NOW, panel, proposal
+    lab = FactorLab(Journal(tmp_path, "synthetic-confirm"), FactorSettings(live_min_observations=3))
+    close, volume = panel(seed=3, days=626)  # The momentum keeps working after validation.
+    day = str(close.index[599].date())
+    assert lab.test([proposal("rank(ret(60))")], NOW, day, close.iloc[:600], volume.iloc[:600])[0]["status"] == "validated"
+    early = lab.context(NOW, close.iloc[:600], volume.iloc[:600])
+    assert early["validated"] == [] and early["provisional"][0]["expression"] == "rank(ret(60))"
+    assert observations(factors=lab.rows())[0]["state"] == "shadow"  # Survivorship-exposed history only.
+    later = lab.context(NOW, close, volume)
+    assert later["provisional"] == [] and later["validated"][0]["live"]["n"] >= 3 and later["validated"][0]["live"]["favored"]
+    assert [e["kind"] for e in lab.journal.all_events()].count("factor_confirmed") == 1
+    assert lab.rows("validated")[0]["confirmed_at"] and observations(factors=lab.rows())[0]["state"] == "paper_active"
+    lab.context(NOW, close, volume)
+    assert [e["kind"] for e in lab.journal.all_events()].count("factor_confirmed") == 1  # Once.

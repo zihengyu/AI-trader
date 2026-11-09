@@ -618,6 +618,8 @@ class FactorLab:
             columns = {row[1] for row in db.execute("PRAGMA table_info(fund_factors)")}
             if "universe" not in columns:
                 db.execute("ALTER TABLE fund_factors ADD COLUMN universe TEXT")
+            if "confirmed_at" not in columns:  # The live record agreed: no longer survivorship-exposed.
+                db.execute("ALTER TABLE fund_factors ADD COLUMN confirmed_at TEXT")
             # Earlier factors were ranked across stocks AND ETFs together; that evidence does not
             # transfer to either cross-section, so they retire (and still count as trials).
             legacy = [dict(r) for r in db.execute(
@@ -742,6 +744,14 @@ class FactorLab:
                 self.journal.event(now, "factor_retired", {"id": row["id"], "expression": row["expression"],
                                                            "reason": reason, "live": live})
                 continue
+            if not row.get("confirmed_at") and confirmed(live, row["direction"], self.settings):
+                # Historical validation used today's names only (survivorship bias); the live record
+                # after validation has no such bias. Only now does the factor count as validated evidence.
+                with self.journal.connection() as db:
+                    db.execute("UPDATE fund_factors SET confirmed_at=? WHERE id=?", (str(now), row["id"]))
+                self.journal.event(now, "factor_confirmed", {"id": row["id"], "expression": row["expression"],
+                                                             "live": {k: live.get(k) for k in ("n", "mean_ic", "t")}})
+                row = {**row, "confirmed_at": str(now)}
             active.append({**row, "live": live})
         return active
 
@@ -773,6 +783,8 @@ class FactorLab:
             live, evidence = item["live"], json.loads(item["evidence"])
             return (live.get("t") or 0) * item["direction"], abs(evidence["in_sample"]["t"] or 0)
         active.sort(key=strength, reverse=True)
+        confirmed_rows = [r for r in active if r.get("confirmed_at")]
+        provisional = [r for r in active if not r.get("confirmed_at")]
         tried = self.rows()
         control = self._negative_control(now, as_panels(close, volume, extra) if close is not None else None)
         return {
@@ -787,7 +799,12 @@ class FactorLab:
                 "the live record is always clean). The quintile spread must survive costs on its "
                 "turnover, and a factor that mostly re-ranks like a validated one is redundant. Each factor names its "
                 "cross-section (stocks incl. the research universe, or etfs); favored lists only tradable names. "
+                "validated lists factors whose live record after validation agreed for at least "
+                "live_min_observations observations; provisional lists factors that passed the historical tests "
+                "only. Those tests use today's names (survivorship bias), so provisional factors are hypotheses: "
+                "they carry no favored names, and only their live record can confirm them. "
                 "Evidence, not orders: weigh it with research."),
+            "live_min_observations": self.settings.live_min_observations,
             "survivorship": SURVIVORSHIP_NOTE,
             "trials": len(tried), "next_critical_t": critical_t(len(tried) + 1, self.settings.significance),
             "validated": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
@@ -796,7 +813,14 @@ class FactorLab:
                            "in_sample": json.loads(r["evidence"])["in_sample"],
                            "holdout": json.loads(r["evidence"])["holdout"], "live": r["live"],
                            **_evidence_flags(json.loads(r["evidence"]))}
-                          for r in active[:self.settings.max_active]],
+                          for r in confirmed_rows[:self.settings.max_active]],
+            "provisional": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
+                             "universe": r.get("universe") or "stocks", "direction": r["direction"],
+                             "validated_on": r["validated_at"], "in_sample": json.loads(r["evidence"])["in_sample"],
+                             "holdout": json.loads(r["evidence"])["holdout"],
+                             "live": {k: (r["live"] or {}).get(k) for k in ("n", "mean_ic", "t", "unavailable")},
+                             **_evidence_flags(json.loads(r["evidence"]))}
+                            for r in provisional[:self.settings.max_active]],
             "negative_control": control,
             "recently_rejected": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
                                    "status": r["status"], "reason": r["reason"]}
@@ -807,8 +831,16 @@ class FactorLab:
 
 SURVIVORSHIP_NOTE = ("Survivorship bias: every historical cross-section uses today's universe and research list. "
                      "Stocks that were delisted, acquired or dropped from an index are missing, so historical ICs and "
-                     "spreads are optimistic. The live record after validation has no such bias.")
+                     "spreads are optimistic. The live record after validation has no such bias, and from the daily "
+                     "universe snapshot's first session on, former members stay in the cross-sections for their "
+                     "membership period (see universe_snapshot).")
 SURVIVORSHIP_TEXT = "历史检验只含当前还在交易的股票，退市、被收购和被剔出指数的不在其中（幸存者偏差），历史 IC 偏乐观；验证之后的样本外记录不受影响。"
+
+
+def confirmed(live, direction, settings):
+    """The live record after validation agrees: enough observations and the validated direction."""
+    return (live.get("n", 0) >= settings.live_min_observations and live.get("mean_ic") is not None
+            and direction is not None and live["mean_ic"] * direction > 0)
 
 
 def _evidence_flags(evidence):

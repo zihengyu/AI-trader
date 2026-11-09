@@ -95,7 +95,7 @@ def _cost_text(costs):
     return cost_line(costs) or "模型费用：没有可估算的调用（设置 FUND_MODEL_PRICES_JSON 后显示）"
 
 
-FACTOR_STATUS = {"validated": "通过", "rejected": "未通过", "insufficient_data": "数据不足", "invalid": "表达式无效"}
+FACTOR_STATUS = {"validated": "历史检验通过（待样本外确认）", "rejected": "未通过", "insufficient_data": "数据不足", "invalid": "表达式无效"}
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
@@ -245,8 +245,8 @@ def daily_document(root, sequence):
                      + (f"，行业内 t={within}（接近 0 说明主要是押行业，不是行业内选股）" if result.get("sector_neutral") else "")
                      + f"；{result.get('reason', '')}")
     if results:
-        from .factors import SURVIVORSHIP_TEXT
-        lines.append(f"- 注意：{SURVIVORSHIP_TEXT}")
+        from .universe import survivorship_text
+        lines.append(f"- 注意：{survivorship_text(root)}")
     lines += ([] if results else ["本次没有提出新因子。"]) + [""]
     health = Counter(body.get("kind") for at, kind, body in events if kind == "notification" and
                      body.get("kind") in HEALTH_KINDS and instant(at).astimezone(zone).date().isoformat() == day)
@@ -760,14 +760,15 @@ def weekly_document(root, sequence):
     if tests:
         counts = Counter(FACTOR_STATUS.get(r.get("status"), r.get("status")) for r in tests)
         lines.append("- 本周检验：" + "、".join(f"{k} {v}" for k, v in sorted(counts.items())))
-        lines += [f"  - 通过：{r.get('name')} `{r.get('expression')}`" for r in tests if r.get("status") == "validated"]
+        lines += [f"  - 历史检验通过（待样本外确认）：{r.get('name')} `{r.get('expression')}`"
+                  for r in tests if r.get("status") == "validated"]
     else:
         lines.append(f"- 本周检验：{NO_DATA}")
     lines.append(f"- 随机因子负对照（{control['as_of']}）：样本内通过率 {_percent(control.get('in_sample_pass_rate'))}，"
                  f"最终通过率 {_percent(control.get('validated_rate'))}，显著性 {_percent(control.get('significance'))}"
                  if control else f"- 随机因子负对照：{NO_DATA}")
-    from .factors import SURVIVORSHIP_TEXT
-    lines.append(f"- 注意：{SURVIVORSHIP_TEXT}")
+    from .universe import survivorship_text
+    lines.append(f"- 注意：{survivorship_text(root)}")
     learning = next((b for _, k, b in reversed(events) if k == "learning_evaluation"), None)
     construction = (card or {}).get("construction")
     lines += ["", "## 六、对照实验状态【统计推断】", ""]

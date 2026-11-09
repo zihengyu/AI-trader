@@ -146,8 +146,13 @@ def observations(*, factors=(), learning=None, construction=None, scorecards=Non
                             + (["SEC point-in-time fundamentals"] if uses else []),
             "config": {"name": row["name"], "expression": row["expression"], "horizon": row["horizon"],
                        "universe": row.get("universe")},
-            "state": FACTOR_STATES.get(row["status"], "historical_test"),
-            "reason": row.get("reason") or row["status"],
+            # Historical validation alone is survivorship-exposed: the factor is observed in the shadow
+            # until its live record confirms it (confirmed_at), and only then in effect.
+            "state": ("shadow" if row["status"] == "validated" and not row.get("confirmed_at")
+                      else FACTOR_STATES.get(row["status"], "historical_test")),
+            "reason": ("historical tests passed; awaiting live confirmation" if row["status"] == "validated"
+                       and not row.get("confirmed_at") else
+                       "live record confirmed" if row["status"] == "validated" else row.get("reason") or row["status"]),
             "evidence": {**{key: evidence[key] for key in ("status", "direction", "in_sample", "holdout", "critical_t",
                                                          "net_spread") if key in evidence},
                          **({"walk_forward_agreeing": walk.get("agreeing"), "walk_forward_required": walk.get("required")}

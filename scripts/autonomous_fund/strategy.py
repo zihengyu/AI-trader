@@ -714,6 +714,9 @@ class AutonomousFund(Strategy):
                 benchmark_symbols=tuple(dict.fromkeys(("SPY", "QQQ", *self.performance.symbols()))))
         factor_settings = FactorSettings.from_config(config.get("factor_lab"))
         self.factor_lab = FactorLab(self.journal, factor_settings) if factor_settings.enabled else None
+        from .universe import UniverseSnapshots
+        # Who was in each cross-section on each session: former members stay in later factor tests.
+        self.universe_snapshots = UniverseSnapshots(self.journal) if self.factor_lab is not None else None
         self.sec = None
         agent = os.environ.get("FUND_SEC_USER_AGENT", "").strip()
         if self.factor_lab is not None and agent and mode != "mock" and live_data:
@@ -2571,10 +2574,15 @@ class AutonomousFund(Strategy):
                 continue
             if pending:
                 continue  # An incomplete cross-section would bias every IC: wait for all of it.
+            stored = self._universe_snapshot(now, name, history)
+            current = set(history)
+            for symbol, rows in stored.items():
+                # A former member (or one the provider no longer serves) keeps its membership-period bars.
+                history[symbol] = [(d, close, shares) for d, close, shares, _, _, _ in rows]
             close, volume = panel_from_rows(history)
-            data = {"close": close, "volume": volume, **self._ohlc_panels(close, now)}
+            data = {"close": close, "volume": volume, **self._ohlc_panels(close, now, stored)}
             if name == "stocks":
-                fundamentals, complete = self._fundamental_panels(close)
+                fundamentals, complete = self._fundamental_panels(close, current)
                 if not complete:
                     pending.append("SEC filings")
                     continue
@@ -2589,7 +2597,33 @@ class AutonomousFund(Strategy):
         self._factor_cache = (day, result)
         return result
 
-    def _ohlc_panels(self, close, now):
+    def _universe_snapshot(self, now, role, history):
+        """Record today's members of `role`; return the stored bars of members no longer served.
+
+        Returns {symbol: [(date, close, volume, open, high, low)]} for symbols that were
+        recorded in this cross-section before but are absent from `history` today
+        (removed from the lists, acquired or delisted). Empty without a snapshot table.
+        """
+        snapshots = getattr(self, "universe_snapshots", None)
+        if snapshots is None:
+            return {}
+        captured = getattr(self, "_ohlc", None) or {}
+        day = trading_day(now)
+        members = {}
+        for symbol, rows in history.items():
+            bars = captured.get((day, symbol)) or {}
+            members[symbol] = [(d, close, shares, *bars.get(str(d), (None, None, None)))
+                               for d, close, shares in rows]
+        try:
+            snapshots.record(now, role, members)
+            stored = snapshots.rows(role, snapshots.former(role, members))
+            self.__dict__.setdefault("_universe_former", {})[role] = sorted(stored)
+            return stored
+        except Exception as exc:  # The snapshot widens research; a failure never blocks the panel.
+            self.journal.event(now, "universe_snapshot_error", {"role": role, "error": type(exc).__name__})
+            return {}
+
+    def _ohlc_panels(self, close, now, stored=None):
         """Completed daily open/high/low aligned to `close`; NaN where the provider gave none."""
         import pandas as pd
         captured = getattr(self, "_ohlc", None) or {}
@@ -2598,19 +2632,29 @@ class AutonomousFund(Strategy):
         for position, field in enumerate(("open", "high", "low")):
             columns = {}
             for symbol in close.columns:
-                rows = captured.get((day, symbol)) or {}
-                columns[symbol] = pd.Series({pd.Timestamp(d): values[position] for d, values in rows.items()},
-                                            dtype=float)
+                if symbol in (stored or {}):  # Former members: the bars stored while they were members.
+                    values = {pd.Timestamp(bar[0]): bar[3 + position] for bar in stored[symbol]}
+                else:
+                    rows = captured.get((day, symbol)) or {}
+                    values = {pd.Timestamp(d): bar[position] for d, bar in rows.items()}
+                columns[symbol] = pd.Series(values, dtype=float)
             frames[field] = pd.DataFrame(columns).reindex(index=close.index, columns=close.columns).astype(float)
         return frames
 
-    def _fundamental_panels(self, close):
-        """(SEC point-in-time fields, complete). Nothing when unavailable; incomplete while still downloading."""
+    def _fundamental_panels(self, close, current=None):
+        """(SEC point-in-time fields, complete). Nothing when unavailable; incomplete while still downloading.
+
+        Only current members are looked up: SEC maps today's tickers, and a former
+        member's ticker may already belong to another company. Former members keep
+        NaN fundamentals (missing, never borrowed).
+        """
         sec = getattr(self, "sec", None)
         if sec is None:
             return {}, True
         try:
-            panels = sec.panels(set(close.columns), close.index, may_download=self._may_prepare)
+            symbols = set(close.columns) if current is None else set(current) & set(close.columns)
+            panels = sec.panels(symbols, close.index, may_download=self._may_prepare)
+            panels = {name: frame.reindex(columns=close.columns) for name, frame in panels.items()}
             return panels, not getattr(sec, "deferred", None)
         except Exception as exc:
             self.journal.event(self.get_datetime(), "fundamentals_unavailable", {"error": type(exc).__name__})
@@ -2641,6 +2685,13 @@ class AutonomousFund(Strategy):
                                       "meaning": "factor history is still being prepared; ranks follow shortly"}
                 return context
             context = lab.context(now, as_panels(panels), tradable=set(self.universe))
+            snapshots = getattr(self, "universe_snapshots", None)
+            if snapshots is not None:
+                former = getattr(self, "_universe_former", None) or {}
+                context["universe_snapshot"] = {
+                    "since": snapshots.since(), "former_members": {role: names[:20] for role, names in former.items()},
+                    "meaning": "daily point-in-time membership; former members stay in the cross-sections for "
+                               "their membership period, so records from 'since' on have no survivorship bias"}
             sec = getattr(self, "sec", None)
             context["fundamentals"] = ({"source": "SEC EDGAR company facts (point in time)",
                                         "errors": dict(list(sec.errors.items())[:10])} if sec is not None else

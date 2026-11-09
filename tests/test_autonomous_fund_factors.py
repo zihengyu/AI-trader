@@ -115,6 +115,12 @@ def test_registry_counts_each_distinct_expression_once_and_caps_a_review(tmp_pat
     assert retest[0]["trials"] == trials  # Its evidence bar is the one it was first tried under.
 
 
+def confirm(lab):
+    """Mark historically validated factors as confirmed, as an agreeing live record would."""
+    with lab.journal.connection() as db:
+        db.execute("UPDATE fund_factors SET confirmed_at='synthetic-live-record' WHERE status='validated'")
+
+
 def test_live_record_retires_a_factor_whose_edge_reverses(tmp_path):
     lab = FactorLab(Journal(tmp_path, "synthetic-live"), FactorSettings(live_min_observations=3))
     close, volume = panel(seed=3, days=626, flip_at=600)
@@ -122,12 +128,16 @@ def test_live_record_retires_a_factor_whose_edge_reverses(tmp_path):
     assert lab.test([proposal("rank(ret(60))")], NOW, validation_day, close.iloc[:600], volume.iloc[:600])[0][
         "status"] == "validated"
     context = lab.context(NOW, close.iloc[:600], volume.iloc[:600])
-    assert context["validated"][0]["live"]["n"] == 0
+    # Historical tests passed, no live record yet: provisional, with no favored names to act on.
+    assert context["validated"] == [] and context["provisional"][0]["live"]["n"] == 0
+    assert "favored" not in context["provisional"][0]["live"]
+    confirm(lab)  # As if its live record had agreed: favored names come from confirmed factors only.
+    context = lab.context(NOW, close.iloc[:600], volume.iloc[:600])
     favored = {row["symbol"] for row in context["validated"][0]["live"]["favored"]}
     leaders = set(close.iloc[599].div(close.iloc[539]).sort_values().tail(5).index)
     assert favored == leaders  # Current ranks come from the latest completed close, direction-adjusted.
     later = lab.context(NOW, close, volume)
-    assert later["validated"] == [] and later["recently_rejected"][-1]["status"] == "retired"
+    assert later["validated"] == later["provisional"] == [] and later["recently_rejected"][-1]["status"] == "retired"
     assert any(row["kind"] == "factor_retired" for row in lab.journal.all_events())
 
 
@@ -138,10 +148,11 @@ def test_context_tells_the_ai_the_grammar_the_standard_and_its_track_record(tmp_
     context = lab.context(NOW, close, volume)
     assert context["grammar"] is GRAMMAR and context["trials"] == 2
     assert context["next_critical_t"] == critical_t(3, SETTINGS.significance)
-    assert [row["expression"] for row in context["validated"]] == ["rank(ret(60))"]
+    assert [row["expression"] for row in context["provisional"]] == ["rank(ret(60))"] and context["validated"] == []
     assert context["recently_rejected"][0]["expression"] == "rank(volume)"
+    assert "survivorship" in context["evidence_standard"] and context["live_min_observations"] == SETTINGS.live_min_observations
     offline = lab.context(NOW, None, None)  # Missing history never hides what was validated.
-    assert offline["validated"][0]["live"]["unavailable"] == "history"
+    assert offline["provisional"][0]["live"]["unavailable"] == "history"
 
 
 @pytest.mark.parametrize("section, message", [
@@ -179,7 +190,7 @@ def test_review_factor_proposals_are_tested_and_reach_the_next_decision(tmp_path
     tested = events(strategy, "factor_tests")[0]
     assert tested["results"][0]["status"] == "validated" and tested["session_date"] == "2026-11-02"
     context = strategy._factor_context(NOW)
-    assert context["validated"][0]["name"] == "中期动量"
+    assert context["provisional"][0]["name"] == "中期动量"  # Awaiting its live record.
     assert AutonomousFund._arm_context({"factor_lab": context}, "baseline")["factor_lab"] is None  # Control arm.
     assert AutonomousFund._arm_context({"factor_lab": context}, "memo")["factor_lab"] is context
 
@@ -253,6 +264,7 @@ def test_favored_names_follow_the_validated_direction(tmp_path):
     lab = FactorLab(Journal(tmp_path, "synthetic-direction"), SETTINGS)
     close, volume = panel()
     lab.test([proposal("-rank(ret(60))", name="inverted")], NOW, "2026-11-02", close, volume)
+    confirm(lab)
     validated = lab.context(NOW, close, volume)["validated"][0]
     assert validated["direction"] == -1
     leaders = set(close.iloc[-1].div(close.iloc[-61]).sort_values().tail(5).index)
