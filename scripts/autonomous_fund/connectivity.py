@@ -34,13 +34,16 @@ def _probes(environ, models):
         headers = {"APCA-API-KEY-ID": environ["ALPACA_API_KEY"], "APCA-API-SECRET-KEY": environ["ALPACA_API_SECRET"]}
         probes.append(("alpaca_paper", "Alpaca Paper 账户", "https://paper-api.alpaca.markets/v2/account", None,
                        headers, True, "返回 401／403 说明 Key 不是 Paper Key 或已失效"))
-        probes.append(("alpaca_data", "Alpaca 历史行情（Yahoo 不可用时的日线备用源）",
+        probes.append(("alpaca_data", "Alpaca 历史行情（日线交叉核对，以及 Yahoo 不可用时的备用源）",
                        "https://data.alpaca.markets/v2/stocks/SPY/bars", {"timeframe": "1Day", "limit": 1},
                        headers, False, "返回 403 说明该账户没有行情权限"))
     agent = str(environ.get("FUND_SEC_USER_AGENT", "")).strip()
     if agent:
         probes.append(("sec", "SEC EDGAR（8-K 公告和财报基本面）", "https://www.sec.gov/files/company_tickers.json",
                        None, {"User-Agent": agent}, False, "返回 403 通常是 FUND_SEC_USER_AGENT 没有写姓名和邮箱"))
+    from .index_membership import SOURCE_URL, USER_AGENT
+    probes.append(("index_membership", "标普 500 成分加入日期（因子检验按加入日期计入）", SOURCE_URL, None,
+                   {"User-Agent": USER_AGENT}, False, "不可用时继续用缓存的列表；没有缓存时历史横截面不按加入日期筛选"))
     start = (datetime.now(timezone.utc) - timedelta(days=10)).date().isoformat()
     probes.append(("fred", "FRED 宏观数据", "https://fred.stlouisfed.org/graph/fredgraph.csv",
                    {"id": "DGS3MO", "cosd": start}, {"User-Agent": "LumiBot-AutonomousFund/1.0"}, False,

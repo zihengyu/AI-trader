@@ -304,7 +304,7 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -336,6 +336,9 @@ def main(argv=None):
     parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
+    parser.add_argument("--symbol", help="settle-position: the local holding that was acquired or delisted")
+    parser.add_argument("--cash-per-share", help="settle-position: cash actually paid per share (0 if worthless)")
+    parser.add_argument("--reason", help="settle-position: what happened, e.g. 'acquired for cash at 54.20'")
     parser.add_argument("--expression", help="factor-lab: factor expression; use --expression=-vol(60) when it starts with '-'")
     parser.add_argument("--horizon", type=int, default=5, help="factor-lab: forward horizon in sessions (1-20)")
     parser.add_argument("--min-names", type=int, help="factor-lab: minimum names per date (default from config)")
@@ -621,6 +624,9 @@ def main(argv=None):
         if args.mode == "adjust-reserve":
             adjust_reserve(args)
             return
+        if args.mode == "settle-position":
+            settle_position(args)
+            return
         if args.scripted and args.mode == "paper":
             raise RiskError("Scripted models are forbidden in paper mode")
         if (args.observe_only or args.once) and args.mode != "local":
@@ -652,7 +658,7 @@ def main(argv=None):
 def factor_lab(args, config):
     """Offline: test one factor expression on recorded daily CSVs (Date, Close and optional Volume)."""
     import pandas as pd
-    from .factors import FactorSettings, canonical, evaluate
+    from .factors import SURVIVORSHIP_NOTE, FactorSettings, canonical, evaluate
     if not args.data_dir or not args.symbols or not args.expression:
         raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
     section = dict(config.get("factor_lab") or {})
@@ -679,6 +685,7 @@ def factor_lab(args, config):
     return {"expression": expression, "horizon_sessions": args.horizon, "names": close.shape[1],
             "first_close": str(close.index[0].date()), "last_close": str(close.index[-1].date()),
             "note": "One offline test (trials=1). In the running fund every distinct expression raises the bar.",
+            "survivorship": SURVIVORSHIP_NOTE,
             **result}
 
 
@@ -727,6 +734,23 @@ def adjust_reserve(args):
         external = {k: number(v) for k, v in latest[-1]["external_holdings"].items()}
     reserve = journal.adjust_reserve(datetime.now(timezone.utc), number(args.amount or 0), external)
     print(f"Reserved cash is now {reserve}; the AI capital sleeve is unchanged.")
+
+
+def settle_position(args):
+    """Operator-only, local book, runner stopped: close an acquired or delisted holding at its cash value."""
+    from .journal import Journal
+    from .settlement import settle_position as settle
+    path = args.run_dir / "state.sqlite3"
+    if not path.is_file():
+        raise RiskError("No existing account journal at the selected run directory")
+    with sqlite3.connect(path) as db:
+        binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+    if not binding:
+        raise RiskError("No existing account journal at the selected run directory")
+    record = settle(Journal(args.run_dir, binding[0]), datetime.now(timezone.utc), args.symbol,
+                    args.cash_per_share, args.reason)
+    print(f"Settled {record['quantity']} {record['symbol']} at {record[record['kind']]} per share: "
+          f"{record['proceeds']} USD added to cash. The strict ledger replay verified the book.")
 
 
 def attach_order(args):

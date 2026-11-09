@@ -7,7 +7,8 @@ account's daily store (datastore.py) and the SEC cache:
 
 - local mode: completed daily bars for the tradable universe, the research
   universe and the benchmarks (the same source and length the runner uses;
-  paper mode keeps the broker's own data and skips this part);
+  paper mode keeps the broker's own data and skips this part), cross-checked
+  against Alpaca's daily bars when Alpaca keys are set (bar_quality.py);
 - FRED series, the earnings calendar, SEC company-facts extracts.
 
 The runner reads these first and fetches only what is missing. It never calls
@@ -59,7 +60,7 @@ def refresh_earnings(store, day, calendar, stocks, refresh=False):
 
 
 def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, clock=time.monotonic,
-             earnings_get=None, earnings_yahoo=None, macro_get=None, sec_get=None):
+             earnings_get=None, earnings_yahoo=None, macro_get=None, sec_get=None, alpaca_get=None):
     from pathlib import Path
     import pandas as pd
     from .datastore import DailyStore
@@ -88,6 +89,11 @@ def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, cloc
         length = history_length(quant, lab if lab.enabled else None)
         symbols = sorted(set(universe) | set(stocks) | {quant.stress_benchmark, "SPY", "QQQ"})
         report["bars"] = fetch_bars(store, day, symbols, length, source or YahooRealtimeData(tape=None))
+        if environ.get("ALPACA_API_KEY") and environ.get("ALPACA_API_SECRET"):
+            from .bar_quality import check_store
+            from .history import AlpacaDailyHistory
+            reference = AlpacaDailyHistory(environ["ALPACA_API_KEY"], environ["ALPACA_API_SECRET"], get=alpaca_get)
+            report["bars"]["quality"] = check_store(store, day, symbols, length, reference)
     else:
         report["bars"] = "skipped: paper mode keeps the broker's own daily data"
 

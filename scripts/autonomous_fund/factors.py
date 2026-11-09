@@ -156,6 +156,9 @@ def canonical(expression):
     return ast.unparse(parse(expression))
 
 
+MEMBERSHIP = "index_member"  # Optional boolean panel in `extra`; not an expression field.
+
+
 def compute(expression, close, volume=None, extra=None):
     """Factor panel (dates x symbols) from completed daily data; backwards-looking only.
 
@@ -170,7 +173,13 @@ def compute(expression, close, volume=None, extra=None):
     value = _eval(parse(expression), data)
     if not isinstance(value, pd.DataFrame):
         raise RiskError("A factor must depend on market data")
-    return value.replace([np.inf, -np.inf], np.nan)
+    value = value.replace([np.inf, -np.inf], np.nan)
+    member = (extra or {}).get(MEMBERSHIP)
+    if member is not None:
+        # A stock counts in a cross-section only from its index entry; its prices stay
+        # complete, so look-back windows right after it joined are unaffected.
+        value = value.where(member.reindex(index=value.index, columns=value.columns).fillna(True).astype(bool))
+    return value
 
 
 def _panel(value, like):
@@ -246,6 +255,32 @@ def daily_ic(factor, close, horizon, min_names):
     pct = f.rank(axis=1, pct=True)
     spread = r.where(pct >= 0.8).mean(axis=1) - r.where(pct <= 0.2).mean(axis=1)
     frame = pd.DataFrame({"ic": ic, "spread": spread, "names": count})
+    return frame[(count >= min_names) & ic.notna()]
+
+
+def daily_ic_within(factor, close, horizon, min_names, sectors):
+    """Per-date rank IC after removing each sector's mean rank: does the factor pick within sectors?
+
+    Ranks are taken across the whole cross-section, as in daily_ic, then demeaned within each
+    sector (names without a sector form one group); a factor that only separates sectors
+    scores about zero here. Names alone in their sector carry no within-sector information.
+    """
+    forward = close.shift(-horizon) / close - 1
+    both = factor.notna() & forward.notna()
+    fr, rr = factor.where(both).rank(axis=1), forward.where(both).rank(axis=1)
+    labels = [sectors.get(column, "unassigned") for column in close.columns]
+
+    def within(frame):
+        means = frame.T.groupby(labels).transform("mean").T
+        return frame - means
+    a, b = within(fr), within(rr)
+    peers = both.T.groupby(labels).transform("sum").T
+    informative = both & (peers >= 2)
+    a, b = a.where(informative), b.where(informative)
+    denominator = np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
+    ic = (a * b).sum(axis=1) / denominator.where(denominator > 0)
+    count = informative.sum(axis=1)
+    frame = pd.DataFrame({"ic": ic, "spread": np.nan, "names": count})
     return frame[(count >= min_names) & ic.notna()]
 
 
@@ -381,10 +416,14 @@ class FactorSettings:
     # Random-ranking diagnostics: how many, and every how many days.
     negative_control_runs: int = 20
     negative_control_days: int = 7
+    # Count S&P 500 members in historical stock cross-sections only from the date they joined.
+    index_membership: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise RiskError("factor_lab.enabled must be true/false")
+        if type(self.index_membership) is not bool:
+            raise RiskError("factor_lab.index_membership must be true/false")
         for key, low, high in (("history_days", 120, 2520), ("min_names", 3, 500), ("min_observations", 5, 500),
                                ("min_holdout_observations", 3, 500), ("live_min_observations", 3, 500),
                                ("max_proposals_per_review", 0, 10), ("max_active", 1, 20),
@@ -433,20 +472,34 @@ class FactorSettings:
         return cls(**section)
 
 
-def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None):
+def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None, sectors=None):
     """In-sample, holdout and walk-forward evidence with a verdict. close/volume end at the last completed session."""
     if type(horizon) is not int or not 1 <= horizon <= 20:
         raise RiskError("Factor horizon must be 1..20 sessions")
-    return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff)
+    return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff,
+                           sectors=sectors)
 
 
-def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None):
-    """The evidence standard applied to a computed factor panel (also used by the negative control)."""
+def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, sectors=None):
+    """The evidence standard applied to a computed factor panel (also used by the negative control).
+
+    With `sectors` ({symbol: sector}) the within-sector IC on the same dates is reported as
+    `sector_neutral`. It is evidence, not a criterion: a sector-rotation factor can be real,
+    but the AI should know it is a sector bet rather than stock selection.
+    """
     rows = daily_ic(factor, close, horizon, settings.min_names)
     sampled = rows.iloc[::horizon]  # Non-overlapping forward windows: honest t-statistics.
     split = int(round(len(sampled) * (1 - settings.holdout_fraction)))
     inside, holdout = sampled.iloc[:split], sampled.iloc[split:]
+    neutral = None
+    if sectors:
+        within = daily_ic_within(factor, close, horizon, max(4, settings.min_names // 2), sectors)
+        neutral = {"in_sample": summarize(within[within.index.isin(inside.index)]),
+                   "holdout": summarize(within[within.index.isin(holdout.index)]),
+                   "meaning": "rank IC after removing each sector's mean rank, on the same dates; near zero means "
+                              "the factor mostly separates sectors (a sector bet), not stocks within them"}
     result = {"in_sample": summarize(inside), "holdout": summarize(holdout), "trials": trials,
+              **({"sector_neutral": neutral} if neutral else {}),
               "critical_t": critical_t(trials, settings.significance), "knowledge": knowledge(sampled, cutoff),
               "first_date": str(sampled.index[0].date()) if len(sampled) else None,
               "last_date": str(sampled.index[-1].date()) if len(sampled) else None}
@@ -578,6 +631,8 @@ class FactorLab:
             columns = {row[1] for row in db.execute("PRAGMA table_info(fund_factors)")}
             if "universe" not in columns:
                 db.execute("ALTER TABLE fund_factors ADD COLUMN universe TEXT")
+            if "confirmed_at" not in columns:  # The live record agreed: no longer survivorship-exposed.
+                db.execute("ALTER TABLE fund_factors ADD COLUMN confirmed_at TEXT")
             # Earlier factors were ranked across stocks AND ETFs together; that evidence does not
             # transfer to either cross-section, so they retire (and still count as trials).
             legacy = [dict(r) for r in db.execute(
@@ -604,7 +659,7 @@ class FactorLab:
         with self.journal.connection() as db:
             return db.execute("SELECT count(*) FROM fund_factors").fetchone()[0]
 
-    def test(self, proposals, now, session_date, close, volume=None, extra=None, models=()):
+    def test(self, proposals, now, session_date, close, volume=None, extra=None, models=(), sectors=None):
         """Evaluate the review's proposals in their cross-section; a repeated expression is not a new trial.
 
         `models` wrote the proposals; their knowledge cutoff separates the clean out-of-sample record.
@@ -638,7 +693,8 @@ class FactorLab:
             trials = self.trials() + (0 if existing else 1)
             try:
                 close_, volume_, extra_ = _fields(data)
-                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_, cutoff)
+                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_, cutoff,
+                                   sectors=sectors if universe == "stocks" else None)
                 if outcome["status"] == "validated":
                     outcome = self._redundancy(outcome, expression, universe, data)
             except RiskError as exc:
@@ -701,6 +757,14 @@ class FactorLab:
                 self.journal.event(now, "factor_retired", {"id": row["id"], "expression": row["expression"],
                                                            "reason": reason, "live": live})
                 continue
+            if not row.get("confirmed_at") and confirmed(live, row["direction"], self.settings):
+                # Historical validation used today's names only (survivorship bias); the live record
+                # after validation has no such bias. Only now does the factor count as validated evidence.
+                with self.journal.connection() as db:
+                    db.execute("UPDATE fund_factors SET confirmed_at=? WHERE id=?", (str(now), row["id"]))
+                self.journal.event(now, "factor_confirmed", {"id": row["id"], "expression": row["expression"],
+                                                             "live": {k: live.get(k) for k in ("n", "mean_ic", "t")}})
+                row = {**row, "confirmed_at": str(now)}
             active.append({**row, "live": live})
         return active
 
@@ -732,6 +796,8 @@ class FactorLab:
             live, evidence = item["live"], json.loads(item["evidence"])
             return (live.get("t") or 0) * item["direction"], abs(evidence["in_sample"]["t"] or 0)
         active.sort(key=strength, reverse=True)
+        confirmed_rows = [r for r in active if r.get("confirmed_at")]
+        provisional = [r for r in active if not r.get("confirmed_at")]
         tried = self.rows()
         control = self._negative_control(now, as_panels(close, volume, extra) if close is not None else None)
         return {
@@ -746,7 +812,13 @@ class FactorLab:
                 "the live record is always clean). The quintile spread must survive costs on its "
                 "turnover, and a factor that mostly re-ranks like a validated one is redundant. Each factor names its "
                 "cross-section (stocks incl. the research universe, or etfs); favored lists only tradable names. "
+                "validated lists factors whose live record after validation agreed for at least "
+                "live_min_observations observations; provisional lists factors that passed the historical tests "
+                "only. Those tests use today's names (survivorship bias), so provisional factors are hypotheses: "
+                "they carry no favored names, and only their live record can confirm them. "
                 "Evidence, not orders: weigh it with research."),
+            "live_min_observations": self.settings.live_min_observations,
+            "survivorship": SURVIVORSHIP_NOTE,
             "trials": len(tried), "next_critical_t": critical_t(len(tried) + 1, self.settings.significance),
             "validated": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
                            "universe": r.get("universe") or "stocks",
@@ -754,7 +826,14 @@ class FactorLab:
                            "in_sample": json.loads(r["evidence"])["in_sample"],
                            "holdout": json.loads(r["evidence"])["holdout"], "live": r["live"],
                            **_evidence_flags(json.loads(r["evidence"]))}
-                          for r in active[:self.settings.max_active]],
+                          for r in confirmed_rows[:self.settings.max_active]],
+            "provisional": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
+                             "universe": r.get("universe") or "stocks", "direction": r["direction"],
+                             "validated_on": r["validated_at"], "in_sample": json.loads(r["evidence"])["in_sample"],
+                             "holdout": json.loads(r["evidence"])["holdout"],
+                             "live": {k: (r["live"] or {}).get(k) for k in ("n", "mean_ic", "t", "unavailable")},
+                             **_evidence_flags(json.loads(r["evidence"]))}
+                            for r in provisional[:self.settings.max_active]],
             "negative_control": control,
             "recently_rejected": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
                                    "status": r["status"], "reason": r["reason"]}
@@ -763,11 +842,31 @@ class FactorLab:
         }
 
 
+SURVIVORSHIP_NOTE = ("Survivorship bias: every historical cross-section uses today's universe and research list. "
+                     "Stocks that were delisted, acquired or dropped from an index are missing, so historical ICs and "
+                     "spreads are optimistic. The live record after validation has no such bias, and from the daily "
+                     "universe snapshot's first session on, former members stay in the cross-sections for their "
+                     "membership period (see universe_snapshot).")
+SURVIVORSHIP_TEXT = "历史检验只含当前还在交易的股票，退市、被收购和被剔出指数的不在其中（幸存者偏差），历史 IC 偏乐观；验证之后的样本外记录不受影响。"
+
+
+def confirmed(live, direction, settings):
+    """The live record after validation agrees: enough observations and the validated direction."""
+    return (live.get("n", 0) >= settings.live_min_observations and live.get("mean_ic") is not None
+            and direction is not None and live["mean_ic"] * direction > 0)
+
+
 def _evidence_flags(evidence):
-    """Walk-forward agreement and memorization risk; factors validated before they existed show None."""
+    """Walk-forward agreement, memorization risk and sector bets; factors validated before they existed show None."""
     windows, memory = evidence.get("walk_forward") or {}, evidence.get("knowledge") or {}
+    neutral, direction = (evidence.get("sector_neutral") or {}).get("in_sample") or {}, evidence.get("direction")
+    within_t = neutral.get("t")
     return {"walk_forward_agreeing": (f"{windows['agreeing']}/{len(windows['windows'])}" if windows else None),
-            "memory_risk": memory.get("memory_risk"), "clean_out_of_sample": memory.get("clean_out_of_sample")}
+            "memory_risk": memory.get("memory_risk"), "clean_out_of_sample": memory.get("clean_out_of_sample"),
+            "sector_neutral_t": within_t,
+            # True: within sectors the factor does not keep its direction with |t| >= 1, so it is mostly a sector bet.
+            "mostly_sector_bet": (None if not neutral or direction is None else
+                                  within_t is None or within_t * direction < 1)}
 
 
 def panel_from_rows(history):

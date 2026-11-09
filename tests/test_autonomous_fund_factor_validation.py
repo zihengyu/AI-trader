@@ -117,7 +117,8 @@ def test_the_lab_runs_the_control_weekly_and_records_the_models_cutoff(tmp_path)
     flags = _evidence_flags(evaluate("rank(ret(21))", 5, close, volume, lab.settings, 1))
     assert flags["walk_forward_agreeing"].endswith("/4") and flags["memory_risk"] == "unknown_cutoff"
     assert _evidence_flags({"in_sample": {}}) == {"walk_forward_agreeing": None, "memory_risk": None,
-                                                  "clean_out_of_sample": None}  # Validated before this existed.
+                                                  "clean_out_of_sample": None, "sector_neutral_t": None,
+                                                  "mostly_sector_bet": None}  # Validated before this existed.
 
 
 def test_the_deflated_sharpe_counts_every_configuration_tried():

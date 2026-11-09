@@ -98,7 +98,8 @@ def test_the_weekly_report_separates_facts_inference_judgment_and_hypotheses(tmp
     assert "模型调用 2 次，估算费用 0.2500 美元（另有 1 次未定价，不按 0 计）" in text
     assert "- 选股：0.10%" in text and "2 个交易日相加" in text
     assert "命中率 50.00%" in text and "研究想法：共 4 条" in text and "把握 0.6-0.70：2 条" in text
-    assert "本周检验：未通过 1、通过 1" in text and "通过：momentum" in text and "负对照（2026-11-02）" in text
+    assert "本周检验：历史检验通过（待样本外确认） 1、未通过 1" in text and "历史检验通过（待样本外确认）：momentum" in text
+    assert "负对照（2026-11-02）" in text
     assert "组合构建对照：当前 ai，配对 5 个交易日" in text and "学习对照（影子 A/B）：当前 memo，配对 4 个交易日" in text
     assert "decision_drought × 1" in text and "没有收盘净值" in text and "本周完成复盘 2 次" in text
     assert "2026-11-04（置信度 low）：周三" in text and "动量延续（验证条件：五日后跑赢 SPY" in text

@@ -159,7 +159,7 @@ def _idea_outcome(idea, closes):
             "always_up_correct": move > 0}
 
 
-def score_ideas(ideas, closes):
+def score_ideas(ideas, closes, regimes=None):
     """Score research ideas registered before the open: calibration, Brier and naive baselines.
 
     Each idea is measured from the first completed close after it was formed (so a
@@ -215,12 +215,85 @@ def score_ideas(ideas, closes):
         "selection": {"scored": len(picks), "hit_rate": sum(picks) / len(picks) if picks else None,
                       "p_value": binomial_tail(sum(picks), len(picks))},
         "verdict": verdict, "minimum_sample": MIN_INFORMATIVE_IDEAS,
+        # Background only: the hit rate in each market regime, and whether it is fading.
+        "by_regime": _idea_regimes(scored, hits, regimes),
+        "trend": recent_versus_earlier(hits),
         "recent": items[-12:],
         "interpretation": "Ideas are scored on completed closes from the first close after they were formed. "
                           "informative needs at least minimum_sample scored ideas, a hit rate above a coin and "
                           "above always-up (p < 0.05 each) and a Brier score under 0.25. selection uses the return "
                           "beyond the beta-matched benchmark. Overlapping horizons make p-values optimistic.",
     }
+
+
+TREND_WINDOW = 200     # Sessions in the benchmark's trend mean.
+VOL_WINDOW = 20        # Sessions in the benchmark's realized volatility.
+VOL_HISTORY = 252      # Earlier sessions whose median volatility separates calm from volatile.
+MIN_VOL_HISTORY = 60
+REGIMES = ("up_calm", "up_volatile", "down_calm", "down_volatile")
+MIN_TREND_SAMPLE = 20  # Scored items before recent and earlier results are compared.
+TREND_T = 1.65
+
+
+def market_regimes(benchmark_rows):
+    """{session: regime} of the benchmark, each from closes through that session only.
+
+    Trend: the close against its TREND_WINDOW-session mean (up when at or above it).
+    Volatility: the VOL_WINDOW-session realized volatility against the median of up
+    to VOL_HISTORY earlier sessions' (volatile when above it). Sessions without
+    enough history have no label. Background for grouping results, never a signal.
+    """
+    days, closes = _series(benchmark_rows)
+    labels, vols = {}, []
+    for i in range(len(days)):
+        if i < VOL_WINDOW or closes[i - VOL_WINDOW] <= 0:
+            vols.append(None)
+            continue
+        window = [closes[j] / closes[j - 1] - 1 for j in range(i - VOL_WINDOW + 1, i + 1) if closes[j - 1] > 0]
+        mean = sum(window) / len(window)
+        vols.append(math.sqrt(sum((r - mean) ** 2 for r in window) / max(1, len(window) - 1)))
+        earlier = sorted(v for v in vols[max(0, i - VOL_HISTORY):i] if v is not None)
+        if i + 1 < TREND_WINDOW or len(earlier) < MIN_VOL_HISTORY:
+            continue
+        trend = "up" if closes[i] >= sum(closes[i - TREND_WINDOW + 1:i + 1]) / TREND_WINDOW else "down"
+        middle = len(earlier) // 2
+        median = earlier[middle] if len(earlier) % 2 else (earlier[middle - 1] + earlier[middle]) / 2
+        labels[days[i]] = f"{trend}_{'volatile' if vols[i] > median else 'calm'}"
+    return labels
+
+
+def recent_versus_earlier(values):
+    """Is a record getting worse? The most recent third of chronological values against the rest.
+
+    Returns the two means, their difference and a Welch t; `change` is weaker_recently or
+    stronger_recently only when |t| >= TREND_T. Overlapping horizons are correlated, so
+    the t is optimistic: evidence of decay (crowding, a changed market), not proof.
+    """
+    values = [float(v) for v in values if v is not None]
+    if len(values) < MIN_TREND_SAMPLE:
+        return {"status": "insufficient_sample", "scored": len(values), "minimum_sample": MIN_TREND_SAMPLE}
+    cut = len(values) - len(values) // 3
+    earlier, recent = values[:cut], values[cut:]
+
+    def moments(rows):
+        mean = sum(rows) / len(rows)
+        return mean, sum((v - mean) ** 2 for v in rows) / max(1, len(rows) - 1)
+    (m1, v1), (m2, v2) = moments(earlier), moments(recent)
+    scale = math.sqrt(v1 / len(earlier) + v2 / len(recent))
+    t = (m2 - m1) / scale if scale > 0 else None
+    change = ("weaker_recently" if t is not None and t <= -TREND_T else
+              "stronger_recently" if t is not None and t >= TREND_T else "no_clear_change")
+    return {"status": "observed", "earlier": {"n": len(earlier), "mean": m1}, "recent": {"n": len(recent), "mean": m2},
+            "difference": m2 - m1, "t_stat": t, "change": change}
+
+
+def _idea_regimes(scored, hits, regimes):
+    if not regimes:
+        return {}
+    groups = {}
+    for item, hit in zip(scored, hits):
+        groups.setdefault(regimes.get(item.get("start_day"), "unlabeled"), []).append(hit)
+    return {label: {"scored": len(rows), "hit_rate": sum(rows) / len(rows)} for label, rows in sorted(groups.items())}
 
 
 BETA_LOOKBACK = 126
@@ -250,7 +323,7 @@ def _series_pairs(rows):
     return [(str(day), float(close)) for day, close in rows or []]
 
 
-def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS):
+def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None, regimes=None):
     """Forward return of each AI target portfolio vs a BETA-MATCHED benchmark, gross and net of costs.
 
     decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
@@ -262,8 +335,27 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     beta_assumed. Costs: |change in target weights| versus the previous decision
     (the first one starts from cash) times cost_bps per side. Cash earns zero and
     the risk overlay is excluded: this isolates the AI's selection skill.
+
+    With `sectors` ({symbol: sector}) the excess also splits, exactly, into
+    within_sector_selection (each holding against the equal-weighted return of its
+    sector's names with closes), sector_allocation (that sector return against the
+    holding's beta x benchmark: a sector bet) and unassigned_excess (holdings with no
+    sector, such as broad or bond ETFs). A portfolio that only overweights a rising
+    sector shows its excess as sector_allocation, not stock selection.
     """
     rows, previous = [], {}
+    members = {}
+    for symbol, sector in (sectors or {}).items():
+        members.setdefault(sector, []).append(symbol)
+    sector_cache = {}
+
+    def sector_return(sector, day, horizon):
+        key = (sector, day, horizon)
+        if key not in sector_cache:
+            paths = [_forward(closes.get(s), day, horizon, sessions=sessions) for s in members.get(sector, ())]
+            returns = [p[1] / p[0] - 1 for p in paths if isinstance(p, tuple)]
+            sector_cache[key] = sum(returns) / len(returns) if returns else None
+        return sector_cache[key]
     sessions, _ = _series(closes.get(benchmark))
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
@@ -281,6 +373,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
         cost = turnover * cost_bps / 10_000
         previous = weights
         row = {"decided_at": at, "session_date": day, "gross_exposure": exposure, "beta": portfolio_beta,
+               **({"regime": regimes.get(day, "unlabeled")} if regimes else {}),
                "beta_assumed": sorted(assumed), "turnover": turnover,
                "prompt_version": body.get("prompt_version") or "unversioned", "horizons": {}}
         for horizon in HORIZONS:
@@ -300,6 +393,20 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                     "excess_return": excess, "cost": cost, "net_excess_return": excess - cost,
                     "exposure_matched_benchmark_return": exposure * benchmark_return,
                     "exposure_excess_return": portfolio - exposure * benchmark_return}
+                if sectors:
+                    selection = allocation = other = assigned = 0.0
+                    for symbol, weight in weights.items():
+                        own = paths[symbol][1] / paths[symbol][0] - 1
+                        peer = sector_return(sectors[symbol], day, horizon) if symbol in sectors else None
+                        if peer is None:
+                            other += weight * (own - betas[symbol] * benchmark_return)
+                            continue
+                        assigned += weight
+                        selection += weight * (own - peer)
+                        allocation += weight * (peer - betas[symbol] * benchmark_return)
+                    row["horizons"][str(horizon)].update(
+                        within_sector_selection=selection, sector_allocation=allocation, unassigned_excess=other,
+                        sector_assigned_weight=assigned)
         rows.append(row)
 
     def summary(selected):
@@ -309,20 +416,38 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                         if r["horizons"][str(horizon)]["status"] == "observed"]
             gross = [o["excess_return"] for o in observed]
             net = [o["net_excess_return"] for o in observed]
+            # Cost sensitivity: the same record if trading cost twice or three times the estimate.
+            stressed = {k: [o["excess_return"] - k * o["cost"] for o in observed] for k in (2, 3)}
             result[str(horizon)] = {
                 "observed": len(observed),
                 "mean_excess_return": sum(gross) / len(gross) if gross else None,
                 "mean_net_excess_return": sum(net) / len(net) if net else None,
+                "mean_net_excess_return_2x_costs": sum(stressed[2]) / len(observed) if observed else None,
+                "mean_net_excess_return_3x_costs": sum(stressed[3]) / len(observed) if observed else None,
                 "positive_excess_rate": sum(e > 0 for e in gross) / len(gross) if gross else None,
                 "mean_exposure_excess_return": (sum(o["exposure_excess_return"] for o in observed) / len(observed)
                                                 if observed else None)}
+            split = [o for o in observed if "within_sector_selection" in o]
+            if split:
+                result[str(horizon)].update(
+                    mean_within_sector_selection=sum(o["within_sector_selection"] for o in split) / len(split),
+                    mean_sector_allocation=sum(o["sector_allocation"] for o in split) / len(split),
+                    positive_within_sector_rate=sum(o["within_sector_selection"] > 0 for o in split) / len(split))
         return result
 
     versions = {}
     for row in rows:
         versions.setdefault(row["prompt_version"], []).append(row)
+    regimes_seen = {}
+    for row in rows:
+        if "regime" in row:
+            regimes_seen.setdefault(row["regime"], []).append(row)
+    five = [r["horizons"]["5"]["net_excess_return"] for r in rows if r["horizons"]["5"]["status"] == "observed"]
     return {"decisions": len(rows), "by_horizon": summary(rows),
             "by_prompt_version": {version: summary(selected) for version, selected in versions.items()},
+            # Background only: results by market regime, and whether the 5-session net excess is fading.
+            "by_regime": {label: summary(selected) for label, selected in sorted(regimes_seen.items())},
+            "trend_5d_net_excess": recent_versus_earlier(five),
             "cost_bps_per_side": cost_bps, "recent": rows[-10:],
             "interpretation": "excess_return is over a beta-matched benchmark (portfolio beta from closes through "
                               "the decision day), so market exposure is not counted as skill; net_excess_return "
@@ -399,3 +524,56 @@ def score_timing(events, closes):
                           "submitted buy limit with the ask when waiting began. Small samples are noise; use this to "
                           "calibrate how tight stops and entry limits should be, not to stop using protection.",
     }
+
+
+REVERSAL_SESSIONS = 3  # A move against the previous move within this many sessions is a reversal.
+MOVE_STEP = 0.01  # Target changes smaller than one weight point are not moves.
+
+
+def score_consistency(decisions, triggers, cost_bps=DEFAULT_COST_BPS, window=REVERSAL_SESSIONS):
+    """How often the manager reverses itself: a target move against the same symbol's previous move.
+
+    decisions: (at, body) validated decisions in order; triggers: (at, kind, body) protective
+    triggers. A move is a target weight change of at least MOVE_STEP (a symbol added,
+    raised, lowered or removed). A reversal is a move in the opposite direction of that
+    symbol's previous move within `window` NYSE sessions, with no protective exit (stop or
+    take-profit) of the symbol in between: the manager changed its mind, the market did
+    not force it. Each reversal pays about the round trip of the reversed amount, so its
+    estimated cost is 2 x |change| x cost_bps of equity.
+    """
+    import pandas_market_calendars as mcal
+    if not decisions:
+        return {"decisions": 0, "moves": 0, "reversals": 0, "reversal_rate": None, "estimated_cost": 0.0,
+                "window_sessions": window, "recent": []}
+    days = [instant(at).astimezone(ZONE).date() for at, _ in decisions]
+    calendar = [index.date() for index in mcal.get_calendar("NYSE").schedule(
+        start_date=min(days), end_date=max(days)).index]
+    position = {day: i for i, day in enumerate(calendar)}
+    exits = sorted((instant(at), body.get("symbol")) for at, _, body in triggers if body.get("symbol"))
+    weights, moved, moves, reversals, cost, recent = {}, {}, 0, 0, 0.0, []
+    for (at, body), day in zip(decisions, days):
+        moment = instant(at)
+        now = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
+        for symbol in sorted(set(now) | set(weights)):
+            change = now.get(symbol, 0.0) - weights.get(symbol, 0.0)
+            if abs(change) < MOVE_STEP:
+                continue
+            moves += 1
+            sign, previous = (1 if change > 0 else -1), moved.get(symbol)
+            if previous and previous[0] != sign:
+                apart = position.get(day, len(calendar)) - position.get(previous[1], -len(calendar))
+                forced = any(previous[2] < when <= moment and name == symbol for when, name in exits)
+                if 0 <= apart <= window and not forced:
+                    reversals += 1
+                    cost += 2 * abs(change) * cost_bps / 10_000
+                    recent.append({"symbol": symbol, "first_move_at": previous[2].isoformat(), "reversed_at": moment.isoformat(),
+                                   "sessions_apart": apart, "change": round(change, 4)})
+            moved[symbol] = (sign, day, moment)
+        weights = now
+    return {"decisions": len(decisions), "moves": moves, "reversals": reversals,
+            "reversal_rate": reversals / moves if moves else None, "estimated_cost": round(cost, 6),
+            "window_sessions": window, "cost_bps_per_side": cost_bps, "recent": recent[-8:],
+            "interpretation": "A reversal is a target move against the same symbol's previous move within "
+                              "window_sessions sessions with no stop or take-profit in between. estimated_cost is a "
+                              "fraction of equity: about the round trip of each reversed amount. A high reversal rate "
+                              "means the manager changes its mind faster than its own horizon."}

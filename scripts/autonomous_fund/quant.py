@@ -36,6 +36,21 @@ WEIGHT_STEP = Decimal("0.000001")
 
 # Operator-reviewed defaults for the shipped universe. A symbol may belong to
 # several groups; each group limits the combined target weight of its members.
+# The GICS sectors among the risk groups: sector-neutral scoring compares a holding with its sector.
+SECTOR_GROUPS = ("technology", "communication", "consumer_discretionary", "financials", "health_care", "energy",
+                 "consumer_staples", "industrials", "materials", "utilities", "real_estate")
+
+
+def sectors(groups):
+    """{symbol: sector} from risk groups; a symbol in several sector groups takes the first in SECTOR_GROUPS order."""
+    members = {name: set(symbols) for name, _, symbols in groups}
+    result = {}
+    for name in SECTOR_GROUPS:
+        for symbol in sorted(members.get(name, ())):
+            result.setdefault(symbol, name)
+    return result
+
+
 DEFAULT_GROUPS = {
     "technology": ("0.30", ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "QCOM", "TXN", "XLK"]),
     "communication": ("0.20", ["GOOGL", "META", "NFLX", "DIS", "T", "VZ", "XLC"]),

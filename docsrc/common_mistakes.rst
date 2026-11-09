@@ -466,6 +466,58 @@ during the session counts at the next decision. The context also lists
 affordable symbols of which at most four shares fit, because a target is
 rounded down to whole shares.
 
+**Biases the review accounts for.** Seven things could make the record look better
+than the skill behind it.
+
+- Sector bets: decision excess beyond beta splits exactly into
+  within-sector selection, the sector bet and holdings without a sector.
+  Stock-cross-section factor tests also report a within-sector IC, and the AI
+  sees ``mostly_sector_bet``.
+- Survivorship: historical factor tests use today's names only; the AI's
+  context and the reports say so. A factor that passes them stays provisional
+  (no favored names for the AI) until its own live record agrees. From its
+  first day the fund also keeps a daily point-in-time universe, so stocks that
+  later leave (acquired, delisted) stay in factor tests for their membership
+  period. Records before the snapshot began remain biased.
+- Winner selection: today's large caps were picked because they grew. With
+  ``factor_lab.index_membership`` (default on) a stock counts in historical
+  factor cross-sections only from the date it joined the S&P 500, taken from
+  the public constituents list.
+- Optimistic simulated fills: investment acceptance requires the edge to stay
+  positive at twice the realized trading costs, and scorecards show 2x and 3x.
+- Fading results: decision and research-idea scorecards are grouped by market
+  regime (SPY trend and volatility, from past closes only) and compare the most
+  recent third of the record with the rest. A weaker recent record is flagged
+  as evidence, never used to change trading by itself.
+- Reversals: the manager sees how often it reversed a target within three
+  sessions without a stop or take-profit, and what that cost. The daily and
+  weekly reports show it too.
+- Day trades: ``fund-logs.sh`` shows the same-day round trips of the last five
+  sessions, the US pattern day trader count. Paper accounts are unaffected.
+
+**Wrong daily bars from a free source (local mode).** Set Alpaca paper keys even
+in local mode: the fund then compares Yahoo's completed daily closes with
+Alpaca's once a day. A session that differs by more than 2% is dropped (never
+replaced or interpolated); a symbol that disagrees on many sessions or on its
+latest close is withheld for the day, and one notice after the close lists
+them. Alpaca's free feed is IEX only, so only gross errors are caught.
+
+**A held stock was acquired or delisted (local book).** Its provider stops
+serving daily bars, so the account cannot be valued and valuation and new
+trading pause rather than use a guessed price. After each close the fund checks
+every holding and, when no new completed bar arrived for more than three NYSE
+sessions, says so once a day. Find out the cash actually paid per share (0 for a
+worthless delisting), stop the fund, then run:
+
+.. code-block:: bash
+
+   bash scripts/run_autonomous_fund.sh settle-position --run-dir <run-dir> --symbol <SYMBOL> --cash-per-share <amount> --reason "<what happened>"
+
+The command refuses while the runner is running, while an order for the symbol
+is open, and when the book does not pass the strict ledger replay; the
+settlement and its evidence commit together or not at all. Alpaca paper
+accounts settle such holdings at the broker.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

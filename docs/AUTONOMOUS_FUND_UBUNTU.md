@@ -2,7 +2,7 @@
 
 本应用的显式秘密配置、无人值守进程管理、审批和日报运维说明。
 
-**Last Updated:** 2026-11-08
+**Last Updated:** 2026-11-09
 
 **Status:** 部署生成器与进程／通知回归已验证；目标 Ubuntu 安装和 Telegram 实际投递待验证
 
@@ -29,7 +29,7 @@
 | `bash scripts/fund-start.sh` | 启动：检查 `.env` → 安装或更新三个 systemd 服务（交易、独立监控、数据员）和每日备份定时器 → 启动 → 等独立监控就绪（最多 3 分钟）→ 处于人工停止时询问是否恢复交易（`-y` 直接恢复）。旧版本装过的 `lumibot-fund-prefetch.timer` 会自动停用并删除（已被数据员取代） |
 | `bash scripts/fund-restart.sh` | **更新代码后用这个**：重新安装有变化的服务文件 → 真正重启三个服务（加载新代码）→ 等到重启后的独立监控写出新状态 → 询问是否恢复交易（`-y` 直接恢复）。`--update` 先 `git pull --ff-only`（只快进，不覆盖本地修改）并按锁定版本重装依赖。`fund-start.sh` 对已经在运行的服务不会重启，所以更新后单独运行它看起来“没反应” |
 | `bash scripts/fund-rehearse.sh` | **盘前彩排**：在交易服务完全相同的文件沙箱里，用 `FUND_MODE` 账户的副本（含数据员准备的数据）和真实行情完整走一遍决策；**默认用模拟 AI 回答每次模型调用，不调用模型、0 模型费用**（数据员状态 → 盘前研究 → 风控数据 → 因子研究 → 财报日历 → FRED → 反方审查 → 基金经理 → 决策校验 → 量化风控），在下单前停下，逐段报告耗时、本次彩排中每次模型调用的耗时和 token，并单列“模型回答是否可用”（格式不符、反方审查失败、复盘失败及位置）。在后台临时服务里运行，断开 SSH 不会中断，重连后用 `--show` 看结果。不碰真实账户、STOP、审批和 Telegram。`--real-models` 改用真实模型（会产生费用，换模型或改提示词后用），`--no-models` 只检查数据环节 |
-| `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、数据员各类数据的更新时间、账户、待审批、周报状态、最近通知）；`logs` 三个服务的实时日志，`errors` 最近 24 小时内最后 80 条警告／错误记录（保留完整 traceback），`report` 账户报告，`approvals` 待审批；`decisions [YYYY-MM-DD]` 按纽约日期核对每次复核、订单、成交及调仓通知；`weekly` 打印本周到目前为止的周报（不发送）；`experiments` 实验登记表（生效、影子观察、未通过、退役及状态变化）；`prune` 预览可清理的旧资讯、追踪文件和导出归档（`--apply` 执行，每日备份后也会自动执行） |
+| `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、数据员各类数据的更新时间、账户、待审批、周报状态、日内交易次数、最近通知）；`logs` 三个服务的实时日志，`errors` 最近 24 小时内最后 80 条警告／错误记录（保留完整 traceback），`report` 账户报告，`approvals` 待审批；`decisions [YYYY-MM-DD]` 按纽约日期核对每次复核、订单、成交及调仓通知；`weekly` 打印本周到目前为止的周报（不发送）；`experiments` 实验登记表（生效、影子观察、未通过、退役及状态变化）；`prune` 预览可清理的旧资讯、追踪文件和导出归档（`--apply` 执行，每日备份后也会自动执行） |
 | `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止三个服务；`--disable` 同时取消开机自启 |
 
 第一次运行 `fund-start.sh` 时如果还没有 `.env`，脚本会从模板创建一份并提示填写 Key 后再运行。
@@ -173,10 +173,12 @@ python3.12 -m venv .venv
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh check
 ```
 
-`connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 的 HTTP 状态和耗时，
+`connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 和标普 500 成分列表（raw.githubusercontent.com）的 HTTP 状态和耗时，
 `connectivity_summary.blocking` 列出会影响运行的失败项并附中文原因。**服务器在中国大陆地域时 Telegram 和 Yahoo 通常无法直连**，
 请改用香港／新加坡等境外地域，或在 `.env` 设置 `HTTPS_PROXY`。设置了 Alpaca Key 时，local 模式在 Yahoo 拿不到日线时
-会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`）。
+会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`），并且每天用 Alpaca 日线逐只核对 Yahoo 日线：
+有分歧的交易日剔除，严重不一致的证券当天停用，收盘后发一条“日线数据交叉核对”通知（见 `docs/AUTONOMOUS_FUND_DATA_SOURCES.md`）。
+**建议 local 模式也配上免费的 Alpaca Paper Key**，这是目前唯一的免费数据核对手段。
 
 `prepare` 只生成 `artifacts/fund-systemd/` 中的交易、监控、数据员三个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`
@@ -411,6 +413,16 @@ Telegram 接收确认丢失时重试可能重复，不保证恰好一次；同�
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh report --run-dir artifacts/fund-local
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh stop --run-dir artifacts/fund-local
 sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
+```
+
+**持仓被收购或退市**（本地账本）：收到“持仓 X 已连续 N 个交易日没有新的日线”的通知后，先查明实际结算金额
+（现金收购价；破产退市一般为 0），停止服务，结算，再启动。结算命令只用于本地账本，运行中会被运行锁拒绝；
+它会用严格对账复核整个账本，不一致就整笔回滚。Alpaca 模拟账户由券商自己结算，不用这个命令。
+
+```bash
+sudo systemctl stop lumibot-fund-runner.service
+sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh settle-position --run-dir artifacts/fund-local --symbol <代码> --cash-per-share <每股实收现金> --reason "<发生了什么>"
+sudo systemctl start lumibot-fund-runner.service
 ```
 
 `runtime.log` 按 20 MB 轮转，保留 5 个历史文件；journald 的磁盘额度由服务器管理员设置。

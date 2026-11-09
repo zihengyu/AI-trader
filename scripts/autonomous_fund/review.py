@@ -551,7 +551,8 @@ def review_after_close(strategy):
                     "session_date": day, "error": "no history for the cross-section of some proposals",
                     "skipped": [p["name"] for p in review["factor_proposals"] if p not in testable]})
             if testable:
-                lab.test(testable, strategy.get_datetime(), day, panels, models=tuple(packet["models"].values()))
+                lab.test(testable, strategy.get_datetime(), day, panels, models=tuple(packet["models"].values()),
+                         sectors=strategy._sectors() if hasattr(strategy, "_sectors") else None)
             strategy._factor_context_cache = None  # The next context includes these results.
         except Exception as exc:  # Evidence tooling must never cost the saved review.
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {

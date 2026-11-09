@@ -180,6 +180,8 @@ def test_favored_names_are_tradable_only(tmp_path):
     lab = FactorLab(Journal(tmp_path, "synthetic-tradable"), SETTINGS)
     close, volume = panel(seed=1)
     lab.test([proposal("rank(ret(60))")], NOW, "2026-11-02", close, volume)
+    from tests.test_autonomous_fund_factors import confirm
+    confirm(lab)  # Favored names come from confirmed factors only.
     tradable = set(close.columns[:6])
     context = lab.context(NOW, close, volume, tradable=tradable)
     names = {r["symbol"] for r in context["validated"][0]["live"]["favored"] + context["validated"][0]["live"][
@@ -231,7 +233,7 @@ def test_a_missing_cross_section_never_hides_the_other_or_aborts_a_batch(tmp_pat
     assert results[0]["status"] == "unavailable" and results[1]["status"] != "unavailable"
     assert lab.trials() == trials + 1  # The unavailable one is not a trial.
     context = lab.context(NOW, only_stocks)
-    assert any(row["universe"] == "stocks" for row in context["validated"])
+    assert any(row["universe"] == "stocks" for row in context["validated"] + context["provisional"])
 
 
 def test_redundancy_is_judged_on_in_sample_dates_only():

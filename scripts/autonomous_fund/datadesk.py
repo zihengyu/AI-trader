@@ -421,7 +421,7 @@ def fomc_meetings(html, today, days=CALENDAR_DAYS):
 class DataDesk:
     def __init__(self, run_dir, config, mode, *, source=None, environ=None, clock=None, news_get=None,
                  news_yahoo=None, macro_get=None, earnings_get=None, earnings_yahoo=None, sec_get=None,
-                 chart=None, calendar_get=None, sleep=time.sleep):
+                 chart=None, calendar_get=None, alpaca_get=None, sleep=time.sleep):
         from .datastore import DailyStore
         from .events import EventSettings
         from .factors import FactorSettings
@@ -447,7 +447,8 @@ class DataDesk:
         self.event_settings = EventSettings.from_config(config.get("events"))
         self._source, self._news, self._macro, self._calendar = source, None, None, None
         self._gets = {"news": news_get, "news_yahoo": news_yahoo, "macro": macro_get, "earnings": earnings_get,
-                      "earnings_yahoo": earnings_yahoo, "sec": sec_get, "chart": chart, "calendar": calendar_get}
+                      "earnings_yahoo": earnings_yahoo, "sec": sec_get, "chart": chart, "calendar": calendar_get,
+                      "alpaca": alpaca_get}
         self._sleep, self._closes = sleep, {}
         self.next_run, self.failures = {}, {}
         self._lock = threading.Lock()
@@ -623,7 +624,11 @@ class DataDesk:
 
     def _previous_close(self, symbol, day):
         """(date, close) of the last completed session: the store first, then one daily read per day."""
-        rows = self.store.bars(day, symbol, 1)
+        from .bar_quality import apply
+        verdict = self.store.get(day, f"quality/{symbol}")
+        if verdict and verdict.get("status") == "unreliable":
+            return None  # The two daily sources disagree: the change is reported as unknown.
+        rows = apply(self.store.bars(day, symbol, 1) or [], verdict)
         if rows:
             return str(rows[-1][0]), float(rows[-1][1])
         key = (day, symbol)
@@ -768,18 +773,35 @@ class DataDesk:
         from .prefetch import fetch_bars
         symbols = sorted(set(self.universe) | set(self.stocks) | {self.quant.stress_benchmark} | set(GAUGES))
         result = fetch_bars(self.store, trading_day(now), symbols, self.length, self._data())
+        reference = self._reference()
+        if reference is not None:
+            from .bar_quality import check_store
+            # Cross-checked here, off the trading process; it reuses these verdicts.
+            result["quality"] = check_store(self.store, trading_day(now), symbols, self.length, reference)
         self.store.prune(trading_day(now))
         if result["failed"] and not result["fetched"] and not result["already_stored"]:
             first = sorted(result["failed"].items())[0]
             raise RiskError(f"daily bars failed for all {len(symbols)} symbols (first: {first[0]}: {first[1]})"[:200])
         return result
 
+    def _reference(self):
+        """The second daily source (Alpaca) for the cross-check, in local mode with keys; else None."""
+        if self.mode != "local" or not (self.environ.get("ALPACA_API_KEY") and self.environ.get("ALPACA_API_SECRET")):
+            return None
+        if getattr(self, "_alpaca_history", None) is None:
+            from .history import AlpacaDailyHistory
+            self._alpaca_history = AlpacaDailyHistory(self.environ["ALPACA_API_KEY"], self.environ["ALPACA_API_SECRET"],
+                                                      get=self._gets.get("alpaca"))
+        return self._alpaca_history
+
     def _job_snapshot(self, now):
+        from .bar_quality import apply
         from .snapshot import snapshot
         day, benchmark = trading_day(now), self.quant.stress_benchmark
         histories = {}
         for symbol in sorted(set(self.tradable) | {benchmark}):
-            rows = self.store.bars(day, symbol, 1) or []
+            # The cross-check's verdict applies here as in the trading process (disputed sessions dropped).
+            rows = apply(self.store.bars(day, symbol, 1) or [], self.store.get(day, f"quality/{symbol}"))
             histories[symbol] = [(str(d), c, v) for d, c, v, *_ in rows if c == c and c > 0]
         if not histories.get(benchmark):
             raise Idle("waiting for the day's daily bars (stored after 06:00 New York); until then the trading "
