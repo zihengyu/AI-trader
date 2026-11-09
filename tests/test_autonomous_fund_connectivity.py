@@ -25,7 +25,8 @@ def fake(blocked=(), status=200):
 
 def test_every_configured_service_is_probed_once():
     get, calls = fake()
-    results = connectivity(ENV, ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"], get=get)
+    # A Paper account probe belongs to paper mode only.
+    results = connectivity({**ENV, "FUND_MODE": "paper"}, ["deepseek/deepseek-flash", "deepseek/deepseek-v4-pro"], get=get)
     assert set(results) == {"yahoo", "telegram", "deepseek", "alpaca_paper", "alpaca_data", "sec", "fred", "finnhub",
                             "index_membership"}
     assert all(row["ok"] for row in results.values()) and summary(results)["all_ok"]
@@ -48,6 +49,35 @@ def test_an_http_error_status_is_a_failure_and_unconfigured_services_are_skipped
     results = connectivity({"DEEPSEEK_API_KEY": "k"}, ["deepseek/deepseek-flash"], get=get)
     assert set(results) == {"yahoo", "deepseek", "fred", "index_membership"}  # Keyless sources are always probed.
     assert results["deepseek"]["status"] == 401 and not results["deepseek"]["ok"] and "401" in results["deepseek"]["hint"]
+
+
+def test_local_with_market_data_keys_never_checks_a_paper_account():
+    get, calls = fake(blocked=("paper-api.alpaca.markets", "data.alpaca.markets"))
+    results = connectivity({**ENV, "FUND_MODE": "local", "ALPACA_IS_PAPER": "false"}, get=get)
+    assert "alpaca_paper" not in results
+    assert not any("paper-api.alpaca.markets" in url for url in calls)
+    assert not results["alpaca_data"]["ok"] and summary(results)["blocking"] == []
+
+
+def test_an_incomplete_pair_is_optional_in_local_and_blocking_in_paper():
+    for mode, row in (("local", "alpaca_data"), ("paper", "alpaca_paper")):
+        get, calls = fake()
+        results = connectivity({"FUND_MODE": mode, "ALPACA_API_KEY": "synthetic-id",
+                                "ALPACA_API_SECRET": "  "}, get=get)
+        assert results[row]["error"] == "configuration" and "ALPACA_API_SECRET" in results[row]["hint"]
+        assert not any("alpaca.markets" in url for url in calls)
+        assert summary(results)["blocking"] == ([row] if mode == "paper" else [])
+
+
+def test_paper_preflight_uses_the_startup_guard_and_yahoo_is_optional():
+    get, calls = fake(blocked=("finance.yahoo.com",))
+    results = connectivity({**ENV, "FUND_MODE": "paper", "ALPACA_IS_PAPER": "false"}, get=get)
+    assert summary(results)["blocking"] == ["alpaca_paper"]
+    assert "ALPACA_IS_PAPER" in results["alpaca_paper"]["hint"]
+    assert not any("paper-api.alpaca.markets" in url for url in calls)
+    results = connectivity({**ENV, "FUND_MODE": "paper"}, get=get)
+    assert results["alpaca_paper"]["ok"] and summary(results)["blocking"] == []
+    assert not results["yahoo"]["ok"]
 
 
 def test_metrics_file_exposes_health_equity_drawdown_and_approvals(tmp_path):

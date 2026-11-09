@@ -17,6 +17,8 @@ from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
+from .claims import MomentumClaim, check_claims, score_claims
+
 from .journal import Journal, encode
 from .risk import (Account, Intent, Limits, ObservedPrice, Price, RiskError, bounded_list, bounded_text, decision_levels,
                    desired_shares, instant, number, plan,
@@ -187,6 +189,10 @@ MANAGER_PROMPT = (
     "your targets act on in idea_refs (optional). scorecards.research_ideas scores past ideas against naive baselines "
     "and separates stock selection from the market's direction. "
     "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
+    "For every 20- or 60-session momentum rank you cite in rationale, also submit a factual_claims entry "
+    "with symbol, metric ret_20d or ret_60d, and minimum_percentile (80 means at least the 80th percentile). "
+    "Use the same-date eligible names in market_snapshot. Omit unsupported ranks and leave factual_claims empty "
+    "when you make no claim of this type. scorecards.claims shows the previous checks. "
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
     "(cross-sectional rank IC in their own cross-section, stocks incl. a non-tradable research universe or ETFs; "
     "trials-adjusted significance, holdout, a quintile spread that survives costs, not redundant, and the live "
@@ -345,6 +351,7 @@ class Decision(BaseModel):
     news_watch: bounded_list(NewsQuery, 8) = Field(default_factory=list)
     # Optional: the registered research ideas (idea_id) this portfolio acts on, for attribution.
     idea_refs: bounded_list(bounded_text(40, 1), 16) = Field(default_factory=list)
+    factual_claims: bounded_list(MomentumClaim, 8) = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -595,15 +602,19 @@ def history_length(quant, factor_settings=None):
 
 
 def daily_rows(bars):
-    """[(date, close, volume, open, high, low)] from a Bars result, row by row (one bad value never drops a symbol)."""
+    """[(date, close, volume, open, high, low)] with a finite positive close."""
     frame = bars.df if bars is not None else None
     if frame is None or not len(frame) or "close" not in frame:
         return []
     def column(name):
         return frame[name] if name in frame else [None] * len(frame)
-    return [(index.date(), _finite(c), _finite(v), _finite(o), _finite(h), _finite(l))
-            for index, c, v, o, h, l in zip(frame.index, frame["close"], column("volume"), column("open"),
-                                             column("high"), column("low"))]
+    rows = []
+    for index, c, v, o, h, l in zip(frame.index, frame["close"], column("volume"), column("open"),
+                                   column("high"), column("low")):
+        close = _finite(c)
+        if close > 0:
+            rows.append((index.date(), close, _finite(v), _finite(o), _finite(h), _finite(l)))
+    return rows
 
 
 def _finite(value):
@@ -750,9 +761,12 @@ class AutonomousFund(Strategy):
         from .construction import ConstructionSettings
         self.construction = ConstructionSettings.from_config(config.get("construction"))
         self.history_fallback = None
-        if mode == "local" and live_data and os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET"):
+        if mode == "local" and live_data:
             from .history import AlpacaDailyHistory
-            self.history_fallback = AlpacaDailyHistory(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_API_SECRET"])
+            from .settings import alpaca_keys
+            keys = alpaca_keys(os.environ)
+            if all(keys):
+                self.history_fallback = AlpacaDailyHistory(*keys)
         from .macro import MacroSettings, MacroWatch
         macro = MacroSettings.from_config(config.get("macro"))
         # `macro` is the native FRED tool client. The app's precomputed regime
@@ -1955,7 +1969,8 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_retry_at", None)
             self.journal.set_meta("decision_failure_role", None)
         self.journal.event(now, "decision_validated", {
-            **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None)})
+            **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None),
+            "claim_checks": check_claims(decision.get("factual_claims", []), context["market_snapshot"], self.universe)})
         self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
         self._record_construction_variant(decision, now)
         self._triggers = []
@@ -2134,13 +2149,18 @@ class AutonomousFund(Strategy):
         settings = getattr(self, "validation", None)
         if settings is None or not settings.shadow_enabled or getattr(self, "quant", None) is None:
             return None
+        from .market_data import completed_daily_cutoff
         from .review import _events
+        from .scorecard import completed_sessions
         from .validation import paired_test, shadow_pairs
-        rows = [r["body"] for r in _events(self.journal, instant(now), kinds=("shadow_decision",)) if r["body"].get("valid")]
+        # The journal timestamp is when both arms were available. The manager's
+        # as_of can precede the close even if the shadow answer arrived after it.
+        rows = [{**r["body"], "decided_at": r["at"]}
+                for r in _events(self.journal, instant(now), kinds=("shadow_decision",)) if r["body"].get("valid")]
         symbols = {"SPY"} | {t["symbol"] for row in rows for body in (row["decision"], row["trading_decision"])
                              for t in body["targets"]}
         closes = {s: self._daily_closes(s, now) for s in sorted(symbols & (set(self.universe) | {"SPY"}))}
-        differences = shadow_pairs(rows, closes)
+        differences = shadow_pairs(rows, closes, sessions=completed_sessions(closes, completed_daily_cutoff(now)))
         stats = paired_test(differences, settings.min_pairs)
         champion = self._champion()
         switch, reason = None, None
@@ -2349,12 +2369,14 @@ class AutonomousFund(Strategy):
             latest = db.execute("SELECT MAX(sequence) FROM events WHERE kind IN (%s) "
                                 "AND julianday(at)<=julianday(?)" % ",".join("?" * len(kinds)),
                                 (*kinds, instant(now).isoformat())).fetchone()[0]
-        key = (trading_day(now), completed_daily_cutoff(now), latest)
+        cutoff = completed_daily_cutoff(now)
+        key = (trading_day(now), cutoff, latest)
         cached = getattr(self, "_scorecard_cache", None)
         if cached and cached[0] == key:
             return cached[1]
         from .review import _events
-        from .scorecard import score_consistency, score_decisions, score_ideas, score_predictions, score_timing
+        from .scorecard import (completed_sessions, score_consistency, score_decisions, score_ideas, score_predictions,
+                                score_timing)
         rows = _events(self.journal, instant(now), kinds=kinds)
         ideas = [r["body"] for r in rows if r["kind"] == "research_idea"][-200:]
         variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
@@ -2387,16 +2409,17 @@ class AutonomousFund(Strategy):
         validated = [(r["at"], r["body"]) for r in rows if r["kind"] == "decision_validated"][-200:]
         triggers = [(at, kind, body) for at, kind, body in timing if kind == "protective_trigger"]
         regimes = self._market_regimes(now)
-        result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
-                  "ideas": score_ideas(ideas, closes, regimes=regimes),
-                  "decisions": score_decisions(decisions, closes, sectors=sector_of, regimes=regimes),
-                  "timing": score_timing(timing, closes),
-                  "consistency": score_consistency(validated, triggers)}
+        sessions = completed_sessions(closes, cutoff)
+        result = {"as_of": str(now), "predictions": score_predictions(reviews, closes, sessions=sessions),
+                  "ideas": score_ideas(ideas, closes, regimes=regimes, sessions=sessions),
+                  "decisions": score_decisions(decisions, closes, sectors=sector_of, regimes=regimes, sessions=sessions),
+                  "timing": score_timing(timing, closes, sessions=sessions),
+                  "consistency": score_consistency(validated, triggers), "claims": score_claims(validated)}
         settings = getattr(self, "construction", None)
         if settings is not None:
             from .construction import evaluate
             current = self.journal.get_meta("construction_champion", "ai")
-            construction = evaluate(variants, closes, settings, current)
+            construction = evaluate(variants, closes, settings, current, sessions=sessions)
             result["construction"] = construction
             if settings.mode == "auto" and construction["champion"] != current:
                 self.journal.set_meta("construction_champion", construction["champion"])
@@ -2482,14 +2505,16 @@ class AutonomousFund(Strategy):
 
     def _market_regimes(self, now):
         """{session: regime} of SPY from its full completed history (trend needs 200 sessions); {} if unavailable."""
-        from .scorecard import market_regimes
+        from .market_data import completed_daily_cutoff
+        from .scorecard import completed_sessions, market_regimes
         try:
             rows, error = self._daily_bars("SPY", now)
         except Exception:
             return {}
         if error or not rows:
             return {}
-        return market_regimes([(d, close) for d, close, _ in self._completed(rows, now)])
+        closes = [(d, close) for d, close, _ in self._completed(rows, now)]
+        return market_regimes(closes, sessions=completed_sessions({"SPY": closes}, completed_daily_cutoff(now)))
 
     def _scorecard_summary(self, now):
         try:
@@ -2506,9 +2531,11 @@ class AutonomousFund(Strategy):
                 "decisions": cards["decisions"]["by_horizon"],
                 "decisions_by_prompt_version": dict(list(cards["decisions"].get("by_prompt_version", {}).items())[-3:]),
                 # Background, not a criterion: 5-session results by market regime and whether they are fading.
-                "decisions_by_regime": {label: {k: card["5"].get(k) for k in ("observed", "mean_net_excess_return")}
+                "decisions_by_regime": {label: {k: card["5"].get(k) for k in
+                                               ("observed", "mean_net_excess_return", "uncertainty")}
                                         for label, card in (cards["decisions"].get("by_regime") or {}).items()},
                 "decisions_trend": cards["decisions"].get("trend_5d_net_excess"),
+                "claims": cards.get("claims"),
                 "construction": cards.get("construction"),
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"},
                 # The manager's own reversals: changing its mind within a few sessions pays round trips.
@@ -2594,15 +2621,18 @@ class AutonomousFund(Strategy):
 
     # ----- Factor lab: AI-proposed factors, objectively tested -----------------------
     def _factor_panel(self, now):
-        """Per cross-section, completed daily bars (and SEC fundamentals for stocks); never today's bar.
+        """Per cross-section, completed daily bars and SEC fundamentals for stocks.
 
         Returns {"stocks": {...}, "etfs": {...}} (a cross-section without history is
         absent) or None. Stocks are the tradable stocks plus the non-tradable
-        research universe; ETFs are the tradable unlevered ETFs. Cached per day.
+        research universe; ETFs are the tradable unlevered ETFs. Reuse until the session cutoff changes.
         """
+        from .market_data import completed_daily_cutoff
         self._expire_history_failures(now)
         day = trading_day(now)
-        if self._factor_cache and self._factor_cache[0] == day:
+        cutoff = completed_daily_cutoff(now)
+        cache_key = (day, cutoff)
+        if self._factor_cache and self._factor_cache[0] == cache_key:
             return self._factor_cache[1]
         from .factors import panel_from_rows
         kinds = (getattr(self, "config", None) or {}).get("universe") or {}
@@ -2611,10 +2641,14 @@ class AutonomousFund(Strategy):
         groups = {"stocks": sorted({s for s in self.universe if kinds.get(s, "stock") == "stock"} | research),
                   "etfs": sorted(s for s in self.universe if kinds.get(s) == "unlevered_etf")}
         panels, missing, pending = {}, [], []
-        fetched = getattr(self, "_bars", None) or {}
+        fetched = (getattr(self, "_bars", None) or {}) if getattr(self, "_bars_cutoff", None) == cutoff else {}
         for name, symbols in groups.items():
             history, withheld = {}, set()
             for symbol in symbols:
+                if symbol in getattr(self, "_action_blocked", ()):
+                    missing.append(symbol)
+                    withheld.add(symbol)
+                    continue
                 if (day, symbol) not in fetched and not self._may_prepare():
                     pending.append(symbol)  # Downloaded in a later iteration; progress is kept in _bars.
                     continue
@@ -2630,7 +2664,7 @@ class AutonomousFund(Strategy):
                 continue
             if pending:
                 continue  # An incomplete cross-section would bias every IC: wait for all of it.
-            stored = self._universe_snapshot(now, name, history, withheld)
+            stored = self._universe_snapshot(now, name, history, withheld, cutoff=cutoff)
             current = set(history)
             for symbol, rows in stored.items():
                 # A former member (or one the provider no longer serves) keeps its membership-period bars.
@@ -2642,7 +2676,7 @@ class AutonomousFund(Strategy):
                 if membership is not None:
                     from .factors import MEMBERSHIP
                     from .index_membership import mask
-                    data[MEMBERSHIP] = mask(close, membership.get("added"))
+                    data[MEMBERSHIP] = mask(close, membership.get("added"), membership.get("windows"))
                 fundamentals, complete = self._fundamental_panels(close, current)
                 if not complete:
                     pending.append("SEC filings")
@@ -2655,7 +2689,7 @@ class AutonomousFund(Strategy):
         if missing:
             self.journal.event(now, "factor_history_unavailable", {"symbols": missing})
         result = panels or None
-        self._factor_cache = (day, result)
+        self._factor_cache = (cache_key, result)
         return result
 
     def _index_membership(self, now):
@@ -2666,15 +2700,20 @@ class AutonomousFund(Strategy):
             return None
         if getattr(self, "mode", None) not in {"local", "paper"}:
             return None  # Replays and tests stay off the network.
-        from .index_membership import load
+        from .index_membership import load, matching_windows, read_history
         cached = getattr(self, "_membership_cache", None)
         if cached and cached[0] == trading_day(now):
             return cached[1]
         membership = load(run_dir / "cache", instant(now))
+        if membership is not None:
+            history = read_history(run_dir / "cache", now)
+            windows = matching_windows(membership, history, trading_day(now))
+            if windows:
+                membership = {**membership, "windows": windows, "history_source": history["source"]}
         self._membership_cache = (trading_day(now), membership)
         return membership
 
-    def _universe_snapshot(self, now, role, history, withheld=()):
+    def _universe_snapshot(self, now, role, history, withheld=(), *, cutoff):
         """Record today's members of `role`; return the stored bars of members no longer served.
 
         Returns {symbol: [(date, close, volume, open, high, low)]} for symbols that were
@@ -2694,7 +2733,8 @@ class AutonomousFund(Strategy):
                                for d, close, shares in rows]
         try:
             snapshots.record(now, role, members)
-            stored = snapshots.rows(role, snapshots.former(role, set(members) | set(withheld)))
+            former = snapshots.former(role, set(members) | set(withheld), before=cutoff)
+            stored = snapshots.rows(role, former, before=cutoff)
             self.__dict__.setdefault("_universe_former", {})[role] = sorted(stored)
             return stored
         except Exception as exc:  # The snapshot widens research; a failure never blocks the panel.
@@ -2739,7 +2779,7 @@ class AutonomousFund(Strategy):
             return {}, True
 
     def _factor_context(self, now):
-        """Once per trading day (warmed before the open): intraday decisions only reuse it.
+        """Warm before the open, reuse during trading, and refresh after the close.
 
         Ranks come from the last completed close, so they cannot change during the
         session; mining and testing happen in the post-market review.
@@ -2747,11 +2787,18 @@ class AutonomousFund(Strategy):
         lab = getattr(self, "factor_lab", None)
         if lab is None:
             return None
-        if getattr(self, "_history_retry_at", None):
-            self._expire_history_failures(now)
-        day = trading_day(now)
+        expire = getattr(self, "_expire_history_failures", None)
+        if expire is not None:
+            expire(now)
+        from .market_data import completed_daily_cutoff
+        short_data = None
+        run_dir = getattr(self, "run_dir", None)
+        if run_dir is not None and getattr(self, "mode", None) in {"local", "paper"}:
+            from .short_volume import read
+            short_data = read(run_dir / "cache", now)
+        cache_key = (trading_day(now), completed_daily_cutoff(now), (short_data or {}).get("observed_at"))
         cached = getattr(self, "_factor_context_cache", None)
-        if cached and cached[0] == day:
+        if cached and cached[0] == cache_key:
             return cached[1]
         try:
             from .factors import as_panels
@@ -2762,16 +2809,17 @@ class AutonomousFund(Strategy):
                 context["warming"] = {"pending": self._factor_warming,
                                       "meaning": "factor history is still being prepared; ranks follow shortly"}
                 return context
-            context = lab.context(now, as_panels(panels), tradable=set(self.universe))
+            options = {"short_volume": short_data} if short_data is not None else {}
+            context = lab.context(now, as_panels(panels), tradable=set(self.universe), **options)
             stocks = ((as_panels(panels) or {}).get("stocks") or {}).get("close")
             membership = getattr(self, "_membership_cache", None)
             if stocks is not None and membership is not None:
                 from .index_membership import summary
                 context["index_membership"] = {
                     **summary(stocks, membership[1]),
-                    "meaning": "a stock counts in historical stock cross-sections only from the date it joined the "
-                               "S&P 500 (today's large caps were selected because they grew); undated stocks count "
-                               "throughout. Stocks that died are still missing (survivorship)"}
+                    "meaning": "use S&P 500 entry and exit windows when supported by both datasets; otherwise use "
+                               "the current roster's entry date. Undated names remain eligible. The history does "
+                               "not supply missing prices or resolve ticker reuse outside the index."}
             snapshots = getattr(self, "universe_snapshots", None)
             if snapshots is not None:
                 former = getattr(self, "_universe_former", None) or {}
@@ -2786,17 +2834,26 @@ class AutonomousFund(Strategy):
                                        {"unavailable": "set FUND_SEC_USER_AGENT (name and e-mail) to enable"})
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
-        self._factor_context_cache = (day, context)
+        self._factor_context_cache = (cache_key, context)
         return context
 
     # ----- Quantitative risk view -------------------------------------------------
     def _expire_history_failures(self, now):
-        """Retry live failures after bounded backoff, including views built from the missing history."""
-        retries = getattr(self, "_history_retry_at", None)
-        if not retries or getattr(self, "mode", None) not in {"local", "paper"}:
+        """Invalidate derived views when history retries or corporate-action verdicts change."""
+        if getattr(self, "mode", None) not in {"local", "paper"}:
             return
         day, tick = trading_day(now), monotonic()
+        retries = getattr(self, "_history_retry_at", None) or {}
         expired = {key for key, until in retries.items() if key[0] != day or tick >= until}
+        store = getattr(self, "daily_store", None)
+        if self.mode == "local" and store is not None:
+            from .action_quality import KEY, blocked
+            version = (day, store.version(day, KEY))
+            if version != getattr(self, "_action_quality_version", None):
+                old = getattr(self, "_action_blocked", set())
+                self._action_blocked = blocked(store.get(day, KEY))
+                self._action_quality_version = version
+                expired.update((day, symbol) for symbol in old ^ self._action_blocked)
         if not expired:
             return
         for key in expired:
@@ -2820,6 +2877,8 @@ class AutonomousFund(Strategy):
         from .market_data import completed_daily_cutoff
         cutoff = completed_daily_cutoff(now)
         day, key = trading_day(now), (trading_day(now), symbol)
+        if symbol in getattr(self, "_action_blocked", ()):
+            return [], "bar_quality_unreliable"
         cache = getattr(self, "_bars", None)
         if cache is None or getattr(self, "_bars_cutoff", None) != cutoff:
             # A pre-open response cannot satisfy the post-close view, even within the same day.
@@ -2872,6 +2931,9 @@ class AutonomousFund(Strategy):
         reference = getattr(self, "history_fallback", None)
         if reference is None:
             return rows, None, None
+        if getattr(self, "_quality_noted_day", None) != day:
+            self._quality_noted_day, self._quality_noted = day, {}
+        noted = self._quality_noted
         store = getattr(self, "daily_store", None)
         paused = getattr(self, "_quality_paused_until", None)
         if paused is not None and monotonic() < paused:
@@ -2883,20 +2945,21 @@ class AutonomousFund(Strategy):
                 verdict = check(store, day, symbol, rows, cutoff, reference)
             except Exception as exc:
                 self._quality_paused_until = monotonic() + QUALITY_PAUSE_SECONDS
-                noted = self.__dict__.setdefault("_quality_noted", set())
-                if (day, "unavailable") not in noted:
-                    noted.add((day, "unavailable"))
+                if None not in noted:
                     self.journal.event(now, "bar_quality_unavailable", {"error": type(exc).__name__,
                                                                         "retry_seconds": QUALITY_PAUSE_SECONDS})
+                    noted[None] = True
                 return rows, None, self._quality_paused_until
-        noted = self.__dict__.setdefault("_quality_noted", set())
-        if verdict["status"] in PROBLEMS and (day, symbol) not in noted:
-            noted.add((day, symbol))
+        missing_latest = verdict.get("missing_latest")
+        issue = (verdict["status"], tuple(verdict.get("disputed") or ()), missing_latest)
+        if (verdict["status"] in PROBLEMS or missing_latest) and noted.get(symbol) != issue:
             self.journal.event(now, "bar_quality", {
                 "symbol": symbol, "status": verdict["status"], "compared": verdict.get("compared"),
                 "disputed_count": len(verdict.get("disputed") or ()), "latest": verdict.get("latest"),
                 "largest": verdict.get("largest"), "missing_count": verdict.get("missing_count"),
+                "missing_latest": missing_latest,
                 "feed": verdict.get("feed")})
+            noted[symbol] = issue
         kept = apply(rows, verdict)
         return kept, ("bar_quality_unreliable" if verdict["status"] == "unreliable" else None), None
 
@@ -2905,24 +2968,37 @@ class AutonomousFund(Strategy):
         day = trading_day(now)
         if self.journal.get_meta("bar_quality_notified") == day:
             return None
-        start = (instant(now) - timedelta(hours=30)).isoformat()
+        moment = instant(now)
+        start = moment.astimezone(ZoneInfo("America/New_York")).replace(hour=0, minute=0, second=0, microsecond=0)
         latest = {}
         with self.journal.connection() as db:
             for kind, body in db.execute("SELECT kind, body FROM events WHERE kind IN "
-                                         "('bar_quality','bar_quality_unavailable') AND julianday(at)>=julianday(?) "
-                                         "ORDER BY sequence", (start,)):
+                                         "('bar_quality','bar_quality_unavailable') "
+                                         "AND julianday(at) BETWEEN julianday(?) AND julianday(?) "
+                                         "ORDER BY sequence", (start.isoformat(), moment.isoformat())):
                 body = json.loads(body)
                 latest[body.get("symbol", "*")] = {"kind": kind, **body}
-        if not latest:
+        from .action_quality import KEY, blocked
+        store = getattr(self, "daily_store", None)
+        actions = (store.get(day, KEY) or {}) if store is not None and self.mode == "local" else {}
+        action_disputed = blocked(actions)
+        action_unconfirmed = {s: len(row["unconfirmed"]) for s, row in actions.items() if row.get("unconfirmed")}
+        action_unavailable = sum(row["status"] == "unavailable" for row in actions.values())
+        if not (latest or action_disputed or action_unconfirmed or action_unavailable):
             return None
-        details = {"withheld": sorted(s for s, b in latest.items() if b.get("status") == "unreliable"),
+        details = {"withheld": sorted(action_disputed | {s for s, b in latest.items() if b.get("status") == "unreliable"}),
                    "disputed": {s: b["disputed_count"] for s, b in sorted(latest.items())
                                 if b.get("status") == "disputed_sessions"},
+                   "missing_latest": {s: b["missing_latest"] for s, b in sorted(latest.items())
+                                      if b.get("missing_latest")},
                    "examples": [{"symbol": s, **b["largest"][0]} for s, b in sorted(latest.items())
                                 if b.get("largest")][:5],
-                   "unavailable": latest.get("*", {}).get("error")}
-        self.journal.set_meta("bar_quality_notified", day)
+                   "unavailable": latest.get("*", {}).get("error"),
+                   "corporate_actions": {"examples": [{"symbol": s, **item} for s in sorted(action_disputed)
+                                                      for item in actions[s]["discrepancies"]][:8],
+                                         "unconfirmed": action_unconfirmed, "unavailable": action_unavailable}}
         self._notify_fund("bar_quality_issues", details)
+        self.journal.set_meta("bar_quality_notified", day)
         return details
 
     def _fetch_daily_bars(self, symbol, length, now, cutoff):
@@ -3095,10 +3171,12 @@ class AutonomousFund(Strategy):
         benchmark = self.quant.stress_benchmark
         prepared = self.daily_store.get(day, "market_snapshot") if getattr(self, "daily_store", None) else None
         wanted = set(self.universe) | {benchmark}
-        if prepared and wanted <= set(prepared.get("symbols") or {}) | set(prepared.get("no_history") or []):
+        blocked = getattr(self, "_action_blocked", set())
+        if (prepared and benchmark not in blocked
+                and wanted <= set(prepared.get("symbols") or {}) | set(prepared.get("no_history") or [])):
             # Prepared by the data desk from the same completed bars: no computation here.
-            result = {**prepared, "symbols": {s: v for s, v in prepared["symbols"].items() if s in wanted},
-                      "no_history": [s for s in prepared.get("no_history") or [] if s in wanted]}
+            result = {**prepared, "symbols": {s: v for s, v in prepared["symbols"].items() if s in wanted - blocked},
+                      "no_history": sorted(wanted & (set(prepared.get("no_history") or []) | blocked))}
             self._market_snapshot_cache = ((day, version), result)
             return result
         histories, deferred = {}, []

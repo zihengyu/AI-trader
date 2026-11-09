@@ -20,6 +20,7 @@ import os
 import shutil
 from datetime import date
 from pathlib import Path
+from time import sleep
 from uuid import uuid4
 
 KEEP_DAYS = 3
@@ -33,25 +34,33 @@ def bars_settled(now):
     return instant(now).astimezone(ZoneInfo("America/New_York")).hour >= SETTLED_HOUR
 
 
+def write_json(path, value):
+    """Publish a complete JSON file using a staging path unique to this writer."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(value, default=str)
+    temporary = path.with_name(path.name + f".{os.getpid()}.{uuid4().hex}.tmp")
+    created = False
+    try:
+        with temporary.open("x", encoding="utf-8") as handle:
+            created = True
+            handle.write(payload)
+        # Concurrent renames or an open reader can briefly lock the destination on Windows.
+        for delay in (0.01, 0.02, 0.04, None):
+            try:
+                temporary.replace(path)
+                break
+            except PermissionError as exc:
+                if delay is None or getattr(exc, "winerror", None) not in (5, 32):
+                    raise
+                sleep(delay)
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
+
+
 class DailyStore:
     def __init__(self, root):
         self.root = Path(root)
-
-    def _write(self, path, value):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(value, default=str)
-        # A PID alone collides when two threads refresh the same entry. Each
-        # writer owns its staging file; publication remains one atomic rename.
-        temporary = path.with_name(path.name + f".{os.getpid()}.{uuid4().hex}.tmp")
-        created = False
-        try:
-            with temporary.open("x", encoding="utf-8") as handle:
-                created = True
-                handle.write(payload)
-            temporary.replace(path)
-        finally:
-            if created:
-                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read(path):
@@ -67,20 +76,23 @@ class DailyStore:
         if (not stored or stored.get("requested", 0) < length or
                 stored.get("cutoff", str(day)) < cutoff):
             return None
-        return [(date.fromisoformat(r[0]), *r[1:]) for r in stored["rows"] if r[0] < cutoff]
+        # Older writers could store a nominal history whose closes were all unusable.
+        rows = [(date.fromisoformat(r[0]), *r[1:]) for r in stored["rows"]
+                if r[0] < cutoff and isinstance(r[1], (int, float)) and 0 < r[1] < float("inf")]
+        return rows or None
 
     def save_bars(self, day, symbol, length, rows, *, cutoff=None):
         """Keep sessions before the caller's verified cutoff (before `day` by default)."""
         cutoff = str(cutoff or day)
         kept = [[str(r[0]), *r[1:]] for r in rows if str(r[0]) < cutoff]
-        self._write(self.root / str(day) / "bars" / f"{symbol}.json",
-                    {"requested": length, "cutoff": cutoff, "rows": kept})
+        write_json(self.root / str(day) / "bars" / f"{symbol}.json",
+                   {"requested": length, "cutoff": cutoff, "rows": kept})
 
     def get(self, day, name):
         return self._read(self.root / str(day) / f"{name}.json")
 
     def put(self, day, name, value):
-        self._write(self.root / str(day) / f"{name}.json", value)
+        write_json(self.root / str(day) / f"{name}.json", value)
 
     def version(self, day, name):
         """Changes whenever `name` is rewritten (the data desk refreshes during the day); None when absent."""

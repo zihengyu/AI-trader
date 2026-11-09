@@ -9,12 +9,15 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+from .risk import RiskError
+from .settings import ALPACA_KEY_NAMES, alpaca_keys, configured_mode, paper_config
+
 MAINLAND = "如果服务器在中国大陆地域，该服务通常无法直连：换香港／新加坡等境外地域，或在 .env 设置 HTTPS_PROXY"
 
 
-def _probes(environ, models):
+def _probes(environ, models, mode, paper_ready):
     probes = [("yahoo", "Yahoo 行情（local 模式实时报价和历史）", "https://query1.finance.yahoo.com/v8/finance/chart/SPY",
-               {"range": "5d", "interval": "1d"}, {"User-Agent": "Mozilla/5.0"}, True, MAINLAND)]
+               {"range": "5d", "interval": "1d"}, {"User-Agent": "Mozilla/5.0"}, mode == "local", MAINLAND)]
     token = str(environ.get("FUND_TELEGRAM_BOT_TOKEN", "")).strip()
     if token:
         probes.append(("telegram", "Telegram（审批和告警的唯一通道）", f"https://api.telegram.org/bot{token}/getMe",
@@ -30,13 +33,17 @@ def _probes(environ, models):
             headers = {header: prefix + key, **({"anthropic-version": "2023-06-01"} if provider == "anthropic" else {})}
             probes.append((provider, f"{provider} 模型 API（只列出模型，不调用推理）", url, None, headers, True,
                            "返回 401 说明 Key 错误；超时请检查网络或代理"))
-    if environ.get("ALPACA_API_KEY") and environ.get("ALPACA_API_SECRET"):
-        headers = {"APCA-API-KEY-ID": environ["ALPACA_API_KEY"], "APCA-API-SECRET-KEY": environ["ALPACA_API_SECRET"]}
-        probes.append(("alpaca_paper", "Alpaca Paper 账户", "https://paper-api.alpaca.markets/v2/account", None,
-                       headers, True, "返回 401／403 说明 Key 不是 Paper Key 或已失效"))
-        probes.append(("alpaca_data", "Alpaca 历史行情（日线交叉核对，以及 Yahoo 不可用时的备用源）",
+    key, secret = alpaca_keys(environ)
+    if key and secret:
+        headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
+        if paper_ready:
+            probes.append(("alpaca_paper", "Alpaca Paper 账户", "https://paper-api.alpaca.markets/v2/account", None,
+                           headers, True, "返回 401／403 说明 Key 不是 Paper Key 或已失效"))
+        purpose = ("Alpaca 历史行情（日线交叉核对，以及 Yahoo 不可用时的备用源）" if mode == "local"
+                   else "Alpaca 历史行情 API")
+        probes.append(("alpaca_data", purpose,
                        "https://data.alpaca.markets/v2/stocks/SPY/bars", {"timeframe": "1Day", "limit": 1},
-                       headers, False, "返回 403 说明该账户没有行情权限"))
+                       headers, False, "返回 401／403 时请核对行情凭证和权限"))
     agent = str(environ.get("FUND_SEC_USER_AGENT", "")).strip()
     if agent:
         probes.append(("sec", "SEC EDGAR（8-K 公告和财报基本面）", "https://www.sec.gov/files/company_tickers.json",
@@ -60,8 +67,10 @@ def connectivity(environ=None, models=(), get=None, clock=time.monotonic):
     import requests
     environ = os.environ if environ is None else environ
     get = get or requests.get
-    results = {}
-    for name, purpose, url, params, headers, required, hint in _probes(environ, models):
+    mode = configured_mode(environ) or "local"
+    results = _alpaca_config_issues(environ, mode)
+    for name, purpose, url, params, headers, required, hint in _probes(
+            environ, models, mode, mode == "paper" and "alpaca_paper" not in results):
         started = clock()
         row = {"purpose": purpose, "required": required}
         try:
@@ -75,6 +84,23 @@ def connectivity(environ=None, models=(), get=None, clock=time.monotonic):
             row["hint"] = hint
         results[name] = row
     return results
+
+
+def _alpaca_config_issues(environ, mode):
+    if mode == "paper":
+        try:
+            paper_config(environ)
+        except RiskError as exc:
+            return {"alpaca_paper": {"ok": False, "status": None, "milliseconds": 0, "required": True,
+                                     "purpose": "Alpaca Paper 账户", "error": "configuration", "hint": str(exc)}}
+    else:
+        keys = alpaca_keys(environ)
+        if any(keys) and not all(keys):
+            missing = next(name for name, value in zip(ALPACA_KEY_NAMES, keys) if not value)
+            return {"alpaca_data": {"ok": False, "status": None, "milliseconds": 0, "required": False,
+                                    "purpose": "Alpaca 历史行情", "error": "configuration",
+                                    "hint": f"缺少 {missing}，补齐后才能核对日线和使用备用行情"}}
+    return {}
 
 
 def summary(results):

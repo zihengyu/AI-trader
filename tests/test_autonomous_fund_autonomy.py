@@ -351,11 +351,14 @@ def test_strategy_scorecards_read_reviews_and_one_decision_per_session(tmp_path)
     stops = cards["timing"]["protective_exits"]["stop_loss"]
     assert stops["count"] == 1 and stops["1"]["observed"] == 1 and stops["5"]["observed"] == 0  # Later: pending.
     summary = strategy._scorecard_summary(NOW)
+    # The manager now sees claim coverage and the regime sample status, even with no mature returns.
     assert set(summary) == {"predictions", "research_ideas", "decisions", "decisions_by_prompt_version", "construction",
-                            "timing", "consistency", "decisions_by_regime", "decisions_trend"} \
+                            "timing", "consistency", "decisions_by_regime", "decisions_trend", "claims"} \
         and "recent" not in summary["timing"]
     # One decision, labelled by the synthetic SPY's regime; its 5-session result is still pending.
-    assert summary["decisions_by_regime"] == {"up_calm": {"observed": 0, "mean_net_excess_return": None}}
+    group = summary["decisions_by_regime"]["up_calm"]
+    assert group["observed"] == 0 and group["mean_net_excess_return"] is None
+    assert group["uncertainty"]["status"] == "unreliable" and summary["claims"]["decisions_with_claims"] == 0
     assert summary["decisions_trend"] == {"status": "insufficient_sample", "scored": 0, "minimum_sample": 20}
     # The manager's reversals count every validated decision: three identical ones are one move, no reversal.
     assert (summary["consistency"]["decisions"], summary["consistency"]["moves"], summary["consistency"]["reversals"]) == (3, 1, 0)

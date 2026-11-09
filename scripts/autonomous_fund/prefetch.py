@@ -89,11 +89,16 @@ def prefetch(run_dir, config, mode, *, source=None, environ=None, now=None, cloc
         from .market_data import YahooRealtimeData
         length = history_length(quant, lab if lab.enabled else None)
         symbols = sorted(set(universe) | set(stocks) | {quant.stress_benchmark, "SPY", "QQQ"})
-        report["bars"] = fetch_bars(store, day, symbols, length, source or YahooRealtimeData(tape=None))
-        if environ.get("ALPACA_API_KEY") and environ.get("ALPACA_API_SECRET"):
+        source = source or YahooRealtimeData(tape=None)
+        report["bars"] = fetch_bars(store, day, symbols, length, source)
+        from .settings import alpaca_keys
+        keys = alpaca_keys(environ)
+        if all(keys):
+            from .action_quality import refresh
             from .bar_quality import check_store
             from .history import AlpacaDailyHistory
-            reference = AlpacaDailyHistory(environ["ALPACA_API_KEY"], environ["ALPACA_API_SECRET"], get=alpaca_get)
+            reference = AlpacaDailyHistory(*keys, get=alpaca_get)
+            report["bars"]["corporate_actions"] = refresh(store, day, symbols, length, source, reference)
             report["bars"]["quality"] = check_store(store, day, symbols, length, reference)
     else:
         report["bars"] = "skipped: paper mode keeps the broker's own daily data"

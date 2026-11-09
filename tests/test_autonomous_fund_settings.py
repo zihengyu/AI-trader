@@ -247,7 +247,8 @@ def test_starting_without_a_command_runs_the_mode_from_the_env_file(tmp_path, mo
     cli(tmp_path, monkeypatch, [], "FUND_MODE=local\nFUND_OBSERVE_ONLY=true\n")
     assert seen == [("local", Path("artifacts/fund-local"), True)]
     out = capsys.readouterr().out
-    assert "FUND_MODE" in out and "artifacts/fund-local" in out
+    # The CLI prints the account path using the host's directory separators.
+    assert "FUND_MODE" in out and str(Path("artifacts/fund-local")) in out
 
 
 def test_stop_works_even_when_the_env_file_has_a_mistake(tmp_path, monkeypatch, capsys):

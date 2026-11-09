@@ -5,6 +5,14 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Fixed
+- The optional autonomous fund retries transient Windows sharing failures when publishing a complete cache file. A failed publication preserves the previous cache entry.
+- The optional autonomous fund uses the NYSE calendar for scorecard deadlines, regime lookbacks and investment acceptance. Late decisions start after acceptance, A/B comparisons count each start session once, and missing price or account marks cannot be collapsed into one-day returns.
+- The autonomous fund's data desk and prefetch cross-check recent split ratios and cash dividends on the same share basis. Material contradictions withhold research history; missing and one-sided evidence are reported separately.
+- Factor panels and context refresh when the completed-session cutoff advances after the close, and archived bars obey that cutoff.
+- Universe snapshots update OHLCV corrections even when the close is unchanged. Rescaling older prices requires corroborating overlapping closes, and older volume is rescaled only when the overlapping volume supports it.
+- Invalid index membership caches trigger a normal refresh or an unmasked factor run when the list is unavailable. A failed cache publication preserves the last complete file.
+- The autonomous fund preflight checks Alpaca Paper account access only in paper mode. In local mode, an incomplete or unavailable optional Alpaca credential pair is reported without blocking Yahoo operation.
+- Yahoo daily histories with no valid close use the Alpaca fallback when configured. Daily bar notices include trailing sessions missing from Yahoo and reflect the most recent issue recorded on the current New York date.
 - Autonomous fund bar checks keep matching cached verdicts during a reference outage, recheck previously unchecked rows after the pause, and keep Alpaca fallback history out of the Yahoo cache. Unreliable bars cannot reenter the factor panel through archived rows.
 - Factor rankings, cross-sectional statistics and random controls exclude S&P 500 constituents before their entry date while preserving raw prices for look-back windows. Reports describe the remaining survivorship bias.
 - The trading cost stress test uses the same NAV intervals as the return calculation and leaves stressed returns unknown when execution evidence is incomplete. Simulated day-trade reports show activity without predicting real-account margin restrictions.
@@ -42,6 +50,10 @@ Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 - The optional autonomous fund's NAV marks store the ledger audit's verdict (status, scope, counts, missing evidence, error and warning codes) instead of the full replayed book; `fund-logs.sh audit` reproduces the replay. The trading process prunes notice-suppression keys that can no longer suppress, which had grown with every distinct notice. New indexes cover unconsumed material news, which every iteration read inside a write transaction (about 260 ms with a year of headlines, now 0.1 ms), and pending deliveries.
 
 ### Added
+- Factor tests apply verified S&P 500 entry, exit, and re-entry intervals when the community history is consistent with the current roster.
+- Factor evidence includes top and bottom quintile crowding proxies using point-in-time book-to-price, pairwise return correlation, and dated FINRA off-exchange short-sale volume ratios.
+- Optional structured manager momentum-rank claims are checked against the exact decision snapshot and scored separately from unavailable evidence.
+- Regime scorecards report 95% intervals on non-overlapping samples and label unreliable groups explicitly.
 - The optional autonomous fund separates stock selection from sector bets. Decision scorecards split the beta-adjusted excess exactly into `within_sector_selection`, `sector_allocation` and `unassigned_excess`, using the 11 GICS risk groups. Stock-cross-section factor tests report a within-sector rank IC (`sector_neutral`), and validated factors carry `mostly_sector_bet`.
 - The optional autonomous fund scores the manager's own reversals (`consistency`): a target move against the symbol's previous move within three sessions, with no stop or take-profit in between. It reports the rate and the estimated cost in the manager's context and the daily and weekly reports.
 - The optional autonomous fund estimates same-day buy-then-sell sequences over the last five sessions. The count is in `fund-logs.sh` status, the weekly report, the acceptance metrics and the manager's context.

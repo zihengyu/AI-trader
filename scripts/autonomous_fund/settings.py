@@ -13,6 +13,7 @@ a mistyped limit must never be silently ignored.
 import copy
 import difflib
 import json
+import os
 import sqlite3
 from pathlib import Path
 
@@ -155,9 +156,9 @@ SETTINGS = {
     "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
     "FUND_MODEL_KNOWLEDGE_CUTOFF_JSON": (("factor_lab", "model_knowledge_cutoff"), _json, False, "外部",
                                          "各模型训练数据截止日 JSON，例如 {\"deepseek-chat\": \"YYYY-MM-DD\"}；之后的样本单独记为干净样本外，未填写的模型标为可能受记忆影响"),
-    "ALPACA_API_KEY": (None, None, True, "券商", "Alpaca Paper Key（仅 paper 模式）"),
-    "ALPACA_API_SECRET": (None, None, True, "券商", "Alpaca Paper Secret（仅 paper 模式）"),
-    "ALPACA_IS_PAPER": (None, None, False, "券商", "必须为 true；false 会拒绝启动"),
+    "ALPACA_API_KEY": (None, None, True, "券商", "paper 模式必填；local 模式与 Secret 一起选填，用于日线核对和备用"),
+    "ALPACA_API_SECRET": (None, None, True, "券商", "paper 模式必填；local 模式与 Key 一起选填，用于日线核对和备用"),
+    "ALPACA_IS_PAPER": (None, None, False, "券商", "仅 paper 模式读取，默认 true；设为 false 会拒绝启动"),
     "LUMIWEALTH_API_KEY": (None, None, True, "券商", "可选：BotSpot／云端报告，本地交易不需要"),
     "SCHWAB_ACCOUNT_NUMBER": (None, None, True, "Schwab", "AI 使用的 Schwab 账户号码（建议单独开一个账户）"),
     "SCHWAB_APP_KEY": (None, None, True, "Schwab", "你自己的 Schwab 开发者应用 App Key（不填则用 LumiBot 默认应用）"),
@@ -180,6 +181,25 @@ ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "audit-ledger", "stop"
                               "notify-test", "status", "decisions", "rehearse", "prefetch", "datadesk", "prune",
                               "weekly", "experiments", "settle-position"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
+
+
+ALPACA_KEY_NAMES = ("ALPACA_API_KEY", "ALPACA_API_SECRET")
+
+
+def alpaca_keys(environ):
+    return tuple(str(environ.get(name) or "").strip() for name in ALPACA_KEY_NAMES)
+
+
+def paper_config(environ=None):
+    """Credentials for the paper broker, shared by startup and the read-only preflight."""
+    environ = os.environ if environ is None else environ
+    keys = alpaca_keys(environ)
+    missing = [name for name, value in zip(ALPACA_KEY_NAMES, keys) if not value]
+    if missing:
+        raise RiskError("Missing environment variables: " + ", ".join(missing))
+    if environ.get("ALPACA_IS_PAPER", "true").strip().lower() not in {"true", "1", "yes"}:
+        raise RiskError("ALPACA_IS_PAPER must be true; live trading is unavailable")
+    return {"API_KEY": keys[0], "API_SECRET": keys[1], "PAPER": True}
 
 
 def configured_mode(environ):

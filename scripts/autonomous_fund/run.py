@@ -12,6 +12,7 @@ from pathlib import Path
 from filelock import FileLock, Timeout as FileLockTimeout
 
 from .risk import RiskError, instant
+from .settings import paper_config
 
 
 class ScriptedRuntime:
@@ -53,15 +54,6 @@ def rehearsal_options(no_models=False, real_models=False):
     if no_models:
         return False, None
     return True, None if real_models else ScriptedRuntime()
-
-
-def paper_config():
-    missing = [name for name in ("ALPACA_API_KEY", "ALPACA_API_SECRET") if not os.environ.get(name)]
-    if missing:
-        raise RiskError("Missing environment variables: " + ", ".join(missing))
-    if os.environ.get("ALPACA_IS_PAPER", "true").lower() not in {"true", "1", "yes"}:
-        raise RiskError("ALPACA_IS_PAPER must be true; live trading is unavailable")
-    return {"API_KEY": os.environ["ALPACA_API_KEY"], "API_SECRET": os.environ["ALPACA_API_SECRET"], "PAPER": True}
 
 
 def model_ready(model):
@@ -204,7 +196,9 @@ def check_market(args, config):
     from .risk import Limits
     import time
     from .connectivity import connectivity, summary
+    from .settings import configured_mode
     # Every external service first, each independently: one blocked host must not hide the others.
+    target_mode = configured_mode(os.environ) or "local"
     reachability = connectivity(models=selected_models(args, config).values())
     market = MarketDataSettings.from_config(config.get("market_data"))
     tape = LiveTape() if market.live_stream else None
@@ -242,10 +236,12 @@ def check_market(args, config):
     research = {"system_resolver": diagnose(_default_resolver), "configured_resolver": network.resolver}
     if network.resolver == "doh":
         research["doh_resolver"] = diagnose(DohResolver(network.doh_url, network.timeout_seconds))
-    result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "market": source.session.status(),
+    result = {"checked_at": now.isoformat(), "mode": "public_market_preflight", "target_mode": target_mode,
+              "market": source.session.status(),
               "connectivity": reachability, "connectivity_summary": summary(reachability),
               "research_network": research,
-              "source": source.SOURCE, "requires_broker_key": False, "model": selected_models(args, config)["manager"],
+              "source": source.SOURCE, "requires_broker_key": target_mode == "paper",
+              "model": selected_models(args, config)["manager"],
               "models": selected_models(args, config),
               "model_key_present": ready, "model_requirement": missing,
               "model_inference_tested": False, "observations": observations,

@@ -63,3 +63,29 @@ def test_strategy_uses_the_fallback_only_when_yahoo_fails_and_records_it(tmp_pat
     strategy.history_fallback = SimpleNamespace(feed="sip", bars=lambda *a: (_ for _ in ()).throw(ConnectionError()))
     rows, error = strategy._daily_bars("ALFA", NOW)
     assert rows == [] and error == "RiskError"  # Both failed: honestly unavailable.
+
+
+def test_invalid_primary_closes_in_old_cache_and_fresh_response_use_the_reference(tmp_path):
+    from scripts.autonomous_fund.datastore import DailyStore
+    from scripts.autonomous_fund.risk import trading_day
+    from tests.test_autonomous_fund_quant import NOW, harness
+
+    strategy = harness(tmp_path, mode="local")
+    strategy.daily_store = DailyStore(tmp_path / "daily")
+    day = trading_day(NOW)
+    dates = [date(2026, 10, 29), date(2026, 10, 30)]
+    strategy.daily_store.save_bars(day, "ALFA", 10000, [(d, 0, None, None, None, None) for d in dates])
+    primary_reads = []
+
+    def primary(asset, length, timestep):
+        primary_reads.append(asset.symbol)
+        return SimpleNamespace(df=pd.DataFrame({"close": [float("nan"), -3]}, index=pd.to_datetime(dates)))
+
+    strategy.get_historical_prices = primary
+    strategy.history_fallback = SimpleNamespace(feed="iex", bars=lambda *args: [
+        (d, 100.0, 1e6, 99.0, 101.0, 98.0) for d in dates])
+    got, error = strategy._daily_bars("ALFA", NOW)
+    assert primary_reads == ["ALFA"] and error is None and [row[1] for row in got] == [100.0, 100.0]
+    assert strategy.daily_store.bars(day, "ALFA", 1) is None  # Invalid Yahoo history is still a cache miss.
+    [event] = strategy.journal.events(("risk_history_fallback",))
+    assert event["body"]["feed"] == "iex"

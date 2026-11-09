@@ -175,33 +175,30 @@ class ValidationSettings:
         return cls(**section)
 
 
-def shadow_pairs(shadows, closes, horizon=1):
+def shadow_pairs(shadows, closes, horizon=1, *, sessions=None):
     """Paired memo-minus-baseline forward excess returns per session (both arms scored identically)."""
+    from .risk import instant
     from .scorecard import score_decisions
-    pairs = []
-    for row in shadows:
-        arms = {row["arm"]: row["decision"], row["trading_arm"]: row["trading_decision"]}
-        if set(arms) != {"memo", "baseline"} or not row.get("valid"):
-            continue
-        scored = {arm: score_decisions([(row["decided_at"], body)], closes)["recent"][0]["horizons"][str(horizon)]
-                  for arm, body in arms.items()}
-        if all(item["status"] == "observed" for item in scored.values()):
-            from zoneinfo import ZoneInfo
-            from .risk import instant
-            day = instant(row["decided_at"]).astimezone(ZoneInfo("America/New_York")).date().isoformat()
-            pairs.append({"session_date": day,
-                          "difference": scored["memo"]["excess_return"] - scored["baseline"]["excess_return"]})
     by_day = {}
-    for pair in pairs:
-        by_day[pair["session_date"]] = pair["difference"]  # One pair per session.
+    valid_shadows = (row for row in shadows if row.get("valid"))
+    for row in sorted(valid_shadows, key=lambda item: instant(item["decided_at"])):
+        arms = {row["arm"]: row["decision"], row["trading_arm"]: row["trading_decision"]}
+        if set(arms) != {"memo", "baseline"}:
+            continue
+        cards = {arm: score_decisions([(row["decided_at"], body)], closes, sessions=sessions)["recent"][0]
+                 for arm, body in arms.items()}
+        scored = {arm: card["horizons"][str(horizon)] for arm, card in cards.items()}
+        if all(item["status"] == "observed" for item in scored.values()):
+            day = cards["memo"]["start_day"]
+            by_day[day] = scored["memo"]["excess_return"] - scored["baseline"]["excess_return"]
     return [by_day[day] for day in sorted(by_day)]
 
 
 def session_pairs(events, sessions, zone):
     """Consecutive completed sessions' last account marks, and every benchmark symbol's last mark per session.
 
-    A pair spanning an operator reserve adjustment is dropped: moving cash in or
-    out of the sleeve is not a return. Returns (pairs, marks) with pairs as dicts
+    Skip pairs with a missing mark or an operator reserve adjustment. Moving cash in
+    or out of the sleeve is not a return. Returns (pairs, marks) with pairs as dicts
     (start/end day and time, starting equity, return) and marks {symbol: {day: price}}.
     """
     from .risk import instant
@@ -221,8 +218,10 @@ def session_pairs(events, sessions, zone):
                     marks.setdefault(symbol, {})[day.isoformat()] = price
         elif kind == "operator_reserve_adjusted":
             adjusted.append(moment)
-    days, pairs = sorted(accounts), []
+    days, pairs = sorted(sessions), []
     for a, b in zip(days, days[1:]):
+        if a not in accounts or b not in accounts:
+            continue
         (start, before), (end, after) = accounts[a], accounts[b]
         if any(start < t <= end for t in adjusted) or before <= 0:
             continue
@@ -350,12 +349,14 @@ def acceptance(root, criteria=None, now=None):
     interval = ((startups[-1].get("execution") or {}).get("iteration_seconds") or 60) if startups else 60
     accounts = [(instant(at), b) for at, k, b in events if k == "account"]
     days = sorted({at.astimezone(zone).date() for at, _ in accounts})
-    sessions = []
+    sessions, completed_days = [], []
     if days:
         schedule = mcal.get_calendar("NYSE").schedule(start_date=days[0], end_date=days[-1])
         for day, market in schedule.iterrows():
-            if day.date() in days and market.market_close <= now:
-                sessions.append((day.date(), market.market_open, market.market_close))
+            if market.market_close <= now:
+                completed_days.append(day.date())
+                if day.date() in days:
+                    sessions.append((day.date(), market.market_open, market.market_close))
     ratios = []
     finished = [instant(at) for at, k, _ in events if k == "iteration_finished"]
     for day, start, end in sessions:
@@ -442,12 +443,16 @@ def acceptance(root, criteria=None, now=None):
     mode = startups[-1].get("mode") if startups else None
     verdict = "ready" if all(r["passed"] for r in results) else "not_ready"
     from .performance import capital_stage, evidence
-    returns, market, aligned = session_returns(events, {day for day, _, _ in sessions}, zone)
-    pairs, marks = session_pairs(events, {day for day, _, _ in sessions}, zone)
+    completed = set(completed_days)
+    returns, market, aligned = session_returns(events, completed, zone)
+    pairs, marks = session_pairs(events, completed, zone)
     tried = trial_count(
         len({b.get("prompt_version") or "unversioned" for _, k, b in events if k == "decision_validated"}),
         len({b.get("risk_policy_digest") for b in startups}), factor_trials, construction_runs, shadow_runs)
     stats = evidence(returns, market if aligned else None, tried["total"])
+    observed = {day for day, _, _ in sessions}
+    stats["missing_account_intervals"] = sum(a not in observed or b not in observed
+                                             for a, b in zip(completed_days, completed_days[1:]))
     stats["configurations_breakdown"] = tried
     net, matched_pairs = benchmark_report(events, pairs, marks, startups)
     limit = ((startups[-1].get("limits") or {}).get("drawdown")) if startups else None
@@ -674,7 +679,7 @@ def investment_markdown(result):
         lines.append(f"| {INVESTMENT_LABELS.get(row['criterion'], row['criterion'])} | {_shown(row['value'])} | "
                      f"{row['threshold']} | {'通过' if row['passed'] else '未通过'} | {'必需' if row['required'] else '参考'} |")
     lines += ["", "## 业绩证据（是能力还是运气）", "",
-              f"- 交易日：{stats.get('sessions')}；年化夏普：{stats.get('sharpe_annualized')}",
+              f"- 有效单日收益样本 {stats.get('sessions')} 个，年化夏普 {stats.get('sharpe_annualized')}",
               f"- 真实夏普 > 0 的概率（PSR）：{pct(stats.get('probabilistic_sharpe'))}；"
               f"扣除 {stats.get('configurations_tried')} 种配置试错后的概率（DSR）：{pct(stats.get('deflated_sharpe'))}",
               "- 试错计数：" + ("；".join(f"{TRIAL_LABELS.get(k, k)} {v}" for k, v in
@@ -685,6 +690,8 @@ def investment_markdown(result):
               f"- 年化收益 {pct(stats.get('annual_return'))}，最大回撤 {pct(stats.get('max_drawdown'))}，"
               f"Sortino {_number(stats.get('sortino_annualized'))}，按自相关修正的夏普（Lo）"
               f"{_number(stats.get('sharpe_lo_adjusted'))}；alpha t 值（Newey-West）{_number(regression.get('alpha_t_newey_west'))}"]
+    if stats.get("missing_account_intervals"):
+        lines.append(f"- 缺账户估值，跳过 {stats['missing_account_intervals']} 个单日收益区间。")
     lines += ["", "## 净收益口径", ""] + _net_lines(result.get("net_returns"), result.get("data_costs_usd_per_month"), pct)
     sensitivity = investment.get("cost_sensitivity") or {}
     costs, stressed = sensitivity.get("trading_costs") or {}, sensitivity.get("risk_matched_excess_annual")

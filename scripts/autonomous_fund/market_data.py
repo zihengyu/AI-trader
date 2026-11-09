@@ -396,6 +396,12 @@ class YahooRealtimeData(DataSource):
         self._history(asset, "1d", period)
         return list(self._actions.get((asset.symbol, period), []))
 
+    def history_actions(self, asset, length):
+        """Actions from the same Yahoo series used by a daily research-history request."""
+        period = "6mo" if length <= 100 else "max"
+        self._history(asset, "1d", period)
+        return list(self._actions.get((asset.symbol, period), []))
+
     def get_quote(self, asset, quote=None, exchange=None):
         frame = self.execution_bars(asset)
         start, last = frame.index[-1], frame.iloc[-1]

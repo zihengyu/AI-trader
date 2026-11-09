@@ -68,6 +68,14 @@ def test_too_little_overlap_is_not_a_verdict_and_missing_sessions_are_only_repor
     assert compare([], rows(closes))["status"] == "no_primary" and TOLERANCE == .02
 
 
+def test_a_latest_session_present_only_on_the_reference_is_reported_without_copying_it():
+    closes = walk(4)
+    primary, reference = rows(closes)[:-1], rows(closes)
+    verdict = compare(primary, reference)
+    assert verdict["missing_latest"] == DAYS[-1].isoformat() and verdict["missing_count"] == 1
+    assert apply(primary, verdict) == primary
+
+
 class Reference:
     feed = "iex"
 
@@ -210,6 +218,24 @@ def test_the_post_close_notice_lists_withheld_and_disputed_symbols_once_a_day(tm
     text = readable("bar_quality_issues", details, 9)
     assert "今天不使用这些证券的历史数据" in text and "BETA" in text and "ALFA 1 天" in text
     assert "Yahoo" in text and "Alpaca" in text and "不替换、不插值" in text
+
+
+def test_daily_notice_uses_latest_issue_of_today_and_excludes_outside_events(tmp_path):
+    from scripts.autonomous_fund.risk import trading_day
+    closes = walk(8)
+    strategy = runner(tmp_path, closes, Reference(closes))
+    day = trading_day(NOW)
+    strategy.journal.event(NOW - timedelta(hours=18), "bar_quality", {"symbol": "YESTERDAY", "status": "unreliable"})
+    strategy.journal.event(NOW + timedelta(hours=9), "bar_quality", {"symbol": "FUTURE", "status": "unreliable"})
+    disputed = closes.copy()
+    disputed[10] *= 1.2
+    strategy._quality_checked(day, "ALFA", rows(disputed), day, NOW)
+    disputed[-1] *= 1.2
+    strategy._quality_checked(day, "ALFA", rows(disputed), day, NOW + timedelta(hours=5))
+    strategy._quality_checked(day, "BETA", rows(closes)[:-1], day, NOW + timedelta(hours=5))
+    details = strategy._report_bar_quality(NOW + timedelta(hours=6))
+    assert details["withheld"] == ["ALFA"] and details["disputed"] == {}
+    assert details["missing_latest"] == {"BETA": DAYS[-1].isoformat()}
 
 
 class Response:

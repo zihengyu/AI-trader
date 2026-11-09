@@ -109,13 +109,53 @@ CHANGE_TEXT = {"weaker_recently": "最近明显变弱（可能是失效、拥挤
                "no_clear_change": "没有明显变化"}
 
 
+def _regime_note(group):
+    uncertainty = group.get("uncertainty")
+    if not uncertainty:  # Older scorecards had no intervals.
+        return ""
+    count = uncertainty["non_overlapping"]
+    interval = uncertainty["interval_95"]
+    if interval is None:
+        return f"（不可靠，非重叠样本 {count}）"
+    return (f"（非重叠样本 {count}，均值 {_percent(uncertainty['sample_mean'])}，"
+            f"95% 区间 {_percent(interval[0])} 至 {_percent(interval[1])}）")
+
+
+def evidence_lines(card):
+    lines = []
+    claims = (card or {}).get("claims")
+    if claims and claims.get("decisions"):
+        lines.append(f"AI 事实核验（动量排名）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
+                     f"正确 {claims['correct']}，错误 {claims['incorrect']}，"
+                     f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。")
+    for factor in (card or {}).get("factor_crowding", [])[:3]:
+        if factor.get("status") != "observed":
+            lines.append(f"因子 {factor['name']} 拥挤度：分组样本不足。")
+            continue
+        favored, disfavored = factor["favored"], factor["disfavored"]
+        lines.append(f"因子 {factor['name']} 拥挤度（{factor['as_of_close']}）："
+                     f"偏好减回避组的账面市值比差 {_percent(factor['book_to_price_spread'])}，"
+                     f"估值覆盖 {favored['valuation_names']}／{disfavored['valuation_names']}，"
+                     f"组内平均相关性 {_percent(favored['mean_pairwise_return_correlation'])}／"
+                     f"{_percent(disfavored['mean_pairwise_return_correlation'])}"
+                     f"（{favored['correlation_pairs']}／{disfavored['correlation_pairs']} 对），"
+                     f"FINRA 场外卖空成交占比（{factor['finra_session'] or '无日期'}）"
+                     f"{_percent(favored['mean_finra_short_volume_ratio'])}／"
+                     f"{_percent(disfavored['mean_finra_short_volume_ratio'])}"
+                     f"（覆盖 {favored['finra_names']}／{disfavored['finra_names']}）。")
+    return lines
+
+
 def regime_trend_lines(card):
     """Scorecard results by market regime and recent-vs-earlier change: background, never a criterion."""
     lines = []
     decisions, ideas = (card or {}).get("decisions") or {}, (card or {}).get("ideas") or {}
     groups = [f"{REGIME_TEXT.get(label, label)} {value['5']['observed']} 次、平均 {_percent(value['5']['mean_net_excess_return'])}"
-              for label, value in (decisions.get("by_regime") or {}).items() if value["5"]["observed"]]
+              + _regime_note(value["5"])
+              for label, value in (decisions.get("by_regime") or {}).items()
+              if value["5"]["observed"] or value["5"].get("uncertainty")]
     hits = [f"{REGIME_TEXT.get(label, label)} {value['scored']} 条、命中率 {_percent(value['hit_rate'])}"
+            + _regime_note(value)
             for label, value in (ideas.get("by_regime") or {}).items() if value["scored"]]
     if groups or hits:
         lines.append("按市场状态分组（SPY 相对 200 日均线、20 日波动相对过去一年中位数；只作背景，不作判断标准）："
@@ -260,7 +300,7 @@ def daily_document(root, sequence):
                          f"{consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
                          f"（{_percent(consistency['reversal_rate'])}，不含止损止盈），"
                          f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
-        lines += regime_trend_lines(card)
+        lines += regime_trend_lines(card) + evidence_lines(card)
         lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
         lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
@@ -533,16 +573,29 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "bar_quality_issues" and isinstance(details, dict):
         parts = []
         if details.get("withheld"):
-            parts.append("两个数据源的日线明显不一致，今天不使用这些证券的历史数据（不新增买入、不进入因子检验）："
+            parts.append("两个数据源的日线或公司行动明显不一致，今天不使用这些证券的历史数据（不新增买入、不进入因子检验）："
                          + "、".join(details["withheld"]))
         if details.get("disputed"):
             parts.append("个别交易日两边收盘价相差超过 2%，这些日子的数据已剔除（不替换、不插值）："
                          + "、".join(f"{s} {n} 天" for s, n in details["disputed"].items()))
+        if details.get("missing_latest"):
+            parts.append("Yahoo 缺少 Alpaca 已提供的最新交易日日线，未补写行情："
+                         + "、".join(f"{s} {day}" for s, day in details["missing_latest"].items()))
         for item in details.get("examples") or []:
             parts.append(f"例：{item['symbol']} {item['date']} Yahoo {item['primary']:.2f}，"
                          f"Alpaca {item['reference']:.2f}（差 {item['difference'] * 100:+.1f}%）")
         if details.get("unavailable"):
             parts.append(f"第二数据源（Alpaca）暂时连不上（{details['unavailable']}），部分日线未经核对就使用了。")
+        actions = details.get("corporate_actions") or {}
+        for item in actions.get("examples") or []:
+            kind = {"split": "拆股比例", "dividend": "每股现金分红（除权日股数口径）"}[item["kind"]]
+            parts.append(f"{item['symbol']} {item['date']} {kind}："
+                         f"Yahoo {item.get('yahoo_ex_date_basis', item['yahoo'])}，Alpaca {item['alpaca']}。")
+        if actions.get("unconfirmed"):
+            parts.append("公司行动只有单一来源或计价口径未确认："
+                         + "、".join(f"{s} {n} 项" for s, n in sorted(actions["unconfirmed"].items())))
+        if actions.get("unavailable"):
+            parts.append(f"{actions['unavailable']} 个证券的公司行动核对暂不可用。")
         text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
         text += "\n不需要操作；明天会重新核对。持续出现时，检查该证券是否刚拆股或数据源有误。"
     elif kind == "degradation_cleared" and isinstance(details, dict):
@@ -812,7 +865,7 @@ def weekly_document(root, sequence):
                      f"其中 {consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
                      f"（{_percent(consistency['reversal_rate'])}，不含止损止盈触发的），"
                      f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
-    lines += [f"- {line}" for line in regime_trend_lines(card)]
+    lines += [f"- {line}" for line in regime_trend_lines(card) + evidence_lines(card)]
     tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
     control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
     lines += ["", "## 五、因子实验进展【统计推断】", ""]

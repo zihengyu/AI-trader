@@ -484,6 +484,8 @@ def review_after_close(strategy):
                     "不因单日盈亏宣称策略有效，不追涨杀跌式过拟合，说明样本不足和置信度。"
                     "备忘仅供下一次 AI 研究和完整目标持仓决策参考，不能修改风险上限、投资范围、权限或代码。"
                     "必须阅读 scorecards（已用收盘价客观打分的历史预测命中率、各决策相对同敞口基准的超额收益），"
+                    "核对 scorecards.claims 的事实错误和提交覆盖率；无法核验的断言应保留为未知。"
+                    "市场状态分组标为不可靠时，不据此推断策略有效或失效。"
                     "据此保留、修正或撤回假设；记分差的假设应撤回。scorecards.timing 客观衡量你自己的止损、止盈和入场限价："
                     "离场后价格继续下跌为正贡献，反弹为负；等待入场后未买入而价格上涨为错过的收益，据此校准价位的松紧，"
                     "但不要因此放弃保护性止损。给出最多 10 条可证伪的 predictions"
@@ -491,6 +493,7 @@ def review_after_close(strategy):
                     "hypothesis_ref 指向对应调整），之后会被自动打分。"
                     "在 mandate_compliance 中逐条核对当日决策是否遵守 operator_mandate 的约束，如有偏离必须说明。"
                     "阅读 factor_lab：已验证因子的样本内、样本外和验证后的实盘记录，以及被拒绝或退役的因子。"
+                    "结合拥挤度代理的日期和覆盖数说明风险，只在数据足够时引用。"
                     "可在 factor_proposals 中按 factor_lab.grammar 提出最多 5 个新的因子表达式（name、expression、"
                     "horizon_sessions 1-20、hypothesis、universe=stocks 或 etfs），优先基于复盘中发现的选股或择时规律；"
                     "代码会在所选横截面（个股含研究股票池，或 ETF）里用无前视的历史数据做 rank IC 检验，"
@@ -558,7 +561,12 @@ def review_after_close(strategy):
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {
                 "session_date": day, "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
     if scorecards:
-        strategy.journal.event(strategy.get_datetime(), "scorecard", {"session_date": day, **scorecards})
+        lab_context = context.get("factor_lab") or {}
+        crowding = [{"name": item["name"], "state": state, **item["live"]["crowding"]}
+                    for state in ("validated", "provisional") for item in lab_context.get(state, [])
+                    if (item.get("live") or {}).get("crowding")]
+        strategy.journal.event(strategy.get_datetime(), "scorecard",
+                               {"session_date": day, **scorecards, "factor_crowding": crowding})
     strategy.log_message(f"Post-market review saved for {day}; strategy memory v{packet['version']} is available.")
 
 

@@ -286,7 +286,7 @@ def test_the_strategy_panel_never_includes_todays_forming_bar(tmp_path):
     assert volume.iloc[-1, 0] == 1e6 and "etfs" not in panels
 
 
-def test_factor_context_is_computed_once_per_trading_day_and_before_the_open(tmp_path):
+def test_factor_context_reuses_intraday_ranks_and_refreshes_after_the_close():
     from datetime import timedelta
     from types import SimpleNamespace
     from scripts.autonomous_fund.strategy import AutonomousFund
@@ -295,7 +295,10 @@ def test_factor_context_is_computed_once_per_trading_day_and_before_the_open(tmp
     fake = SimpleNamespace(factor_lab=lab, _factor_context_cache=None, _factor_panel=lambda now: None,
                            universe=frozenset())
     morning = NOW.replace(hour=13)
-    assert AutonomousFund._factor_context(fake, morning) == AutonomousFund._factor_context(fake, NOW)
+    afternoon = NOW.replace(hour=19)
+    assert AutonomousFund._factor_context(fake, morning) == AutonomousFund._factor_context(fake, afternoon)
     assert len(calls) == 1  # Intraday decisions reuse the morning's ranks.
+    AutonomousFund._factor_context(fake, NOW)
+    assert len(calls) == 2  # At the close the same trading day has a new completed bar.
     AutonomousFund._factor_context(fake, NOW + timedelta(days=1))
-    assert len(calls) == 2
+    assert len(calls) == 3

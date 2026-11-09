@@ -62,7 +62,8 @@ ALIVE_SECONDS = 180  # A heartbeat older than this means the desk is not running
 HEARTBEAT_SECONDS = 15
 STALE_QUOTE_MINUTES = 15
 GAUGES = ("SPY", "QQQ", "IWM", "DIA")  # Broad market gauges for the intraday pulse.
-JOBS = ("news", "intraday", "premarket", "global", "macro", "calendar", "earnings", "bars", "snapshot", "sec")
+JOBS = ("news", "intraday", "premarket", "global", "macro", "calendar", "earnings", "bars", "snapshot", "sec",
+        "short_volume", "index_history")
 GLOBAL_MARKETS = {
     "ES=F": "S&P 500 E-mini futures", "NQ=F": "Nasdaq-100 E-mini futures", "RTY=F": "Russell 2000 E-mini futures",
     "^VIX": "CBOE VIX index", "^TNX": "CBOE 10-year Treasury yield index", "DX-Y.NYB": "US dollar index",
@@ -421,7 +422,8 @@ def fomc_meetings(html, today, days=CALENDAR_DAYS):
 class DataDesk:
     def __init__(self, run_dir, config, mode, *, source=None, environ=None, clock=None, news_get=None,
                  news_yahoo=None, macro_get=None, earnings_get=None, earnings_yahoo=None, sec_get=None,
-                 chart=None, calendar_get=None, alpaca_get=None, sleep=time.sleep):
+                 chart=None, calendar_get=None, alpaca_get=None, short_volume_get=None, index_history_get=None,
+                 sleep=time.sleep):
         from .datastore import DailyStore
         from .events import EventSettings
         from .factors import FactorSettings
@@ -448,7 +450,7 @@ class DataDesk:
         self._source, self._news, self._macro, self._calendar = source, None, None, None
         self._gets = {"news": news_get, "news_yahoo": news_yahoo, "macro": macro_get, "earnings": earnings_get,
                       "earnings_yahoo": earnings_yahoo, "sec": sec_get, "chart": chart, "calendar": calendar_get,
-                      "alpaca": alpaca_get}
+                      "alpaca": alpaca_get, "short_volume": short_volume_get, "index_history": index_history_get}
         self._sleep, self._closes = sleep, {}
         self.next_run, self.failures = {}, {}
         self._lock = threading.Lock()
@@ -484,6 +486,10 @@ class DataDesk:
         if name == "bars":
             # Before 06:00 New York a split or dividend of the new day may not be applied yet.
             return self.mode == "local" and bars_settled(now)
+        if name == "short_volume":
+            return self.mode in {"local", "paper"} and self.lab.enabled and bool(self.stocks or self.tradable)
+        if name == "index_history":
+            return self.mode in {"local", "paper"} and self.lab.enabled and self.lab.index_membership
         return {"news": self.news_settings.enabled, "macro": self.macro_settings.enabled, "global": True,
                 "calendar": True, "earnings": self.event_settings.enabled, "snapshot": True,
                 "sec": self.lab.enabled and bool(str(self.environ.get("FUND_SEC_USER_AGENT", "")).strip())}[name]
@@ -514,6 +520,8 @@ class DataDesk:
             return 900 if (outcome or {}).get("failed") else 3600
         if name == "snapshot":
             return 900
+        if name == "short_volume":
+            return 3600
         return 12 * 3600
 
     def due(self, now):
@@ -635,7 +643,7 @@ class DataDesk:
             from .strategy import daily_rows
             try:
                 rows = [r for r in daily_rows(self._data().get_historical_prices(
-                    Asset(symbol, asset_type="stock"), 5, timestep="day")) if str(r[0]) < str(day) and r[1] == r[1]]
+                    Asset(symbol, asset_type="stock"), 5, timestep="day")) if str(r[0]) < str(day)]
                 self._closes = {k: v for k, v in self._closes.items() if k[0] == day}
                 self._closes[key] = (str(rows[-1][0]), float(rows[-1][1])) if rows else None
             except Exception:
@@ -770,12 +778,15 @@ class DataDesk:
     def _job_bars(self, now):
         from .prefetch import fetch_bars
         symbols = sorted(set(self.universe) | set(self.stocks) | {self.quant.stress_benchmark} | set(GAUGES))
-        result = fetch_bars(self.store, trading_day(now), symbols, self.length, self._data())
+        day, source = trading_day(now), self._data()
+        result = fetch_bars(self.store, day, symbols, self.length, source)
         reference = self._reference()
         if reference is not None:
+            from .action_quality import refresh
             from .bar_quality import check_store
             # Cross-checked here, off the trading process; it reuses these verdicts.
-            result["quality"] = check_store(self.store, trading_day(now), symbols, self.length, reference)
+            result["corporate_actions"] = refresh(self.store, day, symbols, self.length, source, reference)
+            result["quality"] = check_store(self.store, day, symbols, self.length, reference)
         self.store.prune(trading_day(now))
         if result["failed"] and not result["fetched"] and not result["already_stored"]:
             first = sorted(result["failed"].items())[0]
@@ -784,22 +795,25 @@ class DataDesk:
 
     def _reference(self):
         """The second daily source (Alpaca) for the cross-check, in local mode with keys; else None."""
-        if self.mode != "local" or not (self.environ.get("ALPACA_API_KEY") and self.environ.get("ALPACA_API_SECRET")):
+        from .settings import alpaca_keys
+        keys = alpaca_keys(self.environ)
+        if self.mode != "local" or not all(keys):
             return None
         if getattr(self, "_alpaca_history", None) is None:
             from .history import AlpacaDailyHistory
-            self._alpaca_history = AlpacaDailyHistory(self.environ["ALPACA_API_KEY"], self.environ["ALPACA_API_SECRET"],
-                                                      get=self._gets.get("alpaca"))
+            self._alpaca_history = AlpacaDailyHistory(*keys, get=self._gets.get("alpaca"))
         return self._alpaca_history
 
     def _job_snapshot(self, now):
+        from .action_quality import KEY, blocked
         from .bar_quality import apply, cached_verdict
         from .snapshot import snapshot
         day, benchmark = trading_day(now), self.quant.stress_benchmark
+        withheld = blocked(self.store.get(day, KEY)) if self.mode == "local" else set()
         histories = {}
         for symbol in sorted(set(self.tradable) | {benchmark}):
             # The cross-check's verdict applies here as in the trading process (disputed sessions dropped).
-            rows = self.store.bars(day, symbol, 1) or []
+            rows = [] if symbol in withheld else self.store.bars(day, symbol, 1) or []
             rows = apply(rows, cached_verdict(self.store, day, symbol, rows, day))
             histories[symbol] = [(str(d), c, v) for d, c, v, *_ in rows if c == c and c > 0]
         if not histories.get(benchmark):
@@ -816,6 +830,16 @@ class DataDesk:
         sec = SecFundamentals(self.run_dir / "cache" / "sec", self.environ["FUND_SEC_USER_AGENT"], get=self._gets["sec"])
         sec.panels(set(self.stocks), pd.bdate_range(end=trading_day(now), periods=5))
         return {"companies": len(self.stocks), "errors": dict(list(sec.errors.items())[:20])}
+
+    def _job_short_volume(self, now):
+        from .short_volume import refresh
+        data = refresh(self.run_dir / "cache", now, set(self.stocks) | set(self.tradable), get=self._gets["short_volume"])
+        return {"session_date": data["session_date"], "covered_symbols": len(data["ratios"])}
+
+    def _job_index_history(self, now):
+        from .index_membership import refresh_history
+        result = refresh_history(self.run_dir / "cache", now, get=self._gets["index_history"])
+        return {"fetched_at": result["fetched_at"], "covered_symbols": len(result["windows"])}
 
 
 def run(run_dir, config, mode, stop=None):

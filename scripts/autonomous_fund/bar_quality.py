@@ -53,10 +53,11 @@ def compare(primary, reference, feed=None):
     common = sorted(set(mine) & set(theirs))
     differences = {day: mine[day] / theirs[day] - 1 for day in common}
     disputed = [day for day in common if abs(differences[day]) > TOLERANCE]
-    missing = sorted(day for day in theirs if first <= day <= last and day not in mine)
+    missing = sorted(day for day in theirs if day >= first and day not in mine)
+    missing_latest = missing[-1] if missing and missing[-1] > last else None
     largest = sorted(disputed, key=lambda day: -abs(differences[day]))[:3]
     verdict.update(compared=len(common), disputed=disputed, missing_in_primary=missing[:20],
-                   missing_count=len(missing), latest=last,
+                   missing_count=len(missing), missing_latest=missing_latest, latest=last,
                    largest=[{"date": day, "primary": mine[day], "reference": theirs[day],
                              "difference": differences[day]} for day in largest])
     if len(common) < MIN_OVERLAP:

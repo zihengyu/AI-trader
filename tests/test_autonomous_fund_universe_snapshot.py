@@ -2,7 +2,7 @@
 
 Synthetic symbols, bars and journals only; no network, broker or model inference.
 """
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import numpy as np
@@ -51,6 +51,30 @@ def test_a_provider_revision_is_applied_to_every_stored_bar_so_no_fake_jump_appe
     # Bars older than the provider's window were scaled by the same revision: returns are unchanged.
     assert len(closes) == 12 and np.allclose(closes, [(100.0 + i) / 2 for i in range(12)])
     assert np.allclose([row[2] for row in stored[:7]], 2e6) and np.allclose(np.diff(closes), 0.5)
+
+
+def test_an_isolated_correction_does_not_rescale_old_bars_and_ohlcv_updates_without_a_close_change(tmp_path):
+    snapshots = UniverseSnapshots(Journal(tmp_path, "synthetic-universe-corrections"))
+    days = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]
+    for n in range(1, 5):
+        snapshots.record(NOW, "stocks", {"ALFA": bars(days[:n], [100, 101, 102, 103][:n])})
+    served = [(days[2], 150, 1e6, 149, 151, 148), (days[3], 103, 2e6, 99, 110, 90)]
+    assert snapshots.record(NOW, "stocks", {"ALFA": served}) == 2
+    stored = snapshots.rows("stocks", ["ALFA"])["ALFA"]
+    assert [row[1] for row in stored] == [100, 101, 150, 103]
+    assert stored[-1][2:] == (2e6, 99, 110, 90)
+    assert snapshots.record(NOW, "stocks", {"ALFA": served}) == 0
+
+
+def test_a_price_only_adjustment_keeps_older_volume_unchanged(tmp_path):
+    snapshots = UniverseSnapshots(Journal(tmp_path, "synthetic-universe-price-adjustment"))
+    days = ["2026-11-02", "2026-11-03", "2026-11-04"]
+    for n in range(1, 4):
+        snapshots.record(NOW, "stocks", {"ALFA": bars(days[:n], [100, 102, 104][:n])})
+    snapshots.record(NOW, "stocks", {"ALFA": bars(days[1:], [96.9, 98.8])})
+    stored = snapshots.rows("stocks", ["ALFA"])["ALFA"]
+    assert np.isclose(stored[0][1], 95)
+    assert [row[2] for row in stored] == [1e6, 1e6, 1e6]
 
 
 def test_rows_without_a_real_close_are_never_stored(tmp_path):
@@ -146,3 +170,27 @@ def test_a_data_quality_rejection_cannot_reappear_as_a_former_member(tmp_path):
     panels = strategy._factor_panel(NOW)
     assert list(panels["stocks"]["close"].columns) == ["ALFA"]
     assert snapshots.rows("stocks", ["BETA"])["BETA"][0][1] == 12  # Archive stays intact.
+
+
+def test_same_day_factor_panel_refreshes_after_close_and_bounds_archived_bars(tmp_path):
+    from tests.test_autonomous_fund_quant import harness
+    strategy = harness(tmp_path)
+    strategy.universe = frozenset({"ALFA"})
+    strategy.universe_snapshots = snapshots = UniverseSnapshots(strategy.journal)
+    snapshots.record(NOW, "stocks", {"BETA": bars(["2026-11-09"], [50])})
+    data = frame("2026-11-05", [100, 101, 102])
+    reads = []
+
+    def historical(asset, length, timestep):
+        reads.append(asset.symbol)
+        return SimpleNamespace(df=data)
+
+    strategy.get_historical_prices = historical
+    strategy._factor_cache = None
+    before = NOW - timedelta(hours=2)
+    intraday = strategy._factor_panel(before)["stocks"]["close"]
+    assert intraday.index[-1].date().isoformat() == "2026-11-06" and "BETA" not in intraday
+    assert strategy._factor_panel(before + timedelta(minutes=10))["stocks"]["close"] is intraday
+    closed = strategy._factor_panel(NOW)["stocks"]["close"]
+    assert closed.index[-1].date().isoformat() == "2026-11-09"
+    assert closed.iloc[-1].to_dict() == {"ALFA": 102, "BETA": 50} and reads == ["ALFA", "ALFA"]

@@ -4,6 +4,7 @@ Synthetic CSV text, prices and fake HTTP clients only; no network, broker or mod
 """
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -11,7 +12,7 @@ import pandas as pd
 import pytest
 
 from scripts.autonomous_fund.factors import MEMBERSHIP, FactorSettings, compute, daily_ic
-from scripts.autonomous_fund.index_membership import MAX_AGE_DAYS, load, mask, parse, summary
+from scripts.autonomous_fund.index_membership import MAX_AGE_DAYS, load, mask, matching_windows, parse, parse_history, summary
 from scripts.autonomous_fund.risk import RiskError
 
 NOW = datetime(2026, 11, 9, 21, 30, tzinfo=timezone.utc)
@@ -57,6 +58,60 @@ def test_the_list_is_cached_for_a_month_and_a_failed_refresh_keeps_the_old_one(t
     truncated = load(tmp_path, NOW + timedelta(days=MAX_AGE_DAYS + 1), Get(csv_text(50)))
     assert truncated["stale"] == "ValueError"  # A truncated file never replaces the known list.
     assert load(tmp_path / "empty", NOW, Get(error=ConnectionError())) is None
+
+
+@pytest.mark.parametrize("bad_cache", [
+    [1],
+    {"fetched_at": "2026-11-09T20:00:00", "added": {"ALFA": "2026-11-06"}},
+    {"fetched_at": NOW.isoformat(), "added": {"ALFA": "2026-11-31"}},
+    {"fetched_at": (NOW + timedelta(days=1)).isoformat(), "added": {"ALFA": "2026-11-06"}},
+])
+def test_invalid_cache_does_not_block_factor_preparation(tmp_path, bad_cache):
+    (tmp_path / "index_membership.json").write_text(json.dumps(bad_cache))
+    assert load(tmp_path, NOW, Get(error=ConnectionError())) is None
+    get = Get(csv_text())
+    assert load(tmp_path, NOW, get)["added"]["S000"] == "2001-01-01" and get.calls == 1
+
+
+def test_interrupted_cache_publish_keeps_the_previous_complete_file(tmp_path, monkeypatch):
+    first = load(tmp_path, NOW, Get(csv_text()))
+    before = (tmp_path / "index_membership.json").read_bytes()
+
+    def blocked_replace(self, target):
+        raise PermissionError("could not publish")
+
+    monkeypatch.setattr(Path, "replace", blocked_replace)
+    later = NOW + timedelta(days=MAX_AGE_DAYS + 1)
+    refreshed = load(tmp_path, later, Get(csv_text(extra="ALFA,A,Industrials,Sub,City,2010-02-16,1,1900\n")))
+    assert "ALFA" in refreshed["added"] and refreshed["fetched_at"] != first["fetched_at"]
+    assert (tmp_path / "index_membership.json").read_bytes() == before
+    assert list(tmp_path.iterdir()) == [tmp_path / "index_membership.json"]
+
+
+def test_entry_exit_and_reentry_windows_preserve_gaps_and_skip_ambiguous_symbols():
+    data = (
+        "symbol,cik,date_added,date_removed,created_at\n"
+        "ALFA,0000000001,2026-10-26,2026-10-29,2026-10-26\n"
+        "ALFA,0000000001,2026-11-03,,2026-11-02\n"
+        "BETA,0000000002,2026-10-26,2026-10-29,2026-10-26\n"
+        "BETA,0000000003,2026-11-02,,2026-11-02\n"
+        "GAMMA,0000000004,2026-10-26,2026-10-29*,2026-10-26\n"
+        "DELTA,0000000005,2026-10-26,2026-11-02,2026-10-26\n"
+        "EPSI,0000000006,2026-10-26,,2026-10-26\n"
+    )
+    history = {"windows": parse_history(data)}
+    assert set(history["windows"]) == {"ALFA", "DELTA", "EPSI"}
+    current = {"added": {"ALFA": "2026-11-03", "BETA": "2026-11-02", "EPSI": "2026-10-27"},
+               "members": ["ALFA", "BETA", "EPSI"]}
+    windows = matching_windows(current, history, "2026-11-09")
+    assert set(windows) == {"ALFA", "DELTA"}  # EPSI's two sources disagree about its entry.
+    index = pd.DatetimeIndex(["2026-10-26", "2026-10-29", "2026-11-02", "2026-11-03"])
+    close = pd.DataFrame(100, index=index, columns=["ALFA", "BETA", "DELTA", "OTHER"])
+    flags = mask(close, current["added"], windows)
+    assert flags["ALFA"].tolist() == [True, False, False, True]
+    assert flags["DELTA"].tolist() == [True, True, False, False]
+    assert flags["BETA"].tolist() == [False, False, True, True]
+    assert flags["OTHER"].all()
 
 
 def panel(days=300, names=20, seed=4):
@@ -126,8 +181,11 @@ def test_settings_and_the_strategy_panel_apply_the_list_in_live_modes_only(tmp_p
         FactorSettings(index_membership="yes")
     cache = tmp_path / "run" / "cache"
     cache.mkdir(parents=True)
+    now = datetime.fromisoformat("2026-11-05T21:00:00+00:00")
+    # A usable fixture must have been downloaded by the strategy clock.
     (cache / "index_membership.json").write_text(json.dumps({
-        "added": {"ALFA": "2026-10-30", "BETA": "1990-01-02"}, "source": "synthetic", "fetched_at": NOW.isoformat()}))
+        "added": {"ALFA": "2026-10-30", "BETA": "1990-01-02"}, "members": ["ALFA", "BETA"],
+        "source": "synthetic", "fetched_at": now.isoformat()}))
     strategy = harness(tmp_path, mode="local")
     strategy.run_dir = tmp_path / "run"
     strategy.config = {"universe": {"ALFA": "stock", "BETA": "stock", "GAMMA": "stock"}}
@@ -136,13 +194,20 @@ def test_settings_and_the_strategy_panel_apply_the_list_in_live_modes_only(tmp_p
     data = {s: frame("2026-10-26", np.arange(100.0, 110.0) + i) for i, s in enumerate(("ALFA", "BETA", "GAMMA"))}
     strategy.get_historical_prices = lambda asset, length, timestep="day": SimpleNamespace(df=data[asset.symbol])
     strategy._factor_cache = None
-    now = datetime.fromisoformat("2026-11-05T21:00:00+00:00")
     flags = strategy._factor_panel(now)["stocks"][MEMBERSHIP]
     assert not flags["ALFA"].iloc[:4].any() and flags["ALFA"].iloc[4:].all() and flags["BETA"].all()
     strategy._factor_context_cache = None
     context = strategy._factor_context(now)["index_membership"]
     assert context["dated"] == 2 and context["undated"] == ["GAMMA"]
     assert context["joined_within_history"] == {"ALFA": "2026-10-30"}
+    from scripts.autonomous_fund.index_membership import HISTORY_FILE
+    (cache / HISTORY_FILE).write_text(json.dumps({"source": "synthetic-history", "fetched_at": now.isoformat(),
+                                                 "windows": {"ALFA": [["2026-10-26", "2026-10-28", "2026-10-26"],
+                                                                      ["2026-10-30", None, "2026-10-30"]]}}))
+    strategy._membership_cache = strategy._factor_cache = strategy._factor_context_cache = None
+    flags = strategy._factor_panel(now)["stocks"][MEMBERSHIP]
+    assert flags["ALFA"].iloc[:5].tolist() == [True, True, False, False, True]
+    assert strategy._factor_context(now)["index_membership"]["interval_symbols"] == 1
     strategy.mode = "mock"
     strategy._membership_cache = None
     assert strategy._index_membership(now) is None  # Replays and tests stay off the network.

@@ -114,7 +114,7 @@ def test_the_desk_pulse_stretches_with_the_universe_instead_of_raising_the_reque
     from scripts.autonomous_fund.datadesk import GAUGES, INTRADAY_SECONDS_PER_SYMBOL, DataDesk
     now = datetime(2026, 11, 4, 15, tzinfo=timezone.utc)
     narrow = configuration(CONFIG, environ={"FUND_EXCLUDE_SYMBOLS": ",".join(
-        s for s in json.loads(CONFIG.read_text())["universe"] if s not in {"SPY", "QQQ", "AAPL", "SGOV"})})
+        s for s in json.loads(CONFIG.read_text(encoding="utf-8"))["universe"] if s not in {"SPY", "QQQ", "AAPL", "SGOV"})})
     assert DataDesk(tmp_path / "a", narrow, "local", clock=lambda: now, environ={}).interval("intraday", now) == 300
     wide = DataDesk(tmp_path / "b", configuration(CONFIG, environ={}), "local", clock=lambda: now, environ={})
     symbols = len(set(wide.tradable) | set(GAUGES))

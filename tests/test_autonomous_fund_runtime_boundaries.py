@@ -121,7 +121,7 @@ def test_same_process_cache_writers_publish_complete_independent_files(tmp_path,
     replace = Path.replace
 
     def overlapping_replace(path, destination):
-        if Path(destination) == target:
+        if Path(destination) == target and path not in staging:
             staging.append(path)
             barrier.wait(timeout=5)
         return replace(path, destination)
@@ -136,18 +136,48 @@ def test_same_process_cache_writers_publish_complete_independent_files(tmp_path,
     assert list(target.parent.glob("*.tmp")) == []
 
 
-def test_failed_cache_publication_preserves_the_previous_value_and_removes_staging(tmp_path, monkeypatch):
+def test_cache_publication_retries_a_transient_windows_sharing_violation(tmp_path, monkeypatch):
+    store, day = DailyStore(tmp_path), "2026-11-03"
+    store.put(day, "earnings", {"generation": 1})
+    replace = Path.replace
+    attempts = []
+
+    def briefly_locked(path, destination):
+        attempts.append(path)
+        if len(attempts) == 1:
+            error = PermissionError("synthetic sharing violation")
+            error.winerror = 32
+            raise error
+        return replace(path, destination)
+
+    monkeypatch.setattr(Path, "replace", briefly_locked)
+    store.put(day, "earnings", {"generation": 2})
+    assert len(attempts) == 2 and attempts[0] == attempts[1]
+    assert store.get(day, "earnings") == {"generation": 2}
+    assert list((tmp_path / day).glob("*.tmp")) == []
+
+
+@pytest.mark.parametrize("windows_lock", [False, True])
+def test_failed_cache_publication_preserves_the_previous_value_and_removes_staging(tmp_path, monkeypatch, windows_lock):
     store, day = DailyStore(tmp_path), "2026-11-03"
     store.put(day, "earnings", {"generation": 1})
     version = store.version(day, "earnings")
 
-    def fail(*args, **kwargs):
+    attempts = []
+
+    def fail(path, destination):
+        attempts.append(path)
+        if windows_lock:
+            error = PermissionError("synthetic publication failure")
+            error.winerror = 5
+            raise error
         raise OSError("synthetic publication failure")
     monkeypatch.setattr(Path, "replace", fail)
     with pytest.raises(OSError, match="synthetic publication failure"):
         store.put(day, "earnings", {"generation": 2})
     assert store.get(day, "earnings") == {"generation": 1}
     assert store.version(day, "earnings") == version
+    assert len(attempts) == (4 if windows_lock else 1)
     assert list((tmp_path / day).glob("*.tmp")) == []
 
 

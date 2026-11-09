@@ -10,13 +10,16 @@ record from the snapshot's first day on is less exposed to survivorship bias.
 Invariants:
 - Only real bars the provider served are stored; nothing is filled or carried forward.
 - A symbol's rows start at its first recorded session: never before it was a member.
-- While a symbol is a member its stored rows follow the provider's latest adjustment
-  (splits and dividends revise history), so a later read never mixes two adjustments.
+- Provider revisions update the bars the provider still serves. Older prices are
+  rescaled only when overlapping sessions corroborate a common adjustment.
 """
 from __future__ import annotations
 
+from math import isclose, isfinite
+
 ROLES = ("stocks", "etfs")
-REVISION_TOLERANCE = 1e-6  # Relative change of a stored close that counts as a provider revision.
+REVISION_TOLERANCE = 1e-6
+RESCALE_TOLERANCE = 1e-4  # Providers can round a common adjustment differently at different prices.
 
 
 class UniverseSnapshots:
@@ -40,19 +43,25 @@ class UniverseSnapshots:
             raise ValueError(f"unknown universe role {role!r}")
         stamp, written = now.isoformat(), 0
         with self.journal.connection() as db:
-            stored = {}
-            for symbol, day, close in db.execute("SELECT symbol, day, close FROM fund_universe_snapshots "
-                                                 "WHERE role=?", (role,)):
-                stored.setdefault(symbol, {})[day] = close
             for symbol, rows in members.items():
-                rows = sorted((str(r[0])[:10], *r[1:]) for r in rows if r[1] is not None and r[1] > 0)
+                rows = sorted(((str(day)[:10], close, *(_finite(v) for v in fields))
+                               for day, close, *fields in rows if close is not None and isfinite(close) and close > 0),
+                              key=lambda row: row[0])
                 if not rows:
                     continue
-                known = stored.get(symbol) or {}
-                start = min(known) if known else rows[-1][0]
+                first, = db.execute("SELECT MIN(day) FROM fund_universe_snapshots WHERE role=? AND symbol=?",
+                                    (role, symbol)).fetchone()
+                start = first or rows[-1][0]
                 fresh = [r for r in rows if r[0] >= start]
-                revised = self._rescale_older(db, role, symbol, known, fresh)
-                changes = [r for r in fresh if r[0] not in known or revised or _differs(known[r[0]], r[1])]
+                if not fresh:
+                    continue
+                # Read only the overlapping provider window, even after years of archiving.
+                known = {r[0]: tuple(r[1:]) for r in db.execute(
+                    "SELECT day,close,volume,open,high,low FROM fund_universe_snapshots "
+                    "WHERE role=? AND symbol=? AND day BETWEEN ? AND ?", (role, symbol, fresh[0][0], fresh[-1][0]))}
+                self._rescale_older(db, role, symbol, known, fresh)
+                changes = [r for r in fresh if r[0] not in known or
+                           any(_differs(a, b) for a, b in zip(known[r[0]], r[1:]))]
                 db.executemany(
                     "INSERT OR REPLACE INTO fund_universe_snapshots(role,symbol,day,close,volume,open,high,low,"
                     "recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -63,31 +72,43 @@ class UniverseSnapshots:
 
     @staticmethod
     def _rescale_older(db, role, symbol, known, fresh):
-        """When the provider revised the oldest overlapping bar, scale the stored bars before it alike.
-
-        The provider's history is finite: bars older than it can no longer be refreshed
-        directly, so they take the revision ratio of the oldest bar it still serves.
-        """
+        """Extend an adjustment to older bars only when both oldest overlapping closes support it."""
         overlap = [r for r in fresh if r[0] in known]
-        if not overlap or not _differs(known[overlap[0][0]], overlap[0][1]):
-            return False
-        ratio = overlap[0][1] / known[overlap[0][0]]
+        if len(overlap) < 2:
+            return
+        oldest, next_oldest = overlap[:2]
+        old_close, old_volume, *_ = known[oldest[0]]
+        next_close, next_volume, *_ = known[next_oldest[0]]
+        if not all(isfinite(v) and v > 0 for v in (old_close, next_close)):
+            return
+        if not _differs(old_close, oldest[1]) or not _differs(next_close, next_oldest[1]):
+            return
+        ratio = oldest[1] / old_close
+        if not isfinite(ratio) or ratio <= 0 or not isclose(ratio, next_oldest[1] / next_close, rel_tol=RESCALE_TOLERANCE):
+            return  # One corrected print is not evidence of a split or dividend adjustment.
+        inverse = 1 / ratio
+        volume_ratio = inverse if all(
+            before and after and isclose(after / before, inverse, rel_tol=RESCALE_TOLERANCE)
+            for before, after in ((old_volume, oldest[2]), (next_volume, next_oldest[2]))) else 1
         db.execute("UPDATE fund_universe_snapshots SET close=close*?, open=open*?, high=high*?, low=low*?, "
-                   "volume=volume/? WHERE role=? AND symbol=? AND day<?",
-                   (ratio, ratio, ratio, ratio, ratio, role, symbol, overlap[0][0]))
-        return True
+                   "volume=volume*? WHERE role=? AND symbol=? AND day<?",
+                   (ratio, ratio, ratio, ratio, volume_ratio, role, symbol, oldest[0]))
 
-    def rows(self, role, symbols):
-        """{symbol: [(date, close, volume, open, high, low)]} for the given symbols, oldest first."""
+    def rows(self, role, symbols, *, before=None):
+        """Stored bars for these symbols, oldest first and strictly before the optional cutoff."""
         symbols = sorted(set(symbols))
         if not symbols:
             return {}
         result = {}
         with self.journal.connection() as db:
             marks = ",".join("?" * len(symbols))
-            for symbol, day, close, volume, opened, high, low in db.execute(
-                    f"SELECT symbol, day, close, volume, open, high, low FROM fund_universe_snapshots "
-                    f"WHERE role=? AND symbol IN ({marks}) ORDER BY symbol, day", (role, *symbols)):
+            query = (f"SELECT symbol, day, close, volume, open, high, low FROM fund_universe_snapshots "
+                     f"WHERE role=? AND symbol IN ({marks})")
+            args = (role, *symbols)
+            if before is not None:
+                query += " AND day<?"
+                args += (str(before)[:10],)
+            for symbol, day, close, volume, opened, high, low in db.execute(query + " ORDER BY symbol, day", args):
                 result.setdefault(symbol, []).append((day, close, volume, opened, high, low))
         return result
 
@@ -136,4 +157,10 @@ def survivorship_text(root):
 
 
 def _differs(stored, served):
-    return abs(served - stored) > REVISION_TOLERANCE * max(abs(stored), 1e-12)
+    if stored is None or served is None:
+        return stored != served
+    return not isclose(stored, served, rel_tol=REVISION_TOLERANCE, abs_tol=1e-12)
+
+
+def _finite(value):
+    return value if value is not None and isfinite(value) else None

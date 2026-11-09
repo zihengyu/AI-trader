@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 from .risk import RiskError, instant, number
 
 URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+ACTIONS_URL = "https://data.alpaca.markets/v1/corporate-actions"
 ZONE = ZoneInfo("America/New_York")
 
 
@@ -73,3 +74,53 @@ class AlpacaDailyHistory:
         if not rows:
             raise NoDailyBars(f"Alpaca returned no completed daily bars for {symbol}")
         return sorted(rows)[-length:]
+
+    def corporate_actions(self, symbols, start, end):
+        """Split and USD cash-dividend observations by symbol, dated by ex-date."""
+        symbols = sorted(set(symbols))
+        kinds = {"forward_splits": "split", "reverse_splits": "split", "cash_dividends": "dividend"}
+        result = {symbol: [] for symbol in symbols}
+        for offset in range(0, len(symbols), 50):
+            batch = set(symbols[offset:offset + 50])
+            params = {"symbols": ",".join(sorted(batch)), "types": "forward_split,reverse_split,cash_dividend",
+                      "start": str(start), "end": str(end), "limit": 1000}
+            seen = set()
+            for _ in range(10):
+                response = self.get(ACTIONS_URL, headers=self.headers, params=params, timeout=10)
+                response.raise_for_status()
+                payload = response.json()
+                groups = payload.get("corporate_actions")
+                if not isinstance(groups, dict):
+                    raise RiskError("Invalid Alpaca corporate action response")
+                for name, kind in kinds.items():
+                    for action in groups.get(name) or []:
+                        symbol = action.get("symbol")
+                        if symbol not in batch:
+                            continue
+                        day = date.fromisoformat(action["ex_date"])
+                        if not start <= day <= end:
+                            continue
+                        if kind == "dividend" and (action.get("foreign") or action.get("currency", "USD") != "USD"):
+                            continue  # A foreign amount has no established USD basis here.
+                        if kind == "split":
+                            old = number(action["old_rate"])
+                            if old <= 0:
+                                raise RiskError("Invalid Alpaca split ratio")
+                            amount = number(action["new_rate"]) / old
+                        else:
+                            amount = number(action["rate"])
+                        if amount <= 0:
+                            raise RiskError("Invalid Alpaca corporate action amount")
+                        identifier = action.get("id")
+                        if identifier and identifier in seen:
+                            continue
+                        if identifier:
+                            seen.add(identifier)
+                        result[symbol].append({"date": day.isoformat(), kind: str(amount)})
+                token = payload.get("next_page_token")
+                if not token:
+                    break
+                params = {**params, "page_token": token}
+            else:
+                raise RiskError("Alpaca corporate actions returned too many pages")
+        return result

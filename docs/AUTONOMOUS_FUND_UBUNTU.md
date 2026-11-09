@@ -174,7 +174,9 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh check
 ```
 
 `connectivity` 一节逐项给出 Yahoo、Telegram、模型 API、Alpaca、SEC、FRED、Finnhub 和标普 500 成分列表（raw.githubusercontent.com）的 HTTP 状态和耗时，
-`connectivity_summary.blocking` 列出会影响运行的失败项并附中文原因。**服务器在中国大陆地域时 Telegram 和 Yahoo 通常无法直连**，
+`connectivity_summary.blocking` 列出当前 `FUND_MODE` 的必需服务和配置失败。local 只探测可选的 Alpaca 行情，
+paper 会检查必需的 Paper 账户凭证。local 只填一项 Alpaca 凭证时，`check` 会提示补齐。
+**服务器在中国大陆地域时 Telegram 和 Yahoo 通常无法直连**，
 请改用香港／新加坡等境外地域，或在 `.env` 设置 `HTTPS_PROXY`。设置了 Alpaca Key 时，local 模式在 Yahoo 拿不到日线时
 会自动改用 Alpaca 的历史日线（只用于风控和因子，记录 `risk_history_fallback`），并且每天用 Alpaca 日线逐只核对 Yahoo 日线：
 有分歧的交易日剔除，严重不一致的证券当天停用，收盘后发一条“日线数据交叉核对”通知（见 `docs/AUTONOMOUS_FUND_DATA_SOURCES.md`）。
@@ -199,8 +201,8 @@ Telegram、外部数据与运行参数、券商”分节，所有可调项都有
 | `FUND_TELEGRAM_APPROVER_IDS` | 可选；群组中可回复审批的用户 ID（逗号分隔）。私聊默认由聊天本人审批 |
 | `FUND_TELEGRAM_APPROVALS` | 可选；设为 `off` 时 Telegram 只通知、不接受回复审批 |
 | `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
-| `ALPACA_API_KEY`、`ALPACA_API_SECRET` | 仅选择 `paper` 时需要，使用专用模拟账户的 Paper Key |
-| `ALPACA_IS_PAPER=true` | 可选显式声明；设为 false 会拒绝启动，不会启用实盘 |
+| `ALPACA_API_KEY`、`ALPACA_API_SECRET` | paper 必填专用模拟账户凭证；local 选填一整对，用于日线核对及备用行情 |
+| `ALPACA_IS_PAPER=true` | 仅 paper 读取，默认 true；设为 false 会拒绝启动 |
 | `FUND_CAPITAL_USD` 等约束 | 授权资金、仓位、回撤、单日亏损、禁买名单、文字约束、审批额度与外部参数，见模板各节 |
 
 本地虚拟账户不需要券商注册或 Key。其他模型与可选数据服务的变量见模板及

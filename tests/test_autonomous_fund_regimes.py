@@ -43,6 +43,15 @@ def test_regimes_use_only_closes_through_each_session_and_tell_calm_rises_from_v
     assert market_regimes(rows[:150]) == {}  # Too short: no label rather than a guess.
 
 
+def test_regime_lookbacks_do_not_slide_over_a_missing_benchmark_session():
+    rows = benchmark()[:235]
+    sessions = tuple(day for day, _ in rows)
+    partial = rows[:210] + rows[211:]
+    assert sessions[-1] in market_regimes(rows, sessions=sessions)
+    assert sessions[209] in market_regimes(partial, sessions=sessions)
+    assert sessions[-1] not in market_regimes(partial, sessions=sessions)
+
+
 def test_recent_versus_earlier_flags_only_a_clear_change():
     assert recent_versus_earlier([1.0] * (MIN_TREND_SAMPLE - 1))["status"] == "insufficient_sample"
     flat = recent_versus_earlier([0.1] * 30)  # Float rounding must not introduce artificial variance.

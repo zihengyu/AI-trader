@@ -42,28 +42,30 @@ class ConstructionSettings:
         return cls(**section)
 
 
-def pairs(variants, closes, benchmark="SPY"):
+def pairs(variants, closes, benchmark="SPY", *, sessions=None):
     """[(session_date, risk_budget minus ai one-session excess)], one pair per session (its last variant)."""
-    from .scorecard import score_decisions
+    from .scorecard import decision_start, score_decisions
     by_day = {}
-    for at, body in variants:
-        by_day[instant(at).astimezone(ZONE).date().isoformat()] = (at, body)
+    for at, body in sorted(variants, key=lambda item: instant(item[0])):
+        day, _ = decision_start(at, instant(at).astimezone(ZONE).date().isoformat(), sessions)
+        if day is not None:
+            by_day[day] = (at, body)
     result = []
-    for day in sorted(by_day):
-        at, body = by_day[day]
+    for day, (at, body) in sorted(by_day.items()):
         scored = {}
         for arm in ("ai", "risk_budget"):
             targets = [{"symbol": s, "weight": float(w)} for s, w in (body.get(arm) or {}).items()]
-            scored[arm] = score_decisions([(at, {"targets": targets})], closes, benchmark)["recent"][0]["horizons"]["1"]
+            row = score_decisions([(at, {"targets": targets})], closes, benchmark, sessions=sessions)["recent"][0]
+            scored[arm] = row["horizons"]["1"]
         if all(item["status"] == "observed" for item in scored.values()):
             result.append((day, scored["risk_budget"]["excess_return"] - scored["ai"]["excess_return"]))
     return result
 
 
-def evaluate(variants, closes, settings, current="ai"):
+def evaluate(variants, closes, settings, current="ai", *, sessions=None):
     """Paired evidence and which construction should trade next (only `auto` ever switches)."""
     from .validation import paired_test
-    observed = pairs(variants, closes)
+    observed = pairs(variants, closes, sessions=sessions)
     test = paired_test([d for _, d in observed], settings.min_pairs)
     champion = current if settings.mode == "auto" else settings.mode
     reason, trigger = None, test

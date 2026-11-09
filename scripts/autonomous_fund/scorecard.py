@@ -8,6 +8,7 @@ estimated when a close is missing: such items stay `pending` or `unavailable`.
 """
 import math
 from bisect import bisect_left
+from datetime import date, timedelta
 from functools import lru_cache
 from statistics import mean, variance
 from zoneinfo import ZoneInfo
@@ -16,6 +17,23 @@ from .risk import instant
 
 ZONE = ZoneInfo("America/New_York")
 HORIZONS = (1, 5, 20)
+
+
+@lru_cache(maxsize=32)
+def _exchange_sessions(first, cutoff):
+    import pandas_market_calendars as mcal
+
+    end = date.fromisoformat(str(cutoff)) - timedelta(days=1)
+    if date.fromisoformat(first) > end:
+        return ()
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=first, end_date=end)
+    return tuple(day.date().isoformat() for day in schedule.index)
+
+
+def completed_sessions(closes, cutoff):
+    """Real US equity sessions within the price history and before the exclusive cutoff."""
+    first = min((str(day) for rows in closes.values() for day, _ in rows or ()), default=None)
+    return _exchange_sessions(first, str(cutoff)) if first else ()
 
 
 def _series(rows):
@@ -45,7 +63,7 @@ def _forward(rows, start_day, horizon, *, sessions=None):
     return values[start_day], values[end_day]
 
 
-def score_predictions(reviews, closes):
+def score_predictions(reviews, closes, *, sessions=None):
     """Score every review prediction; `closes` maps symbol -> completed daily closes."""
     items = []
     for packet in reviews:
@@ -55,9 +73,9 @@ def score_predictions(reviews, closes):
             item = {"memo_version": packet.get("version"), "session_date": packet["session_date"],
                     "symbol": symbol, "benchmark": benchmark, "direction": prediction["direction"],
                     "horizon_sessions": horizon, "hypothesis_ref": prediction.get("hypothesis_ref", "")}
-            sessions, _ = _series(closes.get(benchmark))
-            own = _forward(closes.get(symbol), packet["session_date"], horizon, sessions=sessions)
-            base = _forward(closes.get(benchmark), packet["session_date"], horizon, sessions=sessions)
+            calendar = _series(closes.get(benchmark))[0] if sessions is None else sessions
+            own = _forward(closes.get(symbol), packet["session_date"], horizon, sessions=calendar)
+            base = _forward(closes.get(benchmark), packet["session_date"], horizon, sessions=calendar)
             if own is None or base is None:
                 item["status"] = "unavailable"
             elif own == "pending" or base == "pending":
@@ -97,7 +115,7 @@ def _idea_session_close(day):
     return _session_close(day)
 
 
-def _start_index(days, formed_at):
+def _start_index(days, formed_at, *, require_prior=True):
     """Index of the first actual exchange close strictly after `formed_at`.
 
     "pending" when no later close is available. None when the history does not
@@ -105,6 +123,8 @@ def _start_index(days, formed_at):
     """
     formed = instant(formed_at).astimezone(ZONE)
     day = formed.date().isoformat()
+    if not require_prior and days and day < days[0]:
+        return None
     # Locate the formation day before consulting its calendar. Historical bars
     # before formation need no calendar builds or assumed 16:00 closing times.
     index = bisect_left(days, day)
@@ -114,7 +134,15 @@ def _start_index(days, formed_at):
             index += 1
     if index >= len(days):
         return "pending"
-    return index if index > 0 else None
+    return index if index > 0 or not require_prior else None
+
+
+def decision_start(at, day, sessions):
+    """Return the decision's start session and whether that close is still pending."""
+    if sessions is None:
+        return day, False
+    start = _start_index(sessions, at, require_prior=False) if sessions else None
+    return sessions[start] if isinstance(start, int) else None, start == "pending"
 
 
 def binomial_tail(successes, trials):
@@ -124,7 +152,7 @@ def binomial_tail(successes, trials):
     return sum(math.comb(trials, k) for k in range(successes, trials + 1)) / 2 ** trials
 
 
-def _idea_outcome(idea, closes):
+def _idea_outcome(idea, closes, sessions=None):
     symbol, benchmark = idea["symbol"], idea.get("benchmark") or "SPY"
     horizon = int(idea["horizon_sessions"])
     item = {key: idea.get(key) for key in ("idea_id", "symbol", "direction", "horizon_sessions", "confidence",
@@ -134,22 +162,26 @@ def _idea_outcome(idea, closes):
         return {**item, "status": "unavailable", "reason": "no completed closes"}
     days, values = _series(closes[symbol])
     base_days, base_values = _series(closes[benchmark])
-    start, base_start = _start_index(days, idea["formed_at"]), _start_index(base_days, idea["formed_at"])
-    if start is None or base_start is None:
+    calendar = base_days if sessions is None else sessions
+    base_start = _start_index(calendar, idea["formed_at"], require_prior=sessions is None)
+    if base_start is None or (sessions is None and _start_index(days, idea["formed_at"]) is None):
         return {**item, "status": "unavailable", "reason": "the close history does not cover the formation time"}
-    if base_start == "pending" or base_start + horizon >= len(base_days):
+    if base_start == "pending":
         return {**item, "status": "pending"}
-    start_day, end_day = base_days[base_start], base_days[base_start + horizon]
-    own = dict(zip(days, values))
-    # The benchmark fixes the mature horizon. Missing symbol bars do not move
-    # its endpoint or leave a completed comparison pending indefinitely.
-    if start_day not in own or end_day not in own:
-        return {**item, "status": "unavailable", "reason": "symbol and benchmark sessions differ"}
+    start_day = calendar[base_start]
+    own, base = dict(zip(days, values)), dict(zip(base_days, base_values))
+    if start_day not in own or start_day not in base:
+        return {**item, "status": "unavailable", "reason": "missing close at the scheduled start"}
+    if base_start + horizon >= len(calendar):
+        return {**item, "status": "pending"}
+    end_day = calendar[base_start + horizon]
+    if end_day not in own or end_day not in base:
+        return {**item, "status": "unavailable", "reason": "missing close at the scheduled end"}
     mine = own[end_day] / own[start_day] - 1
-    market = base_values[base_start + horizon] / base_values[base_start] - 1
+    market = base[end_day] / base[start_day] - 1
     rising, relative = RISING[idea["direction"]], idea["direction"] in {"outperform", "underperform"}
     move = mine - market if relative else mine
-    exposure = beta(closes[symbol], closes[benchmark], start_day)  # Closes through the start only.
+    exposure = beta(closes[symbol], closes[benchmark], start_day, sessions=sessions)
     residual = mine - exposure * market if exposure is not None else None
     return {**item, "status": "correct" if (move > 0) == rising and move != 0 else "incorrect",
             "start_day": start_day, "end_day": end_day, "symbol_return": mine,
@@ -160,7 +192,7 @@ def _idea_outcome(idea, closes):
             "always_up_correct": move > 0}
 
 
-def score_ideas(ideas, closes, regimes=None):
+def score_ideas(ideas, closes, regimes=None, *, sessions=None):
     """Score research ideas registered before the open: calibration, Brier and naive baselines.
 
     Each idea is measured from the first completed close after it was formed (so a
@@ -172,7 +204,7 @@ def score_ideas(ideas, closes, regimes=None):
     beta-matched benchmark move. Overlapping horizons are correlated, so the p-values
     are optimistic; they gate nothing and are evidence for the AI and the operator.
     """
-    items = [_idea_outcome(idea, closes) for idea in ideas]
+    items = [_idea_outcome(idea, closes, sessions=sessions) for idea in ideas]
     scored = [i for i in items if i["status"] in {"correct", "incorrect"}]
     hits = [i["status"] == "correct" for i in scored]
     count, correct = len(scored), sum(hits)
@@ -234,9 +266,11 @@ MIN_VOL_HISTORY = 60
 REGIMES = ("up_calm", "up_volatile", "down_calm", "down_volatile")
 MIN_TREND_SAMPLE = 20  # Scored items before recent and earlier results are compared.
 TREND_T = 1.65
+MIN_REGIME_WINDOWS = 10
+REGIME_T95 = 2.263  # Conservative 95% Student t critical value at the minimum of nine degrees of freedom.
 
 
-def market_regimes(benchmark_rows):
+def market_regimes(benchmark_rows, *, sessions=None):
     """{session: regime} of the benchmark, each from closes through that session only.
 
     Trend: the close against its TREND_WINDOW-session mean (up when at or above it).
@@ -245,18 +279,25 @@ def market_regimes(benchmark_rows):
     enough history have no label. Background for grouping results, never a signal.
     """
     days, closes = _series(benchmark_rows)
+    if sessions is not None:
+        observed = dict(zip(days, closes))
+        days, closes = sessions, [observed.get(day) for day in sessions]
     labels, vols = {}, []
     for i in range(len(days)):
-        if i < VOL_WINDOW or closes[i - VOL_WINDOW] <= 0:
+        window_closes = closes[max(0, i - VOL_WINDOW):i + 1]
+        if i < VOL_WINDOW or any(close is None or close <= 0 for close in window_closes):
             vols.append(None)
             continue
-        window = [closes[j] / closes[j - 1] - 1 for j in range(i - VOL_WINDOW + 1, i + 1) if closes[j - 1] > 0]
+        window = [b / a - 1 for a, b in zip(window_closes, window_closes[1:])]
         mean = sum(window) / len(window)
         vols.append(math.sqrt(sum((r - mean) ** 2 for r in window) / max(1, len(window) - 1)))
         earlier = sorted(v for v in vols[max(0, i - VOL_HISTORY):i] if v is not None)
         if i + 1 < TREND_WINDOW or len(earlier) < MIN_VOL_HISTORY:
             continue
-        trend = "up" if closes[i] >= sum(closes[i - TREND_WINDOW + 1:i + 1]) / TREND_WINDOW else "down"
+        trend_closes = closes[i - TREND_WINDOW + 1:i + 1]
+        if any(close is None or close <= 0 for close in trend_closes):
+            continue
+        trend = "up" if closes[i] >= sum(trend_closes) / TREND_WINDOW else "down"
         middle = len(earlier) // 2
         median = earlier[middle] if len(earlier) % 2 else (earlier[middle - 1] + earlier[middle]) / 2
         labels[days[i]] = f"{trend}_{'volatile' if vols[i] > median else 'calm'}"
@@ -291,8 +332,45 @@ def _idea_regimes(scored, hits, regimes):
         return {}
     groups = {}
     for item, hit in zip(scored, hits):
-        groups.setdefault(regimes.get(item.get("start_day"), "unlabeled"), []).append(hit)
-    return {label: {"scored": len(rows), "hit_rate": sum(rows) / len(rows)} for label, rows in sorted(groups.items())}
+        groups.setdefault(regimes.get(item["start_day"], "unlabeled"), []).append((item, hit))
+    result = {}
+    for label, rows in sorted(groups.items()):
+        by_day = {}
+        for item, hit in rows:
+            by_day.setdefault(item["start_day"], []).append((item["end_day"], hit))
+        # One equally weighted observation per start date, reserving the longest horizon that day.
+        windows = [(day, max(end for end, _ in group), mean(hit for _, hit in group))
+                   for day, group in by_day.items()]
+        result[label] = {"scored": len(rows), "hit_rate": mean(hit for _, hit in rows),
+                         "uncertainty": _regime_interval(windows, label, bounded=True)}
+    return result
+
+
+def _regime_interval(windows, label, *, bounded=False):
+    """Approximate 95% interval on a chronological non-overlapping sample."""
+    sample, previous_end = [], ""
+    for start, end, value in sorted(windows, key=lambda window: window[0]):
+        if start >= previous_end:
+            sample.append(value)
+            previous_end = end
+    n = len(sample)
+    center = mean(sample) if sample else None
+    result = {"non_overlapping": n, "minimum_sample": MIN_REGIME_WINDOWS, "sample_mean": center,
+              "status": "unreliable", "interval_95": None}
+    if label == "unlabeled" or n < MIN_REGIME_WINDOWS:
+        return result
+    if bounded:
+        # Day-level hit rates are bounded by 0 and 1. This conservative interval
+        # also has width when all sampled days are successes or failures.
+        radius = math.sqrt(math.log(40) / (2 * n))
+        interval = [max(0.0, center - radius), min(1.0, center + radius)]
+    else:
+        spread = variance(sample)
+        if spread <= 0:
+            return result
+        radius = REGIME_T95 * math.sqrt(spread / n)
+        interval = [center - radius, center + radius]
+    return {**result, "status": "estimated", "interval_95": interval}
 
 
 BETA_LOOKBACK = 126
@@ -300,15 +378,18 @@ MIN_BETA_OBSERVATIONS = 20
 DEFAULT_COST_BPS = 10
 
 
-def beta(rows, benchmark_rows, through_day, lookback=BETA_LOOKBACK):
+def beta(rows, benchmark_rows, through_day, lookback=BETA_LOOKBACK, *, sessions=None):
     """OLS beta of daily close-to-close returns to the benchmark, using closes through `through_day` only.
 
     None when fewer than MIN_BETA_OBSERVATIONS common returns exist or the benchmark did not move.
     """
     own, base = dict(_series_pairs(rows)), dict(_series_pairs(benchmark_rows))
-    days = sorted(day for day in set(own) & set(base) if day <= through_day)[-(lookback + 1):]
-    x = [base[b] / base[a] - 1 for a, b in zip(days, days[1:]) if base[a] > 0 and own[a] > 0]
-    y = [own[b] / own[a] - 1 for a, b in zip(days, days[1:]) if base[a] > 0 and own[a] > 0]
+    common = set(own) & set(base)
+    calendar = sorted(common) if sessions is None else sessions
+    days = [day for day in calendar if day <= through_day][-(lookback + 1):]
+    pairs = [(a, b) for a, b in zip(days, days[1:]) if a in common and b in common and base[a] > 0 and own[a] > 0]
+    x = [base[b] / base[a] - 1 for a, b in pairs]
+    y = [own[b] / own[a] - 1 for a, b in pairs]
     if len(x) < MIN_BETA_OBSERVATIONS:
         return None
     mx, my = sum(x) / len(x), sum(y) / len(y)
@@ -322,12 +403,13 @@ def _series_pairs(rows):
     return [(str(day), float(close)) for day, close in rows or []]
 
 
-def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None, regimes=None):
+def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None, regimes=None, *,
+                    sessions=None):
     """Forward return of each AI target portfolio vs a BETA-MATCHED benchmark, gross and net of costs.
 
     decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
-    CLOSE of the decision's own session, so the measurement never uses prices
-    from before the decision was made. Each name's beta comes from closes through
+    first scheduled CLOSE after acceptance when an exchange calendar is supplied.
+    Each name's beta comes from closes through
     that session only. A portfolio of high-beta names in a rising market is not
     skill: excess_return = portfolio - portfolio_beta x benchmark. A name whose
     beta cannot be estimated is assumed to have beta 1 and is listed in
@@ -351,18 +433,21 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     def sector_return(sector, day, horizon):
         key = (sector, day, horizon)
         if key not in sector_cache:
-            paths = [_forward(closes.get(s), day, horizon, sessions=sessions) for s in members.get(sector, ())]
+            paths = [_forward(closes.get(s), day, horizon, sessions=calendar) for s in members.get(sector, ())]
             returns = [p[1] / p[0] - 1 for p in paths if isinstance(p, tuple)]
             sector_cache[key] = sum(returns) / len(returns) if returns else None
         return sector_cache[key]
-    sessions, _ = _series(closes.get(benchmark))
+    calendar = _series(closes.get(benchmark))[0] if sessions is None else sessions
+    positions = {day: index for index, day in enumerate(calendar)}
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
+        start_day, start_pending = decision_start(at, day, sessions)
         weights = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
         exposure = sum(weights.values())
         betas, assumed = {}, []
         for symbol in weights:
-            estimate = 1.0 if symbol == benchmark else beta(closes.get(symbol), closes.get(benchmark), day)
+            estimate = 1.0 if symbol == benchmark else beta(closes.get(symbol), closes.get(benchmark),
+                                                           start_day or day, sessions=sessions)
             if estimate is None:
                 estimate = 1.0
                 assumed.append(symbol)
@@ -371,13 +456,17 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
         turnover = sum(abs(weights.get(s, 0.0) - previous.get(s, 0.0)) for s in set(weights) | set(previous))
         cost = turnover * cost_bps / 10_000
         previous = weights
-        row = {"decided_at": at, "session_date": day, "gross_exposure": exposure, "beta": portfolio_beta,
-               **({"regime": regimes.get(day, "unlabeled")} if regimes else {}),
+        row = {"decided_at": at, "session_date": day, "start_day": start_day,
+               "gross_exposure": exposure, "beta": portfolio_beta,
+               **({"regime": regimes.get(start_day, "unlabeled")} if regimes else {}),
                "beta_assumed": sorted(assumed), "turnover": turnover,
                "prompt_version": body.get("prompt_version") or "unversioned", "horizons": {}}
         for horizon in HORIZONS:
-            market = _forward(closes.get(benchmark), day, horizon, sessions=sessions)
-            paths = {s: _forward(closes.get(s), day, horizon, sessions=sessions) for s in weights}
+            if start_day is None:
+                row["horizons"][str(horizon)] = {"status": "pending" if start_pending else "unavailable"}
+                continue
+            market = _forward(closes.get(benchmark), start_day, horizon, sessions=calendar)
+            paths = {s: _forward(closes.get(s), start_day, horizon, sessions=calendar) for s in weights}
             if market is None or any(p is None for p in paths.values()):
                 row["horizons"][str(horizon)] = {"status": "unavailable"}
             elif market == "pending" or any(p == "pending" for p in paths.values()):
@@ -388,6 +477,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                 excess = portfolio - portfolio_beta * benchmark_return
                 row["horizons"][str(horizon)] = {
                     "status": "observed", "portfolio_return": portfolio,
+                    "end_day": calendar[positions[start_day] + horizon],
                     "beta_matched_benchmark_return": portfolio_beta * benchmark_return,
                     "excess_return": excess, "cost": cost, "net_excess_return": excess - cost,
                     "exposure_matched_benchmark_return": exposure * benchmark_return,
@@ -396,7 +486,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                     selection = allocation = other = assigned = 0.0
                     for symbol, weight in weights.items():
                         own = paths[symbol][1] / paths[symbol][0] - 1
-                        peer = sector_return(sectors[symbol], day, horizon) if symbol in sectors else None
+                        peer = sector_return(sectors[symbol], start_day, horizon) if symbol in sectors else None
                         if peer is None:
                             other += weight * (own - betas[symbol] * benchmark_return)
                             continue
@@ -408,11 +498,12 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                         sector_assigned_weight=assigned)
         rows.append(row)
 
-    def summary(selected):
+    def summary(selected, regime=None):
         result = {}
         for horizon in HORIZONS:
-            observed = [r["horizons"][str(horizon)] for r in selected
-                        if r["horizons"][str(horizon)]["status"] == "observed"]
+            selected_observed = [(r["start_day"], r["horizons"][str(horizon)]) for r in selected
+                                 if r["horizons"][str(horizon)]["status"] == "observed"]
+            observed = [o for _, o in selected_observed]
             gross = [o["excess_return"] for o in observed]
             net = [o["net_excess_return"] for o in observed]
             # Cost sensitivity: the same record if trading cost twice or three times the estimate.
@@ -426,6 +517,9 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                 "positive_excess_rate": sum(e > 0 for e in gross) / len(gross) if gross else None,
                 "mean_exposure_excess_return": (sum(o["exposure_excess_return"] for o in observed) / len(observed)
                                                 if observed else None)}
+            if regime is not None:
+                result[str(horizon)]["uncertainty"] = _regime_interval(
+                    [(day, o["end_day"], o["net_excess_return"]) for day, o in selected_observed], regime)
             split = [o for o in observed if "within_sector_selection" in o]
             if split:
                 result[str(horizon)].update(
@@ -445,7 +539,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     return {"decisions": len(rows), "by_horizon": summary(rows),
             "by_prompt_version": {version: summary(selected) for version, selected in versions.items()},
             # Background only: results by market regime, and whether the 5-session net excess is fading.
-            "by_regime": {label: summary(selected) for label, selected in sorted(regimes_seen.items())},
+            "by_regime": {label: summary(selected, label) for label, selected in sorted(regimes_seen.items())},
             "trend_5d_net_excess": recent_versus_earlier(five),
             "cost_bps_per_side": cost_bps, "recent": rows[-10:],
             "interpretation": "excess_return is over a beta-matched benchmark (portfolio beta from closes through "
@@ -454,7 +548,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                               "not proof."}
 
 
-def score_timing(events, closes):
+def score_timing(events, closes, *, sessions=None):
     """Did the AI's own entry and exit levels add value? Completed closes only.
 
     events: [(at_iso, kind, body)] with kinds protective_trigger, entry_waiting and
@@ -476,7 +570,7 @@ def score_timing(events, closes):
             price, row = float(body["bid"]), {"at": at, "symbol": body["symbol"], "trigger": body["trigger"],
                                               "bid": float(body["bid"]), "horizons": {}}
             for horizon in HORIZONS:
-                path = _forward(closes.get(body["symbol"]), day_of(at), horizon)
+                path = _forward(closes.get(body["symbol"]), day_of(at), horizon, sessions=sessions)
                 if path is None or path == "pending":
                     row["horizons"][str(horizon)] = {"status": "unavailable" if path is None else "pending"}
                 else:
@@ -492,7 +586,7 @@ def score_timing(events, closes):
                 row["entry_improvement"] = (ask - float(entered["limit"])) / ask
             else:
                 for horizon in HORIZONS:
-                    path = _forward(closes.get(symbol), day_of(at), horizon)
+                    path = _forward(closes.get(symbol), day_of(at), horizon, sessions=sessions)
                     if path is None or path == "pending":
                         row["horizons"][str(horizon)] = {"status": "unavailable" if path is None else "pending"}
                     else:

@@ -182,6 +182,23 @@ def test_learning_champion_switches_to_baseline_only_on_significant_harm_then_ba
     assert strategy._evaluate_learning(now)["champion"] == "memo"
 
 
+def test_learning_starts_after_both_decisions_are_available(tmp_path):
+    from datetime import date
+
+    day = date(2026, 11, 27)
+    dates = ("2026-11-27", "2026-11-30", "2026-12-01")
+    data = {"SPY": list(zip(dates, (100, 100, 100))),
+            "UP": list(zip(dates, (100, 110, 121))), "DOWN": list(zip(dates, (100, 95, 95)))}
+    strategy = learning_harness(tmp_path, [day], data)
+    strategy._daily_closes = lambda symbol, now: data[symbol]
+    [row] = shadow_rows([day], "UP", "DOWN")
+    strategy.journal.event("2026-11-27T19:00:00+00:00", "shadow_decision", row)
+    monday = datetime(2026, 11, 30, 21, tzinfo=timezone.utc)
+    tuesday = datetime(2026, 12, 1, 21, tzinfo=timezone.utc)
+    assert strategy._evaluate_learning(monday)["memo_minus_baseline_1d_excess"]["pairs"] == 0
+    assert strategy._evaluate_learning(tuesday)["memo_minus_baseline_1d_excess"]["pairs"] == 1
+
+
 def test_shadow_runs_once_per_session_blind_and_within_budget(tmp_path):
     from .test_autonomous_fund_quant import NOW, account, model_harness
     strategy = model_harness(tmp_path)
@@ -282,6 +299,20 @@ def test_acceptance_report_passes_a_clean_run_and_measures_slippage(tmp_path):
     assert metrics["sessions_observed"] == 3 and metrics["median_iteration_ratio"] == 1.0
     assert metrics["mean_slippage_bps_vs_arrival"] == pytest.approx(5.0)
     assert metrics["review_ratio"] == 1.0
+
+
+def test_investment_acceptance_does_not_annualize_a_gap_as_one_day(tmp_path):
+    from scripts.autonomous_fund.validation import investment_markdown
+
+    journal = Journal(tmp_path, "synthetic-acceptance-gap")
+    for at, equity in (("2026-11-24", 10_000), ("2026-11-27", 12_000), ("2026-11-30", 12_120)):
+        journal.event(f"{at}T17:00:00+00:00", "account", {"equity": equity, "cash": equity, "positions": {}})
+    result = acceptance(tmp_path, now=datetime(2026, 12, 1, tzinfo=timezone.utc))
+    assert result["metrics"]["sessions_observed"] == 3
+    # Nov 25 has no account mark, Nov 26 is a holiday, and Nov 27 -> 30 is one session.
+    assert result["performance_evidence"]["sessions"] == 1
+    assert result["performance_evidence"]["missing_account_intervals"] == 2
+    assert "跳过 2 个单日收益区间" in investment_markdown(result)
 
 
 def test_acceptance_report_fails_on_short_runs_unresolved_orders_and_watchdog_stops(tmp_path):

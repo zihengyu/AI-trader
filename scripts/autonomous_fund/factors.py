@@ -584,7 +584,8 @@ def negative_control(close, settings, horizon=5, runs=None, seed=0, membership=N
                        "significance and validated_rate below it; too_loose means luck validates too often here"}
 
 
-def live_record(expression, horizon, direction, since, close, volume, settings, extra=None, tradable=None):
+def live_record(expression, horizon, direction, since, close, volume, settings, extra=None, tradable=None,
+                short_volume=None):
     """IC on dates after the validation day: the factor's genuine out-of-sample track record.
 
     favored/disfavored list only `tradable` names (the research universe widens
@@ -595,9 +596,11 @@ def live_record(expression, horizon, direction, since, close, volume, settings, 
     live = rows[rows.index.date > pd.Timestamp(since).date()].iloc[::horizon]
     record = summarize(live)
     # Today's ranks come from the latest completed close, which has no forward return yet.
-    latest = factor.iloc[-1].dropna().rank(pct=True) if len(factor) else pd.Series(dtype=float)
+    latest = factor.iloc[-1].where(close.iloc[-1].notna()).dropna().rank(pct=True) if len(factor) else pd.Series(dtype=float)
     if direction == -1:
         latest = 1 - latest
+    from .crowding import diagnose
+    record["crowding"] = diagnose(latest, close, extra, short_volume)
     if tradable is not None:
         latest = latest[[s for s in latest.index if s in tradable]]
     ordered = latest.sort_values(ascending=False)
@@ -743,7 +746,7 @@ class FactorLab:
                         "reason": f"ranks correlate {similarity:.2f} with validated factor {row['name']}"}
         return outcome
 
-    def track(self, now, close, volume=None, extra=None, tradable=None):
+    def track(self, now, close, volume=None, extra=None, tradable=None, short_volume=None):
         """Live record of every validated factor; retire those whose live IC turned against them."""
         panels = as_panels(close, volume, extra)
         active = []
@@ -754,7 +757,7 @@ class FactorLab:
                     raise RiskError(f"no {row.get('universe') or 'stocks'} history available")
                 c, v, x = _fields(data)
                 live = live_record(row["expression"], row["horizon"], row["direction"], row["validated_at"],
-                                   c, v, self.settings, x, tradable)
+                                   c, v, self.settings, x, tradable, short_volume=short_volume)
             except RiskError as exc:
                 live = {"n": 0, "unavailable": str(exc)}
             if (live.get("n", 0) >= self.settings.live_min_observations and live.get("mean_ic") is not None
@@ -794,10 +797,10 @@ class FactorLab:
         self.journal.event(now, "factor_negative_control", result)
         return result
 
-    def context(self, now, close, volume=None, extra=None, tradable=None):
+    def context(self, now, close, volume=None, extra=None, tradable=None, short_volume=None):
         """What the AI sees: grammar, standard, validated factors with live record and current ranks."""
         if close is not None:
-            active = self.track(now, close, volume, extra, tradable)
+            active = self.track(now, close, volume, extra, tradable, short_volume)
         else:
             active = [{**r, "live": {"n": 0, "unavailable": "history"}} for r in self.rows("validated")]
 
@@ -825,7 +828,9 @@ class FactorLab:
                 "live_min_observations observations; provisional lists factors that passed the historical tests "
                 "only. Those tests use today's names (survivorship bias), so provisional factors are hypotheses: "
                 "they carry no favored names, and only their live record can confirm them. "
-                "Evidence, not orders: weigh it with research."),
+                "crowding shows descriptive proxies for the current top and bottom quintiles: valuation spread, "
+                "pairwise daily return correlation and dated FINRA off-exchange short-sale volume share. "
+                "Treat gaps as unknown. Evidence, not orders: weigh it with research."),
             "live_min_observations": self.settings.live_min_observations,
             "survivorship": SURVIVORSHIP_NOTE,
             "trials": len(tried), "next_critical_t": critical_t(len(tried) + 1, self.settings.significance),
@@ -840,7 +845,7 @@ class FactorLab:
                              "universe": r.get("universe") or "stocks", "direction": r["direction"],
                              "validated_on": r["validated_at"], "in_sample": json.loads(r["evidence"])["in_sample"],
                              "holdout": json.loads(r["evidence"])["holdout"],
-                             "live": {k: (r["live"] or {}).get(k) for k in ("n", "mean_ic", "t", "unavailable")},
+                             "live": {k: (r["live"] or {}).get(k) for k in ("n", "mean_ic", "t", "unavailable", "crowding")},
                              **_evidence_flags(json.loads(r["evidence"]))}
                             for r in provisional[:self.settings.max_active]],
             "negative_control": control,
