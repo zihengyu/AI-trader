@@ -99,7 +99,8 @@ FACTOR_STATUS = {"validated": "历史检验通过（待样本外确认）", "rej
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
-                "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body"}
+                "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body",
+                "holding_without_market_data"}
 
 
 ATTRIBUTION_LABELS = {"market": "市场（beta×基准）", "selection": "选股", "cash_equivalent": "现金等价物",
@@ -487,6 +488,19 @@ def readable(kind, details, sequence=None, *, now=None):
                     + "\nAI 已被告知不要计划买入它们，研究照常。要交易它们，需要提高授权资金或单只／分组上限。")
         else:
             text = "ℹ️ 投资范围里的证券现在都至少买得起一股了。"
+    elif kind == "holding_without_market_data" and isinstance(details, dict):
+        symbol, last = details.get("symbol"), details.get("last_bar")
+        gap = (f"已连续 {details.get('sessions_without_bar')} 个交易日没有新的日线（最后一根是 {last}）" if last else
+               "数据源已经不再提供它的日线")
+        text = (f"⚠️ 持仓 {symbol} {gap}，可能已被收购、退市或长期停牌。没有价格就无法给账户估值，"
+                "所以账户估值和新的交易会暂停，直到它被处理。")
+        if details.get("mode") == "local":
+            text += ("\n请先查明实际结算情况（例如现金收购价；破产退市一般为 0），然后停止基金，运行：\n"
+                     f"bash scripts/run_autonomous_fund.sh settle-position --run-dir <账户目录> --symbol {symbol} "
+                     "--cash-per-share <每股实收现金> --reason \"<发生了什么>\"\n"
+                     "账本会把这笔持仓按该金额转为现金，并用严格对账复核；之后重新启动即可。")
+        else:
+            text += "\n模拟券商会自行处理收购或退市的结算；请在券商账户里确认，之后账户读数会自动恢复。"
     elif kind == "degradation_cleared" and isinstance(details, dict):
         text = (f"✅ 换手已回到正常：最近日均 {_percent(details.get('recent_mean'))}，不高于之前的中位数 "
                 f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")

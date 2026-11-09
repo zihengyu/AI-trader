@@ -270,6 +270,14 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
                     if body.get("entitled_quantity") is not None:
                         check(same(entitled, body["entitled_quantity"]), "dividend_entitlement_mismatch", symbol=symbol)
                     receivables += entitled * amount
+                elif action_kind == "cash_settlement":
+                    # Operator-stated cash paid per share for an acquired or delisted holding.
+                    check(position["quantity"] > 0 and same(position["quantity"], body.get("quantity", -1)),
+                          "settlement_quantity_mismatch", symbol=symbol)
+                    cash += position["quantity"] * amount
+                    position["quantity"] = number(0)
+                else:
+                    check(False, "corporate_action_kind_unknown", symbol=symbol)
         check(seen == set(actions), "corporate_action_event_missing")
         [actual] = _rows(db, "SELECT cash,receivables FROM local_account WHERE id=1")
         check(same(cash, actual["cash"]), "cash_mismatch", expected=str(cash), recorded=actual["cash"])

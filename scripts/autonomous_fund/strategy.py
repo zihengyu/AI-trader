@@ -962,6 +962,38 @@ class AutonomousFund(Strategy):
             self._sync_experiments(self.get_datetime())
         except Exception as exc:  # The registry records the experiments; it never stops them.
             self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
+        try:
+            self._check_stale_holdings(self.get_datetime())
+        except Exception as exc:  # A missed check is retried after the next close.
+            self._disclose_failure("stale_holding_check_error", exc, phase="postmarket_review")
+
+    def _check_stale_holdings(self, now):
+        """Held stocks the provider stopped serving bars for (acquired, delisted, halted): tell the operator.
+
+        Such a holding cannot be valued, so marks and new buys pause until it is resolved:
+        a paper broker settles it itself; the local book needs `settle-position` with the
+        cash actually paid. Reported once per symbol per New York day.
+        """
+        from .settlement import stale_holding
+        if self.mode not in {"local", "paper"}:
+            return []
+        positions = self.broker._pull_positions(self) or []
+        held = sorted({p.asset.symbol for p in positions if p.asset != getattr(self, "quote_asset", None)
+                       and getattr(p.asset, "asset_type", "stock") == "stock" and number(p.quantity) > 0})
+        stale = []
+        for symbol in held:
+            rows, error = self._daily_bars(symbol, now)
+            found = stale_holding(symbol, self._completed(rows or [], now), error, now)
+            if found:
+                stale.append({**found, "mode": self.mode})
+        day, noted = trading_day(now), self.journal.get_meta("stale_holdings_notified") or {}
+        for item in stale:
+            if noted.get(item["symbol"]) != day:
+                self._notify_fund("holding_without_market_data", item)
+                noted[item["symbol"]] = day
+        self.journal.set_meta("stale_holdings_notified",
+                              {s: d for s, d in noted.items() if s in {item["symbol"] for item in stale}})
+        return stale
 
     def _affordability(self, equity, positions, now):
         """Symbols one share of which is above their position ceiling at this equity (whole shares only).
