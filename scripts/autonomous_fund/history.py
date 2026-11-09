@@ -19,6 +19,10 @@ URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 ZONE = ZoneInfo("America/New_York")
 
 
+class NoDailyBars(RiskError):
+    """The reference returned no completed sessions for this symbol."""
+
+
 class AlpacaDailyHistory:
     def __init__(self, key, secret, get=None):
         import requests
@@ -67,5 +71,5 @@ class AlpacaDailyHistory:
                 rows.append((day, close, float(bar.get("v") or 0), float(bar.get("o") or "nan"),
                              float(bar.get("h") or "nan"), float(bar.get("l") or "nan")))
         if not rows:
-            raise RiskError(f"Alpaca returned no completed daily bars for {symbol}")
+            raise NoDailyBars(f"Alpaca returned no completed daily bars for {symbol}")
         return sorted(rows)[-length:]

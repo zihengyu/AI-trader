@@ -121,14 +121,13 @@ def regime_trend_lines(card):
         lines.append("按市场状态分组（SPY 相对 200 日均线、20 日波动相对过去一年中位数；只作背景，不作判断标准）："
                      + ("决策 5 日净超额：" + "；".join(groups) if groups else "")
                      + ("。" if groups and hits else "") + ("研究想法：" + "；".join(hits) if hits else ""))
-    for name, trend, unit in (("决策 5 日净超额", decisions.get("trend_5d_net_excess"), "percent"),
-                              ("研究想法命中率", ideas.get("trend"), "percent")):
+    for name, trend in (("决策 5 日净超额", decisions.get("trend_5d_net_excess")),
+                        ("研究想法命中率", ideas.get("trend"))):
         if (trend or {}).get("status") == "observed":
+            detail = (f"t={trend['t_stat']:.2f}，{CHANGE_TEXT.get(trend['change'], trend['change'])}"
+                      if trend.get("t_stat") is not None else "组内无波动，无法计算 t")
             lines.append(f"{name}：最近 {trend['recent']['n']} 条平均 {_percent(trend['recent']['mean'])}，"
-                         f"之前 {trend['earlier']['n']} 条 {_percent(trend['earlier']['mean'])}"
-                         f"（t={trend['t_stat']:.2f}，{CHANGE_TEXT.get(trend['change'], trend['change'])}）"
-                         if trend.get("t_stat") is not None else
-                         f"{name}：最近与之前没有差别可比（结果完全相同）")
+                         f"之前 {trend['earlier']['n']} 条 {_percent(trend['earlier']['mean'])}（{detail}）")
     return lines
 
 
@@ -772,8 +771,8 @@ def weekly_document(root, sequence):
     from .holdings import day_trades
     week_trades = day_trades([(at, kind, body) for at, kind, body in events if kind in {"fill", "fill_reconciled"}],
                              cutoff)["by_day"]
-    lines.append(f"- 日内交易（同一天买入又卖出）：本周 {sum(n for d, n in week_trades.items() if monday <= d <= sunday)} 次"
-                 "（美股保证金实盘账户总净值低于 2.5 万美元时，5 个交易日内超过 3 次会被限制；模拟盘不受影响）")
+    lines.append(f"- 日内交易（同一天买入又卖出，估算）：本周 "
+                 f"{sum(n for d, n in week_trades.items() if monday <= d <= sunday)} 次")
     from .call_value import from_events, lines as value_lines
     week = [(at, kind, body) for at, kind, body in events if kind in {"agent", "agent_outcome", "review_skipped",
             "critic_reused"} and monday <= instant(at).astimezone(zone).date().isoformat() <= sunday]

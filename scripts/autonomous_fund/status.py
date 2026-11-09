@@ -87,16 +87,12 @@ def weekly_lines(db, now, stopped=False):
 
 
 def day_trade_line(db, now):
-    """Same-day round trips in the last five sessions (the US pattern day trader count), as one line."""
+    """Estimated same-day round trips in the last five sessions."""
     from .holdings import day_trades
     fills = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
         "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")]
     count = day_trades(fills, now)
-    line = f"日内交易（同一天买入又卖出，PDT 估算）：最近 {count['window']} 个交易日 {count['last_sessions']} 次"
-    if count["last_sessions"] >= count["limit"]:
-        line += ("；如果是总净值低于 2.5 万美元的保证金实盘账户，5 个交易日内超过 3 次会被限制交易 90 天，"
-                 "模拟盘不受影响")
-    return line
+    return f"日内交易（同一天买入又卖出，估算）：最近 {count['window']} 个交易日 {count['last_sessions']} 次"
 
 
 def _age(at, now):

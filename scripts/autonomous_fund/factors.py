@@ -170,16 +170,18 @@ def compute(expression, close, volume=None, extra=None):
     for name in DATA[2:]:
         frame = (extra or {}).get(name)
         data[name] = frame.reindex(index=close.index, columns=close.columns) if frame is not None else nan
-    value = _eval(parse(expression), data)
+    member = _membership(close, (extra or {}).get(MEMBERSHIP))
+    value = _eval(parse(expression), data, member)
     if not isinstance(value, pd.DataFrame):
         raise RiskError("A factor must depend on market data")
     value = value.replace([np.inf, -np.inf], np.nan)
     member = (extra or {}).get(MEMBERSHIP)
-    if member is not None:
-        # A stock counts in a cross-section only from its index entry; its prices stay
-        # complete, so look-back windows right after it joined are unaffected.
-        value = value.where(member.reindex(index=value.index, columns=value.columns).fillna(True).astype(bool))
-    return value
+    return value.where(member) if member is not None else value
+
+
+def _membership(close, member):
+    return (member.reindex(index=close.index, columns=close.columns, fill_value=True).ne(False)
+            if member is not None else None)
 
 
 def _panel(value, like):
@@ -187,17 +189,17 @@ def _panel(value, like):
                                                                          columns=like.columns)
 
 
-def _eval(node, data):
+def _eval(node, data, member):
     close = data["close"]
     if isinstance(node, ast.Name):
         return data[node.id]
     if isinstance(node, ast.Constant):
         return float(node.value)
     if isinstance(node, ast.UnaryOp):
-        value = _eval(node.operand, data)
+        value = _eval(node.operand, data, member)
         return -value if isinstance(node.op, ast.USub) else value
     if isinstance(node, ast.BinOp):
-        left, right = _eval(node.left, data), _eval(node.right, data)
+        left, right = _eval(node.left, data, member), _eval(node.right, data, member)
         if isinstance(node.op, ast.Add):
             return left + right
         if isinstance(node.op, ast.Sub):
@@ -214,7 +216,7 @@ def _eval(node, data):
         return close / close.shift(args[0].value) - 1
     if name == "vol":
         return close.pct_change(fill_method=None).rolling(args[0].value).std() * math.sqrt(252)
-    x = _panel(_eval(args[0], data), close)
+    x = _panel(_eval(args[0], data, member), close)
     if name in {"delay", "delta", "ts_mean", "ts_std", "ts_max", "ts_min", "ts_rank"}:
         n = args[1].value
         if name == "delay":
@@ -231,6 +233,10 @@ def _eval(node, data):
         return x.abs()
     if name == "sign":
         return np.sign(x)
+    # Cross-sectional operators exclude future entrants before computing any ranks or moments.
+    # Raw prices stay available to time-series operators for look-backs after entry.
+    if member is not None:
+        x = x.where(member)
     if name == "rank":
         return x.rank(axis=1, pct=True)
     mean = x.mean(axis=1)
@@ -546,7 +552,7 @@ def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, secto
             "reason": "in-sample, holdout and walk-forward windows agree"}
 
 
-def negative_control(close, settings, horizon=5, runs=None, seed=0):
+def negative_control(close, settings, horizon=5, runs=None, seed=0, membership=None):
     """Random rankings through the full evidence standard with one trial: how often does luck pass?
 
     Each run shuffles every date's ranking (independent random values per name).
@@ -556,6 +562,9 @@ def negative_control(close, settings, horizon=5, runs=None, seed=0):
     """
     runs = settings.negative_control_runs if runs is None else runs
     rng, mask = np.random.default_rng(seed), close.notna()
+    member = _membership(close, membership)
+    if member is not None:
+        mask &= member
     evaluated = passed_in_sample = validated = 0
     for _ in range(runs):
         factor = pd.DataFrame(rng.standard_normal(close.shape), index=close.index, columns=close.columns).where(mask)
@@ -758,8 +767,7 @@ class FactorLab:
                                                            "reason": reason, "live": live})
                 continue
             if not row.get("confirmed_at") and confirmed(live, row["direction"], self.settings):
-                # Historical validation used today's names only (survivorship bias); the live record
-                # after validation has no such bias. Only now does the factor count as validated evidence.
+                # Post-validation observations were not available when the factor was proposed.
                 with self.journal.connection() as db:
                     db.execute("UPDATE fund_factors SET confirmed_at=? WHERE id=?", (str(now), row["id"]))
                 self.journal.event(now, "factor_confirmed", {"id": row["id"], "expression": row["expression"],
@@ -780,7 +788,8 @@ class FactorLab:
         if data is None:
             return saved
         result = {"as_of": today.isoformat(),
-                  **negative_control(data["close"], self.settings, seed=today.toordinal())}
+                  **negative_control(data["close"], self.settings, seed=today.toordinal(),
+                                     membership=data.get(MEMBERSHIP))}
         self.journal.set_meta("factor_negative_control", result)
         self.journal.event(now, "factor_negative_control", result)
         return result
@@ -844,10 +853,9 @@ class FactorLab:
 
 SURVIVORSHIP_NOTE = ("Survivorship bias: every historical cross-section uses today's universe and research list. "
                      "Stocks that were delisted, acquired or dropped from an index are missing, so historical ICs and "
-                     "spreads are optimistic. The live record after validation has no such bias, and from the daily "
-                     "universe snapshot's first session on, former members stay in the cross-sections for their "
-                     "membership period (see universe_snapshot).")
-SURVIVORSHIP_TEXT = "历史检验只含当前还在交易的股票，退市、被收购和被剔出指数的不在其中（幸存者偏差），历史 IC 偏乐观；验证之后的样本外记录不受影响。"
+                     "spreads may be optimistic. The live record is out of sample in time. Daily snapshots preserve "
+                     "some evidence for former members (see universe_snapshot), but coverage gaps can still bias it.")
+SURVIVORSHIP_TEXT = "幸存者偏差：历史检验主要依赖当前股票名单，遗漏退市、被收购和被剔出指数的股票可能让历史 IC 偏乐观。验证后的记录是时间上的样本外证据，仍受数据覆盖限制。"
 
 
 def confirmed(live, direction, settings):

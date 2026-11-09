@@ -4,6 +4,7 @@ Synthetic return series, benchmarks and costs only; no network, broker or model 
 """
 import math
 import random
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -90,25 +91,58 @@ def test_the_edge_must_survive_twice_the_realized_trading_costs():
     result, criteria = verdict(returns, market, costs={**COSTS, "fills_without_arrival": 2})
     assert criteria["risk_matched_excess_annual_2x_trading_costs"]["value"] == "unknown_costs"
     assert result["verdict"] == "edge_not_shown"
+    assert result["cost_sensitivity"]["risk_matched_excess_annual"] == {"1x": 0.05, "2x": None, "3x": None}
+    result, criteria = verdict(returns, market, costs={**COSTS, "incomplete_fill_details": 1})
+    assert criteria["risk_matched_excess_annual_2x_trading_costs"]["value"] == "unknown_costs"
     result, criteria = verdict(returns, market, costs=None)
     assert criteria["risk_matched_excess_annual_2x_trading_costs"]["value"] is None and result["verdict"] == "edge_not_shown"
 
 
 def test_trading_costs_take_fees_and_absolute_slippage_once_per_order():
     from scripts.autonomous_fund.validation import trading_costs
-    events = [("t1", "fill", {"broker_id": "b1", "price": "101", "quantity": "10", "trade_cost": "1.01"}),
-              ("t2", "fill", {"broker_id": "b2", "price": "49", "quantity": "4", "trade_cost": "0.2"}),
-              ("t3", "fill", {"broker_id": "b2", "price": "49", "quantity": "4", "trade_cost": "0.2"}),
+    start = datetime(2026, 11, 2, 21, tzinfo=timezone.utc)
+    tick = lambda n: start + timedelta(minutes=n)
+    events = [(tick(1), "fill", {"broker_id": "b1", "price": "101", "quantity": "10", "trade_cost": "1.01"}),
+              (tick(2), "fill", {"broker_id": "b2", "price": "49", "quantity": "4", "trade_cost": "0.2"}),
+              (tick(3), "fill", {"broker_id": "b2", "price": "49", "quantity": "4", "trade_cost": "0.2"}),
               # The reconciled record replaces b2's two callbacks (cumulative 8 shares).
-              ("t4", "fill_reconciled", {"broker_id": "b2", "price": "49", "quantity": "8", "trade_cost": "0.4"}),
-              ("t5", "fill", {"broker_id": "b3", "price": "20", "quantity": "5", "trade_cost": "0.1"})]
+              (tick(4), "fill_reconciled", {"broker_id": "b2", "price": "49", "quantity": "8", "trade_cost": "0.4"}),
+              (tick(5), "fill", {"broker_id": "b3", "price": "20", "quantity": "5", "trade_cost": "0.1"})]
     by_broker = {"b1": {"intent_id": "i1", "side": "buy"}, "b2": {"intent_id": "i2", "side": "sell"},
                  "b3": {"intent_id": "i3", "side": "buy"}}
     references = {"i1": 100.0, "i2": 50.0}  # b3 has no arrival price.
-    pairs = [{"equity_start": 10_000.0}] * 126
+    pairs = [{"start": start + timedelta(days=i), "end": start + timedelta(days=i + 1), "equity_start": 10_000.0}
+             for i in range(126)]
     costs = trading_costs(events, by_broker, references, pairs)
     # b1: 1.01 + |101-100| x 10; b2: 0.4 + |49-50| x 8 (a worse sale); b3: its fee only.
     assert math.isclose(costs["usd"], 1.01 + 10 + 0.4 + 8 + 0.1)
     assert costs["fills_without_arrival"] == 1 and costs["sessions"] == 126
     assert math.isclose(costs["annual_rate_on_equity"], costs["usd"] / 10_000 * 2)
     assert trading_costs([], {}, {}, [])["annual_rate_on_equity"] is None
+
+
+def test_cost_window_matches_nav_and_incomplete_fill_evidence_stays_unknown():
+    from scripts.autonomous_fund.validation import trading_costs
+    start = datetime(2026, 11, 2, 21, tzinfo=timezone.utc)
+    day = timedelta(days=1)
+    pairs = [{"start": start, "end": start + day, "equity_start": 10_000},
+             {"start": start + day * 2, "end": start + day * 3, "equity_start": 20_000}]
+    fill = {"broker_id": "b1", "price": "101", "quantity": "10", "trade_cost": "1"}
+    events = [(start, "fill", fill), (start + day, "fill", fill),
+              (start + day * 2, "fill", fill), (start + day * 3, "fill", {**fill, "trade_cost": None}),
+              (start + day * 3, "fill_details_unavailable", {"broker_id": "partial"}),
+              (start + day * 4, "fill", fill)]
+    costs = trading_costs(events, {"b1": {"intent_id": "i1"}}, {"i1": 100.0}, pairs)
+    assert costs["usd"] == 21 and costs["incomplete_fill_details"] == 2
+    assert costs["annual_rate_on_equity"] == pytest.approx((11 / 10_000 + 10 / 20_000) * 126)
+
+
+def test_cost_sample_uses_only_intervals_in_the_risk_matched_comparison():
+    from scripts.autonomous_fund.validation import benchmark_report
+    dates = [f"2026-11-0{day}" for day in range(2, 7)]
+    pairs = [{"start_day": a, "end_day": b, "return": 0.01, "equity_start": 10_000}
+             for a, b in zip(dates, dates[1:])]
+    marks = {"SPY": dict.fromkeys(dates, 100), "SGOV": dict.fromkeys(dates[:-1], 100)}
+    report, matched = benchmark_report([], pairs, marks, [])
+    benchmark = next(row for row in report["benchmarks"] if row["name"] == "risk_matched")
+    assert benchmark["sessions_missing_marks"] == 1 and matched == pairs[:-1]

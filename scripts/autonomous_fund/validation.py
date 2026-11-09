@@ -258,7 +258,7 @@ def interval_model_costs(events, pairs):
 
 
 def benchmark_report(events, pairs, marks, startups):
-    """Net returns and the comparison with every benchmark defined so far (old definitions stay reported)."""
+    """Net returns, benchmark comparisons and the intervals in the current risk-matched comparison."""
     from .performance import (SESSIONS_PER_MONTH, PerformanceSettings, benchmark_comparison, benchmark_series,
                               net_returns)
     configured = [b.get("performance") for b in startups if b.get("performance")]
@@ -279,15 +279,17 @@ def benchmark_report(events, pairs, marks, startups):
     window = [(p["start_day"], p["end_day"]) for p in pairs]
     current_ids = {d["id"] for d in current}
     recorded = {s for _, kind, b in events if kind == "benchmark_actions_checked" for s in b.get("symbols", [])}
-    comparisons = []
+    comparisons, matched_pairs = [], []
     for definition in definitions.values():
-        row = benchmark_comparison(definition, returns, benchmark_series(definition, window, marks, actions),
-                                   definition["id"] in current_ids)
+        series = benchmark_series(definition, window, marks, actions)
+        row = benchmark_comparison(definition, returns, series, definition["id"] in current_ids)
+        if row["current"] and row["name"] == "risk_matched":
+            matched_pairs = [pair for pair, benchmark_return in zip(pairs, series) if benchmark_return is not None]
         row["dividends"] = ("included" if set(definition["weights"]) <= recorded else
                             "excluded: no dividend records for " + ", ".join(sorted(set(definition["weights"]) - recorded)))
         comparisons.append(row)
-    return {"returns": net_returns(pairs, interval_model_costs(events, pairs), per_session),
-            "data_costs_usd_per_month": monthly, "benchmarks": comparisons}
+    return ({"returns": net_returns(pairs, interval_model_costs(events, pairs), per_session),
+             "data_costs_usd_per_month": monthly, "benchmarks": comparisons}, matched_pairs)
 
 
 def trial_count(prompt_versions, risk_policies, factor_expressions, construction_runs=0, shadow_runs=0):
@@ -412,7 +414,7 @@ def acceptance(root, criteria=None, now=None):
         "bookkeeping_errors": sum(1 for n in notes if n.get("kind") == "bookkeeping_error"),
         "auto_resumes": count("auto_resume"),
         "ledger_status": integrity["status"], "fills_with_unknown_slippage": slippage_unknown,
-        # US pattern day trader count: informational, a paper account is not restricted.
+        # Informational count of simulated same-day round trips.
         "day_trades": day_trades([(at, kind, body) for at, kind, body in events if kind in {"fill", "fill_reconciled"}],
                                  now),
     }
@@ -447,14 +449,14 @@ def acceptance(root, criteria=None, now=None):
         len({b.get("risk_policy_digest") for b in startups}), factor_trials, construction_runs, shadow_runs)
     stats = evidence(returns, market if aligned else None, tried["total"])
     stats["configurations_breakdown"] = tried
-    net = benchmark_report(events, pairs, marks, startups)
+    net, matched_pairs = benchmark_report(events, pairs, marks, startups)
     limit = ((startups[-1].get("limits") or {}).get("drawdown")) if startups else None
     stage = capital_stage(verdict, stats, drawdown, float(limit) if limit is not None else None)
     from .call_value import from_events
     card = next((b for _, k, b in reversed(events) if k == "scorecard"), None)
     investment = investment_acceptance(stats, returns, market if aligned else None, net, learning,
                                        (card or {}).get("ideas"), from_events(events),
-                                       costs=trading_costs(events, by_broker, references, pairs))
+                                       costs=trading_costs(events, by_broker, references, matched_pairs))
     return {"as_of": now.isoformat(), "mode": mode, "verdict": verdict,
             "criteria": results, "metrics": metrics, "performance_evidence": stats, "capital_stage": stage,
             "net_returns": net["returns"], "benchmarks": net["benchmarks"],
@@ -474,37 +476,64 @@ def _smaller_t(regression):
 
 
 def trading_costs(events, by_broker, references, pairs):
-    """Realized trading costs and their annual rate on equity, for the cost-sensitivity criterion.
+    """Realized trading costs across the same NAV intervals used to measure returns.
 
     Per order the reconciled fill replaces its callbacks (as in the attribution). A
     fill costs its fee plus |fill price - arrival price| x quantity: an absolute
     deviation, so favorable fills are not counted as gains (conservative for a stress
-    test). A fill without an arrival price counts its fee only and is listed as unknown.
+    test). Missing fill details or arrival prices make the stress test unknown.
     """
-    per_order = {}
-    for _, kind, body in events:
-        if kind in {"fill", "fill_reconciled"}:
-            per_order.setdefault(str(body.get("broker_id")), {}).setdefault(kind, []).append(body)
-    total, unknown = 0.0, 0
+    from bisect import bisect_left
+    from math import isfinite
+    from .risk import instant
+
+    ends = [pair["end"] for pair in pairs]
+    per_order, incomplete = {}, set()
+    for at, kind, body in events:
+        if kind not in {"fill", "fill_reconciled", "fill_details_unavailable"}:
+            continue
+        moment = instant(at)
+        index = bisect_left(ends, moment)
+        if index == len(ends) or moment <= pairs[index]["start"]:
+            continue  # Pre-baseline, after the latest mark, or in an excluded interval.
+        broker_id = str(body.get("broker_id"))
+        if kind == "fill_details_unavailable":
+            incomplete.add(broker_id)
+            continue
+        per_order.setdefault(broker_id, {}).setdefault(kind, []).append((index, body))
+    interval_cost = [0.0] * len(pairs)
+    missing_arrival, missing_details = 0, len(incomplete)
     for broker_id, kinds in per_order.items():
-        chosen = kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds else kinds.get("fill", [])
+        reconciled = kinds.get("fill_reconciled")
+        if reconciled and broker_id in incomplete:
+            missing_details -= 1
+        chosen = reconciled[-1:] if reconciled else kinds["fill"]
         order = by_broker.get(broker_id) or {}
         arrival = references.get(order.get("intent_id"))
-        for body in chosen:
+        for index, body in chosen:
             try:
-                price, quantity = float(body.get("price") or 0), abs(float(body.get("quantity") or 0))
-                fee = float(body.get("trade_cost") or 0)
+                fee = float(body.get("trade_cost"))
+                if not isfinite(fee) or fee < 0:
+                    raise ValueError
             except (TypeError, ValueError):
-                unknown += 1
-                continue
-            total += fee
-            if arrival and price > 0:
-                total += abs(price - float(arrival)) * quantity
+                missing_details += 1
             else:
-                unknown += 1
-    equity = [pair["equity_start"] for pair in pairs if pair.get("equity_start")]
-    rate = (total / (sum(equity) / len(equity)) * 252 / len(equity)) if equity else None
-    return {"usd": total, "annual_rate_on_equity": rate, "fills_without_arrival": unknown, "sessions": len(equity)}
+                interval_cost[index] += fee
+            try:
+                price, quantity = float(body.get("price")), float(body.get("quantity"))
+                if not (isfinite(price) and price > 0 and isfinite(quantity) and quantity > 0):
+                    raise ValueError
+            except (TypeError, ValueError):
+                missing_details += 1
+                continue
+            if arrival is not None and isfinite(arrival) and arrival > 0:
+                interval_cost[index] += abs(price - arrival) * quantity
+            else:
+                missing_arrival += 1
+    rate = (sum(cost / pair["equity_start"] for cost, pair in zip(interval_cost, pairs)) * 252 / len(pairs)
+            if pairs else None)
+    return {"usd": sum(interval_cost), "annual_rate_on_equity": rate, "fills_without_arrival": missing_arrival,
+            "incomplete_fill_details": missing_details, "sessions": len(pairs)}
 
 
 COST_MULTIPLE = 2  # Investment acceptance requires the edge to survive this multiple of realized trading costs.
@@ -539,10 +568,10 @@ def investment_acceptance(stats, returns, market, net, learning, ideas, call_val
     evaluation = (learning or {}).get("memo_minus_baseline_1d_excess") or {}
     excess = (matched or {}).get("annual_excess_return") if computed else None
     rate = (costs or {}).get("annual_rate_on_equity")
-    sensitivity = ({f"{k}x": excess - (k - 1) * rate for k in (1, 2, 3)}
+    unknown = (costs or {}).get("fills_without_arrival") or (costs or {}).get("incomplete_fill_details")
+    sensitivity = ({"1x": excess, **{f"{k}x": None if unknown else excess - (k - 1) * rate for k in (2, 3)}}
                    if excess is not None and rate is not None else None)
-    stressed = ("unknown_costs" if (costs or {}).get("fills_without_arrival") else
-                (sensitivity or {}).get(f"{COST_MULTIPLE}x"))
+    stressed = "unknown_costs" if unknown else (sensitivity or {}).get(f"{COST_MULTIPLE}x")
     checks = [
         ("min_sessions", sessions, INVESTMENT_MIN_SESSIONS, sessions >= INVESTMENT_MIN_SESSIONS, True),
         ("alpha_t_vs_spy", _smaller_t(regression), round(Z95, 2),
@@ -661,10 +690,11 @@ def investment_markdown(result):
     costs, stressed = sensitivity.get("trading_costs") or {}, sensitivity.get("risk_matched_excess_annual")
     lines += ["", "## 成本敏感性（模拟成交偏理想，看成本更高时还剩多少）", ""]
     if costs:
-        lines.append(f"- 已实现交易成本 {_number(costs.get('usd'))} 美元（手续费＋成交价偏离到达价的绝对值，偏保守），"
-                     f"约占年化净值 {pct(costs.get('annual_rate_on_equity'))}"
-                     + (f"；{costs['fills_without_arrival']} 笔成交没有到达价，只计了手续费，翻倍检验记为未知"
-                        if costs.get("fills_without_arrival") else ""))
+        lines.append(f"- 已知交易成本 {_number(costs.get('usd'))} 美元（手续费＋成交价偏离到达价的绝对值），"
+                     f"约占年化净值 {pct(costs.get('annual_rate_on_equity'))}")
+        if costs.get("fills_without_arrival") or costs.get("incomplete_fill_details"):
+            lines.append(f"- {costs.get('fills_without_arrival', 0)} 笔成交缺到达价，"
+                         f"另有 {costs.get('incomplete_fill_details', 0)} 项成交或费用证据不完整；翻倍检验为未知。")
     lines.append("- 相对风险匹配基准的年化超额：" + ("；".join(f"成本 {k} {pct(v)}" for k, v in stressed.items())
                                                 if stressed else "无数据"))
     lines += ["", "## 事先定义的基准", "", "| 基准 | 定义 | 当前 | 交易日 | 年化超额 | 信息比率 | alpha t（OLS／NW） | 分红 |",

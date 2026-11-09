@@ -624,13 +624,11 @@ class DataDesk:
 
     def _previous_close(self, symbol, day):
         """(date, close) of the last completed session: the store first, then one daily read per day."""
-        from .bar_quality import apply
-        verdict = self.store.get(day, f"quality/{symbol}")
-        if verdict and verdict.get("status") == "unreliable":
-            return None  # The two daily sources disagree: the change is reported as unknown.
-        rows = apply(self.store.bars(day, symbol, 1) or [], verdict)
+        from .bar_quality import apply, cached_verdict
+        rows = self.store.bars(day, symbol, 1)
         if rows:
-            return str(rows[-1][0]), float(rows[-1][1])
+            kept = apply(rows, cached_verdict(self.store, day, symbol, rows, day))
+            return (str(kept[-1][0]), float(kept[-1][1])) if kept else None
         key = (day, symbol)
         if key not in self._closes:
             from lumibot.entities import Asset
@@ -795,13 +793,14 @@ class DataDesk:
         return self._alpaca_history
 
     def _job_snapshot(self, now):
-        from .bar_quality import apply
+        from .bar_quality import apply, cached_verdict
         from .snapshot import snapshot
         day, benchmark = trading_day(now), self.quant.stress_benchmark
         histories = {}
         for symbol in sorted(set(self.tradable) | {benchmark}):
             # The cross-check's verdict applies here as in the trading process (disputed sessions dropped).
-            rows = apply(self.store.bars(day, symbol, 1) or [], self.store.get(day, f"quality/{symbol}"))
+            rows = self.store.bars(day, symbol, 1) or []
+            rows = apply(rows, cached_verdict(self.store, day, symbol, rows, day))
             histories[symbol] = [(str(d), c, v) for d, c, v, *_ in rows if c == c and c > 0]
         if not histories.get(benchmark):
             raise Idle("waiting for the day's daily bars (stored after 06:00 New York); until then the trading "

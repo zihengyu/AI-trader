@@ -96,19 +96,18 @@ def split_holdings(positions, universe, *, quote_asset=None, allow_external=Fals
     return sleeve, external, value, shared
 
 
-PDT_WINDOW = 5  # FINRA pattern day trader rule: more than 3 day trades within 5 business days.
-PDT_LIMIT = 3
+DAY_TRADE_WINDOW = 5
+LEGACY_PDT_COUNT = 3
 
 
 def day_trades(fills, now):
-    """Same-day round trips per New York date and in the last PDT_WINDOW NYSE sessions (an estimate).
+    """Same-day round trips per New York date and over the last five NYSE sessions (an estimate).
 
     A day trade is a buy followed by a sale of the same symbol on the same New York date;
     each buy-then-sell sequence counts once. fills: (at, kind, body) rows of fill and
     fill_reconciled; a broker's cumulative observation replaces that order's callbacks.
-    In a margin account whose equity is below 25,000 USD, more than PDT_LIMIT day trades
-    in PDT_WINDOW sessions marks the account a pattern day trader. Paper accounts are
-    unaffected; this application has no live trading path.
+    The legacy PDT count is informational; this does not determine a brokerage account's
+    classification, buying power or margin requirements.
     """
     from zoneinfo import ZoneInfo
     import pandas_market_calendars as mcal
@@ -130,7 +129,8 @@ def day_trades(fills, now):
             by_day[day] = by_day.get(day, 0) + count
     today = now.astimezone(zone).date()
     schedule = mcal.get_calendar("NYSE").schedule(start_date=today - timedelta(days=14), end_date=today)
-    sessions = [index.date().isoformat() for index in schedule.index][-PDT_WINDOW:]
+    sessions = [index.date().isoformat() for index in schedule.index][-DAY_TRADE_WINDOW:]
     recent = sum(by_day.get(day, 0) for day in sessions)
     return {"last_sessions": recent, "sessions": sessions, "by_day": dict(sorted(by_day.items())),
-            "limit": PDT_LIMIT, "window": PDT_WINDOW, "would_flag": recent > PDT_LIMIT}
+            "legacy_count_threshold": LEGACY_PDT_COUNT, "window": DAY_TRADE_WINDOW,
+            "above_legacy_count": recent > LEGACY_PDT_COUNT}

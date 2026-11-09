@@ -31,7 +31,8 @@ def fetch_bars(store, day, symbols, length, data):
             bars["already_stored"] += 1
             continue
         try:
-            rows = daily_rows(data.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day"))
+            source = data.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
+            rows = [row for row in daily_rows(source) if str(row[0]) < str(day)]
             if not rows:
                 raise RiskError("no completed daily bars")
             store.save_bars(day, symbol, length, rows)

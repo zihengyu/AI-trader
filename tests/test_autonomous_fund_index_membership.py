@@ -80,6 +80,27 @@ def test_factor_values_are_masked_before_entry_but_look_backs_stay_complete():
     assert masked.drop(columns="N00").equals(plain.drop(columns="N00"))
 
 
+@pytest.mark.parametrize("expression", ["rank(close)", "zscore(close)", "demean(close)", "ts_mean(rank(close), 5)"])
+def test_future_entrant_cannot_change_existing_members_cross_sectional_values(expression):
+    close = panel(names=5)
+    close["N00"] *= 100
+    joined = close.index[150]
+    flags = mask(close, {"N00": joined.date().isoformat()})
+    expected = compute(expression, close.drop(columns="N00"))
+    masked = compute(expression, close, extra={MEMBERSHIP: flags})
+    pd.testing.assert_frame_equal(masked.drop(columns="N00").loc[close.index < joined],
+                                  expected.loc[close.index < joined])
+
+
+def test_negative_control_respects_the_same_membership_as_candidate_factors():
+    from scripts.autonomous_fund.factors import negative_control
+    close = panel(names=10)
+    settings = FactorSettings(min_names=5)
+    flags = mask(close, {s: "2027-01-04" for s in close.columns[4:]})
+    assert negative_control(close, settings, runs=2)["evaluated"] == 2
+    assert negative_control(close, settings, runs=2, membership=flags)["evaluated"] == 0
+
+
 def test_a_future_entrants_pre_entry_rise_no_longer_makes_momentum_look_predictive():
     close = panel(names=25, seed=9)
     winners = [f"N{i:02d}" for i in range(5)]

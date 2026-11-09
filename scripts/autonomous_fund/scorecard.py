@@ -9,6 +9,7 @@ estimated when a close is missing: such items stay `pending` or `unavailable`.
 import math
 from bisect import bisect_left
 from functools import lru_cache
+from statistics import mean, variance
 from zoneinfo import ZoneInfo
 
 from .risk import instant
@@ -269,16 +270,14 @@ def recent_versus_earlier(values):
     stronger_recently only when |t| >= TREND_T. Overlapping horizons are correlated, so
     the t is optimistic: evidence of decay (crowding, a changed market), not proof.
     """
-    values = [float(v) for v in values if v is not None]
+    values = [float(v) for v in values if v is not None and math.isfinite(v)]
     if len(values) < MIN_TREND_SAMPLE:
         return {"status": "insufficient_sample", "scored": len(values), "minimum_sample": MIN_TREND_SAMPLE}
     cut = len(values) - len(values) // 3
     earlier, recent = values[:cut], values[cut:]
 
-    def moments(rows):
-        mean = sum(rows) / len(rows)
-        return mean, sum((v - mean) ** 2 for v in rows) / max(1, len(rows) - 1)
-    (m1, v1), (m2, v2) = moments(earlier), moments(recent)
+    m1, m2 = mean(earlier), mean(recent)
+    v1, v2 = variance(earlier), variance(recent)
     scale = math.sqrt(v1 / len(earlier) + v2 / len(recent))
     t = (m2 - m1) / scale if scale > 0 else None
     change = ("weaker_recently" if t is not None and t <= -TREND_T else

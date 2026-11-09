@@ -132,7 +132,8 @@ def test_each_buy_then_sell_of_a_symbol_on_one_day_is_a_day_trade():
              fill(5, 15, "buy", "DELTA")]
     result = day_trades(fills, datetime(2026, 11, 6, 22, tzinfo=timezone.utc))
     assert result["by_day"] == {"2026-11-02": 2, "2026-11-04": 1}
-    assert result["sessions"][-1] == "2026-11-06" and result["last_sessions"] == 3 and not result["would_flag"]
+    # The historical count threshold is informational, never a broker classification.
+    assert result["sessions"][-1] == "2026-11-06" and result["last_sessions"] == 3 and not result["above_legacy_count"]
     later = day_trades(fills, datetime(2026, 11, 10, 22, tzinfo=timezone.utc))
     assert later["last_sessions"] == 1  # 11-02 has left the five-session window.
 
@@ -155,7 +156,8 @@ def test_status_shows_the_day_trade_count_and_warns_at_the_limit(tmp_path):
         journal.event(row[0], row[1], row[2])
     with sqlite3.connect(tmp_path / "state.sqlite3") as db:
         line = day_trade_line(db, datetime(2026, 11, 4, 22, tzinfo=timezone.utc))
-    assert "最近 5 个交易日 3 次" in line and "限制交易 90 天" in line  # At the limit: the warning shows.
+    # Three round trips still display, without asserting a real-account restriction.
+    assert "最近 5 个交易日 3 次" in line and "限制交易" not in line
 
 
 def test_the_manager_sees_its_reversals_and_day_trades(tmp_path):
@@ -171,7 +173,9 @@ def test_the_manager_sees_its_reversals_and_day_trades(tmp_path):
     strategy._agent_call = call
     strategy._decide(account(), NOW, False)
     context = seen["manager"]
-    assert context["day_trades"]["last_sessions"] == 0 and "25,000 USD" in context["day_trades"]["meaning"]
+    # The manager gets the estimate without instructions based on the old margin rule.
+    assert context["day_trades"]["last_sessions"] == 0 and "simulation" in context["day_trades"]["meaning"]
+    assert "25,000 USD" not in context["day_trades"]["meaning"]
     assert "consistency" in (context.get("scorecards") or {})
 
 

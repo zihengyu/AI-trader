@@ -1040,10 +1040,9 @@ class AutonomousFund(Strategy):
             count = day_trades(fills, now)
         except Exception as exc:
             return {"unavailable": type(exc).__name__}
-        return {"last_sessions": count["last_sessions"], "window": count["window"], "limit": count["limit"],
-                "meaning": "Buying and selling the same symbol on one New York day is a day trade. In a US margin "
-                           "account below 25,000 USD, more than 3 in 5 sessions restricts the account for 90 days. "
-                           "This paper account is unaffected; prefer decisions that do not need same-day exits."}
+        return {"last_sessions": count["last_sessions"], "window": count["window"],
+                "meaning": "Estimated same-day buy-then-sell sequences by New York date. "
+                           "This tracks trading frequency in simulation; it does not impose trading restrictions."}
 
     def _trade_value_model(self, now):
         """V2 4.5, built once per decision: round-trip costs for the manager, and once the research
@@ -2614,7 +2613,7 @@ class AutonomousFund(Strategy):
         panels, missing, pending = {}, [], []
         fetched = getattr(self, "_bars", None) or {}
         for name, symbols in groups.items():
-            history = {}
+            history, withheld = {}, set()
             for symbol in symbols:
                 if (day, symbol) not in fetched and not self._may_prepare():
                     pending.append(symbol)  # Downloaded in a later iteration; progress is kept in _bars.
@@ -2623,13 +2622,15 @@ class AutonomousFund(Strategy):
                 fetched = self._bars
                 if error or not rows:
                     missing.append(symbol)
+                    if error == "bar_quality_unreliable":
+                        withheld.add(symbol)
                     continue
                 history[symbol] = [(d, close, shares) for d, close, shares in self._completed(rows, now)]
             if not history:
                 continue
             if pending:
                 continue  # An incomplete cross-section would bias every IC: wait for all of it.
-            stored = self._universe_snapshot(now, name, history)
+            stored = self._universe_snapshot(now, name, history, withheld)
             current = set(history)
             for symbol, rows in stored.items():
                 # A former member (or one the provider no longer serves) keeps its membership-period bars.
@@ -2673,12 +2674,13 @@ class AutonomousFund(Strategy):
         self._membership_cache = (trading_day(now), membership)
         return membership
 
-    def _universe_snapshot(self, now, role, history):
+    def _universe_snapshot(self, now, role, history, withheld=()):
         """Record today's members of `role`; return the stored bars of members no longer served.
 
         Returns {symbol: [(date, close, volume, open, high, low)]} for symbols that were
         recorded in this cross-section before but are absent from `history` today
-        (removed from the lists, acquired or delisted). Empty without a snapshot table.
+        (removed from the lists, acquired or delisted). A known data contradiction
+        cannot be bypassed using the snapshot. Empty without a snapshot table.
         """
         snapshots = getattr(self, "universe_snapshots", None)
         if snapshots is None:
@@ -2692,7 +2694,7 @@ class AutonomousFund(Strategy):
                                for d, close, shares in rows]
         try:
             snapshots.record(now, role, members)
-            stored = snapshots.rows(role, snapshots.former(role, members))
+            stored = snapshots.rows(role, snapshots.former(role, set(members) | set(withheld)))
             self.__dict__.setdefault("_universe_former", {})[role] = sorted(stored)
             return stored
         except Exception as exc:  # The snapshot widens research; a failure never blocks the panel.
@@ -2775,8 +2777,9 @@ class AutonomousFund(Strategy):
                 former = getattr(self, "_universe_former", None) or {}
                 context["universe_snapshot"] = {
                     "since": snapshots.since(), "former_members": {role: names[:20] for role, names in former.items()},
-                    "meaning": "daily point-in-time membership; former members stay in the cross-sections for "
-                               "their membership period, so records from 'since' on have no survivorship bias"}
+                    "meaning": "archived completed bars preserve some evidence for former members. "
+                               "This reduces survivorship bias; missing bars, fundamentals and terminal returns "
+                               "still limit coverage after 'since'."}
             sec = getattr(self, "sec", None)
             context["fundamentals"] = ({"source": "SEC EDGAR company facts (point in time)",
                                         "errors": dict(list(sec.errors.items())[:10])} if sec is not None else
@@ -2827,17 +2830,20 @@ class AutonomousFund(Strategy):
             length = history_length(self.quant, getattr(getattr(self, "factor_lab", None), "settings", None))
             store = getattr(self, "daily_store", None)
             full, error = (store.bars(day, symbol, length, cutoff=cutoff) if store is not None else None), None
+            from_reference = False
             if full is None:
-                full, error = self._fetch_daily_bars(symbol, length, now)
+                full, error, from_reference = self._fetch_daily_bars(symbol, length, now, cutoff)
                 from .datastore import bars_settled
                 # Before 06:00 New York the day's split or dividend may be missing: used now, not stored.
-                if full and store is not None and bars_settled(now):
+                # The shared store contains the primary source; never cross-check Alpaca against itself.
+                if full and not from_reference and store is not None and bars_settled(now):
                     try:
                         store.save_bars(day, symbol, length, full, cutoff=cutoff)
                     except OSError:
                         pass  # The store is a cache: the bars are still used this time.
-            if full and not error:
-                full, error = self._quality_checked(day, symbol, full, cutoff, now)
+            retry_quality_at = None
+            if full and not error and not from_reference:
+                full, error, retry_quality_at = self._quality_checked(day, symbol, full, cutoff, now)
             if error:
                 self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
             rows = [(d, close, shares) for d, close, shares, _, _, _ in full or []]
@@ -2849,34 +2855,40 @@ class AutonomousFund(Strategy):
                 retries = self.__dict__.setdefault("_history_retry_at", {})
                 if error or not rows:
                     retries[key] = monotonic() + DAILY_HISTORY_RETRY_SECONDS
+                elif retry_quality_at is not None:
+                    retries[key] = retry_quality_at
                 else:
                     retries.pop(key, None)
         return self._bars[key]
 
     def _quality_checked(self, day, symbol, rows, cutoff, now):
-        """(rows, error) after the cross-check against the second daily source; unchanged without one.
+        """(rows, error, retry_at) after the cross-check; unchanged without a second source.
 
         Disputed sessions are dropped; a symbol withheld for the day returns no rows and
         the error `bar_quality_unreliable`. A source failure pauses checks for a while and
         leaves the rows unchecked (said once per day), never blocks the read.
         """
-        from .bar_quality import PROBLEMS, apply, check
+        from .bar_quality import PROBLEMS, apply, cached_verdict, check
         reference = getattr(self, "history_fallback", None)
         if reference is None:
-            return rows, None
+            return rows, None, None
+        store = getattr(self, "daily_store", None)
         paused = getattr(self, "_quality_paused_until", None)
         if paused is not None and monotonic() < paused:
-            return rows, None
-        try:
-            verdict = check(getattr(self, "daily_store", None), day, symbol, rows, cutoff, reference)
-        except Exception as exc:
-            self._quality_paused_until = monotonic() + QUALITY_PAUSE_SECONDS
-            noted = self.__dict__.setdefault("_quality_noted", set())
-            if (day, "unavailable") not in noted:
-                noted.add((day, "unavailable"))
-                self.journal.event(now, "bar_quality_unavailable", {"error": type(exc).__name__,
-                                                                    "retry_seconds": QUALITY_PAUSE_SECONDS})
-            return rows, None
+            verdict = cached_verdict(store, day, symbol, rows, cutoff)
+            if verdict is None:
+                return rows, None, paused
+        else:
+            try:
+                verdict = check(store, day, symbol, rows, cutoff, reference)
+            except Exception as exc:
+                self._quality_paused_until = monotonic() + QUALITY_PAUSE_SECONDS
+                noted = self.__dict__.setdefault("_quality_noted", set())
+                if (day, "unavailable") not in noted:
+                    noted.add((day, "unavailable"))
+                    self.journal.event(now, "bar_quality_unavailable", {"error": type(exc).__name__,
+                                                                        "retry_seconds": QUALITY_PAUSE_SECONDS})
+                return rows, None, self._quality_paused_until
         noted = self.__dict__.setdefault("_quality_noted", set())
         if verdict["status"] in PROBLEMS and (day, symbol) not in noted:
             noted.add((day, symbol))
@@ -2886,7 +2898,7 @@ class AutonomousFund(Strategy):
                 "largest": verdict.get("largest"), "missing_count": verdict.get("missing_count"),
                 "feed": verdict.get("feed")})
         kept = apply(rows, verdict)
-        return kept, ("bar_quality_unreliable" if verdict["status"] == "unreliable" else None)
+        return kept, ("bar_quality_unreliable" if verdict["status"] == "unreliable" else None), None
 
     def _report_bar_quality(self, now):
         """Once per New York day: symbols whose daily bars disagreed between the two sources."""
@@ -2913,25 +2925,25 @@ class AutonomousFund(Strategy):
         self._notify_fund("bar_quality_issues", details)
         return details
 
-    def _fetch_daily_bars(self, symbol, length, now):
-        """([(date, close, volume, open, high, low)], error) from the data source, then the Alpaca fallback."""
+    def _fetch_daily_bars(self, symbol, length, now, cutoff):
+        """(rows, error, from_reference) from the data source, then the Alpaca fallback."""
         rows, error = [], None
         try:
-            rows = daily_rows(self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day"))
+            primary = self.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
+            rows = [row for row in daily_rows(primary) if row[0] < cutoff]
         except Exception as exc:
             error = type(exc).__name__
         fallback = getattr(self, "history_fallback", None)
         if (error or not rows) and fallback is not None:
             # A second, official source for the same completed daily bars (risk and factor history only).
             try:
-                from .market_data import completed_daily_cutoff
-                rows = fallback.bars(symbol, length, completed_daily_cutoff(now))
+                rows = fallback.bars(symbol, length, cutoff)
                 self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
                                                                   "feed": fallback.feed, "yahoo_error": error})
-                error = None
+                return rows, None, True
             except Exception as exc:
                 error = error or type(exc).__name__
-        return rows, error
+        return rows, error, False
 
     @staticmethod
     def _completed(rows, now):

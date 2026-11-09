@@ -49,11 +49,18 @@ def test_a_split_applied_by_one_source_only_or_a_disputed_latest_close_withholds
     latest[-1] *= 1.05
     verdict = compare(rows(latest), rows(closes))
     assert verdict["status"] == "unreliable" and verdict["disputed"] == [DAYS[-1].isoformat()]
+    threshold = closes.copy()
+    threshold[:5] *= 1.25
+    assert compare(rows(threshold), rows(closes))["status"] == "unreliable"
 
 
 def test_too_little_overlap_is_not_a_verdict_and_missing_sessions_are_only_reported():
     closes = walk(4)
     assert compare(rows(closes), rows(closes[-10:], DAYS[-10:]))["status"] == "insufficient_overlap"
+    short = rows(closes[-10:] * 1.25, DAYS[-10:])
+    verdict = compare(rows(closes), short)
+    assert verdict["status"] == "insufficient_overlap" and len(verdict["disputed"]) == 10
+    assert apply(rows(closes), verdict) == rows(closes)  # Report differences without acting on a small sample.
     gappy = [row for i, row in enumerate(rows(closes)) if i not in (10, 11)]
     verdict = compare(gappy, rows(closes))
     assert verdict["status"] == "agree" and verdict["missing_count"] == 2
@@ -75,6 +82,7 @@ class Reference:
 
 
 def test_a_verdict_is_cached_per_primary_rows_and_a_missing_symbol_is_recorded_once(tmp_path):
+    from scripts.autonomous_fund.history import NoDailyBars
     store, closes = DailyStore(tmp_path), walk(5)
     reference = Reference(closes)
     first = check(store, "2026-11-06", "ALFA", rows(closes), "2026-11-06", reference)
@@ -84,12 +92,15 @@ def test_a_verdict_is_cached_per_primary_rows_and_a_missing_symbol_is_recorded_o
     changed[5] *= 1.1
     assert check(store, "2026-11-06", "ALFA", rows(changed), "2026-11-06", reference)["status"] == "disputed_sessions"
     assert reference.calls == 2  # New primary rows: checked again.
-    missing = Reference(closes, RiskError("Alpaca returned no completed daily bars for GONE"))
+    missing = Reference(closes, NoDailyBars("Alpaca returned no completed daily bars for GONE"))
     assert check(store, "2026-11-06", "GONE", rows(closes), "2026-11-06", missing)["status"] == "no_reference"
     check(store, "2026-11-06", "GONE", rows(closes), "2026-11-06", missing)
     assert missing.calls == 1
     with pytest.raises(ConnectionError):  # A service failure propagates: the caller pauses.
         check(store, "2026-11-06", "BETA", rows(closes), "2026-11-06", Reference(closes, ConnectionError()))
+    with pytest.raises(RiskError, match="invalid close"):  # A malformed response is retryable, not an empty result.
+        check(store, "2026-11-06", "BETA", rows(closes), "2026-11-06", Reference(closes, RiskError("invalid close")))
+    assert store.get("2026-11-06", "quality/BETA") is None
 
 
 NOW = datetime(2026, 11, 9, 15, 0, tzinfo=timezone.utc)  # Monday 10:00 New York: completed through Friday.
@@ -138,6 +149,44 @@ def test_a_second_source_outage_leaves_bars_unchecked_pauses_and_is_said_once(tm
     strategy._daily_bars("BETA", NOW)
     assert reference.calls == 1  # Paused: the next symbol does not wait on the dead service.
     assert [e["error"] for e in events(strategy, "bar_quality_unavailable")] == ["ConnectionError"]
+
+
+def test_reference_outage_keeps_cached_rejections_and_rechecks_unverified_bars(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import strategy as fund
+    from scripts.autonomous_fund.risk import trading_day
+    clock = [100.0]
+    monkeypatch.setattr(fund, "monotonic", lambda: clock[0])
+    closes = walk(7)
+    bad = closes.copy()
+    bad[-1] *= 1.3
+    primary = rows(bad)
+    reference = Reference(closes, ConnectionError("down"))
+    strategy = runner(tmp_path, bad, reference)
+    day = trading_day(NOW)
+    strategy.daily_store.save_bars(day, "BETA", 10000, primary)
+    check(strategy.daily_store, day, "BETA", primary, day, Reference(closes))
+
+    assert len(strategy._daily_bars("ALFA", NOW)[0]) == len(primary)
+    assert strategy._daily_bars("BETA", NOW) == ([], "bar_quality_unreliable")
+    assert reference.calls == 1
+    reference.error = None
+    clock[0] += fund.QUALITY_PAUSE_SECONDS + 1
+    assert strategy._daily_bars("ALFA", NOW) == ([], "bar_quality_unreliable")
+    assert reference.calls == 2
+
+
+def test_alpaca_fallback_is_not_compared_with_itself_or_written_as_yahoo(tmp_path):
+    from scripts.autonomous_fund.risk import trading_day
+    closes = walk(7)
+    reference = Reference(closes)
+    strategy = runner(tmp_path, closes, reference)
+    current = pd.DataFrame({"close": [200]}, index=pd.DatetimeIndex([NOW]))
+    strategy.get_historical_prices = lambda *args, **kwargs: SimpleNamespace(df=current)
+    got, error = strategy._daily_bars("ALFA", NOW)
+    assert error is None and len(got) == len(closes)
+    assert reference.calls == 1
+    assert strategy.daily_store.bars(trading_day(NOW), "ALFA", 1) is None
+    assert strategy.daily_store.get(trading_day(NOW), "quality/ALFA") is None
 
 
 def test_the_post_close_notice_lists_withheld_and_disputed_symbols_once_a_day(tmp_path):
@@ -199,5 +248,9 @@ def test_the_data_desk_checks_after_downloading_and_its_snapshot_uses_the_verdic
     assert "QQQ" in snapshot["no_history"] and "QQQ" not in snapshot["symbols"]  # Withheld, not borrowed.
     assert "SPY" in snapshot["symbols"]
     assert desk._previous_close("QQQ", DAY) is None and desk._previous_close("SPY", DAY) is not None
+    # A verdict on older rows cannot withhold a replacement history.
+    new_bars = store.bars(DAY, "QQQ", 1)[:-1]
+    store.save_bars(DAY, "QQQ", desk.length, new_bars)
+    assert desk._previous_close("QQQ", DAY) == (str(new_bars[-1][0]), new_bars[-1][1])
     assert DataDesk(tmp_path / "x", config(), "local", source=source, environ={})._reference() is None
     assert DataDesk(tmp_path / "y", config(), "paper", source=source, environ=environ)._reference() is None

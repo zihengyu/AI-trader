@@ -5,7 +5,7 @@ cross-section is survivorship-biased. From the day the fund starts, this table
 keeps each member's completed daily bars as they were served while it was a
 member. A name that later leaves (acquired, delisted, removed from the lists)
 stays in the factor lab's cross-section for its membership period, so the
-record from the snapshot's first day on has no survivorship bias.
+record from the snapshot's first day on is less exposed to survivorship bias.
 
 Invariants:
 - Only real bars the provider served are stored; nothing is filled or carried forward.
@@ -112,12 +112,13 @@ class UniverseSnapshots:
 def snapshot_since(root):
     """First snapshot session of an account directory, read-only; None when there is none."""
     import sqlite3
+    from contextlib import closing
     from pathlib import Path
     path = Path(root) / "state.sqlite3"
     if not path.is_file():
         return None
     try:
-        with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             row = db.execute("SELECT MIN(day) FROM fund_universe_snapshots").fetchone()
     except sqlite3.Error:
         return None
@@ -131,7 +132,7 @@ def survivorship_text(root):
     if since is None:
         return SURVIVORSHIP_TEXT + "每日股票池快照还没有开始（第一次准备因子数据时开始保存）。"
     return (SURVIVORSHIP_TEXT + f"每日股票池快照从 {since} 开始保存：此后离开股票池的股票（被收购、退市或移出名单）"
-            "仍按在池期间留在因子检验里，这段记录没有幸存者偏差。")
+            "仍可用已保存的行情参与因子检验。缺失的行情、基本面和退市最终收益仍可能造成偏差。")
 
 
 def _differs(stored, served):

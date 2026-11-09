@@ -61,7 +61,8 @@ def compare(primary, reference, feed=None):
                              "difference": differences[day]} for day in largest])
     if len(common) < MIN_OVERLAP:
         verdict["status"] = "insufficient_overlap"
-    elif len(disputed) > max(MIN_UNRELIABLE, UNRELIABLE_SHARE * len(common)) or last in disputed:
+    elif (last in disputed or
+          (len(disputed) >= MIN_UNRELIABLE and len(disputed) > UNRELIABLE_SHARE * len(common))):
         verdict["status"] = "unreliable"
     else:
         verdict["status"] = "disputed_sessions" if disputed else "agree"
@@ -74,8 +75,18 @@ def apply(rows, verdict):
         return rows
     if verdict.get("status") == "unreliable":
         return []
+    if verdict.get("status") != "disputed_sessions":
+        return rows
     disputed = set(verdict.get("disputed") or ())
     return [row for row in rows if str(row[0])[:10] not in disputed] if disputed else rows
+
+
+def cached_verdict(store, day, symbol, rows, cutoff):
+    """A verdict belongs to the exact closes and cutoff, even when the service is down."""
+    saved = store.get(day, f"quality/{symbol}") if store is not None else None
+    if saved and saved.get("cutoff") == str(cutoff) and saved.get("digest") == digest(rows):
+        return saved
+    return None
 
 
 def check(store, day, symbol, rows, cutoff, reference):
@@ -84,21 +95,20 @@ def check(store, day, symbol, rows, cutoff, reference):
     A symbol the reference does not serve is recorded as `no_reference` (checked, not
     comparable). A network or service failure propagates, so the caller can pause.
     """
-    from .risk import RiskError
-    key, fingerprint = f"quality/{symbol}", digest(rows)
-    saved = store.get(day, key) if store is not None else None
-    if saved and saved.get("digest") == fingerprint and saved.get("cutoff") == str(cutoff):
+    from .history import NoDailyBars
+    saved = cached_verdict(store, day, symbol, rows, cutoff)
+    if saved:
         return saved
     try:
         other = reference.bars(symbol, len(rows) + 5, cutoff)
         verdict = compare(rows, other, getattr(reference, "feed", None))
-    except RiskError as exc:
+    except NoDailyBars as exc:
         verdict = {"status": "no_reference", "reason": str(exc)[:120], "feed": getattr(reference, "feed", None),
                    "compared": 0, "disputed": []}
-    verdict.update(symbol=symbol, digest=fingerprint, cutoff=str(cutoff))
+    verdict.update(symbol=symbol, digest=digest(rows), cutoff=str(cutoff))
     if store is not None:
         try:
-            store.put(day, key, verdict)
+            store.put(day, f"quality/{symbol}", verdict)
         except OSError:
             pass  # The cache saves a request; the verdict still applies this time.
     return verdict

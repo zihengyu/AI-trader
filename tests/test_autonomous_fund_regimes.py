@@ -45,7 +45,7 @@ def test_regimes_use_only_closes_through_each_session_and_tell_calm_rises_from_v
 
 def test_recent_versus_earlier_flags_only_a_clear_change():
     assert recent_versus_earlier([1.0] * (MIN_TREND_SAMPLE - 1))["status"] == "insufficient_sample"
-    flat = recent_versus_earlier([0.5] * 30)
+    flat = recent_versus_earlier([0.1] * 30)  # Float rounding must not introduce artificial variance.
     assert flat["status"] == "observed" and flat["t_stat"] is None and flat["change"] == "no_clear_change"
     rng = random.Random(3)
     fading = [rng.gauss(0.01, 0.005) for _ in range(40)] + [rng.gauss(-0.01, 0.005) for _ in range(20)]
@@ -96,6 +96,13 @@ def test_reports_show_regime_groups_and_a_fading_record_as_background():
     assert "最近 10 条平均 -0.30%，之前 20 条 0.60%（t=-2.40，最近明显变弱" in text
     assert "研究想法命中率：最近" not in text  # Too few ideas to compare.
     assert regime_trend_lines({}) == []
+
+
+def test_constant_groups_with_different_hit_rates_are_reported_without_a_t_statistic():
+    trend = recent_versus_earlier([True] * 20 + [False] * 10)
+    assert trend["difference"] == -1 and trend["t_stat"] is None
+    [line] = regime_trend_lines({"ideas": {"trend": trend}})
+    assert "最近 10 条平均 0.00%，之前 20 条 100.00%" in line and "无法计算 t" in line
 
 
 def test_the_managers_scorecard_summary_carries_regimes_and_the_trend(tmp_path):

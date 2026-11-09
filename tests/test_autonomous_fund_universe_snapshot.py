@@ -61,10 +61,11 @@ def test_rows_without_a_real_close_are_never_stored(tmp_path):
 
 
 def test_reports_say_when_the_snapshot_began(tmp_path):
-    assert "还没有开始" in survivorship_text(tmp_path)
-    snapshots = UniverseSnapshots(Journal(tmp_path, "synthetic-universe-text"))
+    root = tmp_path / "paper #2"
+    assert "还没有开始" in survivorship_text(root)
+    snapshots = UniverseSnapshots(Journal(root, "synthetic-universe-text"))
     snapshots.record(NOW, "stocks", {"ALFA": bars(["2026-11-03"], [10])})
-    text = survivorship_text(tmp_path)
+    text = survivorship_text(root)
     assert "每日股票池快照从 2026-11-03 开始保存" in text and "被收购、退市" in text
 
 
@@ -126,3 +127,22 @@ def test_a_snapshot_failure_never_blocks_the_factor_panel(tmp_path):
     assert list(panels["stocks"]["close"].columns) == ["ALFA"]
     with strategy.journal.connection() as db:
         assert db.execute("SELECT body FROM events WHERE kind='universe_snapshot_error'").fetchone()
+
+
+def test_a_data_quality_rejection_cannot_reappear_as_a_former_member(tmp_path):
+    from scripts.autonomous_fund.factors import FactorLab, FactorSettings
+    from tests.test_autonomous_fund_quant import harness
+    strategy = harness(tmp_path, mode="local")
+    strategy.universe = frozenset({"ALFA", "BETA"})
+    strategy.factor_lab = FactorLab(strategy.journal, FactorSettings())
+    strategy.universe_snapshots = snapshots = UniverseSnapshots(strategy.journal)
+    day = "2026-11-06"
+    snapshots.record(NOW, "stocks", {"BETA": bars([day], [12])})
+    strategy._factor_cache = None
+    strategy._bars = {}
+    strategy._daily_bars = lambda symbol, now: (
+        ([], "bar_quality_unreliable") if symbol == "BETA"
+        else ([(pd.Timestamp(day).date(), 20, 1000)], None))
+    panels = strategy._factor_panel(NOW)
+    assert list(panels["stocks"]["close"].columns) == ["ALFA"]
+    assert snapshots.rows("stocks", ["BETA"])["BETA"][0][1] == 12  # Archive stays intact.
