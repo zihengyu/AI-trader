@@ -74,17 +74,37 @@ def structured_answer_diagnostic(result, schema):
     text = getattr(result, "summary", None) or getattr(result, "text", None)
     if not isinstance(text, str) or not text.strip():
         return {"kind": "missing_answer"}
+    shape = answer_shape(text)
     try:
         value = _extract_json_value(text)
     except ValueError:
-        return {"kind": "invalid_json"}
+        return {"kind": "invalid_json", "answer_shape": shape}
     if schema is not None:
         try:
             schema.model_validate(value)
         except ValidationError as error:
             errors = error.errors(include_input=False, include_context=False, include_url=False)
             json_schema = schema.model_json_schema()
-            return {"kind": "schema_validation", "count": len(errors), "errors": [
+            return {"kind": "schema_validation", "count": len(errors), "answer_shape": shape, "errors": [
                 {"path": _validation_path(item["loc"], json_schema), "type": item["type"]}
                 for item in errors[:5]]}
-    return {"kind": "unparsed_answer"}
+    return {"kind": "unparsed_answer", "answer_shape": shape}
+
+
+def answer_shape(text):
+    """What the answer was at its top level, without its content.
+
+    object / array / string / number / boolean / null: the whole text is one JSON value of
+    that type. fenced: a Markdown code block. prose: anything else, such as text before the
+    JSON (a lenient parser may then pick a bracket out of the prose, e.g. "[1]" as a list).
+    """
+    import json
+    stripped = text.strip()
+    try:
+        value = json.loads(stripped)
+    except ValueError:
+        return "fenced" if stripped.startswith("```") else "prose"
+    for name, kind in (("object", dict), ("array", list), ("string", str), ("boolean", bool)):
+        if isinstance(value, kind):
+            return name
+    return "null" if value is None else "number"

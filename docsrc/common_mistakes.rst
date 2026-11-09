@@ -495,6 +495,16 @@ than the skill behind it.
 - Day trades: ``fund-logs.sh`` shows the same-day round trips of the last five
   sessions, the US pattern day trader count. Paper accounts are unaffected.
 
+**"Invalid structured agent answer: manager; schema_validation: $ (model_type)".**
+The manager's answer was not one JSON object; a prose answer whose ``[1]`` was
+read as a list gives exactly this. The decision request already carries the
+schema (an enforced JSON schema for ``deepseek/deepseek-flash`` and
+``deepseek/deepseek-v4-pro``), but providers do not always enforce it. The
+fund now gives such an answer one correction call with the error locations
+and types, within the STOP, call and cost limits; only a second failure skips
+the round and backs off. Other models only get the schema as instructions,
+and the runner says so once at startup.
+
 **Wrong daily bars from a free source (local mode).** Set Alpaca paper keys even
 in local mode: the fund then compares Yahoo's completed daily closes with
 Alpaca's once a day. A session that differs by more than 2% is dropped (never
