@@ -975,9 +975,10 @@ class AutonomousFund(Strategy):
         cash actually paid. Reported once per symbol per New York day.
         """
         from .settlement import stale_holding
-        if self.mode not in {"local", "paper"}:
-            return []
-        positions = self.broker._pull_positions(self) or []
+        pull = getattr(getattr(self, "broker", None), "_pull_positions", None)
+        if self.mode not in {"local", "paper"} or pull is None:
+            return []  # Replays value holdings from their own data; a broker without positions has none.
+        positions = pull(self) or []
         held = sorted({p.asset.symbol for p in positions if p.asset != getattr(self, "quote_asset", None)
                        and getattr(p.asset, "asset_type", "stock") == "stock" and number(p.quantity) > 0})
         stale = []
@@ -2381,9 +2382,11 @@ class AutonomousFund(Strategy):
                   for symbol in sorted((symbols & allowed) | (idea_symbols & allowed_ideas))}
         validated = [(r["at"], r["body"]) for r in rows if r["kind"] == "decision_validated"][-200:]
         triggers = [(at, kind, body) for at, kind, body in timing if kind == "protective_trigger"]
+        regimes = self._market_regimes(now)
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
-                  "ideas": score_ideas(ideas, closes),
-                  "decisions": score_decisions(decisions, closes, sectors=sector_of), "timing": score_timing(timing, closes),
+                  "ideas": score_ideas(ideas, closes, regimes=regimes),
+                  "decisions": score_decisions(decisions, closes, sectors=sector_of, regimes=regimes),
+                  "timing": score_timing(timing, closes),
                   "consistency": score_consistency(validated, triggers)}
         settings = getattr(self, "construction", None)
         if settings is not None:
@@ -2473,6 +2476,17 @@ class AutonomousFund(Strategy):
             return {"status": "unavailable", "session_date": day,
                     "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
 
+    def _market_regimes(self, now):
+        """{session: regime} of SPY from its full completed history (trend needs 200 sessions); {} if unavailable."""
+        from .scorecard import market_regimes
+        try:
+            rows, error = self._daily_bars("SPY", now)
+        except Exception:
+            return {}
+        if error or not rows:
+            return {}
+        return market_regimes([(d, close) for d, close, _ in self._completed(rows, now)])
+
     def _scorecard_summary(self, now):
         try:
             cards = self._scorecards(now)
@@ -2487,6 +2501,10 @@ class AutonomousFund(Strategy):
                                   {"recent": cards["ideas"]["recent"][-6:]} if cards.get("ideas") else None,
                 "decisions": cards["decisions"]["by_horizon"],
                 "decisions_by_prompt_version": dict(list(cards["decisions"].get("by_prompt_version", {}).items())[-3:]),
+                # Background, not a criterion: 5-session results by market regime and whether they are fading.
+                "decisions_by_regime": {label: {k: card["5"].get(k) for k in ("observed", "mean_net_excess_return")}
+                                        for label, card in (cards["decisions"].get("by_regime") or {}).items()},
+                "decisions_trend": cards["decisions"].get("trend_5d_net_excess"),
                 "construction": cards.get("construction"),
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"},
                 # The manager's own reversals: changing its mind within a few sessions pays round trips.

@@ -159,7 +159,7 @@ def _idea_outcome(idea, closes):
             "always_up_correct": move > 0}
 
 
-def score_ideas(ideas, closes):
+def score_ideas(ideas, closes, regimes=None):
     """Score research ideas registered before the open: calibration, Brier and naive baselines.
 
     Each idea is measured from the first completed close after it was formed (so a
@@ -215,12 +215,85 @@ def score_ideas(ideas, closes):
         "selection": {"scored": len(picks), "hit_rate": sum(picks) / len(picks) if picks else None,
                       "p_value": binomial_tail(sum(picks), len(picks))},
         "verdict": verdict, "minimum_sample": MIN_INFORMATIVE_IDEAS,
+        # Background only: the hit rate in each market regime, and whether it is fading.
+        "by_regime": _idea_regimes(scored, hits, regimes),
+        "trend": recent_versus_earlier(hits),
         "recent": items[-12:],
         "interpretation": "Ideas are scored on completed closes from the first close after they were formed. "
                           "informative needs at least minimum_sample scored ideas, a hit rate above a coin and "
                           "above always-up (p < 0.05 each) and a Brier score under 0.25. selection uses the return "
                           "beyond the beta-matched benchmark. Overlapping horizons make p-values optimistic.",
     }
+
+
+TREND_WINDOW = 200     # Sessions in the benchmark's trend mean.
+VOL_WINDOW = 20        # Sessions in the benchmark's realized volatility.
+VOL_HISTORY = 252      # Earlier sessions whose median volatility separates calm from volatile.
+MIN_VOL_HISTORY = 60
+REGIMES = ("up_calm", "up_volatile", "down_calm", "down_volatile")
+MIN_TREND_SAMPLE = 20  # Scored items before recent and earlier results are compared.
+TREND_T = 1.65
+
+
+def market_regimes(benchmark_rows):
+    """{session: regime} of the benchmark, each from closes through that session only.
+
+    Trend: the close against its TREND_WINDOW-session mean (up when at or above it).
+    Volatility: the VOL_WINDOW-session realized volatility against the median of up
+    to VOL_HISTORY earlier sessions' (volatile when above it). Sessions without
+    enough history have no label. Background for grouping results, never a signal.
+    """
+    days, closes = _series(benchmark_rows)
+    labels, vols = {}, []
+    for i in range(len(days)):
+        if i < VOL_WINDOW or closes[i - VOL_WINDOW] <= 0:
+            vols.append(None)
+            continue
+        window = [closes[j] / closes[j - 1] - 1 for j in range(i - VOL_WINDOW + 1, i + 1) if closes[j - 1] > 0]
+        mean = sum(window) / len(window)
+        vols.append(math.sqrt(sum((r - mean) ** 2 for r in window) / max(1, len(window) - 1)))
+        earlier = sorted(v for v in vols[max(0, i - VOL_HISTORY):i] if v is not None)
+        if i + 1 < TREND_WINDOW or len(earlier) < MIN_VOL_HISTORY:
+            continue
+        trend = "up" if closes[i] >= sum(closes[i - TREND_WINDOW + 1:i + 1]) / TREND_WINDOW else "down"
+        middle = len(earlier) // 2
+        median = earlier[middle] if len(earlier) % 2 else (earlier[middle - 1] + earlier[middle]) / 2
+        labels[days[i]] = f"{trend}_{'volatile' if vols[i] > median else 'calm'}"
+    return labels
+
+
+def recent_versus_earlier(values):
+    """Is a record getting worse? The most recent third of chronological values against the rest.
+
+    Returns the two means, their difference and a Welch t; `change` is weaker_recently or
+    stronger_recently only when |t| >= TREND_T. Overlapping horizons are correlated, so
+    the t is optimistic: evidence of decay (crowding, a changed market), not proof.
+    """
+    values = [float(v) for v in values if v is not None]
+    if len(values) < MIN_TREND_SAMPLE:
+        return {"status": "insufficient_sample", "scored": len(values), "minimum_sample": MIN_TREND_SAMPLE}
+    cut = len(values) - len(values) // 3
+    earlier, recent = values[:cut], values[cut:]
+
+    def moments(rows):
+        mean = sum(rows) / len(rows)
+        return mean, sum((v - mean) ** 2 for v in rows) / max(1, len(rows) - 1)
+    (m1, v1), (m2, v2) = moments(earlier), moments(recent)
+    scale = math.sqrt(v1 / len(earlier) + v2 / len(recent))
+    t = (m2 - m1) / scale if scale > 0 else None
+    change = ("weaker_recently" if t is not None and t <= -TREND_T else
+              "stronger_recently" if t is not None and t >= TREND_T else "no_clear_change")
+    return {"status": "observed", "earlier": {"n": len(earlier), "mean": m1}, "recent": {"n": len(recent), "mean": m2},
+            "difference": m2 - m1, "t_stat": t, "change": change}
+
+
+def _idea_regimes(scored, hits, regimes):
+    if not regimes:
+        return {}
+    groups = {}
+    for item, hit in zip(scored, hits):
+        groups.setdefault(regimes.get(item.get("start_day"), "unlabeled"), []).append(hit)
+    return {label: {"scored": len(rows), "hit_rate": sum(rows) / len(rows)} for label, rows in sorted(groups.items())}
 
 
 BETA_LOOKBACK = 126
@@ -250,7 +323,7 @@ def _series_pairs(rows):
     return [(str(day), float(close)) for day, close in rows or []]
 
 
-def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None):
+def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None, regimes=None):
     """Forward return of each AI target portfolio vs a BETA-MATCHED benchmark, gross and net of costs.
 
     decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
@@ -300,6 +373,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
         cost = turnover * cost_bps / 10_000
         previous = weights
         row = {"decided_at": at, "session_date": day, "gross_exposure": exposure, "beta": portfolio_beta,
+               **({"regime": regimes.get(day, "unlabeled")} if regimes else {}),
                "beta_assumed": sorted(assumed), "turnover": turnover,
                "prompt_version": body.get("prompt_version") or "unversioned", "horizons": {}}
         for horizon in HORIZONS:
@@ -360,8 +434,16 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     versions = {}
     for row in rows:
         versions.setdefault(row["prompt_version"], []).append(row)
+    regimes_seen = {}
+    for row in rows:
+        if "regime" in row:
+            regimes_seen.setdefault(row["regime"], []).append(row)
+    five = [r["horizons"]["5"]["net_excess_return"] for r in rows if r["horizons"]["5"]["status"] == "observed"]
     return {"decisions": len(rows), "by_horizon": summary(rows),
             "by_prompt_version": {version: summary(selected) for version, selected in versions.items()},
+            # Background only: results by market regime, and whether the 5-session net excess is fading.
+            "by_regime": {label: summary(selected) for label, selected in sorted(regimes_seen.items())},
+            "trend_5d_net_excess": recent_versus_earlier(five),
             "cost_bps_per_side": cost_bps, "recent": rows[-10:],
             "interpretation": "excess_return is over a beta-matched benchmark (portfolio beta from closes through "
                               "the decision day), so market exposure is not counted as skill; net_excess_return "

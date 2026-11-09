@@ -103,6 +103,35 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "holding_without_market_data"}
 
 
+REGIME_TEXT = {"up_calm": "上涨·平稳", "up_volatile": "上涨·波动大", "down_calm": "下跌·平稳",
+               "down_volatile": "下跌·波动大", "unlabeled": "历史不足"}
+CHANGE_TEXT = {"weaker_recently": "最近明显变弱（可能是失效、拥挤或市场变了）", "stronger_recently": "最近明显变强",
+               "no_clear_change": "没有明显变化"}
+
+
+def regime_trend_lines(card):
+    """Scorecard results by market regime and recent-vs-earlier change: background, never a criterion."""
+    lines = []
+    decisions, ideas = (card or {}).get("decisions") or {}, (card or {}).get("ideas") or {}
+    groups = [f"{REGIME_TEXT.get(label, label)} {value['5']['observed']} 次、平均 {_percent(value['5']['mean_net_excess_return'])}"
+              for label, value in (decisions.get("by_regime") or {}).items() if value["5"]["observed"]]
+    hits = [f"{REGIME_TEXT.get(label, label)} {value['scored']} 条、命中率 {_percent(value['hit_rate'])}"
+            for label, value in (ideas.get("by_regime") or {}).items() if value["scored"]]
+    if groups or hits:
+        lines.append("按市场状态分组（SPY 相对 200 日均线、20 日波动相对过去一年中位数；只作背景，不作判断标准）："
+                     + ("决策 5 日净超额：" + "；".join(groups) if groups else "")
+                     + ("。" if groups and hits else "") + ("研究想法：" + "；".join(hits) if hits else ""))
+    for name, trend, unit in (("决策 5 日净超额", decisions.get("trend_5d_net_excess"), "percent"),
+                              ("研究想法命中率", ideas.get("trend"), "percent")):
+        if (trend or {}).get("status") == "observed":
+            lines.append(f"{name}：最近 {trend['recent']['n']} 条平均 {_percent(trend['recent']['mean'])}，"
+                         f"之前 {trend['earlier']['n']} 条 {_percent(trend['earlier']['mean'])}"
+                         f"（t={trend['t_stat']:.2f}，{CHANGE_TEXT.get(trend['change'], trend['change'])}）"
+                         if trend.get("t_stat") is not None else
+                         f"{name}：最近与之前没有差别可比（结果完全相同）")
+    return lines
+
+
 ATTRIBUTION_LABELS = {"market": "市场（beta×基准）", "selection": "选股", "cash_equivalent": "现金等价物",
                       "timing": "当日交易择时（相对收盘）", "slippage": "执行滑点（相对到达价）", "fees": "费用"}
 
@@ -232,6 +261,7 @@ def daily_document(root, sequence):
                          f"{consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
                          f"（{_percent(consistency['reversal_rate'])}，不含止损止盈），"
                          f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
+        lines += regime_trend_lines(card)
         lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
         lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
@@ -768,6 +798,7 @@ def weekly_document(root, sequence):
                      f"其中 {consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
                      f"（{_percent(consistency['reversal_rate'])}，不含止损止盈触发的），"
                      f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
+    lines += [f"- {line}" for line in regime_trend_lines(card)]
     tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
     control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
     lines += ["", "## 五、因子实验进展【统计推断】", ""]

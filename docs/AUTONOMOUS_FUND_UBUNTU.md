@@ -2,7 +2,7 @@
 
 本应用的显式秘密配置、无人值守进程管理、审批和日报运维说明。
 
-**Last Updated:** 2026-11-08
+**Last Updated:** 2026-11-09
 
 **Status:** 部署生成器与进程／通知回归已验证；目标 Ubuntu 安装和 Telegram 实际投递待验证
 
@@ -411,6 +411,16 @@ Telegram 接收确认丢失时重试可能重复，不保证恰好一次；同�
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh report --run-dir artifacts/fund-local
 sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh stop --run-dir artifacts/fund-local
 sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service lumibot-fund-desk.service
+```
+
+**持仓被收购或退市**（本地账本）：收到“持仓 X 已连续 N 个交易日没有新的日线”的通知后，先查明实际结算金额
+（现金收购价；破产退市一般为 0），停止服务，结算，再启动。结算命令只用于本地账本，运行中会被运行锁拒绝；
+它会用严格对账复核整个账本，不一致就整笔回滚。Alpaca 模拟账户由券商自己结算，不用这个命令。
+
+```bash
+sudo systemctl stop lumibot-fund-runner.service
+sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh settle-position --run-dir artifacts/fund-local --symbol <代码> --cash-per-share <每股实收现金> --reason "<发生了什么>"
+sudo systemctl start lumibot-fund-runner.service
 ```
 
 `runtime.log` 按 20 MB 轮转，保留 5 个历史文件；journald 的磁盘额度由服务器管理员设置。
