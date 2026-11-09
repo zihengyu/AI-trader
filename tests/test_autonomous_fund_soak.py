@@ -90,6 +90,10 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
     assert {"learning:memo": "paper_active", "learning:baseline": "shadow"}.items() <= states.items()
     assert states.get("construction:ai") == "paper_active" and "predictions:research_ideas" in states
     assert not [row for row in rows if row["kind"] == "operation_error" and "experiment" in json.dumps(row["body"])]
+    # V2 4.3: the decision and both review stages record that their answers were used.
+    outcomes = [row["body"] for row in rows if row["kind"] == "agent_outcome"]
+    assert {"decision", "postmarket_review"} <= {o["purpose"] for o in outcomes}
+    assert sum(o["purpose"] == "postmarket_review" for o in outcomes) == 2
     result = acceptance(tmp_path, {"min_sessions": 1, "min_iteration_ratio": 0}, now=clock())
     metrics = result["metrics"]
     assert metrics["protective_orders"] == 1 and metrics["fills"] >= 2 and metrics["review_ratio"] == 1

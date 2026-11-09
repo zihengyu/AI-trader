@@ -331,6 +331,15 @@ and the history of state changes with their evidence. A changed configuration
 is a new version and never overwrites the old one. The registry only records:
 switching and retirement rules are unchanged.
 
+**Whether the AI calls are worth their cost.** Each model call is journaled with
+a ``call_id`` and a purpose, and an ``agent_outcome`` is written when its result
+is actually used. That is a validated decision (and whether it changed the
+target portfolio), saved research (and its ideas), a saved review (and its
+predictions), a scored shadow decision or a critique the manager saw. The
+weekly report lists, per purpose, the calls, how many were used, how many
+changed the portfolio, and the cost per used call and per change. Unpriced calls
+make the cost ratios unknown rather than zero.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

@@ -28,6 +28,21 @@ POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
                    "construction", "critic", "data_desk", "manager_run_timeout_seconds")
 NOTICE_WINDOWS = {"stop_active": 21600}
+# A call's purpose (V2 4.3), from its context phase, else from its role.
+CALL_PURPOSES = {"postmarket_review": "postmarket_review", "before_market_opens": "premarket_research",
+                 "closed_startup": "premarket_research"}
+DEFAULT_PURPOSES = {"manager": "decision", "researcher": "research", "critic": "critique"}
+
+
+def targets_changed(previous, decision):
+    """Whether a decision changes the target portfolio: a symbol added or removed, or a weight moved by
+    at least one point (the rule of the Telegram adjustment notice). The first decision is a change."""
+    def weights(body):
+        return {t["symbol"]: number(t["weight"]) for t in (body or {}).get("targets", []) if number(t["weight"]) > 0}
+    if not previous:
+        return True
+    old, new = weights(previous), weights(decision)
+    return set(old) != set(new) or any(abs(new[s] - old[s]) >= number("0.01") for s in new)
 # A cancel request is asynchronous; repeat it only if the broker still shows the
 # order working this long after the last request (a lost request, not a slow one).
 CANCEL_RETRY_SECONDS = 240
@@ -1088,6 +1103,7 @@ class AutonomousFund(Strategy):
                 packet["idea_ids"] = []
                 self._disclose_failure("idea_registration_error", exc, phase="premarket_research")
             self.journal.event(self.get_datetime(), "premarket_research", packet)
+            self._call_outcome(new_ideas=len(packet["idea_ids"]))
             self.premarket_research = packet
             # The operator reads the research on Telegram before the session.
             self._disclose("premarket_research", {
@@ -1454,7 +1470,9 @@ class AutonomousFund(Strategy):
                 from .review import PostmarketReview
                 schema = PostmarketReview
             diagnostic = structured_answer_diagnostic(result, schema)
+        call = getattr(self, "_current_call", None) or {}
         self.journal.event(now, "agent", {
+            **({"call_id": call["call_id"], "purpose": call["purpose"]} if call.get("role") == name else {}),
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
             "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
             "mock": self.scripted, "phase": phase, "tokens": tokens,
@@ -1475,15 +1493,29 @@ class AutonomousFund(Strategy):
         # research evidence keeps its explicit (nullable) publication time.
         return parsed.model_dump(exclude_none=isinstance(parsed, Decision))
 
-    def _agent_call(self, name, **kwargs):
+    def _call_outcome(self, **fields):
+        """The latest call's result was used (V2 4.3); never raises into the trading path."""
+        call = getattr(self, "_current_call", None)
+        if not call:
+            return
+        try:
+            self.journal.event(self.get_datetime(), "agent_outcome", {**call, "valid": True, **fields})
+        except Exception:
+            pass
+
+    def _agent_call(self, name, purpose=None, **kwargs):
         if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
             kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
         key = uuid4().hex
+        # What the call is for (V2 4.3): its agent event and, once its result is used, its outcome share the id.
+        phase = (kwargs.get("context") or {}).get("phase")
+        purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
+        self._current_call = {"call_id": key, "role": name, "purpose": purpose}
         self.journal.counter("agent_runs", self.get_datetime(), 1)
         self.journal.event(self.get_datetime(), "agent_call_started", {
-            "id": key, "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown")})
+            "id": key, "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "purpose": purpose})
         try:
             return self.agents[name].run(**kwargs)
         except BaseException as exc:
@@ -1492,7 +1524,7 @@ class AutonomousFund(Strategy):
             self.journal.event(self.get_datetime(), "agent", {
                 "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "cache_hit": False, "usage": None,
                 "summary": "Agent attempt failed; provider usage unknown.", "parse_error": type(exc).__name__,
-                "mock": self.scripted, "phase": (kwargs.get("context") or {}).get("phase")})
+                "mock": self.scripted, "phase": phase, "call_id": key, "purpose": purpose})
             raise
         finally:
             self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
@@ -1773,6 +1805,7 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_failure_role", None)
         self.journal.event(now, "decision_validated", {
             **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None)})
+        self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
         self._record_construction_variant(decision, now)
         self._triggers = []
         self.last_decision = decision
@@ -1876,6 +1909,7 @@ class AutonomousFund(Strategy):
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
                 context={**context, "research": research}), phase="critique")
             self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
+            self._call_outcome()
             return critique
         except Exception as exc:
             self.journal.event(self.get_datetime(), "critic_unavailable",
@@ -1933,12 +1967,13 @@ class AutonomousFund(Strategy):
         record = {"arm": arm, "trading_arm": champion, "decided_at": decision["as_of"], "trading_decision": decision,
                   "memo_version": (context.get("strategy_memory") or {}).get("version")}
         try:
-            shadow = self._record_agent("manager", self._agent_call("manager",
+            shadow = self._record_agent("manager", self._agent_call("manager", purpose="shadow",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
                 context=self._arm_context(context, arm)), phase="shadow")
             # Structural validation at its own as_of: this answer is scored, never executed.
             validate_decision(shadow, instant(shadow["as_of"]), self.universe, self.limits)
             self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": shadow, "valid": True})
+            self._call_outcome()
         except Exception as exc:
             self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": None, "valid": False,
                                "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
