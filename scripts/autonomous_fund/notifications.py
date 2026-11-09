@@ -531,6 +531,21 @@ def readable(kind, details, sequence=None, *, now=None):
                      "账本会把这笔持仓按该金额转为现金，并用严格对账复核；之后重新启动即可。")
         else:
             text += "\n模拟券商会自行处理收购或退市的结算；请在券商账户里确认，之后账户读数会自动恢复。"
+    elif kind == "bar_quality_issues" and isinstance(details, dict):
+        parts = []
+        if details.get("withheld"):
+            parts.append("两个数据源的日线明显不一致，今天不使用这些证券的历史数据（不新增买入、不进入因子检验）："
+                         + "、".join(details["withheld"]))
+        if details.get("disputed"):
+            parts.append("个别交易日两边收盘价相差超过 2%，这些日子的数据已剔除（不替换、不插值）："
+                         + "、".join(f"{s} {n} 天" for s, n in details["disputed"].items()))
+        for item in details.get("examples") or []:
+            parts.append(f"例：{item['symbol']} {item['date']} Yahoo {item['primary']:.2f}，"
+                         f"Alpaca {item['reference']:.2f}（差 {item['difference'] * 100:+.1f}%）")
+        if details.get("unavailable"):
+            parts.append(f"第二数据源（Alpaca）暂时连不上（{details['unavailable']}），部分日线未经核对就使用了。")
+        text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
+        text += "\n不需要操作；明天会重新核对。持续出现时，检查该证券是否刚拆股或数据源有误。"
     elif kind == "degradation_cleared" and isinstance(details, dict):
         text = (f"✅ 换手已回到正常：最近日均 {_percent(details.get('recent_mean'))}，不高于之前的中位数 "
                 f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")

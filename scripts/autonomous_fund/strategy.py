@@ -55,6 +55,7 @@ CANCEL_RETRY_SECONDS = 240
 PREPARATION_BUDGET_SECONDS = 45
 # Live source failures are retryable; successful histories still last for the completed-session cutoff.
 DAILY_HISTORY_RETRY_SECONDS = 60
+QUALITY_PAUSE_SECONDS = 600  # After a second-source failure, daily bars are used unchecked for this long.
 # One agent call lasts up to attempts x run timeout + LumiBot's retry backoff: the run timeout
 # is per ATTEMPT and a timeout is retried. The independent monitor stops a runner after
 # MONITOR_AGENT_SECONDS in one call (agent_call_stalled), so every role must end before it.
@@ -966,6 +967,10 @@ class AutonomousFund(Strategy):
             self._check_stale_holdings(self.get_datetime())
         except Exception as exc:  # A missed check is retried after the next close.
             self._disclose_failure("stale_holding_check_error", exc, phase="postmarket_review")
+        try:
+            self._report_bar_quality(self.get_datetime())
+        except Exception as exc:  # The events stay in the journal; the notice is retried next close.
+            self._disclose_failure("bar_quality_report_error", exc, phase="postmarket_review")
 
     def _check_stale_holdings(self, now):
         """Held stocks the provider stopped serving bars for (acquired, delisted, halted): tell the operator.
@@ -2801,6 +2806,8 @@ class AutonomousFund(Strategy):
                         store.save_bars(day, symbol, length, full, cutoff=cutoff)
                     except OSError:
                         pass  # The store is a cache: the bars are still used this time.
+            if full and not error:
+                full, error = self._quality_checked(day, symbol, full, cutoff, now)
             if error:
                 self.journal.event(now, "risk_history_unavailable", {"symbol": symbol, "error": error})
             rows = [(d, close, shares) for d, close, shares, _, _, _ in full or []]
@@ -2815,6 +2822,66 @@ class AutonomousFund(Strategy):
                 else:
                     retries.pop(key, None)
         return self._bars[key]
+
+    def _quality_checked(self, day, symbol, rows, cutoff, now):
+        """(rows, error) after the cross-check against the second daily source; unchanged without one.
+
+        Disputed sessions are dropped; a symbol withheld for the day returns no rows and
+        the error `bar_quality_unreliable`. A source failure pauses checks for a while and
+        leaves the rows unchecked (said once per day), never blocks the read.
+        """
+        from .bar_quality import PROBLEMS, apply, check
+        reference = getattr(self, "history_fallback", None)
+        if reference is None:
+            return rows, None
+        paused = getattr(self, "_quality_paused_until", None)
+        if paused is not None and monotonic() < paused:
+            return rows, None
+        try:
+            verdict = check(getattr(self, "daily_store", None), day, symbol, rows, cutoff, reference)
+        except Exception as exc:
+            self._quality_paused_until = monotonic() + QUALITY_PAUSE_SECONDS
+            noted = self.__dict__.setdefault("_quality_noted", set())
+            if (day, "unavailable") not in noted:
+                noted.add((day, "unavailable"))
+                self.journal.event(now, "bar_quality_unavailable", {"error": type(exc).__name__,
+                                                                    "retry_seconds": QUALITY_PAUSE_SECONDS})
+            return rows, None
+        noted = self.__dict__.setdefault("_quality_noted", set())
+        if verdict["status"] in PROBLEMS and (day, symbol) not in noted:
+            noted.add((day, symbol))
+            self.journal.event(now, "bar_quality", {
+                "symbol": symbol, "status": verdict["status"], "compared": verdict.get("compared"),
+                "disputed_count": len(verdict.get("disputed") or ()), "latest": verdict.get("latest"),
+                "largest": verdict.get("largest"), "missing_count": verdict.get("missing_count"),
+                "feed": verdict.get("feed")})
+        kept = apply(rows, verdict)
+        return kept, ("bar_quality_unreliable" if verdict["status"] == "unreliable" else None)
+
+    def _report_bar_quality(self, now):
+        """Once per New York day: symbols whose daily bars disagreed between the two sources."""
+        day = trading_day(now)
+        if self.journal.get_meta("bar_quality_notified") == day:
+            return None
+        start = (instant(now) - timedelta(hours=30)).isoformat()
+        latest = {}
+        with self.journal.connection() as db:
+            for kind, body in db.execute("SELECT kind, body FROM events WHERE kind IN "
+                                         "('bar_quality','bar_quality_unavailable') AND julianday(at)>=julianday(?) "
+                                         "ORDER BY sequence", (start,)):
+                body = json.loads(body)
+                latest[body.get("symbol", "*")] = {"kind": kind, **body}
+        if not latest:
+            return None
+        details = {"withheld": sorted(s for s, b in latest.items() if b.get("status") == "unreliable"),
+                   "disputed": {s: b["disputed_count"] for s, b in sorted(latest.items())
+                                if b.get("status") == "disputed_sessions"},
+                   "examples": [{"symbol": s, **b["largest"][0]} for s, b in sorted(latest.items())
+                                if b.get("largest")][:5],
+                   "unavailable": latest.get("*", {}).get("error")}
+        self.journal.set_meta("bar_quality_notified", day)
+        self._notify_fund("bar_quality_issues", details)
+        return details
 
     def _fetch_daily_bars(self, symbol, length, now):
         """([(date, close, volume, open, high, low)], error) from the data source, then the Alpaca fallback."""
