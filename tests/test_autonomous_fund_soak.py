@@ -84,6 +84,12 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
     evaluations = [row for row in rows if row["kind"] == "learning_evaluation"]
     assert len(evaluations) == 1 and evaluations[0]["sequence"] > review_at  # Evaluated after the close review.
     assert sum(1 for name, phase, _ in seen if phase == "postmarket_review") == 2
+    # The experiment registry (V2 4.1) syncs after the close review, without an error.
+    from scripts.autonomous_fund.experiments import Registry
+    states = {row["id"]: row["state"] for row in Registry(journal).rows()}
+    assert {"learning:memo": "paper_active", "learning:baseline": "shadow"}.items() <= states.items()
+    assert states.get("construction:ai") == "paper_active" and "predictions:research_ideas" in states
+    assert not [row for row in rows if row["kind"] == "operation_error" and "experiment" in json.dumps(row["body"])]
     result = acceptance(tmp_path, {"min_sessions": 1, "min_iteration_ratio": 0}, now=clock())
     metrics = result["metrics"]
     assert metrics["protective_orders"] == 1 and metrics["fills"] >= 2 and metrics["review_ratio"] == 1

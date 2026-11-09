@@ -629,6 +629,14 @@ def weekly_document(root, sequence):
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
             "json_extract(body,'$.session_date') BETWEEN ? AND ? ORDER BY sequence", (monday, day))]
+        # Experiment registry (V2 4.1): this week's state changes. The registry syncs just after
+        # each review is saved, so like the scorecard they are selected by date, not by the cutoff.
+        changes = []
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_experiment_history'").fetchone():
+            for experiment, at, before, after, reason in db.execute(
+                    "SELECT id,at,from_state,to_state,reason FROM fund_experiment_history ORDER BY rowid"):
+                if monday <= instant(at).astimezone(zone).date().isoformat() <= sunday:
+                    changes.append((experiment, before, after, reason))
     facts = _weekly_facts(events, monday, sunday, zone)
     reviews = [b for _, k, b in events if k == "postmarket_review" and monday <= b["session_date"] <= sunday]
     lines = [f"# {label} 模拟账户周报（{monday} 至 {sunday}）", "",
@@ -710,6 +718,13 @@ def weekly_document(root, sequence):
                      f"t = {stats.get('t_stat')}")
     else:
         lines.append(f"- 学习对照（影子 A/B）：{NO_DATA}")
+    from .experiments import STATE_LABELS
+    if changes:
+        lines.append(f"- 实验登记本周的状态变化（{len(changes)} 条，完整列表：bash scripts/fund-logs.sh experiments）：")
+        lines += [f"  - {experiment}：{STATE_LABELS.get(before, '新登记') if before else '新登记'} → "
+                  f"{STATE_LABELS.get(after, after)}（{reason}）" for experiment, before, after, reason in changes[:12]]
+    else:
+        lines.append("- 实验登记本周没有状态变化")
     lines += ["", "## 七、异常和缺失数据【事实】", ""]
     health = facts["health"]
     lines.append("- 运行异常：" + ("；".join(f"{k} × {v}" for k, v in sorted(health.items())) if health else "本周没有记录"))

@@ -934,6 +934,34 @@ class AutonomousFund(Strategy):
                     self.journal.set_meta("learning_evaluated_session", session)
         except Exception as exc:
             self._notify_fund("learning_evaluation_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+        try:
+            self._sync_experiments(self.get_datetime())
+        except Exception as exc:  # The registry records the experiments; it never stops them.
+            self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
+
+    def _sync_experiments(self, now):
+        """Record every experiment's current state in the registry (V2 4.1), once per completed review."""
+        from .experiments import Registry, observations
+        registry = getattr(self, "_registry", None) or Registry(self.journal)
+        self._registry = registry
+        settings = getattr(self, "validation", None)
+        learning = None
+        if settings is not None:
+            learning = {"enabled": settings.shadow_enabled and getattr(self, "memory_mode", "rolling") == "rolling",
+                        "champion": self._champion(), "evaluation": self.journal.get_meta("learning_evaluation"),
+                        "version_config": {"prompt_version": getattr(self, "prompt_version", None),
+                                           "min_pairs": settings.min_pairs, "switch_t_stat": settings.switch_t_stat}}
+        construction = None
+        cards = self._scorecards(now) if getattr(self, "quant", None) is not None else None
+        if getattr(self, "construction", None) is not None and getattr(self, "quant", None) is not None:
+            options = self.construction
+            construction = {"trading": self._construction_arm(), "evaluation": (cards or {}).get("construction"),
+                            "config": {"mode": options.mode, "min_pairs": options.min_pairs,
+                                       "switch_t_stat": options.switch_t_stat}}
+        lab = getattr(self, "factor_lab", None)
+        return registry.observe(now, observations(
+            factors=lab.rows() if lab is not None else (), learning=learning, construction=construction,
+            scorecards=cards, previous=registry.state))
 
     def _announce_decision(self, decision, now, account=None, decision_id=None):
         """Tell the operator when the AI changes the target portfolio, and its first plan

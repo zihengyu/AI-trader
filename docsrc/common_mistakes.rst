@@ -323,6 +323,14 @@ through it, or the review failed), the week is reported from its latest review
 once the next week's first session opens. ``bash scripts/fund-logs.sh weekly``
 prints this week's report so far without sending it.
 
+**Which experiments are in effect.** ``bash scripts/fund-logs.sh experiments``
+lists every experiment version the fund runs: factors, the learning and
+construction comparisons, and the prediction statistics. For each it shows the
+state (in effect on the paper account, scored in the shadow, rejected or retired)
+and the history of state changes with their evidence. A changed configuration
+is a new version and never overwrites the old one. The registry only records:
+switching and retirement rules are unchanged.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
