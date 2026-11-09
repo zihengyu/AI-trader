@@ -398,7 +398,8 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh approve --run-dir a
 不是交易日不虚构日报；停机、STOP 或模型失败可能导致复盘尚未完成，应查看异常通知和日志。
 运行一段时间后执行 `bash scripts/run_autonomous_fund.sh acceptance --run-dir artifacts/fund-local` 生成验收报告
 （`acceptance.md`）：连续交易日数、迭代完成率、监控 STOP、未结束委托、成交明细、模型失败率、复盘完成率和平均滑点都达标后，
-再考虑进入下一阶段。
+再考虑进入下一阶段。同时生成投资能力验收报告（`investment_acceptance.md`），回答“扣费后有没有超额收益”；
+两份报告互相独立，运行验收通过不代表投资能力验收通过。
 本地文件仍在 `reviews/YYYY-MM-DD.md`、`postmarket_review.md`、`report.json`、`equity.csv`、`fills.csv`。
 
 日报从固定账本生成，不读取 AI 指定的文件路径；原始研究和估值时间保留，缺少收盘估值会明确披露。

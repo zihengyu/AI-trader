@@ -340,6 +340,15 @@ weekly report lists, per purpose, the calls, how many were used, how many
 changed the portfolio, and the cost per used call and per change. Unpriced calls
 make the cost ratios unknown rather than zero.
 
+**Reading the acceptance reports.** ``acceptance`` writes two independent
+reports. ``acceptance.md`` says whether the system runs reliably.
+``investment_acceptance.md`` says whether there is an excess return after
+costs: at least 60 sessions, beta-adjusted alpha against SPY, beating the
+predefined risk-matched benchmark before and after model and data costs, a
+deflated Sharpe ratio of at least 0.90, and a positive result in both halves of
+the record. Its best verdict is ``preliminary_edge``. Passing the operational
+report does not pass the investment report.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

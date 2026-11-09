@@ -131,7 +131,7 @@ def test_the_deflated_sharpe_counts_every_configuration_tried():
 
 
 def test_acceptance_lists_the_trial_breakdown(tmp_path):
-    from scripts.autonomous_fund.validation import acceptance, acceptance_markdown
+    from scripts.autonomous_fund.validation import acceptance, investment_markdown
     journal = Journal(tmp_path, "synthetic-performance")
     start = datetime(2026, 7, 6, 19, 0, tzinfo=timezone.utc)
     journal.event(start, "startup", {"mode": "local", "limits": {"drawdown": "0.08"}, "risk_policy_digest": "p1",
@@ -156,4 +156,4 @@ def test_acceptance_lists_the_trial_breakdown(tmp_path):
     result = acceptance(tmp_path, now=day + timedelta(days=1))
     stats = result["performance_evidence"]
     assert stats["configurations_breakdown"]["total"] == stats["configurations_tried"] == 1 + 4 + 1
-    assert "因子表达式（含未通过） 4" in acceptance_markdown(result)
+    assert "因子表达式（含未通过） 4" in investment_markdown(result)

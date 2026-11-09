@@ -595,12 +595,16 @@ def main(argv=None):
         print(json.dumps(factor_lab(args, config), indent=2, ensure_ascii=False, default=str))
         return
     if args.mode == "acceptance":
-        from .validation import ValidationSettings, acceptance, acceptance_markdown
+        from .validation import ValidationSettings, acceptance, acceptance_markdown, investment_markdown
         result = acceptance(args.run_dir, ValidationSettings.from_config(config.get("validation")).acceptance)
         (args.run_dir / "acceptance.json").write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str),
                                                       encoding="utf-8")
+        # Two reports (V2 4.4): passing one never implies the other.
         (args.run_dir / "acceptance.md").write_text(acceptance_markdown(result), encoding="utf-8")
-        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"]}, indent=2,
+        (args.run_dir / "investment_acceptance.md").write_text(investment_markdown(result), encoding="utf-8")
+        print(json.dumps({"verdict": result["verdict"], "criteria": result["criteria"],
+                          "investment_verdict": result["investment"]["verdict"],
+                          "investment_criteria": result["investment"]["criteria"]}, indent=2,
                          ensure_ascii=False, default=str))
         return
     with FileLock(str(args.run_dir / "runner.lock"), timeout=0):

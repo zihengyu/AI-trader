@@ -1022,7 +1022,12 @@ bash scripts/fund-logs.sh experiments
 
 ## 运行验收报告
 
-本地或 Paper 运行一段时间后，用 `acceptance` 从账本生成验收报告（`acceptance.json` 和 `acceptance.md`），作为进入下一阶段的客观依据：
+本地或 Paper 运行一段时间后，用 `acceptance` 从账本生成两份互相独立的验收报告（数据都在 `acceptance.json`）：
+
+- **运行验收**（`acceptance.md`）：系统是否可靠地运行，标准见下表；
+- **投资能力验收**（`investment_acceptance.md`）：扣除费用后有没有超额收益，标准见本节后面的“投资能力验收”。
+
+运行验收通过不代表投资能力验收通过，反过来也一样。命令：
 
 ```bash
 python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
@@ -1073,6 +1078,23 @@ python -m scripts.autonomous_fund.run acceptance --run-dir artifacts/fund-local
 alpha t ≥ 1.65（单边 95%，普通 t 值和 Newey-West t 值取较小者）、且没有触发回撤上限时，才给出 `eligible_stage_1`（最多投入计划资金的 10%）；否则为 `paper_only`
 并列出每一条不满足的原因。25% 和 50% 两个阶段需要实盘记录满足同样的检验。**这只是报告**：本应用没有实盘模式，
 任何真金白银的一步都需要你明确授权和单独审核的执行路径。
+
+**投资能力验收**（`investment_acceptance`，V2 4.4）：结论只有三种：`insufficient_evidence`（样本不足，尚不能判断）、
+`edge_not_shown`（尚未证明有扣费后的超额收益）、`preliminary_edge`（初步显示扣费后的超额收益）。没有“已证明”这一档：
+模拟盘成交偏理想、样本仍短，通过也不保证未来盈利。
+
+| 标准 | 必需 | 要求 |
+|---|---|---|
+| 交易日数 | 是 | 至少 60 个交易日，否则结论为样本不足 |
+| 相对 SPY 的 alpha | 是 | 扣掉 beta 后的 alpha t 值 ≥ 1.65（普通 t 与 Newey-West t 取较小者） |
+| 相对风险匹配基准 | 是 | 年化超额 > 0，且 alpha t ≥ 1.65（默认 60% SPY + 40% SGOV） |
+| 扣模型和数据费后 | 是 | 系统净收益仍跑赢风险匹配基准；有未定价的调用时为“未知”，不通过 |
+| 去试错夏普（DSR） | 是 | ≥ 0.90，试错数包括所有提示词、风控配置、因子、对照实验 |
+| 稳定性 | 是 | 记录分成前后两半，两半的 beta 调整后日均收益都为正：只在一段时间有效不算稳定 |
+| 学习对照 | 参考 | 看备忘组减对照组的配对 t ≥ 2（第四关）；未达到时写“未证实改善” |
+| 研究想法 | 参考 | 打分结论为 informative |
+
+报告同时列出业绩证据、两种净收益、事先定义的基准、分阶段资金就绪度，以及全部记录的 AI 调用价值。
 
 ## 研究网络与数据边界
 
