@@ -116,3 +116,57 @@ def test_the_decision_context_carries_the_costs_and_the_local_books_own_fees(tmp
     assert strategy._trade_value_model(NOW)["fee_bps"] == 0.0
     strategy._scorecards = lambda now: (_ for _ in ()).throw(RuntimeError("synthetic"))
     assert strategy._trade_value_model(NOW) == {"active": False, "reason": "unavailable: RuntimeError"}
+
+
+# ----- Whole shares only: symbols one share of which is above their ceiling ------------------------------
+
+def test_a_share_above_its_ceiling_is_unaffordable_and_group_caps_count():
+    from scripts.autonomous_fund.trade_value import affordability
+    groups = (("leveraged:SQQQ", "0.05", ("SQQQ",)), ("technology", "0.30", ("NVDA", "SNDK")))
+    result = affordability({"SNDK": 1500.0, "NVDA": 900.0, "SQQQ": 600.0, "SPY": 600.0, "BAD": None}, Decimal("10000"),
+                           Decimal("0.10"), groups, held={"SNDK"})
+    rows = {row["symbol"]: row for row in result["unaffordable"]}
+    assert set(rows) == {"SNDK", "SQQQ"}  # NVDA (9%) and SPY (6%) fit under 10%; SQQQ's own cap is 5%.
+    assert rows["SNDK"] == {"symbol": "SNDK", "share_price": 1500.0, "one_share_weight": 0.15, "max_weight": 0.1,
+                            "held": True}
+    assert rows["SQQQ"]["max_weight"] == 0.05 and "Whole shares only" in result["meaning"]
+    assert affordability({"SNDK": 1500.0}, 0, Decimal("0.10"), ())["unaffordable"] == []
+
+
+def test_the_operator_hears_once_a_day_when_the_unaffordable_list_changes(tmp_path):
+    from scripts.autonomous_fund.notifications import readable
+    from tests.test_autonomous_fund_quant import NOW, harness
+    strategy = harness(tmp_path)
+    prices = {"ALFA": 1500.0, "BETA": 50.0}
+    strategy._market_snapshot = lambda now: {"symbols": {s: {"last_close": p} for s, p in prices.items()}}
+    first = strategy._affordability(Decimal("10000"), {}, NOW)
+    assert [row["symbol"] for row in first["unaffordable"]] == ["ALFA"]
+    strategy._affordability(Decimal("10000"), {}, NOW + timedelta(hours=1))
+    assert [kind for kind, _ in strategy.notices].count("unaffordable_symbols") == 1  # Same day, same list.
+    strategy._affordability(Decimal("10000"), {}, NOW + timedelta(days=1))
+    assert [kind for kind, _ in strategy.notices].count("unaffordable_symbols") == 1  # Unchanged list.
+    prices["ALFA"] = 900.0
+    strategy._affordability(Decimal("10000"), {}, NOW + timedelta(days=2))
+    kinds = [kind for kind, _ in strategy.notices]
+    assert kinds.count("unaffordable_symbols") == 2 and readable(*strategy.notices[-1]) == "ℹ️ 投资范围里的证券现在都至少买得起一股了。"
+    text = readable("unaffordable_symbols", first)
+    assert "ALFA：一股约 1,500.00 美元，占净值 15.0%，上限 10.0%" in text and "系统只买整股" in text
+    strategy._market_snapshot = lambda now: (_ for _ in ()).throw(RuntimeError("synthetic"))
+    assert strategy._affordability(Decimal("10000"), {}, NOW) == {"unavailable": "RuntimeError"}
+
+
+def test_the_manager_sees_which_symbols_it_cannot_buy(tmp_path):
+    from tests.test_autonomous_fund_quant import NOW, account, decision, model_harness
+    strategy = model_harness(tmp_path)
+    seen = {}
+    evidence = [{"source": "Synthetic", "available_at": (NOW - timedelta(days=1)).isoformat(),
+                 "observed_at": NOW.isoformat(), "estimated": False, "estimate_reason": ""}]
+
+    def call(name, **kwargs):
+        seen[name] = kwargs.get("context", {})
+        if name == "researcher":
+            return {"summary": "s", "evidence": evidence}
+        return decision([("ALFA", .05)])
+    strategy._agent_call = call
+    strategy._decide(account(), NOW, False)
+    assert "affordability" in seen["manager"] and "unaffordable" in seen["manager"]["affordability"]

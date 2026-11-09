@@ -460,6 +460,17 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"高于之前 {details.get('earlier_sessions')} 个交易日的 95% 分位 {_percent(details.get('p95'))}。"
                 f"基金经理的最短复核间隔加倍为 {details.get('min_review_minutes')} 分钟，少做调整；止损、止盈照常。"
                 "换手回到之前的中位数后自动恢复。")
+    elif kind == "unaffordable_symbols" and isinstance(details, dict):
+        rows = details.get("unaffordable") or []
+        if rows:
+            text = (f"ℹ️ 按当前账户净值 {details.get('equity'):,.2f} 美元，下面这些证券一股的价格就超过了它最多能占的仓位。"
+                    "系统只买整股，所以买不进：\n"
+                    + "\n".join(f"- {r['symbol']}：一股约 {r['share_price']:,.2f} 美元，占净值 {r['one_share_weight'] * 100:.1f}%，"
+                                 f"上限 {r['max_weight'] * 100:.1f}%" + ("（已持有，可以继续持有或卖出）" if r.get("held") else "")
+                                 for r in rows[:20])
+                    + "\nAI 已被告知不要计划买入它们，研究照常。要交易它们，需要提高授权资金或单只／分组上限。")
+        else:
+            text = "ℹ️ 投资范围里的证券现在都至少买得起一股了。"
     elif kind == "degradation_cleared" and isinstance(details, dict):
         text = (f"✅ 换手已回到正常：最近日均 {_percent(details.get('recent_mean'))}，不高于之前的中位数 "
                 f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")

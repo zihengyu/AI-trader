@@ -75,3 +75,29 @@ def limit_adds(weights, current_weights, ideas, prices, current):
             result[symbol] = now  # Never below the holding: this only declines the purchase.
             held[symbol] = verdict
     return result, held
+
+
+def affordability(last_closes, equity, max_position, groups, held=()):
+    """Symbols whose single share costs more than the fund may ever hold of them.
+
+    The fund buys whole shares. A symbol's ceiling is the smallest of the single-position
+    limit and the cap of every risk group it belongs to (a leveraged ETF's own cap, a
+    sector's combined cap); when one share at the last completed close is above that
+    ceiling, no target can ever buy it. A held symbol can still be held or sold.
+    """
+    equity = float(equity or 0)
+    if equity <= 0:
+        return {"equity": equity, "unaffordable": []}
+    rows = []
+    for symbol, price in sorted(last_closes.items()):
+        if price is None or float(price) <= 0:
+            continue
+        ceiling = min([float(max_position)] + [float(cap) for _, cap, members in groups if symbol in members])
+        weight = float(price) / equity
+        if weight > ceiling:
+            rows.append({"symbol": symbol, "share_price": round(float(price), 2), "one_share_weight": round(weight, 4),
+                         "max_weight": round(ceiling, 4), "held": symbol in held})
+    return {"equity": round(equity, 2), "unaffordable": rows,
+            "meaning": "Whole shares only: one share of each listed symbol is worth more than the most this account "
+                       "may hold of it, so a target cannot buy it at all. Do not target these for purchase; holding "
+                       "or selling an existing position is unaffected. Research on them remains useful."}

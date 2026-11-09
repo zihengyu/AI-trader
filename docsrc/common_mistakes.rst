@@ -365,6 +365,13 @@ idea for that day is held at the current weight when the idea's calibrated
 edge does not cover that cost. The journal records it as ``trade_value_held``.
 Reductions, sells and protective exits are never limited.
 
+**A symbol the AI never buys.** The fund buys whole shares. When one share at
+the last close is worth more than the symbol's ceiling, no target can buy it.
+The ceiling is the smallest of the single-position limit and the caps of its
+groups, such as 5% for a leveraged ETF. The AI's context lists such symbols, and
+Telegram says when the list changes. Raise the authorized capital or the cap to
+trade them.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once

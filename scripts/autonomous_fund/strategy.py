@@ -960,6 +960,29 @@ class AutonomousFund(Strategy):
         except Exception as exc:  # The registry records the experiments; it never stops them.
             self._disclose_failure("experiment_registry_error", exc, phase="postmarket_review")
 
+    def _affordability(self, equity, positions, now):
+        """Symbols one share of which is above their position ceiling at this equity (whole shares only).
+
+        The operator hears once per New York day when that list changes: the AI is told not to
+        target them, and trading them needs more authorized capital or a higher cap.
+        """
+        from .trade_value import affordability
+        try:
+            snapshot = self._market_snapshot(now) or {}
+            closes = {s: v.get("last_close") for s, v in (snapshot.get("symbols") or {}).items() if s in self.universe}
+            groups = getattr(getattr(self, "quant", None), "groups", ())
+            held = {s for s, q in (positions or {}).items() if number(q) != 0}
+            result = affordability(closes, equity, self.limits.max_position, groups, held)
+        except Exception as exc:  # Context for the AI: never costs the decision or the research.
+            return {"unavailable": type(exc).__name__}
+        names = sorted(row["symbol"] for row in result["unaffordable"])
+        noted = self.journal.get_meta("unaffordable_notified") or {}
+        if names != noted.get("symbols", []) and noted.get("day") != trading_day(now):
+            self.journal.set_meta("unaffordable_notified", {"day": trading_day(now), "symbols": names})
+            if names or noted.get("symbols"):
+                self._notify_fund("unaffordable_symbols", result)
+        return result
+
     def _trade_value_model(self, now):
         """V2 4.5, built once per decision: round-trip costs for the manager, and once the research
         ideas are calibrated, what the allocation uses to decline purchases that do not cover them."""
@@ -1143,6 +1166,8 @@ class AutonomousFund(Strategy):
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
+                       "affordability": self._affordability((account or {}).get("equity"), (account or {}).get("positions")
+                                                            or {}, now) if "unavailable" not in account else None,
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
@@ -1813,6 +1838,7 @@ class AutonomousFund(Strategy):
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
                    "trade_value": self._trade_value_model(now),
+                   "affordability": self._affordability(account.equity, account.positions, now),
                    "factor_lab": self._factor_context(now),
                    "macro": self._macro_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
