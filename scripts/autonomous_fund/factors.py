@@ -249,6 +249,32 @@ def daily_ic(factor, close, horizon, min_names):
     return frame[(count >= min_names) & ic.notna()]
 
 
+def daily_ic_within(factor, close, horizon, min_names, sectors):
+    """Per-date rank IC after removing each sector's mean rank: does the factor pick within sectors?
+
+    Ranks are taken across the whole cross-section, as in daily_ic, then demeaned within each
+    sector (names without a sector form one group); a factor that only separates sectors
+    scores about zero here. Names alone in their sector carry no within-sector information.
+    """
+    forward = close.shift(-horizon) / close - 1
+    both = factor.notna() & forward.notna()
+    fr, rr = factor.where(both).rank(axis=1), forward.where(both).rank(axis=1)
+    labels = [sectors.get(column, "unassigned") for column in close.columns]
+
+    def within(frame):
+        means = frame.T.groupby(labels).transform("mean").T
+        return frame - means
+    a, b = within(fr), within(rr)
+    peers = both.T.groupby(labels).transform("sum").T
+    informative = both & (peers >= 2)
+    a, b = a.where(informative), b.where(informative)
+    denominator = np.sqrt((a * a).sum(axis=1) * (b * b).sum(axis=1))
+    ic = (a * b).sum(axis=1) / denominator.where(denominator > 0)
+    count = informative.sum(axis=1)
+    frame = pd.DataFrame({"ic": ic, "spread": np.nan, "names": count})
+    return frame[(count >= min_names) & ic.notna()]
+
+
 def summarize(rows):
     n = len(rows)
     if n == 0:
@@ -433,20 +459,34 @@ class FactorSettings:
         return cls(**section)
 
 
-def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None):
+def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None, sectors=None):
     """In-sample, holdout and walk-forward evidence with a verdict. close/volume end at the last completed session."""
     if type(horizon) is not int or not 1 <= horizon <= 20:
         raise RiskError("Factor horizon must be 1..20 sessions")
-    return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff)
+    return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff,
+                           sectors=sectors)
 
 
-def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None):
-    """The evidence standard applied to a computed factor panel (also used by the negative control)."""
+def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, sectors=None):
+    """The evidence standard applied to a computed factor panel (also used by the negative control).
+
+    With `sectors` ({symbol: sector}) the within-sector IC on the same dates is reported as
+    `sector_neutral`. It is evidence, not a criterion: a sector-rotation factor can be real,
+    but the AI should know it is a sector bet rather than stock selection.
+    """
     rows = daily_ic(factor, close, horizon, settings.min_names)
     sampled = rows.iloc[::horizon]  # Non-overlapping forward windows: honest t-statistics.
     split = int(round(len(sampled) * (1 - settings.holdout_fraction)))
     inside, holdout = sampled.iloc[:split], sampled.iloc[split:]
+    neutral = None
+    if sectors:
+        within = daily_ic_within(factor, close, horizon, max(4, settings.min_names // 2), sectors)
+        neutral = {"in_sample": summarize(within[within.index.isin(inside.index)]),
+                   "holdout": summarize(within[within.index.isin(holdout.index)]),
+                   "meaning": "rank IC after removing each sector's mean rank, on the same dates; near zero means "
+                              "the factor mostly separates sectors (a sector bet), not stocks within them"}
     result = {"in_sample": summarize(inside), "holdout": summarize(holdout), "trials": trials,
+              **({"sector_neutral": neutral} if neutral else {}),
               "critical_t": critical_t(trials, settings.significance), "knowledge": knowledge(sampled, cutoff),
               "first_date": str(sampled.index[0].date()) if len(sampled) else None,
               "last_date": str(sampled.index[-1].date()) if len(sampled) else None}
@@ -604,7 +644,7 @@ class FactorLab:
         with self.journal.connection() as db:
             return db.execute("SELECT count(*) FROM fund_factors").fetchone()[0]
 
-    def test(self, proposals, now, session_date, close, volume=None, extra=None, models=()):
+    def test(self, proposals, now, session_date, close, volume=None, extra=None, models=(), sectors=None):
         """Evaluate the review's proposals in their cross-section; a repeated expression is not a new trial.
 
         `models` wrote the proposals; their knowledge cutoff separates the clean out-of-sample record.
@@ -638,7 +678,8 @@ class FactorLab:
             trials = self.trials() + (0 if existing else 1)
             try:
                 close_, volume_, extra_ = _fields(data)
-                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_, cutoff)
+                outcome = evaluate(expression, horizon, close_, volume_, self.settings, trials, extra_, cutoff,
+                                   sectors=sectors if universe == "stocks" else None)
                 if outcome["status"] == "validated":
                     outcome = self._redundancy(outcome, expression, universe, data)
             except RiskError as exc:
@@ -747,6 +788,7 @@ class FactorLab:
                 "turnover, and a factor that mostly re-ranks like a validated one is redundant. Each factor names its "
                 "cross-section (stocks incl. the research universe, or etfs); favored lists only tradable names. "
                 "Evidence, not orders: weigh it with research."),
+            "survivorship": SURVIVORSHIP_NOTE,
             "trials": len(tried), "next_critical_t": critical_t(len(tried) + 1, self.settings.significance),
             "validated": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
                            "universe": r.get("universe") or "stocks",
@@ -763,11 +805,23 @@ class FactorLab:
         }
 
 
+SURVIVORSHIP_NOTE = ("Survivorship bias: every historical cross-section uses today's universe and research list. "
+                     "Stocks that were delisted, acquired or dropped from an index are missing, so historical ICs and "
+                     "spreads are optimistic. The live record after validation has no such bias.")
+SURVIVORSHIP_TEXT = "历史检验只含当前还在交易的股票，退市、被收购和被剔出指数的不在其中（幸存者偏差），历史 IC 偏乐观；验证之后的样本外记录不受影响。"
+
+
 def _evidence_flags(evidence):
-    """Walk-forward agreement and memorization risk; factors validated before they existed show None."""
+    """Walk-forward agreement, memorization risk and sector bets; factors validated before they existed show None."""
     windows, memory = evidence.get("walk_forward") or {}, evidence.get("knowledge") or {}
+    neutral, direction = (evidence.get("sector_neutral") or {}).get("in_sample") or {}, evidence.get("direction")
+    within_t = neutral.get("t")
     return {"walk_forward_agreeing": (f"{windows['agreeing']}/{len(windows['windows'])}" if windows else None),
-            "memory_risk": memory.get("memory_risk"), "clean_out_of_sample": memory.get("clean_out_of_sample")}
+            "memory_risk": memory.get("memory_risk"), "clean_out_of_sample": memory.get("clean_out_of_sample"),
+            "sector_neutral_t": within_t,
+            # True: within sectors the factor does not keep its direction with |t| >= 1, so it is mostly a sector bet.
+            "mostly_sector_bet": (None if not neutral or direction is None else
+                                  within_t is None or within_t * direction < 1)}
 
 
 def panel_from_rows(history):

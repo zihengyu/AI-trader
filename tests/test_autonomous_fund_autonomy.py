@@ -352,7 +352,9 @@ def test_strategy_scorecards_read_reviews_and_one_decision_per_session(tmp_path)
     assert stops["count"] == 1 and stops["1"]["observed"] == 1 and stops["5"]["observed"] == 0  # Later: pending.
     summary = strategy._scorecard_summary(NOW)
     assert set(summary) == {"predictions", "research_ideas", "decisions", "decisions_by_prompt_version", "construction",
-                            "timing"} and "recent" not in summary["timing"]
+                            "timing", "consistency"} and "recent" not in summary["timing"]
+    # The manager's reversals count every validated decision: three identical ones are one move, no reversal.
+    assert (summary["consistency"]["decisions"], summary["consistency"]["moves"], summary["consistency"]["reversals"]) == (3, 1, 0)
 
 
 def test_timing_scorecard_grades_the_ais_own_exits_and_entry_waits():

@@ -250,7 +250,7 @@ def _series_pairs(rows):
     return [(str(day), float(close)) for day, close in rows or []]
 
 
-def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS):
+def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BPS, sectors=None):
     """Forward return of each AI target portfolio vs a BETA-MATCHED benchmark, gross and net of costs.
 
     decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
@@ -262,8 +262,27 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     beta_assumed. Costs: |change in target weights| versus the previous decision
     (the first one starts from cash) times cost_bps per side. Cash earns zero and
     the risk overlay is excluded: this isolates the AI's selection skill.
+
+    With `sectors` ({symbol: sector}) the excess also splits, exactly, into
+    within_sector_selection (each holding against the equal-weighted return of its
+    sector's names with closes), sector_allocation (that sector return against the
+    holding's beta x benchmark: a sector bet) and unassigned_excess (holdings with no
+    sector, such as broad or bond ETFs). A portfolio that only overweights a rising
+    sector shows its excess as sector_allocation, not stock selection.
     """
     rows, previous = [], {}
+    members = {}
+    for symbol, sector in (sectors or {}).items():
+        members.setdefault(sector, []).append(symbol)
+    sector_cache = {}
+
+    def sector_return(sector, day, horizon):
+        key = (sector, day, horizon)
+        if key not in sector_cache:
+            paths = [_forward(closes.get(s), day, horizon, sessions=sessions) for s in members.get(sector, ())]
+            returns = [p[1] / p[0] - 1 for p in paths if isinstance(p, tuple)]
+            sector_cache[key] = sum(returns) / len(returns) if returns else None
+        return sector_cache[key]
     sessions, _ = _series(closes.get(benchmark))
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
@@ -300,6 +319,20 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                     "excess_return": excess, "cost": cost, "net_excess_return": excess - cost,
                     "exposure_matched_benchmark_return": exposure * benchmark_return,
                     "exposure_excess_return": portfolio - exposure * benchmark_return}
+                if sectors:
+                    selection = allocation = other = assigned = 0.0
+                    for symbol, weight in weights.items():
+                        own = paths[symbol][1] / paths[symbol][0] - 1
+                        peer = sector_return(sectors[symbol], day, horizon) if symbol in sectors else None
+                        if peer is None:
+                            other += weight * (own - betas[symbol] * benchmark_return)
+                            continue
+                        assigned += weight
+                        selection += weight * (own - peer)
+                        allocation += weight * (peer - betas[symbol] * benchmark_return)
+                    row["horizons"][str(horizon)].update(
+                        within_sector_selection=selection, sector_allocation=allocation, unassigned_excess=other,
+                        sector_assigned_weight=assigned)
         rows.append(row)
 
     def summary(selected):
@@ -316,6 +349,12 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                 "positive_excess_rate": sum(e > 0 for e in gross) / len(gross) if gross else None,
                 "mean_exposure_excess_return": (sum(o["exposure_excess_return"] for o in observed) / len(observed)
                                                 if observed else None)}
+            split = [o for o in observed if "within_sector_selection" in o]
+            if split:
+                result[str(horizon)].update(
+                    mean_within_sector_selection=sum(o["within_sector_selection"] for o in split) / len(split),
+                    mean_sector_allocation=sum(o["sector_allocation"] for o in split) / len(split),
+                    positive_within_sector_rate=sum(o["within_sector_selection"] > 0 for o in split) / len(split))
         return result
 
     versions = {}
@@ -399,3 +438,56 @@ def score_timing(events, closes):
                           "submitted buy limit with the ask when waiting began. Small samples are noise; use this to "
                           "calibrate how tight stops and entry limits should be, not to stop using protection.",
     }
+
+
+REVERSAL_SESSIONS = 3  # A move against the previous move within this many sessions is a reversal.
+MOVE_STEP = 0.01  # Target changes smaller than one weight point are not moves.
+
+
+def score_consistency(decisions, triggers, cost_bps=DEFAULT_COST_BPS, window=REVERSAL_SESSIONS):
+    """How often the manager reverses itself: a target move against the same symbol's previous move.
+
+    decisions: (at, body) validated decisions in order; triggers: (at, kind, body) protective
+    triggers. A move is a target weight change of at least MOVE_STEP (a symbol added,
+    raised, lowered or removed). A reversal is a move in the opposite direction of that
+    symbol's previous move within `window` NYSE sessions, with no protective exit (stop or
+    take-profit) of the symbol in between: the manager changed its mind, the market did
+    not force it. Each reversal pays about the round trip of the reversed amount, so its
+    estimated cost is 2 x |change| x cost_bps of equity.
+    """
+    import pandas_market_calendars as mcal
+    if not decisions:
+        return {"decisions": 0, "moves": 0, "reversals": 0, "reversal_rate": None, "estimated_cost": 0.0,
+                "window_sessions": window, "recent": []}
+    days = [instant(at).astimezone(ZONE).date() for at, _ in decisions]
+    calendar = [index.date() for index in mcal.get_calendar("NYSE").schedule(
+        start_date=min(days), end_date=max(days)).index]
+    position = {day: i for i, day in enumerate(calendar)}
+    exits = sorted((instant(at), body.get("symbol")) for at, _, body in triggers if body.get("symbol"))
+    weights, moved, moves, reversals, cost, recent = {}, {}, 0, 0, 0.0, []
+    for (at, body), day in zip(decisions, days):
+        moment = instant(at)
+        now = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
+        for symbol in sorted(set(now) | set(weights)):
+            change = now.get(symbol, 0.0) - weights.get(symbol, 0.0)
+            if abs(change) < MOVE_STEP:
+                continue
+            moves += 1
+            sign, previous = (1 if change > 0 else -1), moved.get(symbol)
+            if previous and previous[0] != sign:
+                apart = position.get(day, len(calendar)) - position.get(previous[1], -len(calendar))
+                forced = any(previous[2] < when <= moment and name == symbol for when, name in exits)
+                if 0 <= apart <= window and not forced:
+                    reversals += 1
+                    cost += 2 * abs(change) * cost_bps / 10_000
+                    recent.append({"symbol": symbol, "first_move_at": previous[2].isoformat(), "reversed_at": moment.isoformat(),
+                                   "sessions_apart": apart, "change": round(change, 4)})
+            moved[symbol] = (sign, day, moment)
+        weights = now
+    return {"decisions": len(decisions), "moves": moves, "reversals": reversals,
+            "reversal_rate": reversals / moves if moves else None, "estimated_cost": round(cost, 6),
+            "window_sessions": window, "cost_bps_per_side": cost_bps, "recent": recent[-8:],
+            "interpretation": "A reversal is a target move against the same symbol's previous move within "
+                              "window_sessions sessions with no stop or take-profit in between. estimated_cost is a "
+                              "fraction of equity: about the round trip of each reversed amount. A high reversal rate "
+                              "means the manager changes its mind faster than its own horizon."}

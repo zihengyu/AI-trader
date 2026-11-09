@@ -210,7 +210,8 @@ def daily_document(root, sequence):
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
-                  "决策超额收益（1/5/20 个交易日；已扣除组合 beta 对应的市场涨跌，net 再扣交易成本）："
+                  "决策超额收益（1/5/20 个交易日；已扣除组合 beta 对应的市场涨跌，net 再扣交易成本；"
+                  "within_sector_selection＝行业内选股，sector_allocation＝押行业带来的部分）："
                   + json.dumps(decisions, ensure_ascii=False)]
         line = idea_text(card.get("ideas"))
         if line:
@@ -224,6 +225,12 @@ def daily_document(root, sequence):
                       f"{_percent(profit['5']['mean_value_added'])}（负＝卖早了）；等待入场 {waits['count']} 次，"
                       f"买入 {waits['entered']} 次，平均价格改善 {_percent(waits['mean_entry_improvement'])}，"
                       f"未买入的 5 日后平均贡献 {_percent(waits['not_entered']['5']['mean_value_added'])}（负＝错过了上涨）"]
+        consistency = card.get("consistency")
+        if consistency and consistency.get("moves"):
+            lines.append(f"决策反复：最近 {consistency['decisions']} 次决策调整目标 {consistency['moves']} 次，"
+                         f"{consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
+                         f"（{_percent(consistency['reversal_rate'])}，不含止损止盈），"
+                         f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
         lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
         lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
@@ -231,9 +238,15 @@ def daily_document(root, sequence):
     results = [result for kind, body in related if kind == "factor_tests" for result in body.get("results", [])]
     for result in results:
         sample, holdout = result.get("in_sample") or {}, result.get("holdout") or {}
+        within = ((result.get("sector_neutral") or {}).get("in_sample") or {}).get("t")
         lines.append(f"- {result.get('name')}：`{result.get('expression')}`（{result.get('horizon_sessions', '?')} 日）→ "
                      f"{FACTOR_STATUS.get(result.get('status'), result.get('status'))}；样本内 t={sample.get('t')}，"
-                     f"样本外 t={holdout.get('t')}；{result.get('reason', '')}")
+                     f"样本外 t={holdout.get('t')}"
+                     + (f"，行业内 t={within}（接近 0 说明主要是押行业，不是行业内选股）" if result.get("sector_neutral") else "")
+                     + f"；{result.get('reason', '')}")
+    if results:
+        from .factors import SURVIVORSHIP_TEXT
+        lines.append(f"- 注意：{SURVIVORSHIP_TEXT}")
     lines += ([] if results else ["本次没有提出新因子。"]) + [""]
     health = Counter(body.get("kind") for at, kind, body in events if kind == "notification" and
                      body.get("kind") in HEALTH_KINDS and instant(at).astimezone(zone).date().isoformat() == day)
@@ -697,6 +710,11 @@ def weekly_document(root, sequence):
                + (f"（另有 {model['unpriced']} 次未定价，不按 0 计）" if model["unpriced"] else "")
                + ("；按角色：" + "、".join(f"{r} {v:.4f}" for r, v in sorted(model["by_role"].items()))
                   if model["by_role"] else "")) if model["calls"] else f"- 模型调用：{NO_DATA}"]
+    from .holdings import day_trades
+    week_trades = day_trades([(at, kind, body) for at, kind, body in events if kind in {"fill", "fill_reconciled"}],
+                             cutoff)["by_day"]
+    lines.append(f"- 日内交易（同一天买入又卖出）：本周 {sum(n for d, n in week_trades.items() if monday <= d <= sunday)} 次"
+                 "（美股保证金实盘账户总净值低于 2.5 万美元时，5 个交易日内超过 3 次会被限制；模拟盘不受影响）")
     from .call_value import from_events, lines as value_lines
     week = [(at, kind, body) for at, kind, body in events if kind in {"agent", "agent_outcome", "review_skipped",
             "critic_reused"} and monday <= instant(at).astimezone(zone).date().isoformat() <= sunday]
@@ -730,6 +748,12 @@ def weekly_document(root, sequence):
                              f"平均把握 {_percent(value['mean_confidence'])}")
     else:
         lines.append(NO_DATA)
+    consistency = (card or {}).get("consistency")
+    if consistency and consistency.get("moves"):
+        lines.append(f"- 决策反复：最近 {consistency['decisions']} 次有效决策中，目标调整 {consistency['moves']} 次，"
+                     f"其中 {consistency['reversals']} 次在 {consistency['window_sessions']} 个交易日内反向调整"
+                     f"（{_percent(consistency['reversal_rate'])}，不含止损止盈触发的），"
+                     f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
     tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
     control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
     lines += ["", "## 五、因子实验进展【统计推断】", ""]
@@ -742,6 +766,8 @@ def weekly_document(root, sequence):
     lines.append(f"- 随机因子负对照（{control['as_of']}）：样本内通过率 {_percent(control.get('in_sample_pass_rate'))}，"
                  f"最终通过率 {_percent(control.get('validated_rate'))}，显著性 {_percent(control.get('significance'))}"
                  if control else f"- 随机因子负对照：{NO_DATA}")
+    from .factors import SURVIVORSHIP_TEXT
+    lines.append(f"- 注意：{SURVIVORSHIP_TEXT}")
     learning = next((b for _, k, b in reversed(events) if k == "learning_evaluation"), None)
     construction = (card or {}).get("construction")
     lines += ["", "## 六、对照实验状态【统计推断】", ""]

@@ -652,7 +652,7 @@ def main(argv=None):
 def factor_lab(args, config):
     """Offline: test one factor expression on recorded daily CSVs (Date, Close and optional Volume)."""
     import pandas as pd
-    from .factors import FactorSettings, canonical, evaluate
+    from .factors import SURVIVORSHIP_NOTE, FactorSettings, canonical, evaluate
     if not args.data_dir or not args.symbols or not args.expression:
         raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
     section = dict(config.get("factor_lab") or {})
@@ -679,6 +679,7 @@ def factor_lab(args, config):
     return {"expression": expression, "horizon_sessions": args.horizon, "names": close.shape[1],
             "first_close": str(close.index[0].date()), "last_close": str(close.index[-1].date()),
             "note": "One offline test (trials=1). In the running fund every distinct expression raises the bar.",
+            "survivorship": SURVIVORSHIP_NOTE,
             **result}
 
 

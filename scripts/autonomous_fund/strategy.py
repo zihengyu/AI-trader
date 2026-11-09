@@ -986,6 +986,24 @@ class AutonomousFund(Strategy):
                 self._notify_fund("unaffordable_symbols", result)
         return result
 
+    def _sectors(self):
+        """{symbol: GICS sector} from the risk groups, for sector-neutral scoring."""
+        from .quant import sectors
+        return sectors(getattr(getattr(self, "quant", None), "groups", ()))
+
+    def _day_trades(self, now):
+        """Same-day round trips in the last five sessions, for the manager (never a reason to fail a decision)."""
+        from .holdings import day_trades
+        try:
+            fills = [(r["at"], r["kind"], r["body"]) for r in self.journal.events(("fill", "fill_reconciled"))]
+            count = day_trades(fills, now)
+        except Exception as exc:
+            return {"unavailable": type(exc).__name__}
+        return {"last_sessions": count["last_sessions"], "window": count["window"], "limit": count["limit"],
+                "meaning": "Buying and selling the same symbol on one New York day is a day trade. In a US margin "
+                           "account below 25,000 USD, more than 3 in 5 sessions restricts the account for 90 days. "
+                           "This paper account is unaffected; prefer decisions that do not need same-day exits."}
+
     def _trade_value_model(self, now):
         """V2 4.5, built once per decision: round-trip costs for the manager, and once the research
         ideas are calibrated, what the allocation uses to decline purchases that do not cover them."""
@@ -1842,6 +1860,7 @@ class AutonomousFund(Strategy):
                    "scorecards": self._scorecard_summary(now),
                    "trade_value": self._trade_value_model(now),
                    "affordability": self._affordability(account.equity, account.positions, now),
+                   "day_trades": self._day_trades(now),
                    "factor_lab": self._factor_context(now),
                    "macro": self._macro_context(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
@@ -2295,7 +2314,7 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == key:
             return cached[1]
         from .review import _events
-        from .scorecard import score_decisions, score_ideas, score_predictions, score_timing
+        from .scorecard import score_consistency, score_decisions, score_ideas, score_predictions, score_timing
         rows = _events(self.journal, instant(now), kinds=kinds)
         ideas = [r["body"] for r in rows if r["kind"] == "research_idea"][-200:]
         variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
@@ -2310,6 +2329,10 @@ class AutonomousFund(Strategy):
         decisions = [by_day[day] for day in sorted(by_day)][-60:]
         allowed = set(self.universe) | {"SPY", "QQQ"}
         symbols = {"SPY"} | {t["symbol"] for _, body in decisions for t in body["targets"]}
+        # Sector-neutral scoring compares each holding with its sector's names.
+        sector_of = self._sectors()
+        held_sectors = {sector_of[s] for s in symbols if s in sector_of}
+        symbols |= {s for s, sector in sector_of.items() if sector in held_sectors}
         for packet in reviews:
             for prediction in packet["review"].get("predictions", []):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
@@ -2321,9 +2344,12 @@ class AutonomousFund(Strategy):
         allowed_ideas = allowed | (set(lab.settings.research_universe) if lab is not None else set())
         closes = {symbol: self._daily_closes(symbol, now)
                   for symbol in sorted((symbols & allowed) | (idea_symbols & allowed_ideas))}
+        validated = [(r["at"], r["body"]) for r in rows if r["kind"] == "decision_validated"][-200:]
+        triggers = [(at, kind, body) for at, kind, body in timing if kind == "protective_trigger"]
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes),
                   "ideas": score_ideas(ideas, closes),
-                  "decisions": score_decisions(decisions, closes), "timing": score_timing(timing, closes)}
+                  "decisions": score_decisions(decisions, closes, sectors=sector_of), "timing": score_timing(timing, closes),
+                  "consistency": score_consistency(validated, triggers)}
         settings = getattr(self, "construction", None)
         if settings is not None:
             from .construction import evaluate
@@ -2427,7 +2453,10 @@ class AutonomousFund(Strategy):
                 "decisions": cards["decisions"]["by_horizon"],
                 "decisions_by_prompt_version": dict(list(cards["decisions"].get("by_prompt_version", {}).items())[-3:]),
                 "construction": cards.get("construction"),
-                "timing": {k: v for k, v in cards["timing"].items() if k != "recent"}}
+                "timing": {k: v for k, v in cards["timing"].items() if k != "recent"},
+                # The manager's own reversals: changing its mind within a few sessions pays round trips.
+                "consistency": {k: v for k, v in (cards.get("consistency") or {}).items() if k != "recent"} |
+                               {"recent": (cards.get("consistency") or {}).get("recent", [])[-4:]}}
 
     def _request_cancel(self, pending, order, now, kind=None, detail=None):
         """Ask once, then only again after CANCEL_RETRY_SECONDS: broker cancellation is asynchronous."""

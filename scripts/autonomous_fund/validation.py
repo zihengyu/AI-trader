@@ -314,6 +314,7 @@ def acceptance(root, criteria=None, now=None):
     from pathlib import Path
     from zoneinfo import ZoneInfo
     import pandas_market_calendars as mcal
+    from .holdings import day_trades
     from .risk import instant
     criteria = {**ValidationSettings.ACCEPTANCE, **(criteria or {})}
     root = Path(root)
@@ -411,6 +412,9 @@ def acceptance(root, criteria=None, now=None):
         "bookkeeping_errors": sum(1 for n in notes if n.get("kind") == "bookkeeping_error"),
         "auto_resumes": count("auto_resume"),
         "ledger_status": integrity["status"], "fills_with_unknown_slippage": slippage_unknown,
+        # US pattern day trader count: informational, a paper account is not restricted.
+        "day_trades": day_trades([(at, kind, body) for at, kind, body in events if kind in {"fill", "fill_reconciled"}],
+                                 now),
     }
     checks = [
         ("local_ledger_verified", integrity["status"], "verified or not_applicable",
@@ -595,7 +599,7 @@ def investment_markdown(result):
               f"- 交易日：{stats.get('sessions')}；年化夏普：{stats.get('sharpe_annualized')}",
               f"- 真实夏普 > 0 的概率（PSR）：{pct(stats.get('probabilistic_sharpe'))}；"
               f"扣除 {stats.get('configurations_tried')} 种配置试错后的概率（DSR）：{pct(stats.get('deflated_sharpe'))}",
-              f"- 试错计数：" + ("；".join(f"{TRIAL_LABELS.get(k, k)} {v}" for k, v in
+              "- 试错计数：" + ("；".join(f"{TRIAL_LABELS.get(k, k)} {v}" for k, v in
                                         (stats.get("configurations_breakdown") or {}).items() if k != "total") or "—"),
               f"- 达到 95% 置信所需的最短记录：{stats.get('min_track_record_sessions')} 个交易日",
               f"- 相对 SPY：beta {regression.get('beta')}，年化 alpha {regression.get('alpha_annualized')}，"

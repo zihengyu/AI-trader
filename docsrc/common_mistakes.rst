@@ -466,6 +466,21 @@ during the session counts at the next decision. The context also lists
 affordable symbols of which at most four shares fit, because a target is
 rounded down to whole shares.
 
+**Biases the review accounts for.** Four things could make the record look better
+than the skill behind it.
+
+- Sector bets: decision excess beyond beta splits exactly into
+  within-sector selection, the sector bet and holdings without a sector.
+  Stock-cross-section factor tests also report a within-sector IC, and the AI
+  sees ``mostly_sector_bet``.
+- Survivorship: historical factor tests use today's names only; the AI's
+  context and the reports say so.
+- Reversals: the manager sees how often it reversed a target within three
+  sessions without a stop or take-profit, and what that cost. The daily and
+  weekly reports show it too.
+- Day trades: ``fund-logs.sh`` shows the same-day round trips of the last five
+  sessions, the US pattern day trader count. Paper accounts are unaffected.
+
 Reads of event kinds that contain no NAV marks (scorecards, shadow decisions)
 no longer audit every NAV mark, and the daily attribution reads the bodies of
 only the two marks it compares. A full NAV-mark check converts each value once
