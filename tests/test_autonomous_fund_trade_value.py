@@ -205,7 +205,8 @@ def test_live_rechecks_run_in_local_and_paper_mode_only(tmp_path):
     strategy = harness(tmp_path)
     strategy._market_snapshot = lambda now: {"symbols": {"ALFA": {"last_close": 1020.0}}}
     quoted = []
-    strategy._alert_price = lambda symbol: quoted.append(symbol) or SimpleNamespace(price=Decimal("990"))
+    # Purchase affordability now uses execution's ask, rather than an alert's last trade or midpoint.
+    strategy._price = lambda symbol, record=True: quoted.append(symbol) or SimpleNamespace(ask=Decimal("990"))
     replay = strategy._affordability(Decimal("10000"), {}, NOW)
     assert quoted == [] and [r["symbol"] for r in replay["unaffordable"]] == ["ALFA"]  # Replays keep the close.
     strategy.mode = "local"

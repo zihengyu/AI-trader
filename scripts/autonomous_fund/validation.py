@@ -242,7 +242,7 @@ def session_returns(events, sessions, zone):
 
 
 def interval_model_costs(events, pairs):
-    """Model cost (USD) between each pair's marks; None when a call there was unpriced."""
+    """Model cost between marks; an unpriced call stays unknown even without usage."""
     from .costs import scripted
     from .risk import instant
     calls = [(instant(at), body) for at, kind, body in events
@@ -250,7 +250,7 @@ def interval_model_costs(events, pairs):
     costs = []
     for pair in pairs:
         inside = [body for at, body in calls if pair["start"] < at <= pair["end"]]
-        if any(body.get("cost_usd") is None and body.get("usage") for body in inside):
+        if any(body.get("cost_usd") is None for body in inside):
             costs.append(None)
         else:
             costs.append(sum(float(body.get("cost_usd") or 0) for body in inside))

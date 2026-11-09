@@ -9,10 +9,11 @@ factor lab only: the local virtual broker still matches orders and books
 dividends and splits from its own feed. The consolidated (SIP) feed is asked
 first; an account without it falls back to IEX bars, and the source is recorded.
 """
+import math
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-from .risk import RiskError
+from .risk import RiskError, instant, number
 
 URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 ZONE = ZoneInfo("America/New_York")
@@ -56,9 +57,14 @@ class AlpacaDailyHistory:
             raw = self._pages(symbol, params)
         rows = []
         for bar in raw:
-            day = datetime.fromisoformat(str(bar["t"]).replace("Z", "+00:00")).astimezone(ZONE).date()
+            # Source timestamps must identify a real instant. Interpreting a
+            # naive value in the host timezone can admit today's bar as yesterday.
+            day = instant(bar["t"]).astimezone(ZONE).date()
             if day < today and bar.get("c") is not None:
-                rows.append((day, float(bar["c"]), float(bar.get("v") or 0), float(bar.get("o") or "nan"),
+                close = float(number(bar["c"]))
+                if not math.isfinite(close) or close <= 0:
+                    raise RiskError("Alpaca history requires finite positive closes")
+                rows.append((day, close, float(bar.get("v") or 0), float(bar.get("o") or "nan"),
                              float(bar.get("h") or "nan"), float(bar.get("l") or "nan")))
         if not rows:
             raise RiskError(f"Alpaca returned no completed daily bars for {symbol}")

@@ -974,8 +974,8 @@ class AutonomousFund(Strategy):
             held = {s for s, q in (positions or {}).items() if number(q) != 0}
             # Near its ceiling a symbol is re-checked with a current quote, so a move during the
             # session counts at the next decision. Replays keep the completed close.
-            live = (lambda symbol: self._alert_price(symbol).price) if self.mode in {"local", "paper"} else None
-            result = affordability(closes, equity, self.limits.max_position, groups, held, live=live)
+            live = (lambda symbol: self._price(symbol, record=False).ask) if self.mode in {"local", "paper"} else None
+            result = affordability(closes, equity, self.limits.max_position, groups, held, live=live, limits=self.limits)
         except Exception as exc:  # Context for the AI: never costs the decision or the research.
             return {"unavailable": type(exc).__name__}
         names = sorted(row["symbol"] for row in result["unaffordable"])

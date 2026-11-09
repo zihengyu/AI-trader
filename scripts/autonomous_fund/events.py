@@ -2,7 +2,7 @@
 
 A stop-loss cannot protect against an overnight gap, and earnings are the most
 common scheduled cause of one. When a stock in the universe reports earnings
-today or within `earnings_window_days` business days, its weight is capped at
+today or within `earnings_window_days` NYSE sessions, its weight is capped at
 `earnings_max_position` until the date has passed; the risk engine sells the
 excess automatically, like any other reduction. ETFs are not capped.
 
@@ -17,8 +17,6 @@ import os
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
-
-import numpy as np
 
 from .risk import RiskError, number
 
@@ -40,7 +38,7 @@ class EventSettings:
         if not Decimal("0") <= self.earnings_max_position <= Decimal("1"):
             raise RiskError("events.earnings_max_position must be 0..1")
         if type(self.earnings_window_days) is not int or not 0 <= self.earnings_window_days <= 5:
-            raise RiskError("events.earnings_window_days must be 0..5 business days")
+            raise RiskError("events.earnings_window_days must be 0..5 NYSE sessions")
         if self.source not in SOURCES:
             raise RiskError("events.source must be one of: " + ", ".join(SOURCES))
 
@@ -105,11 +103,16 @@ def bounded(function, seconds):
 
 
 def within(event_day, today, window_days):
-    """True when the event is today or within `window_days` business days after today."""
+    """Today through the next `window_days` NYSE sessions; zero means today only."""
     event_day, today = _day(event_day), _day(today)
     if event_day < today:
         return False
-    last = np.busday_offset(np.datetime64(today), window_days, roll="forward").astype(date)
+    from .market_data import _session_close
+    last, remaining = today, window_days
+    while remaining > 0:
+        last += timedelta(days=1)
+        if _session_close(last) is not None:
+            remaining -= 1
     return event_day <= last
 
 

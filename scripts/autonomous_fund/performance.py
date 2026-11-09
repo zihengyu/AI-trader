@@ -208,16 +208,19 @@ class PerformanceSettings:
 
 def component_return(prices, actions, a, b):
     """Total return of one symbol from session a's mark to session b's: dividends with an ex-date in (a, b]
-    are added, a split in (a, b] rescales the earlier price. None without both marks."""
+    are paid on the shares held at that time. Same-day dividends use post-split shares.
+    Cash payouts are held, not reinvested. None without both marks."""
     if a not in prices or b not in prices or prices[a] <= 0:
         return None
-    start, paid = prices[a], 0.0
-    for action in actions:
+    shares, paid = 1.0, 0.0
+    # Work in original-share wealth: cash paid before a later split keeps its
+    # dollar value. Sorting also handles actions recorded out of date order.
+    for action in sorted(actions, key=lambda row: (row["date"], 0 if row.get("split") else 1)):
         if a < action["date"] <= b:
             if action.get("split"):
-                start /= float(action["split"])
-            paid += float(action.get("dividend") or 0)
-    return (prices[b] + paid) / start - 1
+                shares *= float(action["split"])
+            paid += shares * float(action.get("dividend") or 0)
+    return (shares * prices[b] + paid) / prices[a] - 1
 
 
 def benchmark_series(definition, pairs, marks, actions):

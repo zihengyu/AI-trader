@@ -20,7 +20,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from .risk import RiskError
+from .risk import RiskError, instant
 
 RANK = {"service": 1, "watchdog": 2, "operator": 3}
 # Faults a fresh process cures. Not resumable: low disk space, an old runner
@@ -37,14 +37,18 @@ def _lock(root):
 def _parse(path):
     try:
         text = path.read_text(encoding="utf-8")
+        record = json.loads(text)
+        if (isinstance(record, dict) and isinstance(record.get("class"), str) and record["class"] in RANK
+                and isinstance(record.get("reason"), str) and record["reason"]):
+            # Missing timestamps in older recognized JSON remain compatible;
+            # an invalid timestamp must not crash the monitor's resume check.
+            if record.get("at") is not None:
+                instant(record["at"])
+            return record
     except FileNotFoundError:
         return None
-    try:
-        record = json.loads(text)
-        if isinstance(record, dict) and record.get("class") in RANK and record.get("reason"):
-            return record
     except ValueError:
-        pass
+        pass  # Invalid JSON, text encoding or timestamp: preserve an operator STOP.
     return {"class": "operator", "reason": "unrecorded", "at": None, "legacy": True}
 
 

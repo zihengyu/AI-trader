@@ -14,11 +14,12 @@ that series unavailable.
 """
 import csv
 import io
+import math
 import os
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from .risk import RiskError
+from .risk import RiskError, number
 
 SERIES = {
     "DGS3MO": "3-month Treasury bill yield, %",
@@ -52,26 +53,36 @@ class MacroSettings:
         return cls(**section)
 
 
+def _clean_observations(rows):
+    """Keep dated finite observations, including legitimate zero and negative rates."""
+    result = []
+    try:
+        observations = iter(rows)
+    except TypeError:
+        return result
+    for row in observations:
+        try:
+            day = date.fromisoformat(str(row[0]).strip()).isoformat()
+            value = float(number(row[1]))
+        except (IndexError, KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value):
+            result.append((day, value))
+    return result
+
+
 def parse_csv(text):
     """fredgraph CSV -> [(YYYY-MM-DD, value)]; missing values ('.' or empty) are skipped, never filled."""
     rows = list(csv.reader(io.StringIO(text)))
     if not rows or len(rows[0]) < 2:
         raise RiskError("FRED returned an unexpected CSV")
-    result = []
-    for row in rows[1:]:
-        if len(row) < 2 or row[1].strip() in {"", "."}:
-            continue
-        try:
-            result.append((date.fromisoformat(row[0].strip()).isoformat(), float(row[1])))
-        except ValueError:
-            continue
-    return result
+    return _clean_observations(rows[1:])
 
 
 def summarize(observations, before_day):
     """Latest value strictly before `before_day`, its 20-observation change and 1-year percentile."""
     before = date.fromisoformat(str(before_day)[:10]).isoformat()
-    usable = sorted((d, v) for d, v in observations if d < before)
+    usable = sorted((d, v) for d, v in _clean_observations(observations) if d < before)
     if not usable:
         return {"unavailable": "no observation before the as-of day"}
     day, latest = usable[-1]
@@ -129,12 +140,16 @@ class MacroWatch:
             response = self.get(API_URL, params={"series_id": name, "api_key": key, "file_type": "json",
                                                  "observation_start": start}, timeout=15)
             response.raise_for_status()
-            return [(row["date"], float(row["value"])) for row in response.json().get("observations", [])
-                    if row.get("value") not in {None, "", "."}]
-        response = self.get(CSV_URL, params={"id": name, "cosd": start}, timeout=15,
-                            headers={"User-Agent": "LumiBot-AutonomousFund/1.0"})
-        response.raise_for_status()
-        return parse_csv(response.text)
+            observations = _clean_observations((row.get("date"), row.get("value"))
+                                               for row in response.json().get("observations", []))
+        else:
+            response = self.get(CSV_URL, params={"id": name, "cosd": start}, timeout=15,
+                                headers={"User-Agent": "LumiBot-AutonomousFund/1.0"})
+            response.raise_for_status()
+            observations = parse_csv(response.text)
+        if not observations:
+            raise RiskError("FRED returned no finite dated observations")
+        return observations
 
     def context(self, as_of_day, may_fetch=None):
         """may_fetch(): when False, series not fetched yet are `deferred` to a later call."""
@@ -150,9 +165,13 @@ class MacroWatch:
                 if version is not None and (stale or version != self._versions.get(name)):
                     saved = self.store.get(today.isoformat(), f"fred_{name}")
                     if saved is not None:
-                        self._raw[name] = cached = (today, [tuple(row) for row in saved])
-                        self._versions[name] = version
-                        stale = False
+                        observations = _clean_observations(saved)
+                        if observations:
+                            self._raw[name] = cached = (today, observations)
+                            self._versions[name] = version
+                            stale = False
+                        # An unusable cache is a miss. Retain any valid in-memory
+                        # data, or fetch normally if this request has budget.
             if stale and may_fetch is not None and not may_fetch():
                 deferred.append(name)
                 series[name] = {"meaning": meaning, "unavailable": "deferred"}
@@ -160,11 +179,17 @@ class MacroWatch:
             if stale:
                 try:
                     self._raw[name] = cached = (today, self._fetch(name, today))
-                    if self.store is not None and not self.historical:
-                        self.store.put(today.isoformat(), f"fred_{name}", cached[1])
-                        self._versions[name] = self.store.version(today.isoformat(), f"fred_{name}")
                 except Exception as exc:
                     self._raw[name] = cached = (today, exc)
+                else:
+                    try:
+                        if self.store is not None and not self.historical:
+                            self.store.put(today.isoformat(), f"fred_{name}", cached[1])
+                            self._versions[name] = self.store.version(today.isoformat(), f"fred_{name}")
+                    except OSError:
+                        # Disk caching is optional for a runner that already has
+                        # valid observations. Keep them in memory for this day.
+                        pass
             if isinstance(cached[1], Exception):
                 error = cached[1]
                 series[name] = {"meaning": meaning,

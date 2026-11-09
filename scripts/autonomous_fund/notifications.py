@@ -463,7 +463,8 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "unaffordable_symbols" and isinstance(details, dict):
         rows = details.get("unaffordable") or []
         if rows:
-            text = (f"ℹ️ 按当前账户净值 {details.get('equity'):,.2f} 美元，下面这些证券一股的价格就超过了它最多能占的仓位。"
+            text = (f"ℹ️ 按当前账户净值 {details.get('equity'):,.2f} 美元，"
+                    "下面这些证券一股的买入限价（含价格缓冲及美分取整）就超过了它最多能占的仓位。"
                     "系统只买整股，所以买不进：\n"
                     + "\n".join(f"- {r['symbol']}：一股约 {r['share_price']:,.2f} 美元"
                                  + ("（实时报价）" if r.get("basis") == "live_quote" else "")

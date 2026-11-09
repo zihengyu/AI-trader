@@ -20,6 +20,8 @@ idea for today is not judged: there is nothing to estimate its edge from.
 """
 from decimal import Decimal
 
+from .risk import Limits, desired_shares, number
+
 MIN_BUCKET = 10
 RISING = {"up": True, "outperform": True, "down": False, "underperform": False}
 
@@ -81,7 +83,7 @@ NEAR_CEILING = 0.10  # Share weights within this fraction of the ceiling are re-
 COARSE_SHARES = 4  # An affordable symbol of which at most this many whole shares fit is listed as coarse.
 
 
-def affordability(last_closes, equity, max_position, groups, held=(), live=None):
+def affordability(last_closes, equity, max_position, groups, held=(), live=None, *, limits=None):
     """Symbols whose single share costs more than the fund may hold of them, and those that fit only a few shares.
 
     The fund buys whole shares. A symbol's ceiling is the smallest of the single-position
@@ -91,43 +93,50 @@ def affordability(last_closes, equity, max_position, groups, held=(), live=None)
     (a current quote) when given, so a move during the session counts at once. A live
     quote that cannot be read leaves the close in use.
 
-    - unaffordable: one share is above the ceiling; no target can buy it.
+    - unaffordable: one share's buffered purchase limit is above the ceiling; no target can buy it.
     - coarse: affordable, but at most COARSE_SHARES whole shares fit under the ceiling; a
       target is rounded down to whole shares, so one below one share's weight buys none.
+    Share counts use the executor's limit buffer and cent rounding. Displayed
+    share prices and weights retain the source observation, before that buffer.
     A held symbol can still be held or sold.
     """
-    equity = float(equity or 0)
+    limits = limits or Limits()
+    equity = number(equity or 0)
     if equity <= 0:
-        return {"equity": equity, "unaffordable": [], "coarse": []}
+        return {"equity": float(equity), "unaffordable": [], "coarse": []}
     unaffordable, coarse = [], []
     for symbol, price in sorted(last_closes.items()):
-        if price is None or float(price) <= 0:
+        if price is None or number(price) <= 0:
             continue
-        ceiling = min([float(max_position)] + [float(cap) for _, cap, members in groups if symbol in members])
+        ceiling = min([number(max_position)] + [number(cap) for _, cap, members in groups if symbol in members])
         if ceiling <= 0:
             continue
-        price, basis = float(price), "last_close"
-        if live is not None and abs(price / equity / ceiling - 1) <= NEAR_CEILING:
+        price, basis = number(price), "last_close"
+        if live is not None and abs(price / equity / ceiling - 1) <= number(NEAR_CEILING):
             try:
-                quoted = float(live(symbol))
+                quoted = number(live(symbol))
                 if quoted > 0:
                     price, basis = quoted, "live_quote"
             except Exception:
                 basis = "last_close (live quote unavailable)"
         weight = price / equity
-        row = {"symbol": symbol, "share_price": round(price, 2), "one_share_weight": round(weight, 4),
-               "max_weight": round(ceiling, 4), "basis": basis}
-        if weight > ceiling:
+        row = {"symbol": symbol, "share_price": round(float(price), 2), "one_share_weight": round(float(weight), 4),
+               "max_weight": round(float(ceiling), 4), "basis": basis}
+        # Reuse execution's Decimal calculation: an unbuffered share can fit
+        # while the rounded purchase limit exceeds the same position cap.
+        shares = desired_shares(equity, ceiling, price, limits)
+        if shares == 0:
             unaffordable.append({**row, "held": symbol in held})
-        else:
-            shares = int(ceiling / weight + 1e-9)
-            if shares <= COARSE_SHARES:
-                coarse.append({**row, "max_shares": shares})
-    return {"equity": round(equity, 2), "unaffordable": unaffordable, "coarse": coarse,
-            "meaning": "Whole shares only. unaffordable: one share is worth more than the most this account may hold "
+        elif shares <= COARSE_SHARES:
+            coarse.append({**row, "max_shares": shares})
+    return {"equity": round(float(equity), 2), "unaffordable": unaffordable, "coarse": coarse,
+            "meaning": "Whole shares only. unaffordable: one share's buffered purchase limit exceeds what this "
+                       "account may hold "
                        "of the symbol, so a target cannot buy it at all; do not target these for purchase. coarse: at "
                        "most max_shares whole shares fit under the ceiling; a target weight is rounded down to whole "
-                       "shares, so a target below one_share_weight buys nothing and one between steps buys the lower "
-                       "step. Holding or selling an existing position is unaffected, and research on these symbols "
+                       "shares. Share counts include the configured purchase limit buffer and upward cent rounding; "
+                       "displayed share_price and one_share_weight are the source price before that buffer, so a "
+                       "target must also cover the buffered purchase price. Holding or selling an existing position "
+                       "is unaffected, and research on these symbols "
                        "remains useful. Prices are the last completed close, or a live quote (basis live_quote) for "
                        "symbols near their ceiling, re-checked at every decision."}

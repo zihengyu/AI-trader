@@ -6,6 +6,54 @@ Common Mistakes and How to Avoid Them
 
 This page documents the most common mistakes made when writing Lumibot strategies, along with the correct patterns to use instead.
 
+Autonomous Fund Scorecards and Whole-Share Purchase Limits
+--------------------------------------------------------------------------------
+
+Prediction and allocation scorecards in the optional autonomous fund compare
+returns over the same start and end dates, selected from the benchmark's
+completed sessions. A missing endpoint is ``unavailable``; a benchmark horizon
+that has not completed is ``pending``. A later symbol observation cannot replace
+the missing endpoint. Missing intermediate closes do not prevent an
+endpoint-to-endpoint comparison.
+
+Research ideas use the NYSE calendar's actual closing time, including half days.
+An idea formed at or after the close starts at the next close. Its horizon also
+uses benchmark-selected endpoints; missing intermediate symbol bars cannot
+leave a mature idea pending or shift the comparison dates.
+
+The fund's ``affordability`` context counts whole shares using the executor's
+configured limit buffer and upward cent rounding. Near a position ceiling,
+local and paper modes refresh the execution ask. For example, an account worth
+10,000 with a 10% position cap cannot buy one share at an ask of 999.50 with a
+0.1% limit buffer: the rounded purchase limit is 1,000.50. Displayed share
+prices and weights retain the source price before the buffer. A completed-close
+fallback is indicative; submission still checks fresh quotes, cash, exposure
+and trading eligibility.
+
+Unknown Model Costs and Split-Adjusted Benchmark Returns
+--------------------------------------------------------------------------------
+
+An interrupted model call may have no usage information. Without a recorded
+``cost_usd``, its cost remains unknown, and the autonomous fund's acceptance
+report leaves system net returns unknown. Scripted calls, local answer-cache
+hits and explicitly recorded zero costs retain their zero-cost treatment.
+
+Benchmark returns apply recorded corporate actions in date order, paying cash
+on the shares held at each dividend date. A later split changes shares while
+preserving previously paid cash. For example, one share worth 100 that pays 2,
+then splits two-for-one and ends at 49 per share, has a zero return: shares
+worth 98 plus cash of 2. Same-day dividends use post-split shares, regardless
+of event insertion order. Payouts are held as cash rather than automatically
+reinvested.
+
+Package Metadata Removing Existing Distributions
+--------------------------------------------------------------------------------
+
+Reading package metadata, including ``python setup.py --version``, preserves
+existing files in ``dist/``. Wheel builds clean their intermediate build
+directory to exclude stale package files. Remove completed distributions only
+as an explicit cleanup step when they are no longer needed.
+
 Pre-Open Hooks Delayed on a Non-UTC Server
 --------------------------------------------------------------------------------
 
@@ -36,6 +84,17 @@ seconds; absent, exited, stale and future-dated heartbeats are identified
 separately. Inspect the current decisions and errors to establish business
 progress.
 
+The watchdog also rejects future-dated runner heartbeats as
+``heartbeat_unavailable``; they cannot establish continuous health for automatic
+resume. Real polling samples the UTC clock after reading the heartbeat, so a
+normal update published during the poll remains valid. A corrected heartbeat
+starts the normal continuous-health period again.
+
+Malformed STOP field types, invalid supplied timestamps and non-UTF-8 content
+retain an operator stop. They no longer crash STOP reads or permit a service
+restart to replace that stop. The normal explicit resume command remains
+available after inspection.
+
 The monitor shares a 20-second work budget between Telegram notifications and
 commands, alternating which queue goes first. An already-started request retains
 its ten-second network timeout. Deferred commands remain unread at the durable
@@ -56,6 +115,36 @@ are written to the journal and runtime log without exception messages, local
 variables, source text, filenames or authenticated request contents. Use the
 retained location to diagnose the underlying fault; additional diagnostics alone
 do not remediate that fault.
+
+Concurrent Autonomous Fund Daily-Cache Refreshes
+--------------------------------------------------------------------------------
+
+Each shared daily-cache write uses its own staging file, including concurrent
+threads in the same process. Publishing replaces the destination atomically.
+A failed write keeps the previous complete value and removes only its own
+staging file. Successful refreshes still change the cache version used by the
+runner to reload data.
+
+Earnings Windows and External Research Data
+--------------------------------------------------------------------------------
+
+The autonomous fund counts ``earnings_window_days`` using NYSE sessions,
+including half days and skipping exchange holidays. Zero covers today only,
+including on weekends; it does not roll the cutoff forward to Monday.
+
+FRED observations from CSV, API responses and the daily cache must have a valid
+date and a finite numeric value. Zero and negative rates remain usable. NaN
+and infinity do not enter percentiles or produce a false low-volatility flag.
+A refresh with no usable observations is unavailable. If a runner has fetched
+valid data but cannot write its optional cache, it retains the data in memory
+for the day rather than replacing it with a cache error or repeatedly fetching.
+An unusable older cache is a miss: the runner fetches normally when preparation
+budget permits, or defers the request when it does not.
+
+Alpaca fallback daily bars require explicit source timezones and finite positive
+closes. Host timezone settings cannot reinterpret a naive timestamp as an
+earlier session. A malformed symbol response is reported independently and
+does not substitute another symbol's history.
 
 Read-Only Native Memory in the Autonomous Fund Service
 --------------------------------------------------------------------------------

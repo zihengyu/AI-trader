@@ -164,7 +164,7 @@ class Monitor:
                 # or uncertain delivery. Never reroute an established ledger.
                 db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('recipient',?)", (recipient,))
 
-    def _health(self, db, now):
+    def _health(self, db, now, *, realtime=False):
         saved = db.execute("SELECT at,body,sequence FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
         if not saved or json.loads(saved[1]).get("mode") not in {"local", "paper"}:
             raise RiskError("Monitor requires an existing local or Alpaca paper run")
@@ -178,10 +178,20 @@ class Monitor:
                 status = json.loads((self.root / filename).read_text(encoding="utf-8"))
                 if status.get("runner_state") != "running":
                     state = "runner_exited"
-                elif (now - instant(status["heartbeat_at"])).total_seconds() > self.heartbeat_seconds:
-                    state = "heartbeat_stale"
-                elif status.get("matching_error"):
-                    state = "matching_error"
+                else:
+                    # The runner may publish after poll() captured its start
+                    # time. Real polling observes the clock after reading the
+                    # file; explicit `now` keeps replay/tests deterministic.
+                    observed = datetime.now(timezone.utc) if realtime else now
+                    age = (observed - instant(status["heartbeat_at"])).total_seconds()
+                    # A clock rollback or future-dated write cannot establish
+                    # continuous runner health for automatic resume.
+                    if age < 0:
+                        state = "heartbeat_unavailable"
+                    elif age > self.heartbeat_seconds:
+                        state = "heartbeat_stale"
+                    elif status.get("matching_error"):
+                        state = "matching_error"
             except Exception:
                 state = "heartbeat_unavailable"
         # A killed provider call remains an audit fact, not a permanently hung
@@ -331,10 +341,11 @@ class Monitor:
         return True
 
     def poll(self, now=None):
+        realtime = now is None
         now = instant(now or datetime.now(timezone.utc))
         deadline = self.clock() + NOTIFICATION_BUDGET_SECONDS
         with operator_connection(self.root) as db:
-            state = self._health(db, now)
+            state = self._health(db, now, realtime=realtime)
             # Recover even if the trader exited between persisting the review
             # and exporting it. One durable notification per completed review.
             # One indexed pass per poll; never a full-table scan per review.

@@ -20,6 +20,7 @@ import os
 import shutil
 from datetime import date
 from pathlib import Path
+from uuid import uuid4
 
 KEEP_DAYS = 3
 SETTLED_HOUR = 6  # New York: a new day's splits and dividends are applied in the daily history by then.
@@ -38,9 +39,19 @@ class DailyStore:
 
     def _write(self, path, value):
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + f".{os.getpid()}.tmp")
-        temporary.write_text(json.dumps(value, default=str), encoding="utf-8")
-        temporary.replace(path)
+        payload = json.dumps(value, default=str)
+        # A PID alone collides when two threads refresh the same entry. Each
+        # writer owns its staging file; publication remains one atomic rename.
+        temporary = path.with_name(path.name + f".{os.getpid()}.{uuid4().hex}.tmp")
+        created = False
+        try:
+            with temporary.open("x", encoding="utf-8") as handle:
+                created = True
+                handle.write(payload)
+            temporary.replace(path)
+        finally:
+            if created:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _read(path):

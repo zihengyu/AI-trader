@@ -5,9 +5,8 @@ import setuptools
 from setuptools.command.build_py import build_py as _build_py
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DIST_DIR = PROJECT_ROOT / "dist"
-if DIST_DIR.exists():
-    shutil.rmtree(DIST_DIR)
+# Metadata commands also execute this file. Keep completed distributions intact;
+# BuildWithThetaJar.run() cleans only its own intermediate build directory.
 
 
 class BuildWithThetaJar(_build_py):

@@ -7,7 +7,8 @@ narrative. Nothing here calls a model, a broker or the network, and nothing is
 estimated when a close is missing: such items stay `pending` or `unavailable`.
 """
 import math
-from datetime import date, datetime, time
+from bisect import bisect_left
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 
 from .risk import instant
@@ -21,15 +22,26 @@ def _series(rows):
     return [day for day, _ in ordered], [close for _, close in ordered]
 
 
-def _forward(rows, start_day, horizon):
-    """Return (start_close, end_close) `horizon` completed sessions after start_day."""
+def _forward(rows, start_day, horizon, *, sessions=None):
+    """Return endpoint closes on a shared session calendar when supplied.
+
+    A missing endpoint is unavailable, never replaced by the next observed bar.
+    Intermediate bars are not needed to measure an endpoint-to-endpoint return.
+    """
     days, closes = _series(rows)
     if start_day not in days:
         return None
-    index = days.index(start_day)
-    if index + horizon >= len(days):
+    calendar = days if sessions is None else sessions
+    if start_day not in calendar:
+        return None
+    index = calendar.index(start_day)
+    if index + horizon >= len(calendar):
         return "pending"
-    return closes[index], closes[index + horizon]
+    values = dict(zip(days, closes))
+    end_day = calendar[index + horizon]
+    if end_day not in values:
+        return None
+    return values[start_day], values[end_day]
 
 
 def score_predictions(reviews, closes):
@@ -42,8 +54,9 @@ def score_predictions(reviews, closes):
             item = {"memo_version": packet.get("version"), "session_date": packet["session_date"],
                     "symbol": symbol, "benchmark": benchmark, "direction": prediction["direction"],
                     "horizon_sessions": horizon, "hypothesis_ref": prediction.get("hypothesis_ref", "")}
-            own = _forward(closes.get(symbol), packet["session_date"], horizon)
-            base = _forward(closes.get(benchmark), packet["session_date"], horizon)
+            sessions, _ = _series(closes.get(benchmark))
+            own = _forward(closes.get(symbol), packet["session_date"], horizon, sessions=sessions)
+            base = _forward(closes.get(benchmark), packet["session_date"], horizon, sessions=sessions)
             if own is None or base is None:
                 item["status"] = "unavailable"
             elif own == "pending" or base == "pending":
@@ -76,17 +89,31 @@ IDEA_SIGNIFICANCE = 0.05
 RISING = {"up": True, "outperform": True, "down": False, "underperform": False}
 
 
-def _start_index(days, formed_at):
-    """Index of the first completed close after `formed_at` (16:00 New York on its session day).
+@lru_cache(maxsize=512)
+def _idea_session_close(day):
+    """A bounded calendar cache for historical formation dates across scorecard refreshes."""
+    from .market_data import _session_close
+    return _session_close(day)
 
-    None when the series has no such close yet, or does not reach back before the
-    formation (an idea older than the window cannot be placed honestly).
+
+def _start_index(days, formed_at):
+    """Index of the first actual exchange close strictly after `formed_at`.
+
+    "pending" when no later close is available. None when the history does not
+    reach back before formation (an older idea cannot be placed honestly).
     """
     formed = instant(formed_at).astimezone(ZONE)
-    for index, day in enumerate(days):
-        if datetime.combine(date.fromisoformat(day), time(16), ZONE) > formed:
-            return index if index > 0 else None
-    return "pending"
+    day = formed.date().isoformat()
+    # Locate the formation day before consulting its calendar. Historical bars
+    # before formation need no calendar builds or assumed 16:00 closing times.
+    index = bisect_left(days, day)
+    if index < len(days) and days[index] == day:
+        closed = _idea_session_close(day)
+        if closed is None or closed <= formed:
+            index += 1
+    if index >= len(days):
+        return "pending"
+    return index if index > 0 else None
 
 
 def binomial_tail(successes, trials):
@@ -109,19 +136,22 @@ def _idea_outcome(idea, closes):
     start, base_start = _start_index(days, idea["formed_at"]), _start_index(base_days, idea["formed_at"])
     if start is None or base_start is None:
         return {**item, "status": "unavailable", "reason": "the close history does not cover the formation time"}
-    if start == "pending" or base_start == "pending" or start + horizon >= len(days) \
-            or base_start + horizon >= len(base_days):
+    if base_start == "pending" or base_start + horizon >= len(base_days):
         return {**item, "status": "pending"}
-    if days[start] != base_days[base_start] or days[start + horizon] != base_days[base_start + horizon]:
+    start_day, end_day = base_days[base_start], base_days[base_start + horizon]
+    own = dict(zip(days, values))
+    # The benchmark fixes the mature horizon. Missing symbol bars do not move
+    # its endpoint or leave a completed comparison pending indefinitely.
+    if start_day not in own or end_day not in own:
         return {**item, "status": "unavailable", "reason": "symbol and benchmark sessions differ"}
-    mine = values[start + horizon] / values[start] - 1
+    mine = own[end_day] / own[start_day] - 1
     market = base_values[base_start + horizon] / base_values[base_start] - 1
     rising, relative = RISING[idea["direction"]], idea["direction"] in {"outperform", "underperform"}
     move = mine - market if relative else mine
-    exposure = beta(closes[symbol], closes[benchmark], days[start])  # Closes through the start only.
+    exposure = beta(closes[symbol], closes[benchmark], start_day)  # Closes through the start only.
     residual = mine - exposure * market if exposure is not None else None
     return {**item, "status": "correct" if (move > 0) == rising and move != 0 else "incorrect",
-            "start_day": days[start], "end_day": days[start + horizon], "symbol_return": mine,
+            "start_day": start_day, "end_day": end_day, "symbol_return": mine,
             "benchmark_return": market, "beta": exposure, "residual_return": residual,
             # Beyond the beta-matched market move: was the stock chosen, not just the market's direction?
             "selection_correct": None if residual is None or residual == 0 else (residual > 0) == rising,
@@ -234,6 +264,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     the risk overlay is excluded: this isolates the AI's selection skill.
     """
     rows, previous = [], {}
+    sessions, _ = _series(closes.get(benchmark))
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
         weights = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
@@ -253,8 +284,8 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                "beta_assumed": sorted(assumed), "turnover": turnover,
                "prompt_version": body.get("prompt_version") or "unversioned", "horizons": {}}
         for horizon in HORIZONS:
-            market = _forward(closes.get(benchmark), day, horizon)
-            paths = {s: _forward(closes.get(s), day, horizon) for s in weights}
+            market = _forward(closes.get(benchmark), day, horizon, sessions=sessions)
+            paths = {s: _forward(closes.get(s), day, horizon, sessions=sessions) for s in weights}
             if market is None or any(p is None for p in paths.values()):
                 row["horizons"][str(horizon)] = {"status": "unavailable"}
             elif market == "pending" or any(p == "pending" for p in paths.values()):
