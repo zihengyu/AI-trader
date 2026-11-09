@@ -47,6 +47,11 @@ def test_turnover_costs_are_charged_against_excess():
     assert first["net_excess_return"] == pytest.approx(first["excess_return"] - 0.4 * 0.001)
     assert second["net_excess_return"] == pytest.approx(second["excess_return"] - 0.8 * 0.001)
     assert result["by_horizon"]["1"]["mean_net_excess_return"] < result["by_horizon"]["1"]["mean_excess_return"]
+    # Cost sensitivity: the same record at twice and three times the estimated costs.
+    summary = result["by_horizon"]["1"]
+    mean_cost = (0.4 + 0.8) * 0.001 / 2
+    assert summary["mean_net_excess_return_2x_costs"] == pytest.approx(summary["mean_excess_return"] - 2 * mean_cost)
+    assert summary["mean_net_excess_return_3x_costs"] == pytest.approx(summary["mean_excess_return"] - 3 * mean_cost)
 
 
 def test_beta_uses_only_closes_through_the_decision_day():

@@ -453,7 +453,8 @@ def acceptance(root, criteria=None, now=None):
     from .call_value import from_events
     card = next((b for _, k, b in reversed(events) if k == "scorecard"), None)
     investment = investment_acceptance(stats, returns, market if aligned else None, net, learning,
-                                       (card or {}).get("ideas"), from_events(events))
+                                       (card or {}).get("ideas"), from_events(events),
+                                       costs=trading_costs(events, by_broker, references, pairs))
     return {"as_of": now.isoformat(), "mode": mode, "verdict": verdict,
             "criteria": results, "metrics": metrics, "performance_evidence": stats, "capital_stage": stage,
             "net_returns": net["returns"], "benchmarks": net["benchmarks"],
@@ -472,7 +473,44 @@ def _smaller_t(regression):
     return min(values) if values else None
 
 
-def investment_acceptance(stats, returns, market, net, learning, ideas, call_value):
+def trading_costs(events, by_broker, references, pairs):
+    """Realized trading costs and their annual rate on equity, for the cost-sensitivity criterion.
+
+    Per order the reconciled fill replaces its callbacks (as in the attribution). A
+    fill costs its fee plus |fill price - arrival price| x quantity: an absolute
+    deviation, so favorable fills are not counted as gains (conservative for a stress
+    test). A fill without an arrival price counts its fee only and is listed as unknown.
+    """
+    per_order = {}
+    for _, kind, body in events:
+        if kind in {"fill", "fill_reconciled"}:
+            per_order.setdefault(str(body.get("broker_id")), {}).setdefault(kind, []).append(body)
+    total, unknown = 0.0, 0
+    for broker_id, kinds in per_order.items():
+        chosen = kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds else kinds.get("fill", [])
+        order = by_broker.get(broker_id) or {}
+        arrival = references.get(order.get("intent_id"))
+        for body in chosen:
+            try:
+                price, quantity = float(body.get("price") or 0), abs(float(body.get("quantity") or 0))
+                fee = float(body.get("trade_cost") or 0)
+            except (TypeError, ValueError):
+                unknown += 1
+                continue
+            total += fee
+            if arrival and price > 0:
+                total += abs(price - float(arrival)) * quantity
+            else:
+                unknown += 1
+    equity = [pair["equity_start"] for pair in pairs if pair.get("equity_start")]
+    rate = (total / (sum(equity) / len(equity)) * 252 / len(equity)) if equity else None
+    return {"usd": total, "annual_rate_on_equity": rate, "fills_without_arrival": unknown, "sessions": len(equity)}
+
+
+COST_MULTIPLE = 2  # Investment acceptance requires the edge to survive this multiple of realized trading costs.
+
+
+def investment_acceptance(stats, returns, market, net, learning, ideas, call_value, costs=None):
     """Investment-capability acceptance (V2 4.4), separate from the operational verdict.
 
     Required: enough sessions; beta-adjusted alpha against SPY; beating the predefined
@@ -499,6 +537,12 @@ def investment_acceptance(stats, returns, market, net, learning, ideas, call_val
     system_excess = (system["annual_return"] - benchmark_annual
                      if system.get("status") == "computed" and benchmark_annual is not None else None)
     evaluation = (learning or {}).get("memo_minus_baseline_1d_excess") or {}
+    excess = (matched or {}).get("annual_excess_return") if computed else None
+    rate = (costs or {}).get("annual_rate_on_equity")
+    sensitivity = ({f"{k}x": excess - (k - 1) * rate for k in (1, 2, 3)}
+                   if excess is not None and rate is not None else None)
+    stressed = ("unknown_costs" if (costs or {}).get("fills_without_arrival") else
+                (sensitivity or {}).get(f"{COST_MULTIPLE}x"))
     checks = [
         ("min_sessions", sessions, INVESTMENT_MIN_SESSIONS, sessions >= INVESTMENT_MIN_SESSIONS, True),
         ("alpha_t_vs_spy", _smaller_t(regression), round(Z95, 2),
@@ -507,6 +551,9 @@ def investment_acceptance(stats, returns, market, net, learning, ideas, call_val
          computed and matched["annual_excess_return"] > 0 and (_smaller_t(stats_matched) or 0) >= Z95, True),
         ("system_net_excess_annual", system_excess if system.get("status") != "unknown_costs" else "unknown_costs", "> 0",
          system_excess is not None and system_excess > 0, True),
+        # Simulated fills are optimistic: the edge must survive twice the realized trading costs.
+        ("risk_matched_excess_annual_2x_trading_costs", stressed, "> 0",
+         isinstance(stressed, float) and stressed > 0, True),
         ("deflated_sharpe", stats.get("deflated_sharpe"), 0.90, (stats.get("deflated_sharpe") or 0) >= 0.90, True),
         ("both_halves_beta_adjusted_positive", halves, "> 0 in each half",
          halves is not None and all(h > 0 for h in halves), True),
@@ -523,7 +570,8 @@ def investment_acceptance(stats, returns, market, net, learning, ideas, call_val
         verdict = "preliminary_edge"
     else:
         verdict = "edge_not_shown"
-    return {"verdict": verdict, "criteria": criteria, "call_value": call_value, "notice": SEPARATION}
+    return {"verdict": verdict, "criteria": criteria, "call_value": call_value, "notice": SEPARATION,
+            "cost_sensitivity": {"trading_costs": costs, "risk_matched_excess_annual": sensitivity}}
 
 
 def _number(value, digits=2):
@@ -555,6 +603,7 @@ VERDICT_LABELS = {"ready": "通过", "not_ready": "未通过", "insufficient_evi
 INVESTMENT_LABELS = {"min_sessions": "交易日数", "alpha_t_vs_spy": "相对 SPY 的 alpha t（普通与 Newey-West 取小）",
                      "risk_matched_excess_annual": "相对风险匹配基准的年化超额",
                      "system_net_excess_annual": "扣模型和数据费后相对风险匹配基准的年化超额",
+                     "risk_matched_excess_annual_2x_trading_costs": "交易成本翻倍后相对风险匹配基准的年化超额",
                      "deflated_sharpe": "去试错夏普（DSR）", "both_halves_beta_adjusted_positive": "前后两半的 beta 调整后日均收益",
                      "learning_beats_baseline_t": "学习对照：看备忘组减对照组的 t",
                      "research_ideas_informative": "研究想法的预测能力"}
@@ -608,6 +657,16 @@ def investment_markdown(result):
               f"Sortino {_number(stats.get('sortino_annualized'))}，按自相关修正的夏普（Lo）"
               f"{_number(stats.get('sharpe_lo_adjusted'))}；alpha t 值（Newey-West）{_number(regression.get('alpha_t_newey_west'))}"]
     lines += ["", "## 净收益口径", ""] + _net_lines(result.get("net_returns"), result.get("data_costs_usd_per_month"), pct)
+    sensitivity = investment.get("cost_sensitivity") or {}
+    costs, stressed = sensitivity.get("trading_costs") or {}, sensitivity.get("risk_matched_excess_annual")
+    lines += ["", "## 成本敏感性（模拟成交偏理想，看成本更高时还剩多少）", ""]
+    if costs:
+        lines.append(f"- 已实现交易成本 {_number(costs.get('usd'))} 美元（手续费＋成交价偏离到达价的绝对值，偏保守），"
+                     f"约占年化净值 {pct(costs.get('annual_rate_on_equity'))}"
+                     + (f"；{costs['fills_without_arrival']} 笔成交没有到达价，只计了手续费，翻倍检验记为未知"
+                        if costs.get("fills_without_arrival") else ""))
+    lines.append("- 相对风险匹配基准的年化超额：" + ("；".join(f"成本 {k} {pct(v)}" for k, v in stressed.items())
+                                                if stressed else "无数据"))
     lines += ["", "## 事先定义的基准", "", "| 基准 | 定义 | 当前 | 交易日 | 年化超额 | 信息比率 | alpha t（OLS／NW） | 分红 |",
               "|---|---|---|---|---|---|---|---|"]
     for row in result.get("benchmarks") or []:

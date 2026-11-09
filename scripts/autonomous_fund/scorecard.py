@@ -416,10 +416,14 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
                         if r["horizons"][str(horizon)]["status"] == "observed"]
             gross = [o["excess_return"] for o in observed]
             net = [o["net_excess_return"] for o in observed]
+            # Cost sensitivity: the same record if trading cost twice or three times the estimate.
+            stressed = {k: [o["excess_return"] - k * o["cost"] for o in observed] for k in (2, 3)}
             result[str(horizon)] = {
                 "observed": len(observed),
                 "mean_excess_return": sum(gross) / len(gross) if gross else None,
                 "mean_net_excess_return": sum(net) / len(net) if net else None,
+                "mean_net_excess_return_2x_costs": sum(stressed[2]) / len(observed) if observed else None,
+                "mean_net_excess_return_3x_costs": sum(stressed[3]) / len(observed) if observed else None,
                 "positive_excess_rate": sum(e > 0 for e in gross) / len(gross) if gross else None,
                 "mean_exposure_excess_return": (sum(o["exposure_excess_return"] for o in observed) / len(observed)
                                                 if observed else None)}
