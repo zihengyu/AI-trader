@@ -156,6 +156,9 @@ def canonical(expression):
     return ast.unparse(parse(expression))
 
 
+MEMBERSHIP = "index_member"  # Optional boolean panel in `extra`; not an expression field.
+
+
 def compute(expression, close, volume=None, extra=None):
     """Factor panel (dates x symbols) from completed daily data; backwards-looking only.
 
@@ -170,7 +173,13 @@ def compute(expression, close, volume=None, extra=None):
     value = _eval(parse(expression), data)
     if not isinstance(value, pd.DataFrame):
         raise RiskError("A factor must depend on market data")
-    return value.replace([np.inf, -np.inf], np.nan)
+    value = value.replace([np.inf, -np.inf], np.nan)
+    member = (extra or {}).get(MEMBERSHIP)
+    if member is not None:
+        # A stock counts in a cross-section only from its index entry; its prices stay
+        # complete, so look-back windows right after it joined are unaffected.
+        value = value.where(member.reindex(index=value.index, columns=value.columns).fillna(True).astype(bool))
+    return value
 
 
 def _panel(value, like):
@@ -407,10 +416,14 @@ class FactorSettings:
     # Random-ranking diagnostics: how many, and every how many days.
     negative_control_runs: int = 20
     negative_control_days: int = 7
+    # Count S&P 500 members in historical stock cross-sections only from the date they joined.
+    index_membership: bool = True
 
     def __post_init__(self):
         if type(self.enabled) is not bool:
             raise RiskError("factor_lab.enabled must be true/false")
+        if type(self.index_membership) is not bool:
+            raise RiskError("factor_lab.index_membership must be true/false")
         for key, low, high in (("history_days", 120, 2520), ("min_names", 3, 500), ("min_observations", 5, 500),
                                ("min_holdout_observations", 3, 500), ("live_min_observations", 3, 500),
                                ("max_proposals_per_review", 0, 10), ("max_active", 1, 20),

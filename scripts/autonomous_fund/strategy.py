@@ -2637,6 +2637,11 @@ class AutonomousFund(Strategy):
             close, volume = panel_from_rows(history)
             data = {"close": close, "volume": volume, **self._ohlc_panels(close, now, stored)}
             if name == "stocks":
+                membership = self._index_membership(now)
+                if membership is not None:
+                    from .factors import MEMBERSHIP
+                    from .index_membership import mask
+                    data[MEMBERSHIP] = mask(close, membership.get("added"))
                 fundamentals, complete = self._fundamental_panels(close, current)
                 if not complete:
                     pending.append("SEC filings")
@@ -2651,6 +2656,22 @@ class AutonomousFund(Strategy):
         result = panels or None
         self._factor_cache = (day, result)
         return result
+
+    def _index_membership(self, now):
+        """S&P 500 dates added (cached a month in the account's cache); None when off or unavailable."""
+        lab = getattr(self, "factor_lab", None)
+        run_dir = getattr(self, "run_dir", None)
+        if lab is None or not lab.settings.index_membership or run_dir is None:
+            return None
+        if getattr(self, "mode", None) not in {"local", "paper"}:
+            return None  # Replays and tests stay off the network.
+        from .index_membership import load
+        cached = getattr(self, "_membership_cache", None)
+        if cached and cached[0] == trading_day(now):
+            return cached[1]
+        membership = load(run_dir / "cache", instant(now))
+        self._membership_cache = (trading_day(now), membership)
+        return membership
 
     def _universe_snapshot(self, now, role, history):
         """Record today's members of `role`; return the stored bars of members no longer served.
@@ -2740,6 +2761,15 @@ class AutonomousFund(Strategy):
                                       "meaning": "factor history is still being prepared; ranks follow shortly"}
                 return context
             context = lab.context(now, as_panels(panels), tradable=set(self.universe))
+            stocks = ((as_panels(panels) or {}).get("stocks") or {}).get("close")
+            membership = getattr(self, "_membership_cache", None)
+            if stocks is not None and membership is not None:
+                from .index_membership import summary
+                context["index_membership"] = {
+                    **summary(stocks, membership[1]),
+                    "meaning": "a stock counts in historical stock cross-sections only from the date it joined the "
+                               "S&P 500 (today's large caps were selected because they grew); undated stocks count "
+                               "throughout. Stocks that died are still missing (survivorship)"}
             snapshots = getattr(self, "universe_snapshots", None)
             if snapshots is not None:
                 former = getattr(self, "_universe_former", None) or {}
