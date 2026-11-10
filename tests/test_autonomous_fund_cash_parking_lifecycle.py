@@ -1,9 +1,11 @@
 """Idle cash parking is system cash management: it outlives the AI decision it followed.
 
-Incident (2026-11-05..09, local book): after the AI moved to cash, every parking order was canceled when
-the short-lived hold-cash decision expired, one to three minutes after submission and before the virtual
-broker could match a fresh minute bar. About fifty orders never filled, and on one day they used the whole
-daily purchase budget. Synthetic accounts, neutral symbols and deterministic bars only.
+Background (2026-11-05..09, local book): about fifty parking orders never filled and on one day used the
+whole daily purchase budget. The cause, ordinary position and exposure limits applied to parking buys at
+virtual fill time, is covered by test_native_cash_parking_fills_without_investment_caps_but_preserves_the_sleeve.
+These tests pin the further guarantees: parking outlives a decision's expiry, gives way to a newer allocation,
+re-parks when idle, waits a session after an AI trade, and never sends more than three orders a day.
+Synthetic accounts, neutral symbols and deterministic bars only.
 """
 from datetime import timedelta
 
