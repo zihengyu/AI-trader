@@ -35,6 +35,7 @@
   "macro": {"enabled": true, "history_days": 400},
   "construction": {"mode": "auto", "min_pairs": 20, "switch_t_stat": 2.0},
   "critic": {"enabled": true, "model": null},
+  "triage": {"mode": "auto", "model": null, "window": 40, "max_miss_rate": 0.15, "audit_every": 5},
   "quant_risk": {
     "vol_lookback_days": 63,
     "es_lookback_days": 252,
