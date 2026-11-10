@@ -30,7 +30,7 @@
     "SDS": "leveraged_etf", "QID": "leveraged_etf", "TBF": "leveraged_etf", "VIXY": "leveraged_etf",
     "SGOV": "cash_equivalent"
   },
-  "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02"},
+  "cash_sweep": {"enabled": true, "symbol": "SGOV", "keep_cash": "0.01", "band": "0.02", "min_idle_sessions": 1},
   "events": {"enabled": true, "earnings_max_position": "0.05", "earnings_window_days": 1, "source": "auto"},
   "macro": {"enabled": true, "history_days": 400},
   "construction": {"mode": "auto", "min_pairs": 20, "switch_t_stat": 2.0},

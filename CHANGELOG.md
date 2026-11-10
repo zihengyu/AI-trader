@@ -5,6 +5,12 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Fixed
+- The optional autonomous fund's cash parking is hardened. Background: in one local account, about fifty SGOV parking orders over three sessions never filled, and on one day they used the whole daily purchase budget. The cause was the local broker applying ordinary position and exposure limits to parking buys at fill time; that was fixed earlier in this release, which now also records cancel reasons. This change hardens parking further:
+  - Parking buys outlive the expiry of the AI decision they followed. They are still repriced when stale, and are cancelled (`cash_parking_superseded`) when a newer AI allocation takes force, so they never hold up its purchases.
+  - Idle iterations re-park without waiting for a new decision.
+  - At most three parking orders are sent per trading day.
+  - After an AI trade, cash waits for the next session before it is parked (`cash_sweep.min_idle_sessions`, default 1; 0 parks at once), because the local book charges about 0.4% for a parking round trip.
+  - The manager's decision and pre-market contexts now carry the `cash_management` policy, as the reviews already did.
 - Autonomous fund model probes wait for the exchange close, skip observe-only mode, and recheck STOP and cost limits between calls. Invalid knowledge months in probe answers and saved journals are ignored.
 - Autonomous fund snapshot claims reject non-finite bounds through structured answer validation. Direct value checks can use same-date data even when unrelated symbols are deferred.
 - Autonomous fund stability checks repeat the accepted task and strategy context, including corrections. The scorecard separates those measurements from legacy checks and describes the changing runtime inputs.
