@@ -17,7 +17,7 @@ from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
-from .claims import MomentumClaim, check_claims, score_claims
+from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
 from .risk import (Account, DecisionTimingError, Intent, Limits, ObservedPrice, Price, RiskError,
@@ -206,10 +206,13 @@ MANAGER_PROMPT = (
     "your targets act on in idea_refs (optional). scorecards.research_ideas scores past ideas against naive baselines "
     "and separates stock selection from the market's direction. "
     "scorecards.timing shows whether your own stop-losses, take-profits and entry limits added value. "
-    "For every 20- or 60-session momentum rank you cite in rationale, also submit a factual_claims entry "
-    "with symbol, metric ret_20d or ret_60d, and minimum_percentile (80 means at least the 80th percentile). "
-    "Use the same-date eligible names in market_snapshot. Omit unsupported ranks and leave factual_claims empty "
-    "when you make no claim of this type. scorecards.claims shows the previous checks. "
+    "For every market_snapshot number your rationale relies on (a symbol's return, volatility, beta, correlation, "
+    "distance from its 50/200-session mean or 252-session high, or liquidity), also submit a factual_claims entry: "
+    "symbol, the snapshot metric name, and the bound you claim, either its rank among the same-date eligible names "
+    "(minimum_percentile/maximum_percentile, 100 = highest value; 80 means at least the 80th percentile) or the "
+    "value itself (minimum/maximum, fractions as in the snapshot). Leave the bounds you do not claim null. Code checks "
+    "them against the snapshot you saw; omit claims you cannot support and leave factual_claims empty when you cite "
+    "no such number. scorecards.claims shows the previous checks by metric. "
     "factor_lab lists factors you proposed in reviews that deterministic code validated without look-ahead "
     "(cross-sectional rank IC in their own cross-section, stocks incl. a non-tradable research universe or ETFs; "
     "trials-adjusted significance, holdout, a quintile spread that survives costs, not redundant, and the live "
@@ -368,7 +371,7 @@ class Decision(BaseModel):
     news_watch: bounded_list(NewsQuery, 8) = Field(default_factory=list)
     # Optional: the registered research ideas (idea_id) this portfolio acts on, for attribution.
     idea_refs: bounded_list(bounded_text(40, 1), 16) = Field(default_factory=list)
-    factual_claims: bounded_list(MomentumClaim, 8) = Field(default_factory=list)
+    factual_claims: bounded_list(SnapshotClaim, 12) = Field(default_factory=list)
 
 
 @dataclass(frozen=True)

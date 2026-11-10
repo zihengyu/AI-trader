@@ -125,9 +125,12 @@ def evidence_lines(card):
     lines = []
     claims = (card or {}).get("claims")
     if claims and claims.get("decisions"):
-        lines.append(f"AI 事实核验（动量排名）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
+        wrong = [f"{metric} {group['incorrect']}/{group['correct'] + group['incorrect']}"
+                 for metric, group in (claims.get("by_metric") or {}).items() if group["incorrect"]]
+        lines.append(f"AI 事实核验（对照它看到的行情快照）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
                      f"正确 {claims['correct']}，错误 {claims['incorrect']}，"
-                     f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。")
+                     f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。"
+                     + (f"错得多的指标（错/核验）：{'、'.join(wrong[:5])}。" if wrong else ""))
     for factor in (card or {}).get("factor_crowding", [])[:3]:
         if factor.get("status") != "observed":
             lines.append(f"因子 {factor['name']} 拥挤度：分组样本不足。")
