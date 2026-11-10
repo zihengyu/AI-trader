@@ -156,6 +156,7 @@ def test_schema_is_sent_to_deepseek_responses_and_usage_is_retained(model, strea
     assert response.usage_metadata.cached_content_token_count == 7
     assert response.usage_metadata.thoughts_token_count == 4
     assert response.usage_metadata.total_token_count == 30
+    assert response.model_version == model.removeprefix("deepseek/")
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -269,6 +270,8 @@ def test_actual_adk_tool_loop_keeps_schema_reasoning_permissions_and_usage(monke
     assert any(item["type"] == "function_call" and item["call_id"] == "call_synthetic" for item in sent[1]["input"])
     assert any(item["type"] == "function_call_output" and item["call_id"] == "call_synthetic" for item in sent[1]["input"])
     assert result.model == model
+    # The model version the provider reported for its responses, separate from the name requested.
+    assert result.served_models == [model.removeprefix("deepseek/")]
     assert result.usage["prompt_token_count"] == 40
     assert result.usage["candidates_token_count"] == 20
     assert result.usage["cached_content_token_count"] == 14
@@ -435,3 +438,51 @@ def test_all_fund_role_schemas_use_strict_wire_copy_and_original_local_validatio
     parsed, error = parse_structured_output(result.content.parts[0].text, schema, schema_model)
     assert error is None
     assert parsed.model_dump() == answer.model_dump() and schema == original_schema
+
+
+def test_reported_model_versions_survive_the_replay_cache_and_run_summaries(tmp_path, monkeypatch):
+    """A provider can serve a different model behind the same name; what it reported must stay on record."""
+    from lumibot.components.agents.manager import AgentManager
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("LUMIBOT_MEMORY_DIR", str(tmp_path / "memory"))
+    calls = []
+
+    class Vars(dict):
+        def set(self, key, value):
+            self[key] = value
+
+    class Strategy:
+        is_backtesting = True  # Replays are cached in backtests.
+        parameters = {}
+        vars = Vars()
+
+        def get_datetime(self):
+            return datetime(2026, 1, 2, tzinfo=timezone.utc)
+
+        def log_message(self, *args, **kwargs):
+            pass
+
+    class Runtime:
+        def run(self, request):
+            calls.append(request)
+            return AgentRunResult(summary=json.dumps(ANSWER), model=request.model, events=[],
+                                  served_models=["synthetic-model-2026-01-01"])
+
+    manager = AgentManager(Strategy())
+    agent = manager.create(name="observer", model="deepseek/deepseek-flash", output_schema=SCHEMA,
+                           include_builtin_tools=False, include_builtin_skills=False, _runtime=Runtime())
+    saved = []
+    original_save = manager.replay_cache.save
+    monkeypatch.setattr(manager.replay_cache, "save", lambda key, value: (saved.append(value), original_save(key, value)))
+    first = agent.run()
+    assert len(calls) == 1 and first.served_models == ["synthetic-model-2026-01-01"]
+    [entry] = saved
+    assert entry["served_models"] == ["synthetic-model-2026-01-01"]
+    replayed = agent._result_from_cached(entry, "synthetic-key")
+    assert replayed.cache_hit and replayed.served_models == ["synthetic-model-2026-01-01"]
+    assert agent._result_from_cached({"summary": "older entry"}, "k").served_models == []  # Saved before the field.
+    rows = [json.loads(line) for path in tmp_path.rglob("agent_run_summaries.jsonl")
+            for line in path.read_text().splitlines()]
+    assert rows and rows[-1]["served_models"] == ["synthetic-model-2026-01-01"]
+    assert AgentRunResult(summary=None, model="m", events=[]).served_models == []

@@ -640,6 +640,23 @@ def readable(kind, details, sequence=None, *, now=None):
                 "这些估计很可能低估了风险（历史压力情景仍照常计入）。\n"
                 "这只是提醒：风险上限和订单都不会因此自动改变，基金经理在决策时也能看到这条信息。"
                 "需要更保守时，可以手动收紧风险设置或暂停（STOP）。")
+    elif kind == "model_identity_changed" and isinstance(details, dict):
+        roles = {"researcher": "研究员", "manager": "基金经理", "critic": "反方评审", "triage": "事件判断"}
+        used = "、".join(roles.get(r, r) for r in details.get("roles") or []) or "未在用的角色"
+        what = {"served_version": f"提供方返回的模型版本从 {', '.join(details.get('before') or []) or '无'} "
+                                  f"变成了 {details.get('after')}",
+                "knowledge_later": f"每日固定问题显示它的知识截止从 {details.get('before')} 推后到 {details.get('after')}"
+                                   "（连续 3 天一致）",
+                "self_reported_name": f"每日固定问题里它自称的型号从 {details.get('before')} 变成了 {details.get('after')}"
+                                      "（连续 3 天一致，自报不一定准）"}.get(details.get("kind"), details.get("kind"))
+        text = (f"⚠️ 模型可能换了：{details.get('model')}（用于{used}）{what}。\n"
+                f"从现在起记分卡、实验登记和事件判断的校准按新版本（第 {details.get('epoch')} 版）单独统计，"
+                "不再和之前的记录混在一起。交易照常进行，不需要操作；"
+                "如果在因子实验室配置了该模型的知识截止日期，请核对是否需要更新。")
+    elif kind == "model_cutoff_tightened" and isinstance(details, dict):
+        text = (f"ℹ️ {details.get('model')} 在每日固定问题里显示的知识截止（{details.get('observed')}）晚于配置的 "
+                f"{details.get('configured')}。因子实验室已自动改用较晚的日期，只把这之后的日子算作干净的样本外记录"
+                "（只会更保守，不会放宽）。核实后可以更新 factor_lab.model_knowledge_cutoff。")
     elif kind == "market_back_within_history" and isinstance(details, dict):
         text = (f"ℹ️ 市场回到历史范围内（{details.get('as_of_close')} 收盘）：波动、单日涨跌、回撤和相关性"
                 "都不再超出风险模型窗口。不需要操作。")

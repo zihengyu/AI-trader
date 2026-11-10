@@ -81,6 +81,10 @@ class AgentRunResult:
     # `parse_error` says why. `payload` stays run bookkeeping, never the answer.
     parsed: Any = None
     parse_error: str | None = None
+    # Model versions the provider reported for this run's responses (first-seen order), as distinct
+    # from `model`, the name that was requested. A provider can change the model behind a name;
+    # recording what it reports lets a strategy notice. Empty when the provider reported none.
+    served_models: list[str] = field(default_factory=list)
 
     @property
     def text(self) -> str:

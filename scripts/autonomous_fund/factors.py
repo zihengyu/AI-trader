@@ -459,14 +459,20 @@ class FactorSettings:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not low <= value <= high:
                 raise RiskError(f"factor_lab.{key} must be {low}..{high}")
 
-    def cutoff(self, models):
-        """The latest knowledge cutoff of the proposing models, or None when any of them is unknown."""
+    def cutoff(self, models, observed=None):
+        """The latest knowledge cutoff of the proposing models, or None when any of them is unknown.
+
+        `observed` ({model: date}, from the daily model probe) can only move a configured cutoff
+        later, a shorter clean record; it never supplies a cutoff the operator did not configure.
+        """
         found = []
         for model in {m for m in models if m}:
             value = self.model_knowledge_cutoff.get(model) or self.model_knowledge_cutoff.get(model.split("/")[-1])
             if value is None:
                 return None
             found.append(date.fromisoformat(value))
+            if (observed or {}).get(model):
+                found.append(date.fromisoformat(observed[model]))
         return max(found) if found else None
 
     @classmethod
@@ -677,7 +683,7 @@ class FactorLab:
         `models` wrote the proposals; their knowledge cutoff separates the clean out-of-sample record.
         """
         panels = as_panels(close, volume, extra)
-        cutoff = self.settings.cutoff(models)
+        cutoff = self.settings.cutoff(models, getattr(self, "observed_cutoffs", None))
         results = []
         for proposal in list(proposals)[:self.settings.max_proposals_per_review]:
             name, horizon = proposal["name"], proposal["horizon_sessions"]

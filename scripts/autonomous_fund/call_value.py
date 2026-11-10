@@ -17,7 +17,7 @@ never used as a measure of quality.
 
 PURPOSE_LABELS = {"decision": "决策复核", "shadow": "影子对照", "critique": "反方审查",
                   "premarket_research": "盘前研究", "research": "研究（回放）", "postmarket_review": "盘后复盘",
-                  "triage": "事件判断", "decision_correction": "决策格式纠正", "stability": "稳定性测试"}
+                  "triage": "事件判断", "decision_correction": "决策格式纠正", "stability": "稳定性测试", "model_probe": "模型身份核对"}
 PURPOSES = tuple(PURPOSE_LABELS)
 
 

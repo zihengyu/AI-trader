@@ -865,20 +865,36 @@ class AutonomousFund(Strategy):
         self.triage = TriageSettings.from_config(config.get("triage"))
         # Kept out of agent_models: the triage model does not shape decisions, so prompt_version is unchanged.
         self.triage_model = None
+        from .model_identity import META as IDENTITY_META, ModelProbe, PROBE_PROMPT, observed_cutoffs
+        # What the provider served behind each configured name (model_identity.py); its epochs
+        # are part of prompt_version so records before and after a model change stay apart.
+        self.model_identity = self.journal.get_meta(IDENTITY_META) or {}
+        if self.factor_lab is not None:
+            self.factor_lab.observed_cutoffs = observed_cutoffs(self.model_identity)
         from .triage import bind_profile
         self.triage_profile = bind_profile(
             self.journal, self.triage, self.triage.model or self.agent_models["researcher"],
-            prompt_version(self.agent_models), self.get_datetime())
+            self._decision_version(), self.get_datetime())
         if self.triage.mode != "off":
             self.triage_model = self.triage.model or self.agent_models["researcher"]
             # No tools or network: it judges the triggers it is given, quickly.
             self.agents.create(name="triage", model=self.triage_model, output_schema=Triage,
                                **{**common, "tools": None, "allow_network": False},
                                run_timeout_seconds=run_timeouts["critic"], system_prompt=TRIAGE_PROMPT)
+        self.probe_agents = {}
+        if mode in {"paper", "local"} and not self.scripted:
+            # One fixed daily question per distinct model, without tools or network.
+            probed = set(self.agent_models.values()) | ({self.triage_model} if self.triage_model else set())
+            for index, probe_model in enumerate(sorted(probed), 1):
+                name = f"model_probe_{index}"
+                self.agents.create(name=name, model=probe_model, output_schema=ModelProbe,
+                                   **{**common, "tools": None, "allow_network": False},
+                                   run_timeout_seconds=run_timeouts["critic"], system_prompt=PROBE_PROMPT)
+                self.probe_agents[name] = probe_model
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
                          + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))
         self._record_output_protocols(mode)
-        self.prompt_version = prompt_version(self.agent_models)
+        self.prompt_version = self._decision_version()
         before = self.journal.get_meta("prompt_version")
         if before and before != self.prompt_version:
             self.journal.event(self.get_datetime(), "prompt_version_changed", {"from": before, "to": self.prompt_version})
@@ -1032,6 +1048,10 @@ class AutonomousFund(Strategy):
             self._market_history(self.get_datetime())
         except Exception as exc:  # Context only: the next decision evaluates it again.
             self._disclose_failure("market_history_check_error", exc, phase="postmarket_review")
+        try:
+            self._probe_models(self.get_datetime())
+        except Exception as exc:  # The next close asks again.
+            self._disclose_failure("model_probe_error", exc, phase="postmarket_review")
 
     def _check_stale_holdings(self, now):
         """Held stocks the provider stopped serving bars for (acquired, delisted, halted): tell the operator.
@@ -1680,19 +1700,32 @@ class AutonomousFund(Strategy):
         if result.parse_error or result.parsed is None:
             from .diagnostics import structured_answer_diagnostic
             from .triage import Triage
+            from .model_identity import ModelProbe
             schema = {"researcher": Research, "manager": Decision, "critic": Critique, "triage": Triage}.get(name)
+            if name.startswith("model_probe_"):
+                schema = ModelProbe
             if name == "manager" and phase == "postmarket_review":
                 from .review import PostmarketReview
                 schema = PostmarketReview
             diagnostic = structured_answer_diagnostic(result, schema)
         call = getattr(self, "_current_call", None) or {}
+        served = list(getattr(result, "served_models", None) or [])
         self.journal.event(now, "agent", {
             **({"call_id": call["call_id"], "purpose": call["purpose"]} if call.get("role") == name else {}),
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
             "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
             "mock": self.scripted, "phase": phase, "tokens": tokens,
             "cost_usd": round(cost, 6) if cost is not None else None,
+            **({"served_models": served} if served else {}),
             **({"answer_diagnostic": diagnostic} if diagnostic else {})})
+        if served and not self.scripted and not result.cache_hit and getattr(self, "mode", None) in {"local", "paper"}:
+            try:
+                from .model_identity import observe_served
+                if getattr(self, "model_identity", None) is None:
+                    self.model_identity = {}
+                self._identity_changes(observe_served(self.model_identity, result.model, served, now.isoformat()), now)
+            except Exception as exc:  # A measurement, never a reason to lose the answer.
+                self._disclose_failure("model_identity_error", exc, phase=phase or "agent")
         if diagnostic:
             detail = diagnostic["kind"]
             if "errors" in diagnostic:
@@ -1719,7 +1752,7 @@ class AutonomousFund(Strategy):
             pass
 
     def _agent_call(self, name, purpose=None, run_counter="agent_runs", **kwargs):
-        if (name != "triage" and getattr(self, "mode", None) == "local"
+        if (name != "triage" and not name.startswith("model_probe_") and getattr(self, "mode", None) == "local"
                 and hasattr(getattr(self, "broker", None), "ledger_audit")):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
@@ -1732,7 +1765,8 @@ class AutonomousFund(Strategy):
         # Triage has its own counter: it must never use up the runs the manager's decisions need.
         self.journal.counter(run_counter, self.get_datetime(), 1)
         model = getattr(self, "agent_models", {}).get(name) or (
-            getattr(self, "triage_model", None) if name == "triage" else None) or "unknown"
+            getattr(self, "triage_model", None) if name == "triage" else None) or (
+            getattr(self, "probe_agents", None) or {}).get(name) or "unknown"
         self.journal.event(self.get_datetime(), "agent_call_started", {
             "id": key, "name": name, "model": model, "purpose": purpose})
         try:
@@ -2065,6 +2099,75 @@ class AutonomousFund(Strategy):
             # The repeat question waits for an idle iteration with no open order of ours, so its
             # call never holds up stops, limit repricing or fills (_run_pending_stability).
             self._stability_pending = (armed, decision, accepted_id, now)
+
+    def _decision_version(self):
+        """prompt_version, plus the model-identity epochs once any model behind a name changed."""
+        from .model_identity import epochs
+        identity = epochs(getattr(self, "model_identity", None) or {})
+        return prompt_version(self.agent_models, {"model_identity": identity} if identity else None)
+
+    def _probe_models(self, now):
+        """Once a trading day, the fixed calibration question to every distinct model (model_identity.py)."""
+        probes = getattr(self, "probe_agents", None) or {}
+        day = trading_day(now)
+        if (not probes or self.scripted or getattr(self, "mode", None) not in {"local", "paper"}
+                or self.halt_path.exists() or self.journal.get_meta("model_probe_day") == day
+                or self._cost_exhausted(now, "model_probe")):
+            return None
+        from .model_identity import PROBE_TASK, observe_probe
+        self.journal.set_meta("model_probe_day", day)  # One attempt a day, also when a probe fails.
+        results = {}
+        for name, model in sorted(probes.items()):
+            try:
+                answer = self._record_agent(name, self._agent_call(
+                    name, purpose="model_probe", run_counter="probe_runs", task_prompt=PROBE_TASK,
+                    context={"as_of": instant(now).isoformat(), "phase": "model_probe"}), phase="model_probe")
+            except Exception as exc:  # One model's failure never hides the others.
+                results[model] = {"error": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__}
+                continue
+            results[model] = answer
+            self._identity_changes(observe_probe(self.model_identity, model, answer,
+                                                 instant(now).astimezone(ZoneInfo("America/New_York")).date(),
+                                                 instant(now).isoformat()), now)
+        self.journal.event(now, "model_probe", {"day": day, "answers": results})
+        return results
+
+    def _identity_changes(self, changes, now):
+        """Persist the identity state; on a change, notify and start a new prompt_version."""
+        from .model_identity import META, observed_cutoffs
+        self.journal.set_meta(META, self.model_identity)
+        lab = getattr(self, "factor_lab", None)
+        if lab is not None:
+            observed = observed_cutoffs(self.model_identity)
+            lab.observed_cutoffs = observed
+            notified = self.journal.get_meta("model_cutoff_notified") or {}
+            for model, seen in sorted(observed.items()):
+                configured = lab.settings.cutoff([model])
+                if configured is not None and seen > configured.isoformat() and notified.get(model) != seen:
+                    self._notify_fund("model_cutoff_tightened", {"model": model, "configured": configured.isoformat(),
+                                                                 "observed": seen})
+                    notified[model] = seen
+                    self.journal.set_meta("model_cutoff_notified", notified)
+        if not changes:
+            return
+        roles = sorted(role for role, model in {**self.agent_models,
+                                                **({"triage": self.triage_model}
+                                                   if getattr(self, "triage_model", None) else {})}.items()
+                       if any(model == change["model"] for change in changes))
+        for change in changes:
+            self.journal.event(now, "model_identity_changed", {**change, "roles": roles})
+            self._notify_fund("model_identity_changed", {**change, "roles": roles})
+        before, after = getattr(self, "prompt_version", None), self._decision_version()
+        if after != before:
+            self.prompt_version = after
+            self.journal.event(now, "prompt_version_changed", {"from": before, "to": after,
+                                                               "reason": "model_identity"})
+            self.journal.set_meta("prompt_version", after)
+            triage = getattr(self, "triage", None)
+            if triage is not None and getattr(self, "triage_profile", None) is not None:
+                from .triage import bind_profile
+                self.triage_profile = bind_profile(self.journal, triage, triage.model or self.agent_models["researcher"],
+                                                   after, now)
 
     def _run_pending_stability(self, now):
         """Ask the session's accepted decision again once nothing of ours is in flight; never raises.

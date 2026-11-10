@@ -46,6 +46,7 @@ Result surface:
 - `result.tool_calls` -- list of tool call events
 - `result.tool_results` -- list of tool result events
 - `(result.payload or {}).get("trace_path")` -- path to JSON trace
+- `result.served_models` -- model versions the provider reported (ADK `LlmResponse.model_version`, which LiteLLM fills from the response's `model` and the DeepSeek Responses adapter sets the same way). Kept in replays, traces and `agent_run_summaries.jsonl`. Empty when the provider reports none; many providers only echo the requested name, so an unchanged value is not proof the model is unchanged.
 
 ---
 

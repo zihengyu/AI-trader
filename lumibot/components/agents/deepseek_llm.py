@@ -222,4 +222,9 @@ class DeepSeekResponsesLlm(BaseLlm):
                                    organization="", project="", http_client=http_client,
                                    timeout=self._timeout, max_retries=0) as client:
                 response = await client.responses.create(**body)
-        yield _answer(response)
+        answer = _answer(response)
+        # As ADK's LiteLLM path does: the provider-reported model, for every answer or error.
+        served = getattr(response, "model", None)
+        if isinstance(served, str) and served:
+            answer.model_version = served
+        yield answer

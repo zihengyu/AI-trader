@@ -1853,6 +1853,7 @@ class AgentHandle:
             "agent_name": self.name,
             "mode": runtime_context.get("mode"),
             "model": result.model,
+            "served_models": list(result.served_models),
             "summary": result.summary or result.text or "",
             "cache_hit": result.cache_hit,
             "cache_key": result.cache_key,
@@ -1916,6 +1917,7 @@ class AgentHandle:
             ended_at=timing.get("call_ended_at"),
             latency_ms=_coerce_usage_int(timing.get("call_latency_ms")),
             first_event_latency_ms=_coerce_usage_int(timing.get("call_first_event_latency_ms")),
+            served_models=[str(m) for m in cached.get("served_models") or [] if isinstance(m, str)],
         )
 
     def _tool_journal_callback(self, model_call_id: str):
@@ -2505,6 +2507,7 @@ class AgentHandle:
                 "warnings": result.warnings,
                 "summary": result.summary,
                 "usage": result.usage,
+                "served_models": list(result.served_models),
                 "timing": _runtime_timing_payload(result),
                 "duckdb_metrics": self.manager.duckdb.get_metrics(),
                 "execution_outcome": execution_outcome,
@@ -2527,6 +2530,7 @@ class AgentHandle:
                         "usage": result.usage,
                         "payload": result.payload,
                         "timing": _runtime_timing_payload(result),
+                        "served_models": list(result.served_models),
                     },
                 )
             self.manager._record_agent_observability(
