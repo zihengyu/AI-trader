@@ -11,12 +11,14 @@ model between the soft triggers (news, price moves) and the manager:
 - hard triggers (market stress, the AI's own price alerts, stop and take-profit
   exits) and a failed triage still go straight to the manager, and the manager
   still reviews at least every max_quiet_minutes;
-- it starts in the shadow: the manager runs as before and every dismissal is
-  scored by whether that manager call changed the targets (a miss). Only when the
-  one-sided 95% Clopper-Pearson upper bound of the miss rate over the latest
-  `window` dismissals is at most `max_miss_rate` does it start dismissing; then
-  every `audit_every`-th dismissal still runs the manager to keep measuring, and
-  a miss rate above `max_miss_rate` returns it to the shadow.
+- in auto mode it dismisses from the start (`start: enforce`, the default) or begins
+  in the shadow (`start: shadow`). While dismissing, every `audit_every`-th
+  dismissal still runs the manager, blind to the verdict, and is scored by whether
+  that call changed the targets (a miss); once at least 10 are scored, a miss rate
+  above `max_miss_rate` returns it to the shadow. In the shadow the manager always
+  runs and every dismissal is scored; it dismisses again only when the one-sided
+  95% Clopper-Pearson upper bound of the miss rate over the latest `window`
+  dismissals is at most `max_miss_rate`.
 """
 from __future__ import annotations
 
@@ -58,8 +60,12 @@ TRIAGE_PROMPT = (
 
 @dataclass(frozen=True)
 class TriageSettings:
-    """`triage` section. mode: off, shadow (score only), auto (shadow until proven, then enforce), enforce."""
+    """`triage` section. mode: off, shadow (score only), auto (switches on the measured miss rate), enforce.
+
+    start: where auto mode begins on an account that has no state yet (enforce or shadow).
+    """
     mode: str = "auto"
+    start: str = "enforce"
     model: str | None = None  # Default: the research model.
     window: int = 40
     max_miss_rate: float = 0.15
@@ -68,6 +74,8 @@ class TriageSettings:
     def __post_init__(self):
         if self.mode not in MODES:
             raise RiskError("triage.mode must be off, shadow, auto or enforce")
+        if self.start not in {"enforce", "shadow"}:
+            raise RiskError("triage.start must be enforce or shadow")
         if self.model is not None and (not isinstance(self.model, str) or self.model.count("/") != 1):
             raise RiskError("triage.model must be an exact provider/model ID or null")
         if type(self.window) is not int or not 10 <= self.window <= 500:
@@ -100,6 +108,15 @@ def upper_bound(misses, n, confidence=0.95):
         tail = sum(comb(n, k) * p ** k * (1 - p) ** (n - k) for k in range(misses + 1))  # P(X <= misses)
         low, high = (p, high) if tail > target else (low, p)
     return high
+
+
+def enforcing_state(settings, saved):
+    """Whether dismissals take effect: fixed by shadow/enforce/off; in auto the saved state, else `start`."""
+    if settings.mode in {"off", "shadow"}:
+        return False
+    if settings.mode == "enforce":
+        return True
+    return bool(saved) if saved is not None else settings.start == "enforce"
 
 
 def evaluate(pairs, settings, enforcing):

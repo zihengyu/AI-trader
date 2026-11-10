@@ -511,11 +511,12 @@ days used to wake the manager (the expensive model) at every review floor: in
 one account, 1,031 news triggers in five days and 19 manager calls in a day
 with no portfolio change. With ``FUND_TRIAGE=auto`` (the default) news and
 price-move triggers are first screened by the fast research model, which only
-answers whether the manager should reassess now. It starts in the shadow (the
-manager still runs, blind to the verdict) and starts skipping the manager only
-when, over the last 40 dismissals, the 95% upper bound of the rate at which the
-manager changed the portfolio anyway is at most 15%. Every fifth dismissal is
-still audited, and too many misses return it to the shadow. Market stress,
+answers whether the manager should reassess now. It takes effect at once;
+every fifth dismissal still runs the manager (blind to the verdict) as an
+audit, and when more than 15% of audited dismissals changed the portfolio it
+returns to the shadow, where the manager always runs. It takes effect again
+when, over the last 40 dismissals, the 95% upper bound of that rate is at most
+15%. Set ``triage.start`` to ``shadow`` to begin in the shadow. Market stress,
 the AI's own price alerts and stop or take-profit exits always reach the
 manager directly, and the manager still reviews at least every two hours.
 

@@ -10,7 +10,8 @@ from types import SimpleNamespace
 import pytest
 
 from scripts.autonomous_fund.risk import RiskError, trading_day
-from scripts.autonomous_fund.triage import TRIAGED, TriageSettings, evaluate, soft_only, upper_bound
+from scripts.autonomous_fund.triage import (TRIAGED, TriageSettings, enforcing_state, evaluate, soft_only,
+                                             upper_bound)
 from tests.test_autonomous_fund_quant import NOW, account, decision, model_harness
 
 NEWS = {"at": str(NOW), "reason": "news", "material": "news_query", "title": "Analysts discuss chip demand",
@@ -22,9 +23,9 @@ def verdict(escalate, reason="routine coverage of a known story"):
             "reason": reason}
 
 
-def fund(tmp_path, mode, answers, decided_minutes_ago=10):
+def fund(tmp_path, mode, answers, decided_minutes_ago=10, start="enforce"):
     strategy = model_harness(tmp_path)
-    strategy.triage, strategy.triage_model = TriageSettings(mode=mode), "deepseek/deepseek-flash"
+    strategy.triage, strategy.triage_model = TriageSettings(mode=mode, start=start), "deepseek/deepseek-flash"
     strategy.last_decision = decision([("ALFA", .05)])
     strategy.journal.set_meta("last_model_decision", {"at": (NOW - timedelta(minutes=decided_minutes_ago)).isoformat(),
                                                       "day": trading_day(NOW)})
@@ -55,8 +56,9 @@ def manager_answers(strategy, changed):
 
 
 def test_settings_bound_and_soft_trigger_rules():
-    assert TriageSettings().mode == "auto" and TRIAGED == {"news", "price_move"}
-    for bad in ({"mode": "always"}, {"window": 5}, {"max_miss_rate": 0.9}, {"audit_every": 1}, {"model": "flash"}):
+    assert TriageSettings().mode == "auto" and TriageSettings().start == "enforce" and TRIAGED == {"news", "price_move"}
+    for bad in ({"mode": "always"}, {"window": 5}, {"max_miss_rate": 0.9}, {"audit_every": 1}, {"model": "flash"},
+                {"start": "later"}):
         with pytest.raises(RiskError):
             TriageSettings(**bad)
     with pytest.raises(RiskError, match="Unknown triage"):
@@ -68,7 +70,7 @@ def test_settings_bound_and_soft_trigger_rules():
 
 
 def test_in_the_shadow_the_manager_still_runs_blind_and_the_dismissal_is_scored(tmp_path):
-    strategy, calls = fund(tmp_path, "auto", [verdict(False)])
+    strategy, calls = fund(tmp_path, "shadow", [verdict(False)])
     strategy._triggers = [NEWS, {**NEWS, "title": "Another preview"}]
     assert strategy._triage_gate(account(), NOW) is False  # The manager runs.
     assert len(calls) == 1 and calls[0]["context"]["triggers"][0]["title"] == NEWS["title"]
@@ -79,7 +81,7 @@ def test_in_the_shadow_the_manager_still_runs_blind_and_the_dismissal_is_scored(
     assert screen["action"] == "shadow" and screen["reasons"] == ["news"] and screen["triggers"] == 2
     scored = manager_answers(strategy, changed=False)
     assert scored["miss"] is False and scored["stats"]["dismissals_scored"] == 1
-    assert strategy.journal.get_meta("triage_pairs") == [False] and not strategy.journal.get_meta("triage_enforcing")
+    assert strategy.journal.get_meta("triage_pairs") == [False] and not strategy._triage_enforcing()
 
 
 def test_hard_triggers_the_first_decision_and_the_two_hour_floor_bypass_screening(tmp_path):
@@ -138,8 +140,8 @@ def test_every_fifth_enforced_dismissal_is_audited_by_running_the_manager(tmp_pa
     assert strategy._pending_triage["action"] == "audit"
 
 
-def test_auto_enforces_after_a_clean_window_and_rolls_back_when_misses_rise(tmp_path):
-    strategy, _ = fund(tmp_path, "auto", [])
+def test_auto_from_the_shadow_enforces_after_a_clean_window_and_rolls_back_when_misses_rise(tmp_path):
+    strategy, _ = fund(tmp_path, "auto", [], start="shadow")
     notices = strategy.notices
 
     def score(miss):
@@ -147,7 +149,7 @@ def test_auto_enforces_after_a_clean_window_and_rolls_back_when_misses_rise(tmp_
         return manager_answers(strategy, changed=miss)
     for _ in range(39):
         score(False)
-    assert not strategy.journal.get_meta("triage_enforcing")
+    assert not strategy._triage_enforcing()
     score(False)  # The 40th clean dismissal: upper bound 7.2% <= 15%.
     assert strategy.journal.get_meta("triage_enforcing") is True
     assert [k for k, _ in notices] == ["triage_enforced"]
@@ -170,7 +172,7 @@ def test_a_failed_screening_leaves_the_decision_to_the_manager(tmp_path):
 
 
 def test_the_manager_context_in_a_shadow_round_has_the_triggers_but_never_the_verdict(tmp_path):
-    strategy, _ = fund(tmp_path, "auto", [verdict(False)])
+    strategy, _ = fund(tmp_path, "shadow", [verdict(False)])
     strategy._triggers = [NEWS]
     assert strategy._triage_gate(account(), NOW) is False
     seen = []
@@ -199,10 +201,33 @@ def test_notices_and_status_line_say_what_happened(tmp_path):
     assert "每 5 次" in text and "至少每 2 小时" in text
     back = readable("triage_rolled_back", {**stats, "misses": 7, "miss_rate": 0.175}, 4)
     assert "退回影子观察" in back and "17.50%" in back
-    strategy, _ = fund(tmp_path, "auto", [verdict(False)])
+    strategy, _ = fund(tmp_path, "shadow", [verdict(False)])
     strategy._triggers = [NEWS]
     strategy._triage_gate(account(), NOW)
     manager_answers(strategy, changed=False)
     with strategy.journal.connection() as db:
         line = triage_line(db, NOW)
     assert line.startswith("盘中事件判断：影子观察") and "最近 1 次" in line and "今天判断 1 次" in line
+
+
+def test_by_default_auto_takes_effect_at_once_and_its_audits_roll_it_back_on_misses(tmp_path):
+    settings = TriageSettings()
+    assert enforcing_state(settings, None) is True  # A new account: effective immediately.
+    assert enforcing_state(settings, False) is False and enforcing_state(TriageSettings(start="shadow"), None) is False
+    assert enforcing_state(TriageSettings(mode="enforce"), False) is True
+    assert enforcing_state(TriageSettings(mode="shadow"), True) is False
+    strategy, calls = fund(tmp_path, "auto", [verdict(False)])
+    strategy.journal.set_meta("scheduled_review_at", (NOW + timedelta(hours=1)).isoformat())
+    strategy._triggers = [NEWS]
+    assert strategy._triage_gate(account(), NOW) is True and len(calls) == 1  # Dismissed: no manager call.
+
+    def audit(miss):
+        strategy._pending_triage = {"id": "a", "action": "audit", "verdict": verdict(False)}
+        return manager_answers(strategy, changed=miss)
+    for _ in range(9):
+        audit(False)
+    audit(True)
+    assert strategy._triage_enforcing() is True  # 1 of 10 audits: 10% is within 15%.
+    audit(True)
+    assert strategy._triage_enforcing() is False  # 2 of 11: back to the shadow.
+    assert [k for k, _ in strategy.notices] == ["triage_rolled_back"]

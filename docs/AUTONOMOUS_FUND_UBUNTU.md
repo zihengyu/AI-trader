@@ -418,7 +418,8 @@ sudo systemctl stop lumibot-fund-runner.service lumibot-fund-monitor.service lum
 ```
 
 **盘中事件判断**：`bash scripts/fund-logs.sh` 概况里的“盘中事件判断”一行显示它在影子观察还是已生效、最近漏判次数和今天的判断次数。
-默认先影子运行几天（基金经理照常被叫），漏判率达标后自动生效并发 Telegram 通知；不想用可在 `.env` 设 `FUND_TRIAGE=off` 后重启交易进程。
+默认直接生效，每 5 次“不需要”仍抽查一次基金经理；漏判变多会自动退回影子运行并发 Telegram 通知，达标后再自动生效。
+不想用可在 `.env` 设 `FUND_TRIAGE=off` 后重启交易进程。
 
 **持仓被收购或退市**（本地账本）：收到“持仓 X 已连续 N 个交易日没有新的日线”的通知后，先查明实际结算金额
 （现金收购价；破产退市一般为 0），停止服务，结算，再启动。结算命令只用于本地账本，运行中会被运行锁拒绝；

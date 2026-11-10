@@ -605,7 +605,7 @@ def readable(kind, details, sequence=None, *, now=None):
                 "从现在起，普通新闻和价格异动先由快速模型判断，确实重要才叫基金经理；市场压力、价格提醒、止损止盈后仍直接叫，"
                 f"基金经理仍至少每 2 小时复核一次。每 {details.get('audit_every')} 次“不需要”仍抽查一次，漏判变多会自动退回。")
     elif kind == "triage_rolled_back" and isinstance(details, dict):
-        text = (f"⚠️ 盘中事件判断退回影子观察：最近 {details.get('dismissals_scored')} 次抽查里，快速模型说“不需要”但基金经理"
+        text = (f"⚠️ 盘中事件判断退回影子观察：最近 {details.get('dismissals_scored')} 次检查里，快速模型说“不需要”但基金经理"
                 f"实际改了组合 {details.get('misses')} 次（{_percent(details.get('miss_rate'))}，超过 "
                 f"{_percent(details.get('max_miss_rate'))}）。\n现在恢复为所有触发都叫基金经理，快速模型只在旁边打分；"
                 "漏判率重新达标后会再自动生效。")

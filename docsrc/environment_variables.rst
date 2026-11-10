@@ -1453,7 +1453,8 @@ independent monitor lift a STOP written by a service restart or a liveness fault
 after continuous health, never an operator's stop), model choice (``FUND_RESEARCH_MODEL``, ``FUND_DECISION_MODEL``,
 ``FUND_CRITIC``, ``FUND_CRITIC_MODEL``, ``FUND_TRIAGE`` (intraday event triage:
 ``auto`` by default, ``shadow``, ``enforce`` or ``off``; news and price-move triggers are
-screened by a fast model before the manager is called, first in the shadow), ``FUND_TRIAGE_MODEL``,
+screened by a fast model before the manager is called; ``auto`` takes effect at once, audits a sample
+and returns to the shadow when the measured miss rate is high), ``FUND_TRIAGE_MODEL``,
 ``FUND_REASONING_EFFORT``,
 ``FUND_MANAGER_RUN_TIMEOUT_SECONDS`` for each manager attempt in intraday decisions
 and postmarket reviews (1–899 seconds, default 300, applied on restart), ``FUND_MAX_AGENT_RUNS_PER_DAY``,

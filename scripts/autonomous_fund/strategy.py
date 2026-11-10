@@ -858,6 +858,9 @@ class AutonomousFund(Strategy):
         self.triage = TriageSettings.from_config(config.get("triage"))
         # Kept out of agent_models: the triage model does not shape decisions, so prompt_version is unchanged.
         self.triage_model = None
+        from .triage import enforcing_state
+        # Saved for the status line; auto keeps an account's earned state across restarts.
+        self.journal.set_meta("triage_enforcing", enforcing_state(self.triage, self.journal.get_meta("triage_enforcing")))
         if self.triage.mode != "off":
             self.triage_model = self.triage.model or self.agent_models["researcher"]
             # No tools or network: it judges the triggers it is given, quickly.
@@ -2182,10 +2185,9 @@ class AutonomousFund(Strategy):
         return True
 
     def _triage_enforcing(self):
+        from .triage import enforcing_state
         settings = getattr(self, "triage", None)
-        if settings is None or settings.mode in {"off", "shadow"}:
-            return False
-        return settings.mode == "enforce" or bool(self.journal.get_meta("triage_enforcing"))
+        return settings is not None and enforcing_state(settings, self.journal.get_meta("triage_enforcing"))
 
     def _triage_gate(self, account, now, paused=False):
         """True when the manager call is skipped because the fast model judged the soft triggers not worth it.
@@ -2274,7 +2276,7 @@ class AutonomousFund(Strategy):
         if not escalate:
             pairs = (self.journal.get_meta("triage_pairs") or [])[-499:] + [scored["miss"]]
             self.journal.set_meta("triage_pairs", pairs)
-            was = bool(self.journal.get_meta("triage_enforcing"))
+            was = self._triage_enforcing()
             enforcing, stats = evaluate(pairs, self.triage, was)
             scored["stats"] = stats
             if self.triage.mode == "auto" and enforcing != was:
