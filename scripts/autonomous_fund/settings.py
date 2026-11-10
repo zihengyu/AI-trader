@@ -94,6 +94,8 @@ SETTINGS = {
                                          "基金经理每次尝试的整轮超时（秒，默认 300），适用于盘中决策和盘后复盘"),
     "FUND_CRITIC": (("critic", "enabled"), _bool, False, "模型", "是否在研究员和基金经理之间加入反方审查（每次决策多一次模型调用）"),
     "FUND_CRITIC_MODEL": (("critic", "model"), _optional, False, "模型", "反方审查使用的模型，留空用研究员模型"),
+    "FUND_TRIAGE": (("triage", "mode"), str, False, "模型", "盘中事件判断：新闻和价格异动先由快速模型判断要不要叫基金经理。auto（默认：先影子验证，漏判率达标后自动生效）／shadow（只打分）／enforce（直接生效）／off（关闭）"),
+    "FUND_TRIAGE_MODEL": (("triage", "model"), _optional, False, "模型", "事件判断使用的模型，留空用研究员模型"),
     "FUND_MAX_AGENT_RUNS_PER_DAY": (("model_budget", "max_agent_runs_per_day"), _int, False, "模型", "每个交易日最多 Agent 调用次数（控制费用）"),
     "FUND_MIN_REVIEW_MINUTES": (("model_budget", "min_review_minutes"), _int, False, "模型", "两次 AI 复核的最短间隔（分钟）"),
     "FUND_SKIP_QUIET_REVIEWS": (("model_budget", "skip_quiet_reviews"), _bool, False, "模型", "到点复核时若无任何变化（无提醒、无成交、持仓和研究不变）则跳过本次模型调用"),

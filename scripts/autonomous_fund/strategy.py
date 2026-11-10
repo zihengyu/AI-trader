@@ -29,7 +29,7 @@ from .risk import (Account, DecisionTimingError, Intent, Limits, ObservedPrice, 
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
-                   "construction", "critic", "data_desk", "manager_run_timeout_seconds")
+                   "construction", "critic", "triage", "data_desk", "manager_run_timeout_seconds")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # Assumed per-side slippage when the broker states none (Alpaca paper), for the trade value check (V2 4.5).
 DEFAULT_SLIPPAGE = 0.0005
@@ -578,6 +578,8 @@ def configuration(path, environ=None):
     from .construction import ConstructionSettings
     ConstructionSettings.from_config(result.get("construction"))
     CriticSettings.from_config(result.get("critic"))
+    from .triage import TriageSettings
+    triage = TriageSettings.from_config(result.get("triage"))
     from .datadesk import DeskSettings
     DeskSettings.from_config(result.get("data_desk"))
     from .performance import PerformanceSettings
@@ -589,6 +591,8 @@ def configuration(path, environ=None):
         critic = CriticSettings.from_config(result.get("critic"))
         if critic.enabled and critic.model:
             models.add(critic.model)
+        if triage.mode != "off" and triage.model:
+            models.add(triage.model)
         prices = result.get("model_prices_per_million")
         unpriced = sorted(m for m in models if not rate_for(prices, m, len(models)))
         if unpriced:
@@ -850,6 +854,19 @@ class AutonomousFund(Strategy):
             self.agents.create(name="critic", model=self.agent_models["critic"], output_schema=Critique, **common,
                                run_timeout_seconds=run_timeouts["critic"], system_prompt=CRITIC_PROMPT)
             self._critic_ready = True
+        from .triage import TRIAGE_PROMPT, Triage, TriageSettings
+        self.triage = TriageSettings.from_config(config.get("triage"))
+        # Kept out of agent_models: the triage model does not shape decisions, so prompt_version is unchanged.
+        self.triage_model = None
+        from .triage import enforcing_state
+        # Saved for the status line; auto keeps an account's earned state across restarts.
+        self.journal.set_meta("triage_enforcing", enforcing_state(self.triage, self.journal.get_meta("triage_enforcing")))
+        if self.triage.mode != "off":
+            self.triage_model = self.triage.model or self.agent_models["researcher"]
+            # No tools or network: it judges the triggers it is given, quickly.
+            self.agents.create(name="triage", model=self.triage_model, output_schema=Triage,
+                               **{**common, "tools": None, "allow_network": False},
+                               run_timeout_seconds=run_timeouts["critic"], system_prompt=TRIAGE_PROMPT)
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
                          + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))
         self._record_output_protocols(mode)
@@ -1647,7 +1664,8 @@ class AutonomousFund(Strategy):
         diagnostic = None
         if result.parse_error or result.parsed is None:
             from .diagnostics import structured_answer_diagnostic
-            schema = {"researcher": Research, "manager": Decision, "critic": Critique}.get(name)
+            from .triage import Triage
+            schema = {"researcher": Research, "manager": Decision, "critic": Critique, "triage": Triage}.get(name)
             if name == "manager" and phase == "postmarket_review":
                 from .review import PostmarketReview
                 schema = PostmarketReview
@@ -1685,8 +1703,9 @@ class AutonomousFund(Strategy):
         except Exception:
             pass
 
-    def _agent_call(self, name, purpose=None, **kwargs):
-        if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+    def _agent_call(self, name, purpose=None, run_counter="agent_runs", **kwargs):
+        if (name != "triage" and getattr(self, "mode", None) == "local"
+                and hasattr(getattr(self, "broker", None), "ledger_audit")):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
             kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
@@ -1695,16 +1714,19 @@ class AutonomousFund(Strategy):
         phase = (kwargs.get("context") or {}).get("phase")
         purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
         self._current_call = {"call_id": key, "role": name, "purpose": purpose}
-        self.journal.counter("agent_runs", self.get_datetime(), 1)
+        # Triage has its own counter: it must never use up the runs the manager's decisions need.
+        self.journal.counter(run_counter, self.get_datetime(), 1)
+        model = getattr(self, "agent_models", {}).get(name) or (
+            getattr(self, "triage_model", None) if name == "triage" else None) or "unknown"
         self.journal.event(self.get_datetime(), "agent_call_started", {
-            "id": key, "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "purpose": purpose})
+            "id": key, "name": name, "model": model, "purpose": purpose})
         try:
             return self.agents[name].run(**kwargs)
         except BaseException as exc:
             # Interrupting a paid request must also retain unknown usage. The
             # interrupt is re-raised so Ctrl+C still stops the runner normally.
             self.journal.event(self.get_datetime(), "agent", {
-                "name": name, "model": getattr(self, "agent_models", {}).get(name, "unknown"), "cache_hit": False, "usage": None,
+                "name": name, "model": model, "cache_hit": False, "usage": None,
                 "summary": "Agent attempt failed; provider usage unknown.", "parse_error": type(exc).__name__,
                 "mock": self.scripted, "phase": phase, "call_id": key, "purpose": purpose})
             raise
@@ -1802,7 +1824,12 @@ class AutonomousFund(Strategy):
             if self._quiet_review(account, now, paused):
                 self._warm_optional(now)
                 return
+            if self._triage_gate(account, now, paused):
+                self._warm_optional(now)
+                return
+            before = self.last_decision
             self._decide(account, now, paused)
+            self._score_triage(before)
         except Exception as exc:
             from .execution import ApprovalPending
             if isinstance(exc, ApprovalPending):
@@ -1931,6 +1958,7 @@ class AutonomousFund(Strategy):
                    "data_desk": self._desk_context(now),
                    "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
                    "watch_triggers": list(getattr(self, "_triggers", [])),
+                   **({"event_triage": self._triage_note} if getattr(self, "_triage_note", None) else {}),
                    "news": self._news_context(account, now),
                    "scorecards": self._scorecard_summary(now),
                    "trade_value": self._trade_value_model(now),
@@ -1995,6 +2023,7 @@ class AutonomousFund(Strategy):
         self._triggers = []
         self.last_decision = decision
         self.next_review = max(instant(decision["next_review_at"]), now + minimum)
+        self.journal.set_meta("scheduled_review_at", self.next_review.isoformat())
         announcement_account = account
         if live:
             try:
@@ -2154,6 +2183,108 @@ class AutonomousFund(Strategy):
             "decided_at": last["at"], "next_check": self.next_review.isoformat(),
             "manager_due_by": (made + timedelta(minutes=budget.max_quiet_minutes)).isoformat()})
         return True
+
+    def _triage_enforcing(self):
+        from .triage import enforcing_state
+        settings = getattr(self, "triage", None)
+        return settings is not None and enforcing_state(settings, self.journal.get_meta("triage_enforcing"))
+
+    def _triage_gate(self, account, now, paused=False):
+        """True when the manager call is skipped because the fast model judged the soft triggers not worth it.
+
+        Only news and price-move triggers are screened (triage.TRIAGED); anything else, no decision yet
+        today, the max_quiet_minutes guarantee, no cost budget, or a failed triage call goes to the manager
+        exactly as before. In the shadow the manager always runs and the verdict is scored afterwards
+        (_score_triage); the manager never sees a shadow verdict, so the comparison stays blind.
+        """
+        from .triage import soft_only
+        self._triage_note, self._pending_triage = None, None
+        settings = getattr(self, "triage", None)
+        triggers = list(getattr(self, "_triggers", None) or [])
+        if (settings is None or settings.mode == "off" or getattr(self, "triage_model", None) is None
+                or not soft_only(triggers)):
+            return False
+        budget = getattr(self, "model_budget", None) or ModelBudget()
+        if self.journal.counter("triage_runs", now) >= budget.max_agent_runs_per_day:
+            return False  # A day's screening is bounded like the manager's runs.
+        last = self.journal.get_meta("last_model_decision") or {}
+        try:
+            made = instant(last["at"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if last.get("day") != trading_day(now) or now - made >= timedelta(minutes=budget.max_quiet_minutes):
+            return False  # The manager is due anyway: no screening call.
+        enforcing = self._triage_enforcing()
+        floor = timedelta(minutes=budget.min_review_minutes)
+        previous = self.journal.get_meta("triage_last_at")
+        if enforcing and previous and now - instant(previous) < floor:
+            self.next_review = instant(previous) + floor  # Batch the next headlines into one screening call.
+            return True
+        if self._cost_exhausted(now, "triage"):
+            return False
+        plan = self.last_decision or {}
+        context = {"as_of": now.isoformat(), "triggers": triggers[-20:],
+                   "positions": {s: str(q) for s, q in (account.positions or {}).items()},
+                   "plan": {"decided_at": last.get("at"), "targets": plan.get("targets", []),
+                            "rationale": str(plan.get("rationale") or "")[:1500],
+                            "news_watch": plan.get("news_watch", [])}}
+        try:
+            verdict = self._record_agent("triage", self._agent_call(
+                "triage", purpose="triage", run_counter="triage_runs",
+                task_prompt="Should the portfolio manager reassess now because of these events?", context=context),
+                phase="triage")
+        except Exception as exc:  # Unscreened: the manager decides, as before.
+            self.journal.event(now, "triage_unavailable",
+                               {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+            return False
+        self.journal.set_meta("triage_last_at", now.isoformat())
+        record = {"id": uuid4().hex[:12], "at": now.isoformat(), "verdict": verdict, "triggers": len(triggers),
+                  "reasons": sorted({t.get("reason") for t in triggers})}
+        if verdict["escalate"]:
+            record["action"] = "escalated" if enforcing else "shadow"
+            if enforcing:  # The manager learns why it was woken; a shadow verdict stays hidden from it.
+                self._triage_note = {**verdict, "meaning": "a fast screen of watch_triggers judged them worth a "
+                                     "reassessment; it chose no trades"}
+        elif not enforcing:
+            record["action"] = "shadow"
+        else:
+            count = int(self.journal.get_meta("triage_dismissal_count", 0) or 0) + 1
+            self.journal.set_meta("triage_dismissal_count", count)
+            settings = self.triage
+            record["action"] = "audit" if count % settings.audit_every == 0 else "dismissed"
+        self.journal.event(now, "event_triage", record)
+        if record["action"] != "dismissed":
+            self._pending_triage = record  # Scored once the manager has answered.
+            return False
+        self._triggers = []
+        scheduled = self.journal.get_meta("scheduled_review_at")
+        if scheduled and instant(scheduled) > now:
+            self.next_review = instant(scheduled)
+            return True
+        return self._quiet_review(account, now, paused)  # Its own schedule is due: quiet, or the manager runs.
+
+    def _score_triage(self, before):
+        """After a manager call that followed a screening: did the manager change the targets?"""
+        from .triage import evaluate
+        record, self._pending_triage, self._triage_note = getattr(self, "_pending_triage", None), None, None
+        if not record or self.last_decision is before:
+            return None  # No new decision (failed or skipped): nothing to score.
+        changed = targets_changed(before, self.last_decision)
+        escalate = record["verdict"]["escalate"]
+        scored = {"id": record["id"], "action": record["action"], "escalate": escalate, "manager_changed": changed,
+                  "miss": (not escalate) and changed}
+        if not escalate:
+            pairs = (self.journal.get_meta("triage_pairs") or [])[-499:] + [scored["miss"]]
+            self.journal.set_meta("triage_pairs", pairs)
+            was = self._triage_enforcing()
+            enforcing, stats = evaluate(pairs, self.triage, was)
+            scored["stats"] = stats
+            if self.triage.mode == "auto" and enforcing != was:
+                self.journal.set_meta("triage_enforcing", enforcing)
+                self._notify_fund("triage_enforced" if enforcing else "triage_rolled_back",
+                                  {**stats, "audit_every": self.triage.audit_every})
+        self.journal.event(self.get_datetime(), "triage_scored", scored)
+        return scored
 
     def _critique(self, context, research, budget, now):
         """The devil's advocate's critique, or None (disabled, no budget, or failed: never blocks a decision)."""

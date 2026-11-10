@@ -95,6 +95,29 @@ def day_trade_line(db, now):
     return f"日内交易（同一天买入又卖出，估算）：最近 {count['window']} 个交易日 {count['last_sessions']} 次"
 
 
+def triage_line(db, now):
+    """Intraday event triage: shadow or enforcing, the scored misses, and today's screening calls."""
+    from zoneinfo import ZoneInfo
+    from .triage import upper_bound
+    meta = {key: json.loads(value) for key, value in db.execute(
+        "SELECT key,value FROM meta WHERE key IN ('triage_enforcing','triage_pairs')")}
+    pairs = (meta.get("triage_pairs") or [])[-40:]
+    zone = ZoneInfo("America/New_York")
+    today = instant(now).astimezone(zone).date().isoformat()
+    actions = {}
+    for at, body in db.execute("SELECT at,body FROM events WHERE kind='event_triage' ORDER BY sequence DESC LIMIT 400"):
+        if instant(at).astimezone(zone).date().isoformat() == today:
+            action = json.loads(body).get("action")
+            actions[action] = actions.get(action, 0) + 1
+    if not pairs and not actions:
+        return None
+    misses = sum(bool(p) for p in pairs)
+    state = "生效中" if meta.get("triage_enforcing") else "影子观察（基金经理照常被叫，只打分）"
+    return (f"盘中事件判断：{state}；最近 {len(pairs)} 次“不需要”里漏判 {misses} 次"
+            f"（95% 上限 {upper_bound(misses, len(pairs)) * 100:.1f}%）；今天判断 {sum(actions.values())} 次"
+            + (f"，其中未叫基金经理 {actions.get('dismissed', 0)} 次" if meta.get("triage_enforcing") else ""))
+
+
 def _age(at, now):
     try:
         return (now - instant(at)).total_seconds()
@@ -385,6 +408,12 @@ def summary(root, mode, now=None):
             lines.append(day_trade_line(db, now))
         except Exception as exc:
             lines.append(f"日内交易计数：暂不可用（{type(exc).__name__}）")
+        try:
+            line = triage_line(db, now)
+            if line:
+                lines.append(line)
+        except Exception as exc:
+            lines.append(f"盘中事件判断：状态暂不可用（{type(exc).__name__}）")
     from zoneinfo import ZoneInfo
     from .decision_activity import activity, lines as activity_lines
     audit = activity(root, now=now)
