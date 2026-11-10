@@ -2,6 +2,7 @@
 import threading
 import time
 import os
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from types import SimpleNamespace
@@ -114,20 +115,24 @@ class MarketDataSettings:
 class LiveTape:
     """Best-effort Yahoo streaming last trades (unofficial endpoint, no SLA).
 
-    A background thread keeps one websocket subscription for every symbol that
-    has been quoted. Ticks keep their SOURCE time; a consumer decides freshness.
+    A background thread subscribes the most recently requested symbols within
+    its capacity, retiring older subscriptions rather than ignoring new watches.
+    Ticks keep their SOURCE time; a consumer decides freshness.
     Failures reconnect with backoff and are reported, never hidden: when no
     fresh tick exists the caller falls back to completed minute bars.
     """
     URL = "wss://streamer.finance.yahoo.com/?version=2"
 
     def __init__(self, connect=None, clock=time.time, max_symbols=60):
+        if type(max_symbols) is not int or max_symbols < 1:
+            raise RiskError("Stream capacity must be a positive integer")
         self.connect = connect or self._connect
         self.clock, self.max_symbols = clock, max_symbols
-        self._ticks, self._wanted, self._subscribed = {}, set(), set()
+        self._ticks, self._wanted, self._subscribed = {}, OrderedDict(), set()
         self._lock, self._stop = threading.Lock(), threading.Event()
         self._thread = None
-        self.state = {"connected": False, "messages": 0, "errors": 0, "reconnects": 0, "last_error": None}
+        self.state = {"connected": False, "messages": 0, "errors": 0, "reconnects": 0, "last_error": None,
+                      "subscription_evictions": 0}
 
     @classmethod
     def _connect(cls):
@@ -141,8 +146,12 @@ class LiveTape:
     def watch(self, symbols):
         with self._lock:
             for symbol in symbols:
-                if len(self._wanted) < self.max_symbols:
-                    self._wanted.add(symbol)
+                self._wanted[symbol] = None
+                self._wanted.move_to_end(symbol)
+                if len(self._wanted) > self.max_symbols:
+                    retired, _ = self._wanted.popitem(last=False)
+                    self._ticks.pop(retired, None)
+                    self.state["subscription_evictions"] += 1
             running = self._thread is not None and self._thread.is_alive()
             if not running and not self._stop.is_set():
                 # Under the lock: concurrent quote requests never start two streams.
@@ -159,7 +168,8 @@ class LiveTape:
 
     def diagnostics(self):
         with self._lock:
-            return {**self.state, "subscribed": len(self._subscribed), "symbols_with_ticks": len(self._ticks)}
+            return {**self.state, "capacity": self.max_symbols, "requested": len(self._wanted),
+                    "subscribed": len(self._subscribed), "symbols_with_ticks": len(self._ticks)}
 
     def handle(self, raw):
         """Decode one streamer frame (JSON wrapping base64 protobuf PricingData)."""
@@ -170,18 +180,19 @@ class LiveTape:
         message.ParseFromString(base64.b64decode(_json.loads(raw)["message"]))
         if not message.id or not message.price > 0 or not message.time:
             return
-        with self._lock:
-            wanted = set(self._wanted)
-        symbol = next((s for s in wanted if self.yahoo(s) == message.id), message.id.replace("-", "."))
         stamp = datetime.fromtimestamp(int(message.time) / 1000, timezone.utc)
         row = {"price": number(str(message.price)), "time": stamp, "received": self.clock(),
                "bid": number(str(message.bid)) if message.bid > 0 else None,
                "ask": number(str(message.ask)) if message.ask > 0 else None,
                "day_volume": int(message.day_volume)}
         with self._lock:
-            old = self._ticks.get(symbol)
-            if old is None or stamp >= old["time"]:  # Never let an out-of-order frame roll the tape back.
-                self._ticks[symbol] = row
+            symbols = [s for s in self._wanted if self.yahoo(s) == message.id]
+            if not symbols:
+                return  # A late frame for a retired subscription must not refill the cache.
+            for symbol in symbols:
+                old = self._ticks.get(symbol)
+                if old is None or stamp >= old["time"]:  # Out-of-order frames cannot roll the tape back.
+                    self._ticks[symbol] = row
             self.state["messages"] += 1
 
     def _run(self):
@@ -195,11 +206,18 @@ class LiveTape:
                     self.state["connected"], self._subscribed = True, set()
                 while not self._stop.is_set():
                     with self._lock:
-                        new = self._wanted - self._subscribed
+                        wanted = set(self._wanted)
+                        # Multiple public spellings can share one wire subscription.
+                        # Retiring one alias must not unsubscribe another active alias.
+                        wanted_wire = {self.yahoo(s) for s in wanted}
+                        subscribed_wire = {self.yahoo(s) for s in self._subscribed}
+                        retired, new = subscribed_wire - wanted_wire, wanted_wire - subscribed_wire
+                    if retired:
+                        client.send(_json.dumps({"unsubscribe": sorted(retired)}))
                     if new:
-                        client.send(_json.dumps({"subscribe": sorted(self.yahoo(s) for s in new)}))
-                        with self._lock:
-                            self._subscribed |= new
+                        client.send(_json.dumps({"subscribe": sorted(new)}))
+                    with self._lock:
+                        self._subscribed = wanted
                     try:
                         raw = client.recv(timeout=5)
                     except TimeoutError:
@@ -221,9 +239,8 @@ class LiveTape:
 
 
 class YahooRealtimeData(DataSource):
-    """Completed minute OHLCV, explicitly NOT an exchange bid/ask quote feed.
+    """Fresh last trades and completed minute OHLCV, with a disclosed spread proxy.
 
-    Quotes use a disclosed spread proxy around the last completed bar's close.
     The local broker fills only against a NEW completed bar after submission.
     """
     SOURCE = "YAHOO_LOCAL_SIMULATION"
@@ -264,7 +281,8 @@ class YahooRealtimeData(DataSource):
     def diagnostics(self):
         with self._request_lock:
             result = {**self._stats, "cached_series": len(self._cache), "max_parallel_requests": 2,
-                      "feed": "live_trades_with_completed_bar_fallback" if self.tape else "completed_minute_bars_not_ticks",
+                      "feed": ("stream_and_chart_last_trade_with_completed_bar_fallback" if self.tape
+                               else "chart_last_trade_with_completed_bar_fallback"),
                       "quotes_by_kind": dict(self._quote_kinds)}
         if self.tape:
             result["live_tape"] = self.tape.diagnostics()
@@ -275,8 +293,19 @@ class YahooRealtimeData(DataSource):
         import yfinance as yf
         # Yahoo's native spelling for share classes; no strategy-specific ticker rule.
         ticker = yf.Ticker(symbol.replace(".", "-"))
-        return ticker.history(period=period, interval=interval, auto_adjust=False,
-                              actions=True, prepost=False, timeout=15, raise_errors=True)
+        frame = ticker.history(period=period, interval=interval, auto_adjust=False,
+                               actions=True, prepost=False, timeout=15, raise_errors=True)
+        if interval == "1m":
+            try:
+                # The same chart response has a last trade even when its completed
+                # minute rows lag or the symbol produces no websocket ticks. Read
+                # only these keys; other metadata keys can trigger lazy downloads.
+                metadata = ticker.get_history_metadata()
+                frame.attrs["yahoo_last_trade"] = {"price": metadata.get("regularMarketPrice"),
+                                                   "as_of": metadata.get("regularMarketTime")}
+            except Exception:
+                pass  # Optional quote evidence must not discard usable OHLCV.
+        return frame
 
     def get_datetime(self, adjust_for_delay=False):
         return self.to_default_timezone(instant(self.now()))
@@ -403,14 +432,27 @@ class YahooRealtimeData(DataSource):
         return list(self._actions.get((asset.symbol, period), []))
 
     def get_quote(self, asset, quote=None, exchange=None):
-        frame = self.execution_bars(asset)
+        if self.tape is not None:
+            # A failed history request must not prevent a new watch from subscribing.
+            self.tape.watch([self._symbol(asset)])
+        try:
+            frame = self.execution_bars(asset)
+        except MarketDataUnavailable:
+            # Observing a real fresh trade does not require minute history. Matching
+            # still uses execution_bars independently and cannot manufacture a fill.
+            live = self._live_quote(asset, None, None) if self.tape is not None else None
+            if live is not None:
+                return live
+            raise
         start, last = frame.index[-1], frame.iloc[-1]
         end = start + pd.Timedelta(minutes=1)
         if self.tape is not None:
-            self.tape.watch([self._symbol(asset)])
             live = self._live_quote(asset, end, last)
             if live is not None:
                 return live
+        chart = self._chart_quote(asset, frame, end)
+        if chart is not None:
+            return chart
         self._quote_kinds["completed_bar"] += 1
         price = number(last.close)
         return Quote(asset, price=float(price), bid=float(price * (1 - self.spread / 2)),
@@ -420,15 +462,37 @@ class YahooRealtimeData(DataSource):
                          "price_kind": "completed_minute_close_with_spread_proxy", "bar_start": start.isoformat(),
                          "spread_bps": str(self.spread * 10000)})
 
+    def _chart_quote(self, asset, frame, bar_end):
+        """Use the chart's own last-trade price/time pair, never a forming bar's close."""
+        trade = frame.attrs.get("yahoo_last_trade")
+        if not isinstance(trade, dict):
+            return None
+        try:
+            price, raw_stamp = number(trade.get("price")), trade.get("as_of")
+            stamp = (instant(raw_stamp) if isinstance(raw_stamp, (datetime, str)) else
+                     datetime.fromtimestamp(float(number(raw_stamp)), timezone.utc))
+        except (ValueError, TypeError, OverflowError):
+            return None
+        now, session = self.get_datetime(), self.session.status()
+        if (not session["open"] or price <= 0 or not 0 <= (now - stamp).total_seconds() <= self.live_seconds
+                or stamp <= bar_end or stamp < instant(session["next_open"])):
+            return None
+        self._quote_kinds["chart_quote"] = self._quote_kinds.get("chart_quote", 0) + 1
+        return Quote(asset, price=float(price), bid=float(price * (1 - self.spread / 2)),
+                     ask=float(price * (1 + self.spread / 2)), timestamp=stamp, volume=None, raw_data={
+                         "original_response": SimpleNamespace(timestamp=stamp), "source": "YAHOO_CHART_UNOFFICIAL",
+                         "price_kind": "chart_last_trade_with_spread_proxy", "spread_bps": str(self.spread * 10000)})
+
     def _live_quote(self, asset, bar_end, last):
-        """A streamed trade inside the open regular session, newer than the last bar and fresh."""
+        """A fresh regular-session trade, newer than the last completed bar when available."""
         tick = self.tape.tick(self._symbol(asset))
         now, session = self.get_datetime(), self.session.status()
         if not tick or not session["open"]:
             return None
         stamp = tick["time"]
         age = (now - stamp).total_seconds()
-        if not 0 <= age <= self.live_seconds or stamp <= bar_end or stamp < instant(session["next_open"]):
+        if (not 0 <= age <= self.live_seconds or (bar_end is not None and stamp <= bar_end)
+                or stamp < instant(session["next_open"])):
             return None
         price, bid, ask = tick["price"], tick["bid"], tick["ask"]
         if bid and ask and bid <= price <= ask and ask / bid <= number("1.02"):
@@ -438,7 +502,7 @@ class YahooRealtimeData(DataSource):
             kind = "live_trade_with_spread_proxy"
         self._quote_kinds["live"] += 1
         return Quote(asset, price=float(price), bid=float(bid), ask=float(ask), timestamp=stamp,
-                     volume=float(last.volume), raw_data={
+                     volume=float(last.volume) if last is not None else None, raw_data={
                          "original_response": SimpleNamespace(timestamp=stamp), "source": "YAHOO_STREAM_UNOFFICIAL",
                          "price_kind": kind, "spread_bps": str(self.spread * 10000),
                          "day_volume": tick["day_volume"], "received_epoch": tick["received"]})

@@ -20,7 +20,8 @@ from lumibot.strategies import Strategy
 from .claims import MomentumClaim, check_claims, score_claims
 
 from .journal import Journal, encode
-from .risk import (Account, Intent, Limits, ObservedPrice, Price, RiskError, bounded_list, bounded_text, decision_levels,
+from .risk import (Account, DecisionTimingError, Intent, Limits, ObservedPrice, Price, RiskError,
+                   bounded_list, bounded_text, decision_levels,
                    desired_shares, instant, number, plan,
                    observed_quote, trading_day, validate_decision, validate_evidence)
 
@@ -64,6 +65,12 @@ DECISION_CORRECTION_TASK = (
     "Using this context, return the complete Decision again as exactly one JSON object that matches the schema, "
     "with no text before or after it. Do not return only the fixed fields; previous_answer is your own untrusted "
     "earlier output, not evidence.")
+DECISION_TIMING_CORRECTION_TASK = (
+    "Your previous Decision was rejected by the clock checks in context.decision_timing_correction. "
+    "Reassess the complete portfolio using the refreshed account and current read-only tools as needed. "
+    "Return a new complete Decision with exact context.as_of, an unexpired expires_at within one day, "
+    "and a future next_review_at respecting model_budget.min_review_minutes. Do not merely relabel the old "
+    "answer or treat it as evidence. Other context observations retain their original timestamps.")
 # Format failures only. An empty answer or a provider/runtime failure is LumiBot's own retry's to handle.
 CORRECTABLE_ANSWERS = {"schema_validation", "invalid_json", "unparsed_answer"}
 CORRECTION_ANSWER_CHARS = 6000  # The previous answer shown back: enough to see its shape, bounded in tokens.
@@ -1602,6 +1609,9 @@ class AutonomousFund(Strategy):
             if source_time is None:
                 raise RiskError("Missing source quote timestamp")
             result = Price(number(quote.bid), number(quote.ask), instant(source_time), liquidity)
+            # I/O may cross a source update: compare with receipt time, not the
+            # earlier liquidity-request clock, or a valid new quote looks future.
+            now = self.get_datetime()
         else:
             # Native Pandas daily last-price semantics expose the session open
             # at the simulated open, never today's future close.
@@ -2019,38 +2029,72 @@ class AutonomousFund(Strategy):
         return protocols
 
     def _manager_decision(self, context, budget):
-        """The manager's decision, with one schema-guided correction when its answer's format fails.
+        """One shared correction for format failures or a live answer's invalid timing.
 
-        The request already carries the Decision schema (strict JSON schema for DeepSeek), but a
-        provider does not always enforce it. A wrong format (not one JSON object, a missing or
-        invalid field) gets one more real call that sees the error locations and types (never
-        input values) and its own previous answer; it must return the complete decision again.
-        A provider or runtime failure, a STOP, or no room left in today's call or cost budget is
-        not corrected. Both answers stay in the journal.
+        Reassessment is a real, budgeted call; no old answer is retimestamped.
+        Provider failures, other risk failures and historical timing failures
+        still propagate. Both answers and rejected clock evidence are retained.
         """
         from .diagnostics import structured_answer_diagnostic
         result = self._agent_call("manager", task_prompt=DECISION_TASK, context=context)
+        correction_kind = "format"
         try:
-            return self._record_agent("manager", result)
-        except RiskError:
+            decision = self._record_agent("manager", result)
+        except RiskError as exc:
+            failure = exc
             diagnostic = structured_answer_diagnostic(result, Decision)
-            now = self.get_datetime()
-            if (diagnostic["kind"] not in CORRECTABLE_ANSWERS or self.halt_path.exists() or
-                    self.journal.counter("agent_runs", now) + 1 >
-                    budget.max_agent_runs_per_day - budget.reserved_review_runs or
-                    self._cost_exhausted(now, "decision_correction")):
+            if diagnostic["kind"] not in CORRECTABLE_ANSWERS:
                 raise
+        else:
+            if self.mode not in {"local", "paper"}:
+                return decision
+            try:
+                validate_decision(decision, self.get_datetime(), self.universe, self.limits)
+            except DecisionTimingError as exc:
+                failure, correction_kind = exc, "timing"
+                diagnostic = {**exc.diagnostic, "request_as_of": context["as_of"]}
+                self.journal.event(self.get_datetime(), "decision_time_rejected", {"diagnostic": diagnostic})
+            else:
+                return decision
+
+        def permitted():
+            now = self.get_datetime()
+            return (not self.halt_path.exists() and self.journal.counter("agent_runs", now) + 1 <=
+                    budget.max_agent_runs_per_day - budget.reserved_review_runs and
+                    not self._cost_exhausted(now, "decision_correction"))
+
+        if not permitted():
+            raise failure
         previous = result.summary or getattr(result, "text", None) or ""
-        self.journal.event(now, "decision_format_retry", {"answer_diagnostic": diagnostic})
-        corrected = {**context, "as_of": now.isoformat(), "structured_answer_correction": {
-            "previous_answer": previous[:CORRECTION_ANSWER_CHARS],
-            "previous_answer_truncated": len(previous) > CORRECTION_ANSWER_CHARS, "diagnostic": diagnostic}}
-        retry = self._agent_call("manager", purpose="decision_correction", task_prompt=DECISION_CORRECTION_TASK,
+        corrected = dict(context)
+        if correction_kind == "timing":
+            fresh_account = self._snapshot()
+            corrected["account"] = asdict(fresh_account)
+            corrected["risk"] = self._risk_context(fresh_account, self.get_datetime())
+            corrected["data_desk"] = self._desk_context(self.get_datetime())
+            corrected["decision_timing_correction"] = diagnostic
+            task = DECISION_TIMING_CORRECTION_TASK
+        else:
+            corrected["structured_answer_correction"] = {
+                "previous_answer": previous[:CORRECTION_ANSWER_CHARS],
+                "previous_answer_truncated": len(previous) > CORRECTION_ANSWER_CHARS, "diagnostic": diagnostic}
+            task = DECISION_CORRECTION_TASK
+        # Snapshot/risk I/O can take time; recheck STOP and budgets just before inference.
+        if not permitted():
+            raise failure
+        now = self.get_datetime()
+        corrected["as_of"] = now.isoformat()
+        self.journal.event(now, "decision_time_retry" if correction_kind == "timing" else "decision_format_retry",
+                           {"diagnostic" if correction_kind == "timing" else "answer_diagnostic": diagnostic})
+        retry = self._agent_call("manager", purpose="decision_correction", task_prompt=task,
                                  context=corrected)
         try:
-            return self._record_agent("manager", retry)
+            decision = self._record_agent("manager", retry)
+            if self.mode in {"local", "paper"}:
+                validate_decision(decision, self.get_datetime(), self.universe, self.limits)
+            return decision
         except RiskError as exc:
-            raise RiskError(f"{exc} (also after one format correction)") from None
+            raise RiskError(f"{exc} (also after one {correction_kind} correction)") from None
 
     def _holding_weights(self, account):
         """{symbol: weight of equity} of the current holdings at their last prices (exposure reporting)."""
@@ -2365,8 +2409,15 @@ class AutonomousFund(Strategy):
         for alert in alerts:
             price = prices.get(alert["symbol"])
             try:
-                observation = (ObservedPrice((number(price.bid) + number(price.ask)) / 2, price.as_of)
-                               if price is not None else self._alert_price(alert["symbol"]))
+                observation = None
+                if price is not None:
+                    try:
+                        observation = ObservedPrice((number(price.bid) + number(price.ask)) / 2, price.as_of).validate(
+                            self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
+                    except RiskError:
+                        pass  # Other symbols' I/O may have aged it; try new source evidence once.
+                if observation is None:
+                    observation = self._alert_price(alert["symbol"])
                 observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
             except Exception as exc:
                 self._disclose("price_alert_unavailable", {"symbol": alert["symbol"],

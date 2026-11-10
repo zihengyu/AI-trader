@@ -581,6 +581,39 @@ positive price and its source timestamp. Missing, stale or future quotes are
 disclosed and retried. An observation alert never authorizes an order or target
 outside the tradable universe.
 
+The local Yahoo stream retains the 60 most recently requested symbols. At
+capacity it unsubscribes the least recently requested symbol and admits the
+new one, rather than silently ignoring all later symbols. Diagnostics include
+``capacity``, ``requested`` and ``subscription_evictions``. A failed minute-history
+request still subscribes the requested symbol; an independently fresh
+regular-session streamed trade can supply a quote while history is unavailable.
+It supplies no invented minute volume, and simulated fills still require new
+completed minute bars. If a quote ages during the watch loop, the alert reads
+new source evidence once before reporting failure. Quote validation samples
+the clock after source I/O so a legitimate new quote does not look future-dated.
+Share-class aliases share one wire subscription; retiring one spelling does
+not unsubscribe another spelling that is still being watched.
+If a symbol has no fresh stream tick, the adapter next checks the same chart
+response's ``regularMarketPrice`` and ``regularMarketTime`` pair. It uses this
+only when both are valid, newer than the completed bar and fresh within the
+current regular session. This is labeled ``chart_last_trade_with_spread_proxy``
+and counted as ``chart_quote``; a forming minute bar is never used instead.
+Absent, stale, future, naive or nonpositive source observations still fall back
+to completed bars and remain subject to the normal freshness checks. Cached
+metadata retains its original source time. Matching still requires new bars.
+
+An intraday manager's stale, future or expired decision in local or paper mode
+can use the same single correction opportunity as a malformed answer. The
+manager receives a refreshed account, risk and data-desk context and must
+reassess and return a complete new decision. ``decision_time_rejected`` and
+``decision_time_retry`` retain the original decision times, request time,
+validation time, age and rejection reason. STOP and call/cost budgets are
+checked again after preparation. A second failure backs off without a third
+call; format and timing failures share this limit. The five-minute acceptance
+limit and every execution check remain enforced. Python never retimestamps an
+old answer or its evidence. Historical timing failures and other risk failures
+do not trigger this timing correction.
+
 Invalid Structured Answers in the Autonomous Fund
 --------------------------------------------------------------------------------
 

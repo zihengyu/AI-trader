@@ -28,6 +28,17 @@ class MarketDataUnavailable(RiskError):
     pass
 
 
+class DecisionTimingError(RiskError):
+    """A rejected answer with safe clock evidence for one bounded reassessment."""
+
+    def __init__(self, as_of, expires, now):
+        age = (now - as_of).total_seconds()
+        reason = "future" if age < 0 else "expired" if now >= expires else "stale"
+        self.diagnostic = {"reason": reason, "as_of": as_of.isoformat(), "expires_at": expires.isoformat(),
+                           "checked_at": now.isoformat(), "age_seconds": age, "max_age_seconds": 300}
+        super().__init__("Stale, future or expired decision")
+
+
 def number(value):
     if isinstance(value, bool):
         raise RiskError("Boolean is not a financial number")
@@ -237,7 +248,7 @@ def validate_evidence(evidence, now, historical):
 def validate_decision(decision, now, universe, limits):
     as_of, expires = instant(decision["as_of"]), instant(decision["expires_at"])
     if not as_of <= now < expires or (now - as_of).total_seconds() > 300:
-        raise RiskError("Stale, future or expired decision")
+        raise DecisionTimingError(as_of, expires, now)
     if expires - as_of > timedelta(days=1):
         raise RiskError("Decision validity exceeds one day")
     targets = {}
