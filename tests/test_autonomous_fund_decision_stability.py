@@ -108,9 +108,31 @@ def test_the_decision_path_hands_the_check_the_exact_context_the_manager_saw(tmp
     strategy._stability_check = lambda context, accepted, decision_id, now, budget: checked.append(
         (context, accepted, decision_id))
     strategy._decide(account(), NOW, False)
+    assert checked == []  # Not inside the decision: its call would hold up stops and order repricing.
+    strategy._run_pending_stability(NOW + timedelta(minutes=1))
     manager_context = next(context for name, context in seen if name == "manager")
     [(context, accepted, decision_id)] = checked
     assert context is manager_context and accepted["targets"][0]["symbol"] == "ALFA" and decision_id
+    strategy._run_pending_stability(NOW + timedelta(minutes=2))
+    assert len(checked) == 1  # Asked once.
+
+
+def test_the_repeat_waits_for_open_orders_and_never_crosses_a_session(tmp_path):
+    strategy = model_harness(tmp_path)
+    checked = []
+    strategy._stability_check = lambda context, accepted, decision_id, now, budget: checked.append(decision_id)
+    open_orders = [{"id": "o-1"}]
+    strategy.journal.pending = lambda: open_orders
+    strategy._stability_pending = ({}, decision([("ALFA", .05)]), "d-1", NOW)
+    strategy._stability_pending = ({}, decision([("ALFA", .06)]), "d-2", NOW + timedelta(minutes=5))  # Newer wins.
+    strategy._run_pending_stability(NOW + timedelta(minutes=6))
+    assert checked == []  # Our order is still working.
+    open_orders.clear()
+    strategy._run_pending_stability(NOW + timedelta(minutes=7))
+    assert checked == ["d-2"]
+    strategy._stability_pending = ({}, decision([("ALFA", .05)]), "d-3", NOW)
+    strategy._run_pending_stability(NOW + timedelta(days=1))
+    assert checked == ["d-2"] and strategy._stability_pending is None  # Yesterday's decision is not asked today.
 
 
 def test_settings_and_report_line():

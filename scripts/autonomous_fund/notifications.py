@@ -626,6 +626,23 @@ def readable(kind, details, sequence=None, *, now=None):
             parts.append(f"{actions['unavailable']} 个证券的公司行动核对暂不可用。")
         text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
         text += "\n不需要操作；明天会重新核对。持续出现时，检查该证券是否刚拆股或数据源有误。"
+    elif kind == "market_out_of_history" and isinstance(details, dict):
+        labels = {"benchmark_vol_20d": "基准近 20 日波动率（年化）", "benchmark_return_1d": "基准单日涨跌",
+                  "benchmark_drawdown": "基准从高点回撤", "stock_mean_correlation_20d": "股票之间近 20 日平均相关性"}
+        beyond_history = set(details.get("beyond_history") or [])
+        parts = [f"{labels.get(name, name)} "
+                 + (f"{value:.2f}" if name == "stock_mean_correlation_20d" else _percent(value))
+                 + ("（超出全部历史）" if name in beyond_history else "（超出风险模型窗口）")
+                 for name, value in (details.get("values") or {}).items()]
+        text = (f"⚠️ 市场超出历史范围（{details.get('as_of_close')} 收盘）：" + "；".join(parts) + "。\n"
+                f"风险模型的预期损失和相关性是用最近 {details.get('risk_window_sessions')} 个交易日估出来的，"
+                f"基金手上的历史共 {details.get('history_sessions')} 个交易日；现在的市场比这些数据里任何时候都极端，"
+                "这些估计很可能低估了风险（历史压力情景仍照常计入）。\n"
+                "这只是提醒：风险上限和订单都不会因此自动改变，基金经理在决策时也能看到这条信息。"
+                "需要更保守时，可以手动收紧风险设置或暂停（STOP）。")
+    elif kind == "market_back_within_history" and isinstance(details, dict):
+        text = (f"ℹ️ 市场回到历史范围内（{details.get('as_of_close')} 收盘）：波动、单日涨跌、回撤和相关性"
+                "都不再超出风险模型窗口。不需要操作。")
     elif kind == "triage_enforced" and isinstance(details, dict):
         text = (f"✅ 盘中事件判断开始生效：最近 {details.get('dismissals_scored')} 次快速模型判断“不需要叫基金经理”时，"
                 f"基金经理实际改了组合的只有 {details.get('misses')} 次（漏判率 95% 上限 "
