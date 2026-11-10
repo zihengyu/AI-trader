@@ -117,6 +117,7 @@
   "validation": {
     "shadow_enabled": true,
     "shadows_per_session": 1,
+    "stability_checks_per_session": 1,
     "min_pairs": 20,
     "switch_t_stat": 2.0,
     "acceptance": {"min_sessions": 20, "min_iteration_ratio": 0.9, "max_watchdog_stops": 3,

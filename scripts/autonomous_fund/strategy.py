@@ -2008,7 +2008,8 @@ class AutonomousFund(Strategy):
                 return
             context["as_of"] = self.get_datetime().isoformat()
             failure_role = "manager"
-            decision = self._manager_decision(self._arm_context(context, champion), budget)
+            armed = self._arm_context(context, champion)
+            decision = self._manager_decision(armed, budget)
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -2048,6 +2049,35 @@ class AutonomousFund(Strategy):
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow(context, champion, decision, now, budget)
+            self._stability_check(armed, decision, accepted_id, now, budget)
+
+    def _stability_check(self, context, decision, decision_id, now, budget):
+        """Once a session: the accepted decision's exact input to the manager again, compared, never traded.
+
+        Live modes only (a replay could answer from its cache). Skipped under STOP and when the day's
+        calls (keeping the reserved review runs) or cost budget are used up.
+        """
+        from .stability import compare
+        settings = getattr(self, "validation", None)
+        per_session = getattr(settings, "stability_checks_per_session", 0) if settings is not None else 0
+        if (not per_session or getattr(self, "mode", None) not in {"local", "paper"} or self.halt_path.exists()
+                or self.journal.counter("stability_checks", now) >= per_session
+                or self.journal.counter("agent_runs", now) + 1 > budget.max_agent_runs_per_day - budget.reserved_review_runs
+                or self._cost_exhausted(now, "stability")):
+            return None
+        self.journal.counter("stability_checks", now, 1)
+        try:
+            again = self._record_agent("manager", self._agent_call(
+                "manager", purpose="stability", task_prompt=DECISION_TASK, context=context), phase="stability")
+        except Exception as exc:
+            self.journal.event(self.get_datetime(), "decision_stability", {
+                "decision_id": decision_id, "valid": False,
+                "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+            return None
+        result = {"decision_id": decision_id, "valid": True, **compare(decision, again)}
+        self.journal.event(self.get_datetime(), "decision_stability", result)
+        self._call_outcome(decision_id=decision_id, stability=True)
+        return result
 
     def _record_output_protocols(self, mode):
         """Whether each role's requests carry its schema as enforced JSON output, or only as instructions.
@@ -2643,7 +2673,7 @@ class AutonomousFund(Strategy):
         self._expire_history_failures(now)
         from .market_data import completed_daily_cutoff
         kinds = ("postmarket_review", "decision_validated", "protective_trigger", "entry_waiting",
-                 "order_submitted", "construction_variant", "research_idea")
+                 "order_submitted", "construction_variant", "research_idea", "decision_stability")
         with self.journal.connection() as db:
             latest = db.execute("SELECT MAX(sequence) FROM events WHERE kind IN (%s) "
                                 "AND julianday(at)<=julianday(?)" % ",".join("?" * len(kinds)),
@@ -2654,6 +2684,7 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == key:
             return cached[1]
         from .review import _events
+        from .stability import score as score_stability
         from .scorecard import (completed_sessions, score_consistency, score_decisions, score_ideas, score_predictions,
                                 score_timing)
         rows = _events(self.journal, instant(now), kinds=kinds)
@@ -2693,7 +2724,9 @@ class AutonomousFund(Strategy):
                   "ideas": score_ideas(ideas, closes, regimes=regimes, sessions=sessions),
                   "decisions": score_decisions(decisions, closes, sectors=sector_of, regimes=regimes, sessions=sessions),
                   "timing": score_timing(timing, closes, sessions=sessions),
-                  "consistency": score_consistency(validated, triggers), "claims": score_claims(validated)}
+                  "consistency": score_consistency(validated, triggers), "claims": score_claims(validated),
+                  "stability": score_stability([r["body"] for r in rows if r["kind"] == "decision_stability"][-60:],
+                                               [body for _, body in validated])}
         settings = getattr(self, "construction", None)
         if settings is not None:
             from .construction import evaluate
@@ -2815,6 +2848,8 @@ class AutonomousFund(Strategy):
                                         for label, card in (cards["decisions"].get("by_regime") or {}).items()},
                 "decisions_trend": cards["decisions"].get("trend_5d_net_excess"),
                 "claims": cards.get("claims"),
+                # How much the manager's answer to an identical input varies (sampling noise in its decisions).
+                "decision_stability": {k: v for k, v in (cards.get("stability") or {}).items() if k != "recent"},
                 "construction": cards.get("construction"),
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"},
                 # The manager's own reversals: changing its mind within a few sessions pays round trips.

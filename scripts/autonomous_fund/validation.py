@@ -142,17 +142,21 @@ def load_closes(directory, symbols):
 
 class ValidationSettings:
     """`validation` section: shadow A/B of the learning loop and acceptance criteria."""
-    FIELDS = {"shadow_enabled", "shadows_per_session", "min_pairs", "switch_t_stat", "acceptance"}
+    FIELDS = {"shadow_enabled", "shadows_per_session", "stability_checks_per_session", "min_pairs", "switch_t_stat",
+              "acceptance"}
     ACCEPTANCE = {"min_sessions": 20, "min_iteration_ratio": 0.9, "max_watchdog_stops": 3,
                   "max_unresolved_intents": 0, "max_fill_details_unavailable": 0, "max_model_failure_rate": 0.2,
                   "min_review_ratio": 0.9, "max_mean_slippage_bps": 25, "max_bot_crashes": 0}
 
-    def __init__(self, shadow_enabled=False, shadows_per_session=1, min_pairs=20, switch_t_stat=2.0, acceptance=None):
+    def __init__(self, shadow_enabled=False, shadows_per_session=1, min_pairs=20, switch_t_stat=2.0, acceptance=None,
+                 stability_checks_per_session=1):
         from .risk import RiskError
         if type(shadow_enabled) is not bool:
             raise RiskError("validation.shadow_enabled must be true or false")
         if type(shadows_per_session) is not int or not 0 <= shadows_per_session <= 5:
             raise RiskError("validation.shadows_per_session must be 0..5")
+        if type(stability_checks_per_session) is not int or not 0 <= stability_checks_per_session <= 3:
+            raise RiskError("validation.stability_checks_per_session must be 0..3")
         if type(min_pairs) is not int or not 5 <= min_pairs <= 250:
             raise RiskError("validation.min_pairs must be 5..250")
         if not isinstance(switch_t_stat, (int, float)) or not 1 <= float(switch_t_stat) <= 5:
@@ -163,6 +167,7 @@ class ValidationSettings:
             raise RiskError("Unknown acceptance criteria: " + ", ".join(sorted(unknown)))
         criteria.update(acceptance or {})
         self.shadow_enabled, self.shadows_per_session = shadow_enabled, shadows_per_session
+        self.stability_checks_per_session = stability_checks_per_session
         self.min_pairs, self.switch_t_stat, self.acceptance = min_pairs, float(switch_t_stat), criteria
 
     @classmethod

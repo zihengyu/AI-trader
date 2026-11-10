@@ -123,6 +123,13 @@ def _regime_note(group):
 
 def evidence_lines(card):
     lines = []
+    stability = (card or {}).get("stability")
+    if stability and stability.get("checks"):
+        lines.append(f"决策稳定性（同一输入再问基金经理一次）：{stability['checks']} 次，两次目标组合平均有 "
+                     f"{_percent(stability['mean_weight_distance'])} 的仓位不同，完全一致 {_percent(stability['same_rate'])}；"
+                     f"同期相邻两次真实决策平均调整 {_percent(stability['mean_consecutive_distance'])}"
+                     + (f"，噪声占比 {_percent(stability['noise_ratio'])}（越接近 100% 越说明调仓多半是随机波动）"
+                        if stability.get("noise_ratio") is not None else "") + "。")
     claims = (card or {}).get("claims")
     if claims and claims.get("decisions"):
         wrong = [f"{metric} {group['incorrect']}/{group['correct'] + group['incorrect']}"
