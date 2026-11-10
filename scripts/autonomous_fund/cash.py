@@ -14,6 +14,14 @@ are unchanged by sweeping. The executor then:
 
 Sweep orders are ordinary limit orders on the same durable submission path
 (STOP, monitor, market hours, one unresolved intent, daily caps).
+
+Parking is the system's cash management, not part of an AI decision: an open
+parking order is never canceled because the decision it followed expired (it is
+still repriced when stale, and canceled when a newer AI allocation takes force).
+After an AI trade, cash waits for the next session before it is parked
+(`min_idle_sessions`), so cash the AI may soon spend again does not pay a round
+trip. At most SWEEP_BUYS_PER_DAY parking orders are sent a day, so parking can
+never use up the purchase budget the AI's own orders need.
 """
 from dataclasses import dataclass, replace
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
@@ -21,6 +29,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from .risk import Intent, RiskError, number
 
 KIND = "cash_equivalent"
+SWEEP_BUYS_PER_DAY = 3
 
 
 def policy_context(sweep):
@@ -28,6 +37,7 @@ def policy_context(sweep):
     if sweep is None:
         return {"enabled": False}
     return {"enabled": True, "symbol": sweep.symbol, "keep_cash": str(sweep.keep_cash), "band": str(sweep.band),
+            "min_idle_sessions": sweep.min_idle_sessions, "max_parking_orders_per_day": SWEEP_BUYS_PER_DAY,
             "execution_owner": "system_cash_management", "ai_target_allowed": False, "counts_as_cash": True,
             "ordinary_position_and_exposure_limits_apply": False,
             "order_controls": ["real_cash", "cash_buffer", "fees", "limit_price", "fresh_source_data",
@@ -39,10 +49,14 @@ class CashSweep:
     symbol: str
     keep_cash: Decimal = Decimal("0.01")
     band: Decimal = Decimal("0.02")
+    # 1: after an AI trade, wait for the next session before parking; 0: park at once.
+    min_idle_sessions: int = 1
 
     def __post_init__(self):
         object.__setattr__(self, "keep_cash", number(self.keep_cash))
         object.__setattr__(self, "band", number(self.band))
+        if type(self.min_idle_sessions) is not int or self.min_idle_sessions not in (0, 1):
+            raise RiskError("cash_sweep.min_idle_sessions must be 0 or 1")
         if not Decimal("0") <= self.keep_cash <= Decimal("0.2"):
             raise RiskError("cash_sweep.keep_cash must be 0..0.2 of equity")
         if not Decimal("0") < self.band <= Decimal("0.5"):
@@ -53,7 +67,7 @@ class CashSweep:
         """The configured sweep, or None when disabled or no cash equivalent is admitted."""
         section = dict(section or {})
         enabled = section.pop("enabled", True)
-        unknown = set(section) - {"symbol", "keep_cash", "band"}
+        unknown = set(section) - {"symbol", "keep_cash", "band", "min_idle_sessions"}
         if unknown:
             raise RiskError("Unknown cash_sweep settings: " + ", ".join(sorted(unknown)))
         if type(enabled) is not bool:
@@ -113,11 +127,19 @@ def funding_sell(account, order, quote, limits, sweep):
     return Intent(sweep.symbol, "sell", quantity, limit) if quantity else None
 
 
-def park_buy(account, quote, limits, sweep, min_trade=Decimal("0")):
-    """Buy the sweep with cash above the buffer when the excess exceeds the band; None otherwise."""
+def idle_excess(account, sweep, min_trade=Decimal("0")):
+    """Real cash above the buffer when it exceeds the band (and the minimum trade); None otherwise."""
     equity = number(account.equity)
     excess = real_cash(account) - sweep.keep_cash * equity
     if excess < sweep.band * equity or excess < number(min_trade):
+        return None
+    return excess
+
+
+def park_buy(account, quote, limits, sweep, min_trade=Decimal("0")):
+    """Buy the sweep with cash above the buffer when the excess exceeds the band; None otherwise."""
+    excess = idle_excess(account, sweep, min_trade)
+    if excess is None:
         return None
     limit = (number(quote.ask) * (1 + limits.limit_buffer)).quantize(Decimal("0.01"), rounding=ROUND_CEILING)
     quantity = int((excess / (limit * (1 + limits.fee_buffer))).to_integral_value(rounding=ROUND_FLOOR))

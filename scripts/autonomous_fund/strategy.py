@@ -17,6 +17,7 @@ from lumibot.components.agents import agent_tool
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
+from .cash import policy_context
 from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
@@ -1305,6 +1306,7 @@ class AutonomousFund(Strategy):
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "leveraged_etfs": self._leveraged_context(),
+                       "cash_management": policy_context(getattr(self, "cash_sweep", None)),
                        "account": account, "previous_premarket_research": previous,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
@@ -1869,6 +1871,9 @@ class AutonomousFund(Strategy):
                 self._warm_optional(now)
                 return
             if self.next_review and now < self.next_review:
+                if getattr(self, "cash_sweep", None) is not None:
+                    latest = self.execution.latest(now)
+                    self._park_idle_cash(account, now, latest["id"] if latest else None)
                 self._run_pending_stability(now)
                 self._warm_optional(now)
                 return
@@ -2007,6 +2012,8 @@ class AutonomousFund(Strategy):
                    "strategy_followup": self._strategy_evaluations(),
                    "risk_increase_paused": paused,
                    "risk": self._risk_context(account, now),
+                   # The system parks idle cash in the sweep ETF; it counts as cash and is never an AI target.
+                   "cash_management": policy_context(getattr(self, "cash_sweep", None)),
                    "market_snapshot": self._market_snapshot(now),
                    "data_desk": self._desk_context(now),
                    "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
@@ -3072,12 +3079,18 @@ class AutonomousFund(Strategy):
             # A protective exit outlives the allocation that preceded it: it is
             # only repriced when stale, never canceled because a target expired.
             protective = self.execution.is_protective(pending["id"])
-            if expired and not protective:
-                cancel(pending, order, None, {})
-                continue
             body = json.loads(pending["body"])
             sweep = getattr(self, "cash_sweep", None)
             cash_order = sweep is not None and body["symbol"] == sweep.symbol
+            # Parking idle cash is system cash management, not part of the AI decision it followed:
+            # it outlives that decision's expiry, and gives way when a newer AI allocation is in force.
+            parking = cash_order and body["side"] == "buy"
+            if parking and latest and latest["state"] == "active" and not expired:
+                cancel(pending, order, "cash_parking_superseded", {"decision_id": latest["id"]})
+                continue
+            if expired and not protective and not parking:
+                cancel(pending, order, None, {})
+                continue
             stop = (levels.get(body["symbol"]) or {}).get("stop_loss")
             if body["side"] == "buy" and stop:
                 try:
@@ -4169,15 +4182,43 @@ class AutonomousFund(Strategy):
                                                           "positions": self._holdings_key(account)})
             if sweep is not None:
                 # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
-                # Parking is optional: a failure is recorded, never raised past a completed allocation.
-                from .cash import park_buy
-                try:
-                    park = park_buy(account, self._sweep_quote(now), self.limits, sweep,
-                                    min_trade=getattr(getattr(self, "quant", None), "min_trade_notional", 0))
-                    if park is not None:
-                        self._submit(park, now, active["id"], kind="cash_sweep")
-                except RiskError as exc:
-                    self.journal.event(now, "cash_sweep_unavailable", {"step": "park", "error": str(exc)})
+                self._park_idle_cash(account, now, active["id"])
+
+    def _park_idle_cash(self, account, now, decision_id):
+        """Park cash above the buffer in the sweep ETF (cash.py); optional, so a failure is recorded, never raised.
+
+        Waits for the next session after an AI trade (cash_sweep.min_idle_sessions) and sends at most
+        SWEEP_BUYS_PER_DAY parking orders a day. The quote is read only when there is cash to park.
+        """
+        from .cash import SWEEP_BUYS_PER_DAY, idle_excess, park_buy
+        sweep = getattr(self, "cash_sweep", None)
+        min_trade = getattr(getattr(self, "quant", None), "min_trade_notional", 0)
+        if sweep is None or decision_id is None or idle_excess(account, sweep, min_trade) is None:
+            return None
+        day, ai_traded, parked = trading_day(now), False, 0
+        with self.journal.connection() as db:
+            for (body,) in db.execute("SELECT body FROM intents WHERE day=?", (day,)):
+                body = json.loads(body)
+                if body["symbol"] != sweep.symbol:
+                    ai_traded = True
+                elif body["side"] == "buy":
+                    parked += 1
+        reason = ("waits for the next session after today's AI trade" if sweep.min_idle_sessions and ai_traded else
+                  f"daily parking limit of {SWEEP_BUYS_PER_DAY} orders reached" if parked >= SWEEP_BUYS_PER_DAY else None)
+        try:
+            if reason is None:
+                park = park_buy(account, self._sweep_quote(now), self.limits, sweep, min_trade=min_trade)
+                if park is not None:
+                    self._submit(park, now, decision_id, kind="cash_sweep")
+                return park
+        except RiskError as exc:
+            reason = str(exc)
+        # Said once per day and reason: idle iterations ask every minute.
+        noted = self.__dict__.setdefault("_sweep_noted", set())
+        if (day, reason) not in noted:
+            noted.add((day, reason))
+            self.journal.event(now, "cash_sweep_unavailable", {"step": "park", "error": reason})
+        return None
 
     def _sweep_quote(self, now):
         quote = self._price(self.cash_sweep.symbol)
