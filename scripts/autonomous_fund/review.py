@@ -403,6 +403,7 @@ def review_after_close(strategy):
                "strategy_followup": strategy._strategy_evaluations(),
                "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
+               "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}

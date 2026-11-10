@@ -275,6 +275,7 @@ Working with the Result
 - ``result.tool_results`` -- list of tool result events
 - ``result.parsed`` -- the parsed, validated answer when you pass ``output_schema`` (see below)
 - ``result.parse_error`` -- why the answer did not match ``output_schema`` (``None`` when it did)
+- ``result.served_models`` -- the model versions the provider reported for this run's responses, in the order first seen. ``result.model`` is the name you requested; a provider can change the model behind that name, and this is what it said it served. It is empty when the provider reports nothing, and a replayed result keeps the versions recorded when it was first run.
 - ``(result.payload or {}).get("trace_path")`` -- path to one call's JSON trace. ``result.payload`` is run bookkeeping, never the answer.
 - ``*_agent_detail.parquet`` -- the table for the whole run, next to the tear sheet in a backtest, or under ``~/Library/Caches/lumibot/1.0/agent_runtime/`` on macOS for live and paper. The ``call_summary`` row includes ``effective_system_prompt``. Raising ``LUMIBOT_LOG_LEVEL`` does not create this file. See :doc:`agents_observability`.
 

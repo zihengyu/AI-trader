@@ -96,7 +96,7 @@ Per-Run Summary Artifacts
 
 LumiBot writes machine-readable artifacts for agent runs:
 
-- ``agent_run_summaries.jsonl`` -- one JSON line per agent run with summary, warnings, and metadata
+- ``agent_run_summaries.jsonl`` -- one JSON line per agent run with summary, warnings, and metadata, including ``served_models`` (the model versions the provider reported, next to the requested ``model``)
 - ``agent_traces.zip`` -- packaged trace files for the full backtest
 
 These artifacts support downstream tooling, dashboards, and run history display without reparsing raw logs.

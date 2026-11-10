@@ -123,11 +123,39 @@ def _regime_note(group):
 
 def evidence_lines(card):
     lines = []
+    stability = (card or {}).get("stability")
+    if stability and stability.get("checks"):
+        lines.append(f"决策稳定性（同一输入再问基金经理一次）：{stability['checks']} 次，两次目标组合平均有 "
+                     f"{_percent(stability['mean_weight_distance'])} 的仓位不同，完全一致 {_percent(stability['same_rate'])}；"
+                     f"同期相邻两次真实决策平均调整 {_percent(stability['mean_consecutive_distance'])}"
+                     + (f"，噪声占比 {_percent(stability['noise_ratio'])}（越接近 100% 越说明调仓多半是随机波动）"
+                        if stability.get("noise_ratio") is not None else "") + "。")
+    down = (card or {}).get("down_days") or {}
+    if (down.get("down_days") or {}).get("days"):
+        days, up, exits = down["down_days"], down.get("up_days") or {}, down.get("protective_exits_on_down_days") or {}
+        threshold = _percent(abs(down["down_threshold"]))
+        lines.append(
+            f"大跌日表现（基准单日跌 {threshold} 以上）：{days['days']} 天"
+            + ("（不足 3 天，仅供参考）" if down.get("status") != "observed" else "")
+            + f"，基准平均 {_percent(days['mean_benchmark_return'])}、基金平均 {_percent(days['mean_fund_return'])}，"
+            f"下跌捕获 {_percent(days['capture'])}（100% ＝ 跟市场跌得一样多）"
+            + (f"；大涨日 {up['days']} 天上涨捕获 {_percent(up['capture'])}" if up.get("days") else "")
+            + (f"；大跌日开盘时有效贝塔比平常低 {down['beta_lower_on_down_days_by']:.2f}"
+               if down.get("beta_lower_on_down_days_by") is not None else "")
+            + f"；当天选股贡献 {_percent(days['selection'])}、择时 {_percent(days['timing'])}"
+            + (f"（{days['timing_unknown_days']} 天择时未知，未计入）" if days.get("timing_unknown_days") else "")
+            + (f"；止损/止盈 {exits['count']} 次，"
+               + (f"次日平均价值 {_percent(exits['mean_value_added_1d'])}（正＝卖出后又跌）"
+                  if exits.get("mean_value_added_1d") is not None else "次日价值待定")
+               if exits.get("count") else "") + "。")
     claims = (card or {}).get("claims")
     if claims and claims.get("decisions"):
-        lines.append(f"AI 事实核验（动量排名）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
+        wrong = [f"{metric} {group['incorrect']}/{group['correct'] + group['incorrect']}"
+                 for metric, group in (claims.get("by_metric") or {}).items() if group["incorrect"]]
+        lines.append(f"AI 事实核验（对照它看到的行情快照）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
                      f"正确 {claims['correct']}，错误 {claims['incorrect']}，"
-                     f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。")
+                     f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。"
+                     + (f"错得多的指标（错/核验）：{'、'.join(wrong[:5])}。" if wrong else ""))
     for factor in (card or {}).get("factor_crowding", [])[:3]:
         if factor.get("status") != "observed":
             lines.append(f"因子 {factor['name']} 拥挤度：分组样本不足。")
@@ -598,6 +626,40 @@ def readable(kind, details, sequence=None, *, now=None):
             parts.append(f"{actions['unavailable']} 个证券的公司行动核对暂不可用。")
         text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
         text += "\n不需要操作；明天会重新核对。持续出现时，检查该证券是否刚拆股或数据源有误。"
+    elif kind == "market_out_of_history" and isinstance(details, dict):
+        labels = {"benchmark_vol_20d": "基准近 20 日波动率（年化）", "benchmark_return_1d": "基准单日涨跌",
+                  "benchmark_drawdown": "基准从高点回撤", "stock_mean_correlation_20d": "股票之间近 20 日平均相关性"}
+        beyond_history = set(details.get("beyond_history") or [])
+        parts = [f"{labels.get(name, name)} "
+                 + (f"{value:.2f}" if name == "stock_mean_correlation_20d" else _percent(value))
+                 + ("（超出全部历史）" if name in beyond_history else "（超出风险模型窗口）")
+                 for name, value in (details.get("values") or {}).items()]
+        text = (f"⚠️ 市场超出历史范围（{details.get('as_of_close')} 收盘）：" + "；".join(parts) + "。\n"
+                f"风险模型的预期损失和相关性是用最近 {details.get('risk_window_sessions')} 个交易日估出来的，"
+                f"基金手上的历史共 {details.get('history_sessions')} 个交易日；现在的市场比这些数据里任何时候都极端，"
+                "这些估计很可能低估了风险（历史压力情景仍照常计入）。\n"
+                "这只是提醒：风险上限和订单都不会因此自动改变，基金经理在决策时也能看到这条信息。"
+                "需要更保守时，可以手动收紧风险设置或暂停（STOP）。")
+    elif kind == "model_identity_changed" and isinstance(details, dict):
+        roles = {"researcher": "研究员", "manager": "基金经理", "critic": "反方评审", "triage": "事件判断"}
+        used = "、".join(roles.get(r, r) for r in details.get("roles") or []) or "未在用的角色"
+        what = {"served_version": f"提供方返回的模型版本从 {', '.join(details.get('before') or []) or '无'} "
+                                  f"变成了 {details.get('after')}",
+                "knowledge_later": f"每日固定问题显示它的知识截止从 {details.get('before')} 推后到 {details.get('after')}"
+                                   "（连续 3 天一致）",
+                "self_reported_name": f"每日固定问题里它自称的型号从 {details.get('before')} 变成了 {details.get('after')}"
+                                      "（连续 3 天一致，自报不一定准）"}.get(details.get("kind"), details.get("kind"))
+        text = (f"⚠️ 模型可能换了：{details.get('model')}（用于{used}）{what}。\n"
+                f"从现在起记分卡、实验登记和事件判断的校准按新版本（第 {details.get('epoch')} 版）单独统计，"
+                "不再和之前的记录混在一起。交易照常进行，不需要操作；"
+                "如果在因子实验室配置了该模型的知识截止日期，请核对是否需要更新。")
+    elif kind == "model_cutoff_tightened" and isinstance(details, dict):
+        text = (f"ℹ️ {details.get('model')} 在每日固定问题里显示的知识截止（{details.get('observed')}）晚于配置的 "
+                f"{details.get('configured')}。因子实验室已自动改用较晚的日期，只把这之后的日子算作干净的样本外记录"
+                "（只会更保守，不会放宽）。核实后可以更新 factor_lab.model_knowledge_cutoff。")
+    elif kind == "market_back_within_history" and isinstance(details, dict):
+        text = (f"ℹ️ 市场回到历史范围内（{details.get('as_of_close')} 收盘）：波动、单日涨跌、回撤和相关性"
+                "都不再超出风险模型窗口。不需要操作。")
     elif kind == "triage_enforced" and isinstance(details, dict):
         text = (f"✅ 盘中事件判断开始生效：最近 {details.get('dismissals_scored')} 次快速模型判断“不需要叫基金经理”时，"
                 f"基金经理实际改了组合的只有 {details.get('misses')} 次（漏判率 95% 上限 "

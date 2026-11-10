@@ -1984,6 +1984,7 @@ class GoogleADKRuntime:
             parts=[genai_types.Part(text=self._build_user_text(request))],
         )
         events: list[AgentTraceEvent] = []
+        served_models: list[str] = []
         run_config = run_config_module.RunConfig(max_llm_calls=sys.maxsize - 1)
         async for event in runner.run_async(
             user_id=user_id,
@@ -1991,6 +1992,10 @@ class GoogleADKRuntime:
             new_message=content,
             run_config=run_config,
         ):
+            # ADK carries the provider-reported model of each response as model_version.
+            served = getattr(event, "model_version", None)
+            if isinstance(served, str) and served.strip() and served.strip() not in served_models:
+                served_models.append(served.strip())
             normalized_events = _normalize_event(event)
             if normalized_events and first_event_perf is None:
                 first_event_perf = time.perf_counter()
@@ -2036,6 +2041,7 @@ class GoogleADKRuntime:
             first_event_latency_ms=(
                 max(int((first_event_perf - started_perf) * 1000), 0) if first_event_perf is not None else None
             ),
+            served_models=served_models,
         )
 
     # Transient-error retry policy for the full agent call. Covers both the
