@@ -519,6 +519,29 @@ when, over the last 40 dismissals, the 95% upper bound of that rate is at most
 15%. Set ``triage.start`` to ``shadow`` to begin in the shadow. Market stress,
 the AI's own price alerts and stop or take-profit exits always reach the
 manager directly, and the manager still reviews at least every two hours.
+Batching and dismissal schedules are capped at that review deadline; if the
+screening call crosses it, the manager runs with the original triggers intact.
+Risk pauses and invalid or future scheduling state bypass the soft-event
+screen. STOP arriving during screening or context preparation prevents a
+follow-up manager call. Status uses the actual scoring window.
+
+**Cash parking orders are canceled or reported as outside the AI universe.**
+The configured cash-equivalent sweep is deliberately excluded from AI targets.
+Local fill-time checks treat it as cash, as planning does: ordinary security
+position/exposure limits do not cap parking, and remaining sweep holdings do
+not count as investment exposure. Actual cash, reserved capital, fees, the cash
+buffer, source data and order controls still apply. A kind label on an ordinary
+stock order does not grant this classification. Unfilled parking orders also
+obey the ordinary stale-order cancellation interval after allocation completes.
+``local_risk_canceled.reason`` distinguishes position/exposure limits, a cash
+buffer breach, insufficient cash and a drawdown pause. Older canceled orders
+without a recorded reason cannot be assigned one from status alone.
+
+Postmarket agents receive a citable ``cash_management`` policy snapshot, so
+they can distinguish AI eligibility from system cash parking. A retried review
+reuses the saved policy; legacy snapshots without it remain missing rather
+than being backfilled with the current configuration. This input improvement
+does not rewrite already completed reviews or guarantee an AI's interpretation.
 
 **Wrong daily bars from a free source (local mode).** Set Alpaca paper keys even
 in local mode: the fund then compares Yahoo's completed daily closes with

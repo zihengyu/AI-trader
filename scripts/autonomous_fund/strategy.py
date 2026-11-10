@@ -1932,6 +1932,8 @@ class AutonomousFund(Strategy):
         return True
 
     def _decide(self, account, now, paused):
+        if self.halt_path.exists():
+            return  # A screen or preparation may have been running when STOP arrived.
         budget = getattr(self, "model_budget", None) or ModelBudget()
         if self._cost_exhausted(now, "decision"):
             return  # Accepted targets keep executing and protective levels stay armed; tomorrow resumes.
@@ -1996,6 +1998,8 @@ class AutonomousFund(Strategy):
                 validate_evidence(research["evidence"], now, True)
                 context["research"] = research
             context["critique"] = self._critique(context, context["research"], budget, now)
+            if self.halt_path.exists():
+                return
             context["as_of"] = self.get_datetime().isoformat()
             failure_role = "manager"
             decision = self._manager_decision(self._arm_context(context, champion), budget)
@@ -2201,7 +2205,7 @@ class AutonomousFund(Strategy):
         self._triage_note, self._pending_triage = None, None
         settings = getattr(self, "triage", None)
         triggers = list(getattr(self, "_triggers", None) or [])
-        if (settings is None or settings.mode == "off" or getattr(self, "triage_model", None) is None
+        if (paused or settings is None or settings.mode == "off" or getattr(self, "triage_model", None) is None
                 or not soft_only(triggers)):
             return False
         budget = getattr(self, "model_budget", None) or ModelBudget()
@@ -2212,13 +2216,23 @@ class AutonomousFund(Strategy):
             made = instant(last["at"])
         except (KeyError, TypeError, ValueError):
             return False
-        if last.get("day") != trading_day(now) or now - made >= timedelta(minutes=budget.max_quiet_minutes):
+        if (last.get("day") != trading_day(now) or made > now
+                or now - made >= timedelta(minutes=budget.max_quiet_minutes)):
             return False  # The manager is due anyway: no screening call.
+        deadline = made + timedelta(minutes=budget.max_quiet_minutes)
         enforcing = self._triage_enforcing()
         floor = timedelta(minutes=budget.min_review_minutes)
         previous = self.journal.get_meta("triage_last_at")
-        if enforcing and previous and now - instant(previous) < floor:
-            self.next_review = instant(previous) + floor  # Batch the next headlines into one screening call.
+        scheduled = self.journal.get_meta("scheduled_review_at")
+        try:
+            previous = instant(previous) if previous else None
+            scheduled = instant(scheduled) if scheduled else None
+        except (TypeError, ValueError):
+            return False  # Invalid scheduling evidence cannot suppress the manager.
+        if previous is not None and previous > now:
+            return False
+        if enforcing and previous is not None and now - previous < floor:
+            self.next_review = min(previous + floor, deadline)
             return True
         if self._cost_exhausted(now, "triage"):
             return False
@@ -2237,9 +2251,16 @@ class AutonomousFund(Strategy):
             self.journal.event(now, "triage_unavailable",
                                {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
             return False
+        # Inference can cross the mandatory review deadline. A dismissal cannot
+        # defer that review, and the event batch stays available to the manager.
+        now = self.get_datetime()
         self.journal.set_meta("triage_last_at", now.isoformat())
         record = {"id": uuid4().hex[:12], "at": now.isoformat(), "verdict": verdict, "triggers": len(triggers),
                   "reasons": sorted({t.get("reason") for t in triggers})}
+        if now >= deadline:
+            record["action"] = "deadline"
+            self.journal.event(now, "event_triage", record)
+            return False
         if verdict["escalate"]:
             record["action"] = "escalated" if enforcing else "shadow"
             if enforcing:  # The manager learns why it was woken; a shadow verdict stays hidden from it.
@@ -2257,9 +2278,8 @@ class AutonomousFund(Strategy):
             self._pending_triage = record  # Scored once the manager has answered.
             return False
         self._triggers = []
-        scheduled = self.journal.get_meta("scheduled_review_at")
-        if scheduled and instant(scheduled) > now:
-            self.next_review = instant(scheduled)
+        if scheduled and scheduled > now:
+            self.next_review = min(scheduled, deadline)
             return True
         return self._quiet_review(account, now, paused)  # Its own schedule is due: quiet, or the manager runs.
 
@@ -2845,6 +2865,8 @@ class AutonomousFund(Strategy):
                 cancel(pending, order, None, {})
                 continue
             body = json.loads(pending["body"])
+            sweep = getattr(self, "cash_sweep", None)
+            cash_order = sweep is not None and body["symbol"] == sweep.symbol
             stop = (levels.get(body["symbol"]) or {}).get("stop_loss")
             if body["side"] == "buy" and stop:
                 try:
@@ -2858,7 +2880,7 @@ class AutonomousFund(Strategy):
             submitted = self.execution.submitted_at(pending["id"])
             interval = (getattr(policy, "protective_reprice_seconds", 60) if protective
                         else getattr(policy, "reprice_after_seconds", None))
-            if (interval is not None and submitted is not None and (protective or latest["state"] == "active") and
+            if (interval is not None and submitted is not None and (protective or cash_order or latest["state"] == "active") and
                     (instant(now) - submitted).total_seconds() >= interval):
                 cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
 
@@ -3894,7 +3916,8 @@ class AutonomousFund(Strategy):
 
     def _sweep_quote(self, now):
         quote = self._price(self.cash_sweep.symbol)
-        quote.validate(now, self.limits, self.mode not in {"paper", "local"})
+        historical = self.mode not in {"paper", "local"}
+        quote.validate(now if historical else self.get_datetime(), self.limits, historical)
         return quote
 
     def _execute(self, intent, now, account=None, prices=None):
@@ -3969,7 +3992,8 @@ class AutonomousFund(Strategy):
         if kind == "protective":
             self.execution.mark_protective(key, now)
         # Call the native implementation, with the only accepted intent schema.
-        reason = "Protective exit at an AI level" if kind == "protective" else "Validated structured portfolio target"
+        reason = ("Protective exit at an AI level" if kind == "protective" else
+                  "Configured cash-equivalent sweep" if kind == "cash_sweep" else "Validated structured portfolio target")
         Strategy.submit_order(self, order, reason=reason, evidence={"intent_id": key})
         broker_id = getattr(getattr(order, "_raw", None), "id", None) if self.mode == "paper" else order.identifier
         self.journal.update(key, broker_id, False, now)

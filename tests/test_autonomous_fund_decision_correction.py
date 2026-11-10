@@ -109,7 +109,16 @@ def test_no_correction_for_provider_failures_a_stop_or_an_exhausted_budget(tmp_p
              if blocker == "runtime_error" else answer("", Decision) if blocker == "empty" else answer(PROSE, Decision))
     strategy, calls = fund(tmp_path, [first, valid()])
     if blocker == "stop":
-        strategy.halt_path.write_text("synthetic stop")
+        original = strategy._agent_call
+
+        def stop_during_answer(name, **kwargs):
+            result = original(name, **kwargs)
+            if name == "manager":
+                strategy.halt_path.write_text("synthetic stop")
+            return result
+        # Exercise correction gating after STOP arrives in flight; an existing
+        # STOP now prevents the initial decision call altogether.
+        strategy._agent_call = stop_during_answer
     elif blocker == "no_room":
         budget = strategy.model_budget
         original = strategy.journal.counter

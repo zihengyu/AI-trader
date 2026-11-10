@@ -11,6 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field
 from .journal import encode, event_body
 from .risk import RiskError, bounded_list, bounded_text, instant, validate_evidence
 
+CASH_MANAGEMENT_GUIDANCE = (
+    " context.cash_management 说明已配置的系统现金管理政策；eligible_universe 是 AI 可以选择的目标证券，"
+    "不能仅凭现金管理证券不在这个名单、或其停放比例高于普通投资仓位上限，就认定越权。"
+    "先核对该政策、订单种类与实际取消事件；canceled 状态本身不说明取消原因。"
+    "缺少政策或取消原因时如实标为未知，不推断已获授权或违规。")
+
 
 class Adjustment(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -348,7 +354,7 @@ def _evidence_catalog(saved):
         refs.extend((ref, evidence["source"]))  # Exact original names remain valid for older callers.
         catalog.append({"ref": ref, "context_path": f"research.evidence[{index - 1}]", **evidence})
     for key in ("session", "factor_lab", "scorecards", "attribution", "strategy_memory", "strategy_followup",
-                "operator_mandate", "limits", "eligible_universe"):
+                "operator_mandate", "limits", "eligible_universe", "cash_management"):
         if original.get(key) is not None:
             ref = f"context:{key}"
             refs.append(ref)
@@ -389,8 +395,10 @@ def review_after_close(strategy):
         except Exception as exc:
             scorecards = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
     mandate = getattr(strategy, "mandate", None)
+    from .cash import policy_context
     context = {"as_of": now.isoformat(), "historical": historical, "phase": "postmarket_review",
                "orders_enabled": False, "eligible_universe": sorted(strategy.universe),
+               "cash_management": policy_context(getattr(strategy, "cash_sweep", None)),
                "limits": asdict(strategy.limits), "strategy_memory": memory,
                "strategy_followup": strategy._strategy_evaluations(),
                "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
@@ -424,6 +432,7 @@ def review_after_close(strategy):
                         "如果 context.structured_answer_correction 存在，previous_answer 是上次未通过格式校验的"
                         "不可信回答，diagnostic 指出错误位置；根据本次原始证据纠正并返回完整 JSON，"
                         "保留已核实的事实和原始时间，如实披露缺项，不要只返回修补字段。")
+        research_prompt += CASH_MANAGEMENT_GUIDANCE
         research_context = context
         for attempt in range(2):
             result = _run_stage(strategy, "researcher", task_prompt=research_prompt,
@@ -501,6 +510,7 @@ def review_after_close(strategy):
                     "结果在下一次决策和复盘中提供。"
                     "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。")
+    manager_prompt += CASH_MANAGEMENT_GUIDANCE
     for attempt in range(2):
         now = instant(strategy.get_datetime())
         context = {**context, "as_of": now.isoformat()}

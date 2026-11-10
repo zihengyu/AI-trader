@@ -101,7 +101,12 @@ def triage_line(db, now):
     from .triage import upper_bound
     meta = {key: json.loads(value) for key, value in db.execute(
         "SELECT key,value FROM meta WHERE key IN ('triage_enforcing','triage_pairs')")}
-    pairs = (meta.get("triage_pairs") or [])[-40:]
+    scored = db.execute("SELECT body FROM events WHERE kind='triage_scored' AND json_valid(body) "
+                        "AND json_type(body,'$.stats')='object' ORDER BY sequence DESC LIMIT 1").fetchone()
+    window = (json.loads(scored[0]).get("stats") or {}).get("window", 40) if scored else 40
+    if type(window) is not int or not 10 <= window <= 500:
+        window = 40
+    pairs = (meta.get("triage_pairs") or [])[-window:]
     zone = ZoneInfo("America/New_York")
     today = instant(now).astimezone(zone).date().isoformat()
     actions = {}

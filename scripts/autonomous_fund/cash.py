@@ -23,6 +23,17 @@ from .risk import Intent, RiskError, number
 KIND = "cash_equivalent"
 
 
+def policy_context(sweep):
+    """Explicit operator policy for read-only reviews; no new trading permission."""
+    if sweep is None:
+        return {"enabled": False}
+    return {"enabled": True, "symbol": sweep.symbol, "keep_cash": str(sweep.keep_cash), "band": str(sweep.band),
+            "execution_owner": "system_cash_management", "ai_target_allowed": False, "counts_as_cash": True,
+            "ordinary_position_and_exposure_limits_apply": False,
+            "order_controls": ["real_cash", "cash_buffer", "fees", "limit_price", "fresh_source_data",
+                               "market_session", "STOP", "monitor_if_required", "daily_submissions"]}
+
+
 @dataclass(frozen=True)
 class CashSweep:
     symbol: str

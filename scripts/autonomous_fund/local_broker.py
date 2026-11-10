@@ -20,7 +20,9 @@ from .risk import Account, MarketDataUnavailable, ObservedPrice, RiskError, inst
 
 
 class VirtualRiskCancellation(RiskError):
-    pass
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(f"Virtual fill exceeds current risk capacity ({reason})")
 
 
 class LocalPaperBroker(CachedMarketHours, Broker):
@@ -234,6 +236,9 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         """Use the existing broker poll to mark the bound sleeve during long AI calls."""
         if not 5 <= interval_seconds <= 300:
             raise RiskError("Valuation interval must be from 5 to 300 seconds")
+        universe = frozenset(universe)
+        if sweep is not None and sweep.symbol not in universe:
+            raise RiskError("Cash sweep must belong to the configured universe")
         self._valuation_policy = dict(universe=frozenset(universe), mandate=mandate, sweep=sweep,
                                       daily_loss_limit=daily_loss_limit, interval_seconds=interval_seconds,
                                       benchmark_symbols=tuple(benchmark_symbols))
@@ -510,9 +515,10 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 continue
             try:
                 self._fill_bar(row["id"], order, start, bar)
-            except VirtualRiskCancellation:
+            except VirtualRiskCancellation as exc:
                 self.cancel_order(order)
-                self.journal.event(self.data_source.get_datetime(), "local_risk_canceled", {"broker_id": row["id"]})
+                self.journal.event(self.data_source.get_datetime(), "local_risk_canceled", {
+                    "broker_id": row["id"], "symbol": order.asset.symbol, "reason": exc.reason})
                 return
 
     def _matchable(self, db, identifier, start):
@@ -593,9 +599,23 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             notional, fee = price * quantity, price * quantity * self.fee_rate
             if buy:
                 net_equity = number(equity) - fee
-                if (paused or sleeve_cash < notional + fee or marks.get(order.asset.symbol, 0) + notional > net_equity * self.limits.max_position
-                        or sum(marks.values()) + notional > net_equity * self.limits.max_exposure):
-                    raise VirtualRiskCancellation("Virtual fill exceeds current risk capacity")
+                sweep = (self._valuation_policy or {}).get("sweep")
+                parking = sweep is not None and order.asset.symbol == sweep.symbol
+                # Classification comes from operator policy, never an order's kind label.
+                # The same cash-equivalent view used by planning must hold at fill time.
+                risk_marks = {s: value for s, value in marks.items() if sweep is None or s != sweep.symbol}
+                if sleeve_cash < notional + fee:
+                    raise VirtualRiskCancellation("insufficient_cash")
+                if parking:
+                    if sleeve_cash - notional - fee < net_equity * sweep.keep_cash:
+                        raise VirtualRiskCancellation("cash_buffer")
+                else:
+                    if paused:
+                        raise VirtualRiskCancellation("drawdown_pause")
+                    if risk_marks.get(order.asset.symbol, 0) + notional > net_equity * self.limits.max_position:
+                        raise VirtualRiskCancellation("position_limit")
+                    if sum(risk_marks.values()) + notional > net_equity * self.limits.max_exposure:
+                        raise VirtualRiskCancellation("exposure_limit")
                 average = (number(position["average"]) * held + notional) / (held + quantity) if position else price
                 db.execute("INSERT OR REPLACE INTO local_positions VALUES(?,?,?,?)", (
                     order.asset.symbol, held + quantity, str(average), position["opened_at"] if held else str(self.data_source.get_datetime())))

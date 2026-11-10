@@ -344,7 +344,14 @@ def test_correction_does_not_bypass_stops_budgets_risk_or_historical_rules(tmp_p
         bad["as_of"] = (NOW - timedelta(seconds=301)).isoformat()
     strategy, calls = live_fund(tmp_path, [answer(json.dumps(bad), Decision), valid()])
     if blocker == "stop":
-        strategy.halt_path.touch()
+        original = strategy._agent_call
+
+        def stop_during_answer(name, **kwargs):
+            result = original(name, **kwargs)
+            strategy.halt_path.touch()
+            return result
+        # STOP arrives during the first call; a pre-existing STOP now skips it.
+        strategy._agent_call = stop_during_answer
     elif blocker == "calls":
         original = strategy.journal.counter
         strategy.journal.counter = lambda name, when, add=0: (
