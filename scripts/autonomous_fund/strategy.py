@@ -2684,6 +2684,7 @@ class AutonomousFund(Strategy):
         if cached and cached[0] == key:
             return cached[1]
         from .review import _events
+        from .downdays import score as score_down_days
         from .stability import score as score_stability
         from .scorecard import (completed_sessions, score_consistency, score_decisions, score_ideas, score_predictions,
                                 score_timing)
@@ -2692,7 +2693,8 @@ class AutonomousFund(Strategy):
         variants = [(r["at"], r["body"]) for r in rows if r["kind"] == "construction_variant"][-400:]
         timing = [(r["at"], r["kind"], r["body"]) for r in rows
                   if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
-        reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"][-40:]
+        all_reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"]
+        reviews = all_reviews[-40:]
         # One allocation per session (its last), so frequent reviews are not over-counted.
         by_day = {}
         for row in rows:
@@ -2726,7 +2728,10 @@ class AutonomousFund(Strategy):
                   "timing": score_timing(timing, closes, sessions=sessions),
                   "consistency": score_consistency(validated, triggers), "claims": score_claims(validated),
                   "stability": score_stability([r["body"] for r in rows if r["kind"] == "decision_stability"][-60:],
-                                               [body for _, body in validated])}
+                                               [body for _, body in validated]),
+                  # Every reviewed session, not only the last 40: large down days are rare.
+                  "down_days": score_down_days(all_reviews, [(at, body) for at, _, body in triggers], closes,
+                                               sessions=sessions)}
         settings = getattr(self, "construction", None)
         if settings is not None:
             from .construction import evaluate
@@ -2850,6 +2855,8 @@ class AutonomousFund(Strategy):
                 "claims": cards.get("claims"),
                 # How much the manager's answer to an identical input varies (sampling noise in its decisions).
                 "decision_stability": {k: v for k, v in (cards.get("stability") or {}).items() if k != "recent"},
+                # How much of the market's large falls (and rises) the fund took; rare days, read with the count.
+                "down_days": {k: v for k, v in (cards.get("down_days") or {}).items() if k != "meaning"},
                 "construction": cards.get("construction"),
                 "timing": {k: v for k, v in cards["timing"].items() if k != "recent"},
                 # The manager's own reversals: changing its mind within a few sessions pays round trips.

@@ -130,6 +130,24 @@ def evidence_lines(card):
                      f"同期相邻两次真实决策平均调整 {_percent(stability['mean_consecutive_distance'])}"
                      + (f"，噪声占比 {_percent(stability['noise_ratio'])}（越接近 100% 越说明调仓多半是随机波动）"
                         if stability.get("noise_ratio") is not None else "") + "。")
+    down = (card or {}).get("down_days") or {}
+    if (down.get("down_days") or {}).get("days"):
+        days, up, exits = down["down_days"], down.get("up_days") or {}, down.get("protective_exits_on_down_days") or {}
+        threshold = _percent(abs(down["down_threshold"]))
+        lines.append(
+            f"大跌日表现（基准单日跌 {threshold} 以上）：{days['days']} 天"
+            + ("（不足 3 天，仅供参考）" if down.get("status") != "observed" else "")
+            + f"，基准平均 {_percent(days['mean_benchmark_return'])}、基金平均 {_percent(days['mean_fund_return'])}，"
+            f"下跌捕获 {_percent(days['capture'])}（100% ＝ 跟市场跌得一样多）"
+            + (f"；大涨日 {up['days']} 天上涨捕获 {_percent(up['capture'])}" if up.get("days") else "")
+            + (f"；大跌日开盘时有效贝塔比平常低 {down['beta_lower_on_down_days_by']:.2f}"
+               if down.get("beta_lower_on_down_days_by") is not None else "")
+            + f"；当天选股贡献 {_percent(days['selection'])}、择时 {_percent(days['timing'])}"
+            + (f"（{days['timing_unknown_days']} 天择时未知，未计入）" if days.get("timing_unknown_days") else "")
+            + (f"；止损/止盈 {exits['count']} 次，"
+               + (f"次日平均价值 {_percent(exits['mean_value_added_1d'])}（正＝卖出后又跌）"
+                  if exits.get("mean_value_added_1d") is not None else "次日价值待定")
+               if exits.get("count") else "") + "。")
     claims = (card or {}).get("claims")
     if claims and claims.get("decisions"):
         wrong = [f"{metric} {group['incorrect']}/{group['correct'] + group['incorrect']}"

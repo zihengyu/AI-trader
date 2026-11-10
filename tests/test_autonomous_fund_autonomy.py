@@ -354,7 +354,7 @@ def test_strategy_scorecards_read_reviews_and_one_decision_per_session(tmp_path)
     # The manager now sees claim coverage and the regime sample status, even with no mature returns.
     assert set(summary) == {"predictions", "research_ideas", "decisions", "decisions_by_prompt_version", "construction",
                             "timing", "consistency", "decisions_by_regime", "decisions_trend", "claims",
-                            "decision_stability"} \
+                            "decision_stability", "down_days"} \
         and "recent" not in summary["timing"]
     # One decision, labelled by the synthetic SPY's regime; its 5-session result is still pending.
     group = summary["decisions_by_regime"]["up_calm"]
@@ -362,6 +362,8 @@ def test_strategy_scorecards_read_reviews_and_one_decision_per_session(tmp_path)
     assert group["uncertainty"]["status"] == "unreliable" and summary["claims"]["decisions_with_claims"] == 0
     # No stability check in a replay: nothing is scored, and nothing is reported as zero noise.
     assert summary["decision_stability"]["checks"] == 0 and summary["decision_stability"]["noise_ratio"] is None
+    # The synthetic review carries no attribution: no down day is counted or scored.
+    assert summary["down_days"]["status"] == "insufficient_sample" and summary["down_days"]["down_days"]["days"] == 0
     assert summary["decisions_trend"] == {"status": "insufficient_sample", "scored": 0, "minimum_sample": 20}
     # The manager's reversals count every validated decision: three identical ones are one move, no reversal.
     assert (summary["consistency"]["decisions"], summary["consistency"]["moves"], summary["consistency"]["reversals"]) == (3, 1, 0)
