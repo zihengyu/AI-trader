@@ -559,6 +559,15 @@ reuses the saved policy; legacy snapshots without it remain missing rather
 than being backfilled with the current configuration. This input improvement
 does not rewrite already completed reviews or guarantee an AI's interpretation.
 
+**Interpreting autonomous fund diagnostics.** Model identity probes run after
+the exchange close, including on half days. They skip observe-only mode and
+recheck STOP and cost limits before each call. The decision stability check
+repeats the accepted task and strategy context, including any correction.
+Account state, the runtime clock and tool results can change, so its distance
+measures observed variation across those calls. The down-day scorecard reports
+all recorded protective triggers on reviewed down days and separately counts
+the ones with enough price evidence for next-session valuation.
+
 **Wrong daily bars from a free source (local mode).** Set Alpaca paper keys even
 in local mode: the fund then compares Yahoo's completed daily closes with
 Alpaca's once a day. A session that differs by more than 2% is dropped (never

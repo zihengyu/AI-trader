@@ -87,6 +87,21 @@ def test_a_malformed_decision_gets_one_correction_and_the_round_continues(tmp_pa
     assert strategy.journal.get_meta("decision_failures") in (0, None)
 
 
+@pytest.mark.parametrize("bound", ["minimum", "maximum"])
+def test_overflowing_claim_bound_is_corrected_before_the_decision_is_written(tmp_path, bound):
+    body = {**decision([("ALFA", .05)]),
+            "factual_claims": [{"symbol": "ALFA", "metric": "ret_20d", bound: 9.876}]}
+    overflow = answer(json.dumps(body).replace("9.876", "1e309"), Decision)
+    strategy, calls = fund(tmp_path, [overflow, valid()])
+
+    strategy._decide(account(), NOW, False)
+
+    [correction] = [call for call in calls if call["purpose"] == "decision_correction"]
+    errors = correction["context"]["structured_answer_correction"]["diagnostic"]["errors"]
+    assert errors == [{"path": f"factual_claims[0].{bound}", "type": "finite_number"}]
+    assert len(events(strategy, "decision_validated")) == 1
+
+
 def test_a_second_malformed_answer_backs_off_as_before_and_says_it_was_corrected(tmp_path):
     strategy, calls = fund(tmp_path, [answer(PROSE, Decision), answer('{"rationale": "half"}', Decision)])
     with pytest.raises(RiskError, match=r"also after one format correction") as raised:

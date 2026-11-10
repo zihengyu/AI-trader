@@ -51,6 +51,31 @@ def test_protective_exits_on_down_days_are_valued_on_the_next_session():
     assert exits["mean_value_added_1d"] == pytest.approx(-(90 / 96 - 1))  # Sold before a further fall: positive.
 
 
+def test_down_day_scorecards_count_old_triggers_outside_the_timing_window(tmp_path):
+    from scripts.autonomous_fund.journal import encode
+    from scripts.autonomous_fund.notifications import evidence_lines
+    from tests.test_autonomous_fund_quant import NOW, harness
+
+    strategy = harness(tmp_path)
+    day, following = "2026-10-01", "2026-10-02"
+    strategy._daily_closes = lambda symbol, now: [(day, 95.0), (following, 90.0)]
+    strategy.journal.event(f"{day}T21:00:00+00:00", "postmarket_review",
+                           {**review(day, -0.03, -0.02), "review": {}})
+    for bid in ("96", None):
+        strategy.journal.event(f"{day}T15:00:00+00:00", "protective_trigger",
+                               {"symbol": "ALFA", "trigger": "stop_loss", "bid": bid})
+    with strategy.journal.connection() as db:
+        db.executemany("INSERT INTO events(at,kind,body) VALUES(?,?,?)",
+                       [(f"{following}T15:00:00+00:00", "order_submitted", encode({"side": "sell"}))] * 400)
+
+    card = strategy._scorecards(NOW)
+
+    exits = card["down_days"]["protective_exits_on_down_days"]
+    assert exits["count"] == 2 and exits["valued"] == 1
+    assert exits["mean_value_added_1d"] == pytest.approx(1 - 90 / 96)
+    assert "止损/止盈触发 2 次，1 次可估值" in evidence_lines(card)[0]
+
+
 def test_report_line_names_the_capture_and_the_small_sample():
     from scripts.autonomous_fund.notifications import evidence_lines
     card = score([review("2026-10-01", -0.03, -0.015, beta=.5), review("2026-10-02", 0.03, 0.024, beta=.8),

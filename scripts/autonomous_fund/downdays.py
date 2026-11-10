@@ -11,7 +11,8 @@ fell by at least DOWN_DAY (and rose by at least UP_DAY) and reports:
 - the effective beta at the start of those days against the other days (a lower
   beta before falls means risk was already reduced; with few days it may be luck);
 - selection and timing contributions on those days;
-- protective exits (stops and take-profits) on those days and their next-session value.
+- protective triggers (stops and take-profits) on those days and their next-session
+  hypothetical value at the trigger bid, when both the quote and closes are available.
 
 Evidence for the review, never a trading rule.
 """
@@ -69,14 +70,21 @@ def score(reviews, triggers=(), closes=None, *, sessions=None):
     up = [r for r in rows if r["benchmark"] >= UP_DAY]
     other = [r for r in rows if DOWN_DAY < r["benchmark"] < UP_DAY]
     down_days = {r["day"] for r in down}
-    exits = []
+    trigger_count, valued = 0, []
     for at, body in triggers:
         day = instant(at).astimezone(ZONE).date().isoformat()
-        if day not in down_days or body.get("bid") is None:
+        if day not in down_days:
+            continue
+        trigger_count += 1
+        try:
+            bid = float(body.get("bid"))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not isfinite(bid) or bid <= 0:
             continue
         path = _forward((closes or {}).get(body.get("symbol")), day, 1, sessions=sessions)
-        exits.append(-(path[1] / float(body["bid"]) - 1) if isinstance(path, tuple) else None)
-    valued = [v for v in exits if v is not None]
+        if isinstance(path, tuple):
+            valued.append(1 - path[1] / bid)
     down_summary, other_summary = _group(down), _group(other)
     beta_cut = (other_summary["mean_beta"] - down_summary["mean_beta"]
                 if down_summary.get("mean_beta") is not None and other_summary.get("mean_beta") is not None else None)
@@ -85,7 +93,7 @@ def score(reviews, triggers=(), closes=None, *, sessions=None):
             "down_days": {**down_summary, "dates": [r["day"] for r in down][-10:]},
             "up_days": _group(up), "other_days": other_summary,
             "beta_lower_on_down_days_by": beta_cut,
-            "protective_exits_on_down_days": {"count": len(exits), "valued": len(valued),
+            "protective_exits_on_down_days": {"count": trigger_count, "valued": len(valued),
                                               "mean_value_added_1d": sum(valued) / len(valued) if valued else None},
             "meaning": "capture = the fund's summed return / the benchmark's on those days (0.6 = lost 60% of the "
                        "market's fall); beta is the effective beta at the start of the day from the attribution; "

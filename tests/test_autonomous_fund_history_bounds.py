@@ -2,11 +2,13 @@
 
 Synthetic closes only; no network, broker or model inference.
 """
+from dataclasses import replace
 from datetime import date, timedelta
 
 import pytest
 
 from scripts.autonomous_fund.history_bounds import MIN_NAMES, WINDOW, assess
+from scripts.autonomous_fund.risk import trading_day
 from tests.test_autonomous_fund_quant import NOW, harness
 
 PATTERN = [0.004, -0.003, 0.006, -0.005, 0.002, -0.001, 0.003, -0.004, 0.005, -0.002, 0.001]  # Repeats: nothing new.
@@ -107,6 +109,33 @@ def test_the_operator_is_told_when_the_market_leaves_its_history_and_when_it_is_
 def test_history_not_read_yet_waits_and_sends_nothing(tmp_path):
     strategy = strategy_with(tmp_path, calm(399) + [-0.08], prepare=False)
     assert strategy._market_history(NOW)["status"] == "pending" and strategy.notices == []
+
+
+def test_history_bounds_recompute_when_a_temporary_read_failure_expires(tmp_path):
+    strategy = strategy_with(tmp_path, calm(399) + [-0.08])
+    strategy.mode = "local"
+    del strategy._expire_history_failures  # Exercise the runner's real invalidation.
+    read_bars = strategy._daily_bars
+    strategy._daily_bars = lambda symbol, now: ([], "temporary")
+    assert strategy._market_history(NOW)["status"] == "unavailable"
+    strategy._history_retry_at = {(trading_day(NOW), "SPY"): 0}
+    strategy._daily_bars = read_bars
+
+    assert strategy._market_history(NOW)["status"] == "beyond_history"
+    assert [kind for kind, _ in strategy.notices] == ["market_out_of_history"]
+
+
+def test_history_only_alert_lists_metrics_when_the_risk_window_is_too_short(tmp_path):
+    from scripts.autonomous_fund.notifications import readable
+
+    strategy = strategy_with(tmp_path, calm(399) + [-0.08])
+    strategy.quant = replace(strategy.quant, es_lookback_days=30, min_history_days=20)
+    result = strategy._market_history(NOW)
+
+    assert result["beyond_history"] and not result["beyond_risk_window"]
+    [(kind, details)] = strategy.notices
+    assert details["values"].keys() == set(result["beyond_history"])
+    assert "基准单日涨跌 -8.00%（超出全部历史）" in readable(kind, details)
 
 
 def test_notice_text_says_nothing_changes_automatically():

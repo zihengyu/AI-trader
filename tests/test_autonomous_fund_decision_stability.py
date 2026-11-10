@@ -1,4 +1,4 @@
-"""Decision stability: an accepted decision's exact input is asked again and the answers are compared.
+"""Decision stability repeats the accepted decision's task and strategy context.
 
 Synthetic decisions and fake model calls only; no network, broker or model inference.
 """
@@ -7,8 +7,8 @@ from datetime import timedelta
 import pytest
 
 from scripts.autonomous_fund.risk import RiskError
-from scripts.autonomous_fund.stability import compare, score
-from scripts.autonomous_fund.strategy import DECISION_TASK
+from scripts.autonomous_fund.stability import INPUT_SCOPE, compare, score
+from scripts.autonomous_fund.strategy import DECISION_CORRECTION_TASK, DECISION_TASK, Decision
 from scripts.autonomous_fund.validation import ValidationSettings
 from tests.test_autonomous_fund_quant import NOW, account, decision, model_harness
 
@@ -95,7 +95,7 @@ def test_a_failed_second_answer_is_recorded_not_raised(tmp_path):
     assert not event["valid"] and event["error"].startswith("Invalid structured agent answer")
 
 
-def test_the_decision_path_hands_the_check_the_exact_context_the_manager_saw(tmp_path):
+def test_the_decision_path_hands_the_check_the_strategy_context_the_manager_saw(tmp_path):
     strategy = model_harness(tmp_path)
     seen, checked = [], []
     evidence = [{"source": "Synthetic", "available_at": (NOW - timedelta(days=1)).isoformat(),
@@ -105,32 +105,54 @@ def test_the_decision_path_hands_the_check_the_exact_context_the_manager_saw(tmp
         seen.append((name, kwargs.get("context")))
         return {"summary": "s", "evidence": evidence} if name == "researcher" else decision([("ALFA", .05)])
     strategy._agent_call = call
-    strategy._stability_check = lambda context, accepted, decision_id, now, budget: checked.append(
-        (context, accepted, decision_id))
+    strategy._stability_check = lambda context, accepted, decision_id, now, budget, **kwargs: checked.append(
+        (context, accepted, decision_id, kwargs["task_prompt"]))
     strategy._decide(account(), NOW, False)
     assert checked == []  # Not inside the decision: its call would hold up stops and order repricing.
     strategy._run_pending_stability(NOW + timedelta(minutes=1))
     manager_context = next(context for name, context in seen if name == "manager")
-    [(context, accepted, decision_id)] = checked
+    [(context, accepted, decision_id, task)] = checked
     assert context is manager_context and accepted["targets"][0]["symbol"] == "ALFA" and decision_id
+    assert task == DECISION_TASK
     strategy._run_pending_stability(NOW + timedelta(minutes=2))
     assert len(checked) == 1  # Asked once.
+
+
+def test_stability_repeats_the_accepted_correction_and_excludes_legacy_comparisons(tmp_path):
+    from tests.test_autonomous_fund_decision_correction import PROSE, answer, fund, valid
+
+    strategy, calls = fund(tmp_path, [answer(PROSE, Decision), valid(), valid()])
+    strategy.mode = "local"
+    strategy.validation = ValidationSettings()
+    strategy._session_research = lambda now: {"research": {}}
+    strategy._decide(account(), NOW, False)
+    strategy.journal.event(NOW, "decision_stability", {
+        "valid": True, "decision_id": "legacy", "weight_distance": .42, "symbol_overlap": .5, "same_targets": False})
+
+    repeat = strategy._run_pending_stability(NOW + timedelta(minutes=1))
+
+    _, correction, repeated = [call for call in calls if call["name"] == "manager"]
+    assert correction["task_prompt"] == repeated["task_prompt"] == DECISION_CORRECTION_TASK
+    assert correction["context"] == repeated["context"]
+    assert repeat["input_scope"] == INPUT_SCOPE
+    stability = strategy._scorecards(NOW + timedelta(minutes=1))["stability"]
+    assert stability["checks"] == 1 and stability["mean_weight_distance"] == 0
 
 
 def test_the_repeat_waits_for_open_orders_and_never_crosses_a_session(tmp_path):
     strategy = model_harness(tmp_path)
     checked = []
-    strategy._stability_check = lambda context, accepted, decision_id, now, budget: checked.append(decision_id)
+    strategy._stability_check = lambda context, accepted, decision_id, now, budget, **kwargs: checked.append(decision_id)
     open_orders = [{"id": "o-1"}]
     strategy.journal.pending = lambda: open_orders
-    strategy._stability_pending = ({}, decision([("ALFA", .05)]), "d-1", NOW)
-    strategy._stability_pending = ({}, decision([("ALFA", .06)]), "d-2", NOW + timedelta(minutes=5))  # Newer wins.
+    strategy._stability_pending = ({}, DECISION_TASK, decision([("ALFA", .05)]), "d-1", NOW)
+    strategy._stability_pending = ({}, DECISION_TASK, decision([("ALFA", .06)]), "d-2", NOW + timedelta(minutes=5))
     strategy._run_pending_stability(NOW + timedelta(minutes=6))
     assert checked == []  # Our order is still working.
     open_orders.clear()
     strategy._run_pending_stability(NOW + timedelta(minutes=7))
     assert checked == ["d-2"]
-    strategy._stability_pending = ({}, decision([("ALFA", .05)]), "d-3", NOW)
+    strategy._stability_pending = ({}, DECISION_TASK, decision([("ALFA", .05)]), "d-3", NOW)
     strategy._run_pending_stability(NOW + timedelta(days=1))
     assert checked == ["d-2"] and strategy._stability_pending is None  # Yesterday's decision is not asked today.
 
@@ -140,8 +162,9 @@ def test_settings_and_report_line():
     assert ValidationSettings().stability_checks_per_session == 1
     with pytest.raises(RiskError, match="stability_checks_per_session"):
         ValidationSettings(stability_checks_per_session=4)
-    card = {"stability": {"checks": 6, "mean_weight_distance": .04, "same_rate": .5, "mean_consecutive_distance": .05,
-                          "noise_ratio": .8}}
+    card = {"stability": {"input_scope": INPUT_SCOPE, "checks": 6, "mean_weight_distance": .04, "same_rate": .5,
+                          "mean_consecutive_distance": .05, "noise_ratio": .8}}
     [line] = [text for text in evidence_lines(card) if text.startswith("决策稳定性")]
-    assert "6 次" in line and "4.00% 的仓位不同" in line and "噪声占比 80.00%" in line
+    # The ratio includes fresh runtime state, so the report now describes what was measured.
+    assert "6 次" in line and "4.00% 的仓位不同" in line and "复问差异相当于真实调整的 80.00%" in line
     assert not [text for text in evidence_lines({"stability": {"checks": 0}}) if text.startswith("决策稳定性")]
