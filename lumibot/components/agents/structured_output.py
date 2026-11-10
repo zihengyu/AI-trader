@@ -63,28 +63,47 @@ def structured_output_instruction(json_schema: dict[str, Any]) -> str:
     )
 
 
-def _extract_json_value(text: str) -> Any:
-    candidates: list[str] = []
+def _extract_json_value(text: str, expected_type: str | None = None) -> Any:
+    """The answer's JSON value: the whole text, else a fenced block, else one found in the prose.
+
+    When the whole text is JSON it is the answer, whatever its type. Fenced blocks and
+    the last-resort scan of prose for a ``{`` or ``[`` use ``expected_type`` (the
+    schema's root type): a value of another type is skipped whole, never searched
+    inside, so a bracket in a sentence ("snapshot [1]") is not mistaken for an object
+    answer. Every answer extracted before with the right root type is extracted
+    exactly as before; only a value that could never validate is skipped.
+    """
     stripped = text.strip()
-    candidates.append(stripped)
-    candidates.extend(match.strip() for match in _FENCE_PATTERN.findall(text))
-    for candidate in candidates:
-        if not candidate:
-            continue
+    if stripped:
         try:
-            return json.loads(candidate)
+            return json.loads(stripped)
         except (TypeError, ValueError):
             pass
-    decoder = json.JSONDecoder()
-    for index, char in enumerate(text):
-        if char not in "{[":
+    for block in (match.strip() for match in _FENCE_PATTERN.findall(text)):
+        if not block:
             continue
         try:
-            value, _end = decoder.raw_decode(text[index:])
-        except ValueError:
+            value = json.loads(block)
+        except (TypeError, ValueError):
             continue
-        return value
-    raise ValueError("the final answer contained no JSON value")
+        if expected_type is None or _type_matches(value, expected_type):
+            return value
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(text):
+        if text[index] not in "{[":
+            index += 1
+            continue
+        try:
+            value, end = decoder.raw_decode(text, index)
+        except ValueError:
+            index += 1
+            continue
+        if expected_type is None or _type_matches(value, expected_type):
+            return value
+        index = end  # Another type: skip the whole value, including anything nested inside it.
+    raise ValueError("the final answer contained no JSON value" if expected_type is None
+                     else f"the final answer contained no JSON {expected_type}")
 
 
 _JSON_TYPES = {
@@ -126,12 +145,18 @@ def _minimal_validate(value: Any, schema: dict[str, Any], path: str = "$") -> No
             _minimal_validate(item, schema["items"], f"{path}[{index}]")
 
 
+def root_type(json_schema: Any) -> str | None:
+    """The schema's single root JSON type ("object" for a pydantic model), else None."""
+    expected = json_schema.get("type") if isinstance(json_schema, dict) else None
+    return expected if expected in {"object", "array"} else None
+
+
 def parse_structured_output(text: str | None, json_schema: dict[str, Any], model_class: Any | None) -> tuple[Any, str | None]:
     """Parse and validate the final answer. Returns ``(parsed, error)``."""
     if not isinstance(text, str) or not text.strip():
         return None, "the agent returned no final answer text"
     try:
-        value = _extract_json_value(text)
+        value = _extract_json_value(text, root_type(json_schema))
     except ValueError as exc:
         return None, str(exc)
     if model_class is not None:

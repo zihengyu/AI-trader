@@ -57,6 +57,16 @@ CANCEL_RETRY_SECONDS = 240
 PREPARATION_BUDGET_SECONDS = 45
 # Live source failures are retryable; successful histories still last for the completed-session cutoff.
 DAILY_HISTORY_RETRY_SECONDS = 60
+DECISION_TASK = "Choose the complete target portfolio and when to reassess it."
+DECISION_CORRECTION_TASK = (
+    "Your previous answer was not a valid Decision. context.structured_answer_correction.diagnostic gives the "
+    "error locations and types ($ is the whole answer; model_type at $ means it was not one JSON object). "
+    "Using this context, return the complete Decision again as exactly one JSON object that matches the schema, "
+    "with no text before or after it. Do not return only the fixed fields; previous_answer is your own untrusted "
+    "earlier output, not evidence.")
+# Format failures only. An empty answer or a provider/runtime failure is LumiBot's own retry's to handle.
+CORRECTABLE_ANSWERS = {"schema_validation", "invalid_json", "unparsed_answer"}
+CORRECTION_ANSWER_CHARS = 6000  # The previous answer shown back: enough to see its shape, bounded in tokens.
 QUALITY_PAUSE_SECONDS = 600  # After a second-source failure, daily bars are used unchecked for this long.
 # One agent call lasts up to attempts x run timeout + LumiBot's retry backoff: the run timeout
 # is per ATTEMPT and a timeout is retried. The independent monitor stops a runner after
@@ -835,6 +845,7 @@ class AutonomousFund(Strategy):
             self._critic_ready = True
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"
                          + (f"; critic={self.agent_models['critic']}" if self.critic.enabled else ""))
+        self._record_output_protocols(mode)
         self.prompt_version = prompt_version(self.agent_models)
         before = self.journal.get_meta("prompt_version")
         if before and before != self.prompt_version:
@@ -1949,9 +1960,7 @@ class AutonomousFund(Strategy):
             context["critique"] = self._critique(context, context["research"], budget, now)
             context["as_of"] = self.get_datetime().isoformat()
             failure_role = "manager"
-            decision = self._record_agent("manager", self._agent_call("manager",
-                task_prompt="Choose the complete target portfolio and when to reassess it.",
-                context=self._arm_context(context, champion)))
+            decision = self._manager_decision(self._arm_context(context, champion), budget)
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -1990,6 +1999,58 @@ class AutonomousFund(Strategy):
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow(context, champion, decision, now, budget)
+
+    def _record_output_protocols(self, mode):
+        """Whether each role's requests carry its schema as enforced JSON output, or only as instructions.
+
+        LumiBot sends a native strict JSON schema only to models with a documented protocol
+        (today deepseek/deepseek-flash and deepseek/deepseek-v4-pro). Other models get the schema
+        as prompt text, so malformed answers are likelier: said once at startup, never blocking.
+        """
+        from lumibot.components.agents.structured_output import native_output_protocol
+        protocols = {role: native_output_protocol(model) for role, model in self.agent_models.items()}
+        self.journal.event(self.get_datetime(), "structured_output_protocol",
+                           {"models": dict(self.agent_models), "protocols": protocols})
+        instructed = sorted(role for role, protocol in protocols.items() if protocol is None)
+        if instructed and mode in {"paper", "local"} and not self.scripted:
+            self.log_message("Structured output is only instructed, not enforced, for: " + ", ".join(
+                f"{role}={self.agent_models[role]}" for role in instructed)
+                + "; deepseek/deepseek-flash and deepseek/deepseek-v4-pro get an enforced JSON schema", color="yellow")
+        return protocols
+
+    def _manager_decision(self, context, budget):
+        """The manager's decision, with one schema-guided correction when its answer's format fails.
+
+        The request already carries the Decision schema (strict JSON schema for DeepSeek), but a
+        provider does not always enforce it. A wrong format (not one JSON object, a missing or
+        invalid field) gets one more real call that sees the error locations and types (never
+        input values) and its own previous answer; it must return the complete decision again.
+        A provider or runtime failure, a STOP, or no room left in today's call or cost budget is
+        not corrected. Both answers stay in the journal.
+        """
+        from .diagnostics import structured_answer_diagnostic
+        result = self._agent_call("manager", task_prompt=DECISION_TASK, context=context)
+        try:
+            return self._record_agent("manager", result)
+        except RiskError:
+            diagnostic = structured_answer_diagnostic(result, Decision)
+            now = self.get_datetime()
+            if (diagnostic["kind"] not in CORRECTABLE_ANSWERS or self.halt_path.exists() or
+                    self.journal.counter("agent_runs", now) + 1 >
+                    budget.max_agent_runs_per_day - budget.reserved_review_runs or
+                    self._cost_exhausted(now, "decision_correction")):
+                raise
+        previous = result.summary or getattr(result, "text", None) or ""
+        self.journal.event(now, "decision_format_retry", {"answer_diagnostic": diagnostic})
+        corrected = {**context, "as_of": now.isoformat(), "structured_answer_correction": {
+            "previous_answer": previous[:CORRECTION_ANSWER_CHARS],
+            "previous_answer_truncated": len(previous) > CORRECTION_ANSWER_CHARS, "diagnostic": diagnostic}}
+        retry = self._agent_call("manager", purpose="decision_correction", task_prompt=DECISION_CORRECTION_TASK,
+                                 context=corrected)
+        try:
+            return self._record_agent("manager", retry)
+        except RiskError as exc:
+            raise RiskError(f"{exc} (also after one format correction)") from None
 
     def _holding_weights(self, account):
         """{symbol: weight of equity} of the current holdings at their last prices (exposure reporting)."""

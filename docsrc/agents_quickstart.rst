@@ -319,6 +319,8 @@ Optional. Most AI strategies do not need this: agents pass plain-language notes 
 
 With a pydantic model, ``result.parsed`` is an instance of that model. When the answer does not match, ``result.parsed`` is ``None``, ``result.parse_error`` explains why, and ``result.warnings`` contains a ``structured_output_invalid`` entry. No extra model call is made. Tools still work normally; the schema only shapes the final answer.
 
+When the model wraps its JSON in prose, LumiBot uses the whole answer if it is JSON, else the first fenced code block, else the first JSON value found in the text, taking only values of the schema's root type (an object for a pydantic model). A bracket in a sentence such as "snapshot [1]" is therefore not mistaken for the answer.
+
 Direct ``deepseek/deepseek-flash`` and ``deepseek/deepseek-v4-pro`` agents with
 ``output_schema`` send the schema to the provider's Responses API as
 ``text.format.type=json_schema`` without changing their model IDs or tools.

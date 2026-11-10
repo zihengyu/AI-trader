@@ -2,7 +2,7 @@
 
 Native provider schema requests and local validation for generic LumiBot agents.
 
-Last Updated: 2026-11-07
+Last Updated: 2026-11-10
 Status: Strict required-field adaptation implemented locally; real-provider rerun pending
 Audience: Agent runtime maintainers and strategy authors
 
@@ -51,6 +51,32 @@ Native DeepSeek schema runs add a protocol revision to their replay-cache key.
 Revision `deepseek_responses_json_schema_v2` separates this strict wire contract
 from both prompt-only and the earlier unadapted native-schema entries. No cache
 is deleted.
+
+## Extracting The Answer From The Final Text
+
+Providers do not always enforce a requested schema, so the final text goes through
+`parse_structured_output` (`structured_output.py`) in three stages:
+
+1. the whole text, when it is JSON, is the answer whatever its type;
+2. otherwise the first Markdown fenced block that parses and has the schema's root
+   type (`root_type`: `object` for a Pydantic model or `{"type": "object"}`,
+   `array` for an array schema);
+3. otherwise the first `{` or `[` in the prose that decodes to a value of that type.
+
+A value of another type is skipped whole and never searched inside, so a bracket in
+a sentence ("snapshot [1]") is not mistaken for an object answer, and an object
+nested in a skipped list is not promoted. Schemas without a single object/array root
+type keep the earlier untyped behavior. Until 2026-11-10 stages 2 and 3 returned the
+first decodable value of any type: prose containing `[1]` before the real object gave
+the list and failed as `$ (model_type)` (an autonomous-fund decision round was lost to
+this). `tests/test_agent_structured_output_parsing.py` keeps the previous extraction
+verbatim and checks 5,000 generated answers: every answer it extracted with the right
+root type is extracted identically; only values that could never validate change, to
+the right-typed value or to "the final answer contained no JSON object".
+
+Answer extraction cannot fix a wrong answer: missing or invalid fields, prose with no
+JSON, or a truncated response still fail local validation, and applications decide
+whether to correct (the autonomous fund makes one schema-guided correction call).
 
 ## Configuration Classes And Negative Controls
 
