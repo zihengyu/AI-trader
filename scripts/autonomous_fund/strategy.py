@@ -2107,12 +2107,17 @@ class AutonomousFund(Strategy):
         return prompt_version(self.agent_models, {"model_identity": identity} if identity else None)
 
     def _probe_models(self, now):
-        """Once a trading day, the fixed calibration question to every distinct model (model_identity.py)."""
+        """Once a trading day, the fixed calibration question to every distinct model (model_identity.py).
+
+        Only while the regular session is closed (after the close, before the open, or a restart
+        then), so a probe never delays a trading decision.
+        """
+        from .market_data import regular_session_open
         probes = getattr(self, "probe_agents", None) or {}
         day = trading_day(now)
         if (not probes or self.scripted or getattr(self, "mode", None) not in {"local", "paper"}
-                or self.halt_path.exists() or self.journal.get_meta("model_probe_day") == day
-                or self._cost_exhausted(now, "model_probe")):
+                or regular_session_open(now) or self.halt_path.exists()
+                or self.journal.get_meta("model_probe_day") == day or self._cost_exhausted(now, "model_probe")):
             return None
         from .model_identity import PROBE_TASK, observe_probe
         self.journal.set_meta("model_probe_day", day)  # One attempt a day, also when a probe fails.

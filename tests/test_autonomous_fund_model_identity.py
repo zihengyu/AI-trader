@@ -137,16 +137,18 @@ def test_the_daily_probe_asks_each_model_once_and_isolates_failures(tmp_path):
             raise TimeoutError("synthetic")
         return result([], parsed=answer("2025-04"))
     strategy._agent_call = call
-    answers = strategy._probe_models(NOW)
+    assert strategy._probe_models(NOW) is None and calls == []  # The session is open: never delay a decision.
+    closed = NOW + timedelta(hours=7)  # 17:00 New York, after the close.
+    answers = strategy._probe_models(closed)
     assert [c[:3] for c in calls] == [("model_probe_1", "model_probe", "probe_runs"),
                                       ("model_probe_2", "model_probe", "probe_runs")]
     assert "ledger_audit" not in calls[1][3]
     assert answers["deepseek/synthetic-flash"] == {"error": "TimeoutError"}
     assert answers[MODEL]["knowledge_cutoff"] == "2025-04"
     assert strategy.model_identity[MODEL]["probes"][0]["month"] == "2025-04"
-    assert strategy._probe_models(NOW + timedelta(hours=1)) is None and len(calls) == 2  # Once a day.
+    assert strategy._probe_models(closed + timedelta(hours=1)) is None and len(calls) == 2  # Once a day.
     strategy.scripted = True
-    assert strategy._probe_models(NOW + timedelta(days=1)) is None and len(calls) == 2
+    assert strategy._probe_models(closed + timedelta(days=1)) is None and len(calls) == 2
 
 
 def test_notice_texts_say_what_changed_and_that_trading_continues():
