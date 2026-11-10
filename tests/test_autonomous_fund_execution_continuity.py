@@ -80,7 +80,9 @@ def test_actual_cash_discrepancy_still_blocks_fills_and_requires_reconciliation(
 
 def test_sale_does_not_wait_for_another_holdings_unavailable_mark(tmp_path):
     clock, source, journal, broker = setup_book(tmp_path)
-    configure(broker)
+    # Both positions belong to the sleeve. Fill-time attribution now enforces
+    # that scope; this test isolates an unrelated symbol's quote outage.
+    configure(broker, universe=("ALFA", "BRAV"))
     def order_for(symbol, side):
         limit = 101 if side == "buy" else 99
         intent = Intent(symbol, side, 1, number(limit))

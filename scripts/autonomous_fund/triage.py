@@ -22,7 +22,9 @@ model between the soft triggers (news, price moves) and the manager:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
+import hashlib
+import json
 from math import comb
 from typing import Literal
 
@@ -117,6 +119,46 @@ def enforcing_state(settings, saved):
     if settings.mode == "enforce":
         return True
     return bool(saved) if saved is not None else settings.start == "enforce"
+
+
+def bind_profile(journal, settings, model, decision_version, now):
+    """Atomically bind rolling calibration to its actual model, instructions and policy.
+
+    Daily call/cost counters are never reset. Legacy control state is preserved,
+    but unbound samples are archived rather than attributed to a guessed model.
+    """
+    policy = asdict(settings)
+    policy["model"] = model  # The resolved research-model fallback is part of the identity.
+    source = {"policy": policy, "decision_version": decision_version, "instructions": TRIAGE_PROMPT,
+              "schema": Triage.model_json_schema()}
+    identity = hashlib.sha256(json.dumps(source, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    profile = {"id": identity, "model": model, "policy": policy, "decision_version": decision_version}
+    keys = ("triage_profile", "triage_pairs", "triage_enforcing", "triage_dismissal_count", "triage_last_at")
+    with journal.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        saved = {key: json.loads(value) for key, value in db.execute(
+            "SELECT key,value FROM meta WHERE key IN (%s)" % ",".join("?" * len(keys)), keys)}
+        previous = saved.get("triage_profile")
+        bound = (isinstance(previous, dict) and isinstance(previous.get("id"), str)
+                 and len(previous["id"]) == 64)
+        same = bound and previous["id"] == identity
+        control = saved.get("triage_enforcing")
+        control = control if type(control) is bool else None
+        if not same:
+            legacy = not bound and any(key in saved for key in keys[1:])
+            pairs = saved.get("triage_pairs")
+            pairs = pairs[-500:] if isinstance(pairs, list) and all(type(p) is bool for p in pairs) else []
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (
+                str(now), "triage_profile_changed", json.dumps({
+                    "profile_id": identity, "reason": "legacy_unbound" if legacy else "changed" if previous else "initial",
+                    "previous_profile": previous if isinstance(previous, dict) else None, "profile": profile,
+                    "previous_pairs": pairs, "previous_enforcing": control}, allow_nan=False)))
+            saved.update(triage_pairs=[], triage_dismissal_count=0, triage_last_at=None)
+            control = control if legacy else None
+        saved.update(triage_profile=profile, triage_enforcing=enforcing_state(settings, control))
+        for key, value in saved.items():
+            db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, json.dumps(value, allow_nan=False)))
+    return profile
 
 
 def evaluate(pairs, settings, enforcing):

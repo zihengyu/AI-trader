@@ -858,9 +858,10 @@ class AutonomousFund(Strategy):
         self.triage = TriageSettings.from_config(config.get("triage"))
         # Kept out of agent_models: the triage model does not shape decisions, so prompt_version is unchanged.
         self.triage_model = None
-        from .triage import enforcing_state
-        # Saved for the status line; auto keeps an account's earned state across restarts.
-        self.journal.set_meta("triage_enforcing", enforcing_state(self.triage, self.journal.get_meta("triage_enforcing")))
+        from .triage import bind_profile
+        self.triage_profile = bind_profile(
+            self.journal, self.triage, self.triage.model or self.agent_models["researcher"],
+            prompt_version(self.agent_models), self.get_datetime())
         if self.triage.mode != "off":
             self.triage_model = self.triage.model or self.agent_models["researcher"]
             # No tools or network: it judges the triggers it is given, quickly.
@@ -1657,6 +1658,8 @@ class AutonomousFund(Strategy):
         if tokens is not None and not self.scripted and not result.cache_hit:
             # Priced once, here, so status, reports and the daily document need no price table.
             models = set((getattr(self, "agent_models", None) or {}).values()) or {result.model}
+            if getattr(self, "triage_model", None):
+                models.add(self.triage_model)
             cost = call_cost(tokens, rate_for((getattr(self, "config", None) or {}).get("model_prices_per_million"),
                                               result.model, len(models)))
             if cost:
@@ -2051,13 +2054,16 @@ class AutonomousFund(Strategy):
         as prompt text, so malformed answers are likelier: said once at startup, never blocking.
         """
         from lumibot.components.agents.structured_output import native_output_protocol
-        protocols = {role: native_output_protocol(model) for role, model in self.agent_models.items()}
+        models = dict(self.agent_models)
+        if getattr(self, "triage_model", None):
+            models["triage"] = self.triage_model
+        protocols = {role: native_output_protocol(model) for role, model in models.items()}
         self.journal.event(self.get_datetime(), "structured_output_protocol",
-                           {"models": dict(self.agent_models), "protocols": protocols})
+                           {"models": models, "protocols": protocols})
         instructed = sorted(role for role, protocol in protocols.items() if protocol is None)
         if instructed and mode in {"paper", "local"} and not self.scripted:
             self.log_message("Structured output is only instructed, not enforced, for: " + ", ".join(
-                f"{role}={self.agent_models[role]}" for role in instructed)
+                f"{role}={models[role]}" for role in instructed)
                 + "; deepseek/deepseek-flash and deepseek/deepseek-v4-pro get an enforced JSON schema", color="yellow")
         return protocols
 
@@ -2256,6 +2262,7 @@ class AutonomousFund(Strategy):
         now = self.get_datetime()
         self.journal.set_meta("triage_last_at", now.isoformat())
         record = {"id": uuid4().hex[:12], "at": now.isoformat(), "verdict": verdict, "triggers": len(triggers),
+                  "profile_id": (getattr(self, "triage_profile", None) or {}).get("id"),
                   "reasons": sorted({t.get("reason") for t in triggers})}
         if now >= deadline:
             record["action"] = "deadline"
@@ -2289,9 +2296,15 @@ class AutonomousFund(Strategy):
         record, self._pending_triage, self._triage_note = getattr(self, "_pending_triage", None), None, None
         if not record or self.last_decision is before:
             return None  # No new decision (failed or skipped): nothing to score.
+        profile_id = (getattr(self, "triage_profile", None) or {}).get("id")
+        if record.get("profile_id") != profile_id:
+            self.journal.event(self.get_datetime(), "triage_score_discarded", {
+                "id": record["id"], "reason": "profile_changed"})
+            return None
         changed = targets_changed(before, self.last_decision)
         escalate = record["verdict"]["escalate"]
-        scored = {"id": record["id"], "action": record["action"], "escalate": escalate, "manager_changed": changed,
+        scored = {"id": record["id"], "profile_id": profile_id, "action": record["action"],
+                  "escalate": escalate, "manager_changed": changed,
                   "miss": (not escalate) and changed}
         if not escalate:
             pairs = (self.journal.get_meta("triage_pairs") or [])[-499:] + [scored["miss"]]

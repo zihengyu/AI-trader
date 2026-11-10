@@ -563,20 +563,44 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 if self._matchable(db, identifier, start) is not None:
                     db.execute("UPDATE local_orders SET last_bar=? WHERE id=?", (start.isoformat(), identifier))
             return
-        # Fill-time checks use the operator's capital sleeve, never reserved cash.
+        # Fill-time checks use the operator's capital sleeve, never reserved cash
+        # or frozen operator lots. These identities also apply to pending sales.
+        policy = self._valuation_policy
+        limited = policy is not None and policy["mandate"].capital_usd is not None
+        baseline = self.journal.get_meta("mandate_external") if limited else None
+        if limited and baseline is None:
+            raise RiskError("Capital sleeve must be initialized before virtual fills")
+        if baseline is not None and order.asset.symbol in baseline:
+            raise VirtualRiskCancellation("external_holding")
+        if policy is not None and order.asset.symbol not in policy["universe"]:
+            raise VirtualRiskCancellation("ineligible_asset")
         reserve = self.journal.reserve_cash()
         paused, marks, equity = False, {}, number(0)
         if buy:
             # Admitting a purchase needs the whole book valued from fresh source observations.
             _, _, equity = self._get_balances_at_broker(None, order.strategy)
+            balance_marks = self._last_balance_marks
             equity = number(equity) - reserve
-            paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
-            for position in self._book_positions(order.strategy):  # Reconciled by the balance read above.
+            positions = self._book_positions(order.strategy)  # Reconciled by the balance read above.
+            for position in positions:
                 quote = self.data_source.get_quote(position.asset)
                 age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
                 if not 0 <= age <= self.limits.quote_max_seconds:
                     raise MarketDataUnavailable("Stale holding mark; virtual fills paused")
                 marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
+            if policy is not None:
+                from .holdings import split_holdings
+                holdings, external, external_value, shared = split_holdings(
+                    positions, policy["universe"], allow_external=policy["mandate"].allow_external_holdings,
+                    baseline=baseline, initialized=baseline is not None,
+                    price=lambda symbol: number(balance_marks[symbol]["price"]))
+                if baseline is not None and external != {s: number(q) for s, q in baseline.items()}:
+                    raise RiskError("External holdings changed; review the capital sleeve before virtual fills")
+                if order.asset.symbol in shared:
+                    raise VirtualRiskCancellation("external_holding")
+                equity -= external_value
+                marks = {s: value for s, value in marks.items() if s in holdings}
+            paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             from .ledger_audit import require_consistent

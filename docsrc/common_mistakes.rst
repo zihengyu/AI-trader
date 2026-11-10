@@ -524,6 +524,15 @@ screening call crosses it, the manager runs with the original triggers intact.
 Risk pauses and invalid or future scheduling state bypass the soft-event
 screen. STOP arriving during screening or context preparation prevents a
 follow-up manager call. Status uses the actual scoring window.
+Calibration is bound to a ``triage_profile`` containing the resolved screening
+model, instructions/schema, manager decision version and screening policy.
+Matching restarts retain samples and state; changed profiles archive the old
+samples and start with the configured ``mode``/``start``. Daily call and cost
+budgets are not reset. Legacy samples without source identity are archived;
+auto mode preserves its known control state rather than re-enabling a rolled
+back screen. Results carry ``profile_id`` and cannot be scored into another
+profile. Pricing and output-protocol diagnostics also include the screening
+model; an unpriced second model cannot inherit a legacy single-model rate.
 
 **Cash parking orders are canceled or reported as outside the AI universe.**
 The configured cash-equivalent sweep is deliberately excluded from AI targets.
@@ -536,6 +545,13 @@ obey the ordinary stale-order cancellation interval after allocation completes.
 ``local_risk_canceled.reason`` distinguishes position/exposure limits, a cash
 buffer breach, insufficient cash and a drawdown pause. Older canceled orders
 without a recorded reason cannot be assigned one from status alone.
+Fill-time capital-sleeve checks subtract operator-owned holdings from equity
+and risk exposure using the same attribution rules as account snapshots.
+Those holdings cannot expand the sleeve's position allowance or inflate the
+parking cash-buffer requirement. Frozen operator lots remain untradeable by
+the sleeve, even when the symbol is also in its configured universe. Such
+pending orders are canceled with ``external_holding``; other unadmitted symbols
+are canceled with ``ineligible_asset``.
 
 Postmarket agents receive a citable ``cash_management`` policy snapshot, so
 they can distinguish AI eligibility from system cash parking. A retried review
