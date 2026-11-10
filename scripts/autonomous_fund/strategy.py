@@ -2056,7 +2056,7 @@ class AutonomousFund(Strategy):
             context["as_of"] = self.get_datetime().isoformat()
             failure_role = "manager"
             armed = self._arm_context(context, champion)
-            decision = self._manager_decision(armed, budget)
+            decision, accepted_task, accepted_context = self._manager_decision(armed, budget)
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -2075,7 +2075,8 @@ class AutonomousFund(Strategy):
             self.journal.set_meta("decision_failure_role", None)
         self.journal.event(now, "decision_validated", {
             **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None),
-            "claim_checks": check_claims(decision.get("factual_claims", []), context["market_snapshot"], self.universe)})
+            "claim_checks": check_claims(decision.get("factual_claims", []), accepted_context["market_snapshot"],
+                                         self.universe)})
         self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
         self._record_construction_variant(decision, now)
         self._triggers = []
@@ -2096,9 +2097,8 @@ class AutonomousFund(Strategy):
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
             self._shadow(context, champion, decision, now, budget)
-            # The repeat question waits for an idle iteration with no open order of ours, so its
-            # call never holds up stops, limit repricing or fills (_run_pending_stability).
-            self._stability_pending = (armed, decision, accepted_id, now)
+            # The repeat waits until the iteration has checked protective levels and in-flight orders.
+            self._stability_pending = (accepted_context, accepted_task, decision, accepted_id, now)
 
     def _decision_version(self):
         """prompt_version, plus the model-identity epochs once any model behind a name changed."""
@@ -2108,16 +2108,22 @@ class AutonomousFund(Strategy):
 
     def _probe_models(self, now):
         """Once a trading day, the fixed calibration question to every distinct model (model_identity.py)."""
+        from .market_data import completed_daily_cutoff
         probes = getattr(self, "probe_agents", None) or {}
         day = trading_day(now)
-        if (not probes or self.scripted or getattr(self, "mode", None) not in {"local", "paper"}
-                or self.halt_path.exists() or self.journal.get_meta("model_probe_day") == day
-                or self._cost_exhausted(now, "model_probe")):
+        if (not probes or self.scripted or getattr(self, "observe_only", False)
+                or getattr(self, "mode", None) not in {"local", "paper"}
+                or self.journal.get_meta("model_probe_day") == day
+                or completed_daily_cutoff(now).isoformat() <= day):
             return None
         from .model_identity import PROBE_TASK, observe_probe
-        self.journal.set_meta("model_probe_day", day)  # One attempt a day, also when a probe fails.
         results = {}
         for name, model in sorted(probes.items()):
+            now = self.get_datetime()
+            if trading_day(now) != day or self.halt_path.exists() or self._cost_exhausted(now, "model_probe"):
+                break
+            if not results:
+                self.journal.set_meta("model_probe_day", day)  # Record the attempt before the first call.
             try:
                 answer = self._record_agent(name, self._agent_call(
                     name, purpose="model_probe", run_counter="probe_runs", task_prompt=PROBE_TASK,
@@ -2129,8 +2135,10 @@ class AutonomousFund(Strategy):
             self._identity_changes(observe_probe(self.model_identity, model, answer,
                                                  instant(now).astimezone(ZoneInfo("America/New_York")).date(),
                                                  instant(now).isoformat()), now)
-        self.journal.event(now, "model_probe", {"day": day, "answers": results})
-        return results
+        if results:
+            self.journal.event(self.get_datetime(), "model_probe", {"day": day, "answers": results})
+            return results
+        return None
 
     def _identity_changes(self, changes, now):
         """Persist the identity state; on a change, notify and start a new prompt_version."""
@@ -2178,7 +2186,7 @@ class AutonomousFund(Strategy):
         pending = getattr(self, "_stability_pending", None)
         if not pending:
             return None
-        context, decision, decision_id, decided_at = pending
+        context, task_prompt, decision, decision_id, decided_at = pending
         if trading_day(decided_at) != trading_day(now):
             self._stability_pending = None
             return None
@@ -2186,18 +2194,18 @@ class AutonomousFund(Strategy):
             return None
         self._stability_pending = None
         try:
-            return self._stability_check(context, decision, decision_id, now, self.model_budget)
+            return self._stability_check(context, decision, decision_id, now, self.model_budget, task_prompt=task_prompt)
         except Exception as exc:  # A measurement, never a reason to stop trading.
             self._disclose_failure("stability_check_error", exc, phase="trading_iteration")
             return None
 
-    def _stability_check(self, context, decision, decision_id, now, budget):
-        """Once a session: the accepted decision's exact input to the manager again, compared, never traded.
+    def _stability_check(self, context, decision, decision_id, now, budget, *, task_prompt=DECISION_TASK):
+        """Repeat the accepted task and strategy context with fresh runtime state. Never trade the answer.
 
         Live modes only (a replay could answer from its cache). Skipped under STOP and when the day's
         calls (keeping the reserved review runs) or cost budget are used up.
         """
-        from .stability import compare
+        from .stability import INPUT_SCOPE, compare
         settings = getattr(self, "validation", None)
         per_session = getattr(settings, "stability_checks_per_session", 0) if settings is not None else 0
         if (not per_session or getattr(self, "mode", None) not in {"local", "paper"} or self.halt_path.exists()
@@ -2206,15 +2214,16 @@ class AutonomousFund(Strategy):
                 or self._cost_exhausted(now, "stability")):
             return None
         self.journal.counter("stability_checks", now, 1)
+        evidence = {"decision_id": decision_id, "input_scope": INPUT_SCOPE}
         try:
             again = self._record_agent("manager", self._agent_call(
-                "manager", purpose="stability", task_prompt=DECISION_TASK, context=context), phase="stability")
+                "manager", purpose="stability", task_prompt=task_prompt, context=context), phase="stability")
         except Exception as exc:
             self.journal.event(self.get_datetime(), "decision_stability", {
-                "decision_id": decision_id, "valid": False,
+                **evidence, "valid": False,
                 "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
             return None
-        result = {"decision_id": decision_id, "valid": True, **compare(decision, again)}
+        result = {**evidence, "valid": True, **compare(decision, again)}
         self.journal.event(self.get_datetime(), "decision_stability", result)
         self._call_outcome(decision_id=decision_id, stability=True)
         return result
@@ -2243,6 +2252,7 @@ class AutonomousFund(Strategy):
     def _manager_decision(self, context, budget):
         """One shared correction for format failures or a live answer's invalid timing.
 
+        Return the answer with the task and strategy context that produced it.
         Reassessment is a real, budgeted call; no old answer is retimestamped.
         Provider failures, other risk failures and historical timing failures
         still propagate. Both answers and rejected clock evidence are retained.
@@ -2259,7 +2269,7 @@ class AutonomousFund(Strategy):
                 raise
         else:
             if self.mode not in {"local", "paper"}:
-                return decision
+                return decision, DECISION_TASK, context
             try:
                 validate_decision(decision, self.get_datetime(), self.universe, self.limits)
             except DecisionTimingError as exc:
@@ -2267,7 +2277,7 @@ class AutonomousFund(Strategy):
                 diagnostic = {**exc.diagnostic, "request_as_of": context["as_of"]}
                 self.journal.event(self.get_datetime(), "decision_time_rejected", {"diagnostic": diagnostic})
             else:
-                return decision
+                return decision, DECISION_TASK, context
 
         def permitted():
             now = self.get_datetime()
@@ -2304,7 +2314,7 @@ class AutonomousFund(Strategy):
             decision = self._record_agent("manager", retry)
             if self.mode in {"local", "paper"}:
                 validate_decision(decision, self.get_datetime(), self.universe, self.limits)
-            return decision
+            return decision, task, corrected
         except RiskError as exc:
             raise RiskError(f"{exc} (also after one {correction_kind} correction)") from None
 
@@ -2825,7 +2835,7 @@ class AutonomousFund(Strategy):
             return cached[1]
         from .review import _events
         from .downdays import score as score_down_days
-        from .stability import score as score_stability
+        from .stability import INPUT_SCOPE, score as score_stability
         from .scorecard import (completed_sessions, score_consistency, score_decisions, score_ideas, score_predictions,
                                 score_timing)
         rows = _events(self.journal, instant(now), kinds=kinds)
@@ -2835,6 +2845,7 @@ class AutonomousFund(Strategy):
                   if r["kind"] in {"protective_trigger", "entry_waiting", "order_submitted"}][-400:]
         all_reviews = [r["body"] for r in rows if r["kind"] == "postmarket_review"]
         reviews = all_reviews[-40:]
+        protective = [(r["at"], r["body"]) for r in rows if r["kind"] == "protective_trigger"]
         # One allocation per session (its last), so frequent reviews are not over-counted.
         by_day = {}
         for row in rows:
@@ -2851,6 +2862,7 @@ class AutonomousFund(Strategy):
             for prediction in packet["review"].get("predictions", []):
                 symbols |= {prediction["symbol"], prediction.get("benchmark") or "SPY"}
         symbols |= {body["symbol"] for _, kind, body in timing if kind in {"protective_trigger", "entry_waiting"}}
+        symbols |= {body["symbol"] for _, body in protective}
         symbols |= {s for _, body in variants for arm in ("ai", "risk_budget") for s in body.get(arm, {})}
         lab = getattr(self, "factor_lab", None)
         idea_symbols = {i["symbol"] for i in ideas} | {i.get("benchmark") or "SPY" for i in ideas}
@@ -2860,6 +2872,9 @@ class AutonomousFund(Strategy):
                   for symbol in sorted((symbols & allowed) | (idea_symbols & allowed_ideas))}
         validated = [(r["at"], r["body"]) for r in rows if r["kind"] == "decision_validated"][-200:]
         triggers = [(at, kind, body) for at, kind, body in timing if kind == "protective_trigger"]
+        # Legacy repeats can compare a corrected answer with the original request.
+        stability_checks = [r["body"] for r in rows if r["kind"] == "decision_stability"
+                            and r["body"].get("input_scope") == INPUT_SCOPE][-60:]
         regimes = self._market_regimes(now)
         sessions = completed_sessions(closes, cutoff)
         result = {"as_of": str(now), "predictions": score_predictions(reviews, closes, sessions=sessions),
@@ -2867,11 +2882,9 @@ class AutonomousFund(Strategy):
                   "decisions": score_decisions(decisions, closes, sectors=sector_of, regimes=regimes, sessions=sessions),
                   "timing": score_timing(timing, closes, sessions=sessions),
                   "consistency": score_consistency(validated, triggers), "claims": score_claims(validated),
-                  "stability": score_stability([r["body"] for r in rows if r["kind"] == "decision_stability"][-60:],
-                                               [body for _, body in validated]),
+                  "stability": score_stability(stability_checks, [body for _, body in validated]),
                   # Every reviewed session, not only the last 40: large down days are rare.
-                  "down_days": score_down_days(all_reviews, [(at, body) for at, _, body in triggers], closes,
-                                               sessions=sessions)}
+                  "down_days": score_down_days(all_reviews, protective, closes, sessions=sessions)}
         settings = getattr(self, "construction", None)
         if settings is not None:
             from .construction import evaluate
@@ -2993,7 +3006,7 @@ class AutonomousFund(Strategy):
                                         for label, card in (cards["decisions"].get("by_regime") or {}).items()},
                 "decisions_trend": cards["decisions"].get("trend_5d_net_excess"),
                 "claims": cards.get("claims"),
-                # How much the manager's answer to an identical input varies (sampling noise in its decisions).
+                # How much the manager's answer varies when the strategy sends the same request.
                 "decision_stability": {k: v for k, v in (cards.get("stability") or {}).items() if k != "recent"},
                 # How much of the market's large falls (and rises) the fund took; rare days, read with the count.
                 "down_days": {k: v for k, v in (cards.get("down_days") or {}).items() if k != "meaning"},
@@ -3326,7 +3339,7 @@ class AutonomousFund(Strategy):
         # Cached missing-history estimates must not prevent the next read from reaching the source.
         self._estimates, self._stress_cache = {}, {}
         for name in ("_style_cache", "_factor_cache", "_factor_context_cache", "_market_snapshot_cache",
-                     "_scorecard_cache"):
+                     "_history_bounds_cache", "_scorecard_cache"):
             setattr(self, name, None)
 
     def _daily_bars(self, symbol, now):
@@ -3858,11 +3871,13 @@ class AutonomousFund(Strategy):
             last = self.journal.get_meta("history_bounds_state") or {"beyond_risk_window": [], "beyond_history": []}
             if state != {key: last.get(key, []) for key in state}:
                 if result["status"] != "normal":
+                    exceeded = set(state["beyond_risk_window"]) | set(state["beyond_history"])
                     self._notify_fund("market_out_of_history", {
                         "as_of_close": result["as_of_close"], "status": result["status"], **state,
                         "risk_window_sessions": result["risk_window_sessions"],
                         "history_sessions": result["history_sessions"],
-                        "values": {name: result["metrics"][name]["value"] for name in result["beyond_risk_window"]}})
+                        "values": {name: metric["value"] for name, metric in result["metrics"].items()
+                                   if name in exceeded}})
                 else:
                     self._notify_fund("market_back_within_history", {"as_of_close": result["as_of_close"]})
                 self.journal.set_meta("history_bounds_state", {**state, "as_of_close": result["as_of_close"]})

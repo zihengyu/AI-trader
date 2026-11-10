@@ -63,8 +63,10 @@ class ModelProbe(BaseModel):
 
 
 def _index(text):
-    match = MONTH.match(str(text or ""))
-    return int(match.group(1)) * 12 + int(match.group(2)) - 1 if match else None
+    match = MONTH.fullmatch(str(text or ""))
+    if not match or int(match.group(1)) < date.min.year:
+        return None
+    return int(match.group(1)) * 12 + int(match.group(2)) - 1
 
 
 def _month(index):
@@ -115,7 +117,7 @@ def observe_probe(state, model, answer, day, at):
     entry, changes = _entry(state, model), []
     entry["probes"] = (entry["probes"] + [{"day": day.isoformat(), "month": knowledge_month(answer, day),
                                            "name": _name(answer.get("model_name"))}])[-HISTORY:]
-    months = [_index(p["month"]) for p in entry["probes"] if p["month"]]
+    months = [month for p in entry["probes"] if (month := _index(p["month"])) is not None]
     baseline = _index(entry["baseline_month"])
     if baseline is None:
         if len(months) >= BASELINE_PROBES:

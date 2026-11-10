@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from math import isfinite
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
 
 METRICS = ("ret_1d", "ret_5d", "ret_20d", "ret_60d", "vol_20d", "vol_60d", "beta_60d", "corr_60d",
            "pct_from_ma50", "pct_from_ma200", "pct_from_high_252d", "adv_20d_usd")
@@ -31,8 +31,8 @@ class SnapshotClaim(BaseModel):
     metric: Literal[METRICS]
     minimum_percentile: int | None = Field(default=None, ge=1, le=100)
     maximum_percentile: int | None = Field(default=None, ge=1, le=100)
-    minimum: float | None = None
-    maximum: float | None = None
+    minimum: FiniteFloat | None = None
+    maximum: FiniteFloat | None = None
 
 
 MomentumClaim = SnapshotClaim  # The earlier name: momentum ranks are one case of a snapshot claim.
@@ -69,7 +69,7 @@ def check_claims(claims, snapshot, universe):
             results.append({**result, "status": "no_bound"})
             continue
         ranked = claim["minimum_percentile"] is not None or claim["maximum_percentile"] is not None
-        if snapshot.get("deferred") or symbol not in pool or (ranked and len(pool) < MIN_PEERS):
+        if symbol not in pool or (ranked and (snapshot.get("deferred") or len(pool) < MIN_PEERS)):
             results.append({**result, "status": "unavailable"})
             continue
         value = pool[symbol]

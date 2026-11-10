@@ -63,8 +63,10 @@ def test_missing_evidence_and_boundless_claims_are_never_scored_as_right_or_wron
     assert [r["status"] for r in check_claims([claim("A", "beta_60d", minimum=0.1),
                                                claim("A", "beta_60d", minimum_percentile=1)], small, UNIVERSE)] \
         == ["correct", "unavailable"]
-    assert check_claims([claim("A", "beta_60d", minimum=0.1)], {**snapshot(), "deferred": ["B"]},
-                        UNIVERSE)[0]["status"] == "unavailable"
+    # An unrelated deferred peer only affects ranks. A present same-date value is enough.
+    results = check_claims([claim("A", "beta_60d", minimum=0.1), claim("A", "beta_60d", minimum_percentile=1)],
+                           {**snapshot(), "deferred": ["B"]}, UNIVERSE)
+    assert [r["status"] for r in results] == ["correct", "unavailable"]
     # The earlier momentum form keeps working unchanged.
     [momentum] = check_claims([{"symbol": "F", "metric": "ret_60d", "minimum_percentile": 80}], snapshot(), UNIVERSE)
     assert momentum["status"] == "correct" and momentum["actual_percentile"] == 100.0

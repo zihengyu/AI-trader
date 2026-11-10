@@ -5,6 +5,10 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Fixed
+- Autonomous fund model probes wait for the exchange close, skip observe-only mode, and recheck STOP and cost limits between calls. Invalid knowledge months in probe answers and saved journals are ignored.
+- Autonomous fund snapshot claims reject non-finite bounds through structured answer validation. Direct value checks can use same-date data even when unrelated symbols are deferred.
+- Autonomous fund stability checks repeat the accepted task and strategy context, including corrections. The scorecard separates those measurements from legacy checks and describes the changing runtime inputs.
+- Autonomous fund history warnings refresh after data retries and include metrics that exceeded the full history. Down-day scorecards count protective triggers across all reviewed down days and disclose how many could be valued.
 - Local autonomous fund fill checks now apply the account snapshot's capital-sleeve attribution: external holdings neither enlarge investment allowances nor consume sleeve exposure or parking-buffer capacity. Pending orders cannot trade frozen operator lots, including shared symbols.
 - Triage calibration now binds samples to the resolved model, instructions/schema, manager decision version and screening policy. Matching restarts preserve state; changed profiles archive old samples and restart under the configured mode/start without resetting daily usage budgets. Legacy unbound samples retain their known auto-control state during migration, and mismatched results cannot enter the current cohort.
 - Triage pricing and output-protocol diagnostics include its actual model. A separately selected screening model can no longer inherit another model's legacy flat rate; missing prices remain unknown.

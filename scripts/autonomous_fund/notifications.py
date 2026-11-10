@@ -122,13 +122,15 @@ def _regime_note(group):
 
 
 def evidence_lines(card):
+    from .stability import INPUT_SCOPE
+
     lines = []
     stability = (card or {}).get("stability")
-    if stability and stability.get("checks"):
-        lines.append(f"决策稳定性（同一输入再问基金经理一次）：{stability['checks']} 次，两次目标组合平均有 "
+    if stability and stability.get("input_scope") == INPUT_SCOPE and stability.get("checks"):
+        lines.append(f"决策稳定性（复用任务和策略上下文，运行状态实时更新）：{stability['checks']} 次，两次目标组合平均有 "
                      f"{_percent(stability['mean_weight_distance'])} 的仓位不同，完全一致 {_percent(stability['same_rate'])}；"
-                     f"同期相邻两次真实决策平均调整 {_percent(stability['mean_consecutive_distance'])}"
-                     + (f"，噪声占比 {_percent(stability['noise_ratio'])}（越接近 100% 越说明调仓多半是随机波动）"
+                     f"近期相邻两次真实决策平均调整 {_percent(stability['mean_consecutive_distance'])}"
+                     + (f"，复问差异相当于真实调整的 {_percent(stability['noise_ratio'])}"
                         if stability.get("noise_ratio") is not None else "") + "。")
     down = (card or {}).get("down_days") or {}
     if (down.get("down_days") or {}).get("days"):
@@ -144,9 +146,9 @@ def evidence_lines(card):
                if down.get("beta_lower_on_down_days_by") is not None else "")
             + f"；当天选股贡献 {_percent(days['selection'])}、择时 {_percent(days['timing'])}"
             + (f"（{days['timing_unknown_days']} 天择时未知，未计入）" if days.get("timing_unknown_days") else "")
-            + (f"；止损/止盈 {exits['count']} 次，"
-               + (f"次日平均价值 {_percent(exits['mean_value_added_1d'])}（正＝卖出后又跌）"
-                  if exits.get("mean_value_added_1d") is not None else "次日价值待定")
+            + (f"；止损/止盈触发 {exits['count']} 次，{exits.get('valued', 0)} 次可估值"
+               + (f"，按触发时买一价估算的次日平均价值 {_percent(exits['mean_value_added_1d'])}"
+                  if exits.get("mean_value_added_1d") is not None else "")
                if exits.get("count") else "") + "。")
     claims = (card or {}).get("claims")
     if claims and claims.get("decisions"):
@@ -636,8 +638,8 @@ def readable(kind, details, sequence=None, *, now=None):
                  for name, value in (details.get("values") or {}).items()]
         text = (f"⚠️ 市场超出历史范围（{details.get('as_of_close')} 收盘）：" + "；".join(parts) + "。\n"
                 f"风险模型的预期损失和相关性是用最近 {details.get('risk_window_sessions')} 个交易日估出来的，"
-                f"基金手上的历史共 {details.get('history_sessions')} 个交易日；现在的市场比这些数据里任何时候都极端，"
-                "这些估计很可能低估了风险（历史压力情景仍照常计入）。\n"
+                f"基金手上的历史共 {details.get('history_sessions')} 个交易日。"
+                "遇到历史少见的行情时，风险估计可能失准（历史压力情景仍照常计入）。\n"
                 "这只是提醒：风险上限和订单都不会因此自动改变，基金经理在决策时也能看到这条信息。"
                 "需要更保守时，可以手动收紧风险设置或暂停（STOP）。")
     elif kind == "model_identity_changed" and isinstance(details, dict):

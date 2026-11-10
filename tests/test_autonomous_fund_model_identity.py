@@ -2,7 +2,7 @@
 
 Synthetic answers only; no network, broker or model inference.
 """
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -15,6 +15,7 @@ from tests.test_autonomous_fund_quant import NOW, model_harness
 
 MODEL = "deepseek/synthetic-pro"
 DAY = date(2026, 11, 2)
+CLOSE = NOW.replace(hour=21)
 
 
 def answer(cutoff, events=(), name="Synthetic-Pro 4"):
@@ -44,6 +45,18 @@ def probe_days(state, answers, start=DAY):
     for offset, item in enumerate(answers):
         changes += observe_probe(state, MODEL, item, start + timedelta(days=offset), f"t{offset}")
     return changes
+
+
+def test_year_zero_is_ignored_in_new_probes_and_legacy_state():
+    assert knowledge_month(answer("0000-01", ["0000-12"]), DAY) is None
+    state = {}
+    probe_days(state, [answer("0000-01")] * 3)
+    assert state[MODEL]["baseline_month"] is None
+    # Old journals may already contain the invalid month in both fields.
+    state[MODEL]["baseline_month"] = state[MODEL]["probes"][0]["month"] = "0000-01"
+    assert observed_cutoffs(state) == {}
+    probe_days(state, [answer("2024-02")] * 3, DAY + timedelta(days=3))
+    assert observed_cutoffs(state) == {MODEL: "2024-02-29"}
 
 
 def test_sampling_noise_is_not_a_change_but_a_sustained_later_cutoff_is():
@@ -128,6 +141,7 @@ def test_replays_and_cache_hits_never_count_as_a_served_model(tmp_path):
 
 def test_the_daily_probe_asks_each_model_once_and_isolates_failures(tmp_path):
     strategy = live(tmp_path)
+    strategy.get_datetime = lambda: CLOSE
     strategy.probe_agents = {"model_probe_1": "deepseek/synthetic-flash", "model_probe_2": MODEL}
     calls = []
 
@@ -137,16 +151,60 @@ def test_the_daily_probe_asks_each_model_once_and_isolates_failures(tmp_path):
             raise TimeoutError("synthetic")
         return result([], parsed=answer("2025-04"))
     strategy._agent_call = call
-    answers = strategy._probe_models(NOW)
+    # The daily attempt now starts only once today's regular session has closed.
+    answers = strategy._probe_models(CLOSE)
     assert [c[:3] for c in calls] == [("model_probe_1", "model_probe", "probe_runs"),
                                       ("model_probe_2", "model_probe", "probe_runs")]
     assert "ledger_audit" not in calls[1][3]
     assert answers["deepseek/synthetic-flash"] == {"error": "TimeoutError"}
     assert answers[MODEL]["knowledge_cutoff"] == "2025-04"
     assert strategy.model_identity[MODEL]["probes"][0]["month"] == "2025-04"
-    assert strategy._probe_models(NOW + timedelta(hours=1)) is None and len(calls) == 2  # Once a day.
+    assert strategy._probe_models(CLOSE + timedelta(hours=1)) is None and len(calls) == 2  # Once a day.
     strategy.scripted = True
-    assert strategy._probe_models(NOW + timedelta(days=1)) is None and len(calls) == 2
+    assert strategy._probe_models(CLOSE + timedelta(days=1)) is None and len(calls) == 2
+
+
+def test_probe_waits_for_the_exchange_close_and_respects_observe_only(tmp_path):
+    strategy = live(tmp_path)
+    strategy.probe_agents = {"model_probe_1": MODEL}
+    calls = []
+
+    def call(*args, **kwargs):
+        calls.append(kwargs["context"]["as_of"])
+        return result([], parsed=answer("2025-04"))
+
+    strategy._agent_call = call
+    # The Friday after Thanksgiving is a half day. Thanksgiving itself has no session.
+    half_close = datetime(2026, 11, 27, 18, tzinfo=timezone.utc)
+    for moment in (half_close - timedelta(days=1), half_close - timedelta(seconds=1)):
+        strategy.get_datetime = lambda: moment
+        assert strategy._probe_models(moment) is None
+    strategy.get_datetime = lambda: half_close
+    strategy.observe_only = True
+    assert strategy._probe_models(half_close) is None
+    assert not calls and strategy.journal.get_meta("model_probe_day") is None
+    strategy.observe_only = False
+    assert MODEL in strategy._probe_models(half_close)
+    assert calls == [half_close.isoformat()]
+
+
+@pytest.mark.parametrize("blocker", ["stop", "cost"])
+def test_probe_rechecks_stop_and_cost_between_models(tmp_path, blocker):
+    strategy = live(tmp_path)
+    strategy.get_datetime = lambda: CLOSE
+    strategy.probe_agents = {"model_probe_1": MODEL, "model_probe_2": "deepseek/synthetic-other"}
+    calls = []
+    strategy._cost_exhausted = lambda now, step: bool(calls) and blocker == "cost"
+
+    def call(name, **kwargs):
+        calls.append(name)
+        if blocker == "stop":
+            strategy.halt_path.write_text("synthetic stop")
+        return result([], parsed=answer("2025-04"))
+
+    strategy._agent_call = call
+    assert set(strategy._probe_models(CLOSE)) == {MODEL}
+    assert calls == ["model_probe_1"]
 
 
 def test_notice_texts_say_what_changed_and_that_trading_continues():
