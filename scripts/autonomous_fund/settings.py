@@ -104,6 +104,7 @@ SETTINGS = {
     "FUND_DATA_COSTS_USD_PER_MONTH": (("performance", "data_costs_usd_per_month"), _decimal, False, "模型",
                                       "付费数据订阅的月费（美元），计入系统净收益；默认 0"),
     "FUND_MAX_DAILY_COST_USD": (("model_budget", "max_daily_cost_usd"), _decimal, False, "模型", "每个交易日模型费用上限（美元，按 FUND_MODEL_PRICES_JSON 估算）；到达后当天不再发起新决策、反方审查和盘前研究"),
+    "FUND_COST_ALERT_SHARE": (("model_budget", "cost_alert_share"), _decimal, False, "模型", "AI 和数据费用累计每达到起始资金的这个比例（默认 0.02）提醒一次；只提醒，不停止交易"),
     # ----- User constraints (the operator's mandate and hard limits)
     "FUND_CAPITAL_USD": (("mandate", "capital_usd"), _capital, False, "约束", "AI 可用的授权资金（美元）；account 表示整个专用账户"),
     "FUND_ALLOW_EXTERNAL_HOLDINGS": (("mandate", "allow_external_holdings"), _bool, False, "约束", "账户里是否允许你自己的持仓（AI 不碰、数量冻结）"),

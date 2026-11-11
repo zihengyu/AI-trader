@@ -497,8 +497,10 @@ class Monitor:
             from .holdings import recent_trades
             trades = recent_trades([(at, kind, json.loads(body)) for at, kind, body in db.execute(
                 "SELECT at,kind,body FROM events WHERE kind IN ('fill','fill_reconciled') ORDER BY sequence")], cutoff)
+            from .scoreboard import accrued_costs
             details = {"at": str(now), "account": account, "recent_trades": trades,
-                       "fill_sequences": [row["sequence"] for row in completed], "account_pending": waiting}
+                       "fill_sequences": [row["sequence"] for row in completed], "account_pending": waiting,
+                       "fund_costs": accrued_costs(db, str(now))}
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
                 "kind": "execution_update", "details": details})))
             if waiting:
@@ -879,7 +881,7 @@ class Monitor:
         from .report import report
         from .status import account_lines
         snapshot = report(self.root, write_files=False)
-        lines += account_lines(snapshot.get("latest_account"), now=now)
+        lines += account_lines(snapshot.get("latest_account"), now=now, costs=snapshot.get("fund_costs"))
         if snapshot.get("ledger_audit", {}).get("status") == "failed":
             lines.append("账务校验未通过，争议账户数据暂不展示。")
         try:

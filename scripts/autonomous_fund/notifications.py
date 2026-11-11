@@ -121,10 +121,47 @@ def _regime_note(group):
             f"95% 区间 {_percent(interval[0])} 至 {_percent(interval[1])}）")
 
 
+def fund_scoreboard_line(fund):
+    """One line: since inception, net of every cost, against each benchmark (scoreboard.py); None when not computed."""
+    if not fund or fund.get("status") != "computed":
+        return None
+
+    def label(name, weights):
+        if name == "spy":
+            return "SPY"
+        parts = " + ".join(f"{float(w) * 100:.0f}% {s}" for s, w in weights.items())
+        return f"{'风险匹配基准' if name == 'risk_matched' else name}（{parts}）"
+    costs = fund["model_costs_usd"] + (fund.get("data_costs_usd") or 0)
+    text = (f"扣除全部成本后的基金收益（{fund['since']} 至 {fund['through']}，{fund['sessions']} 个交易日）："
+            f"账户收益 {_percent(fund['account_return'])}（已扣交易费用和滑点，含现金利息），"
+            f"模型和数据费用 ${costs:.2f}（占起始资金 {_percent(fund.get('costs_share_of_starting_equity'))}），"
+            f"净收益 {_percent(fund['net_return'])}")
+    if fund.get("unpriced_calls"):
+        text += f"（另有 {fund['unpriced_calls']} 次调用未定价、未计入，实际更低）"
+    if fund.get("data_costs_usd") is None:
+        text += "（数据费用未知、未计入）"
+    marks = [f"{label(name, row['weights'])} {_percent(row['return'])}（净超额 {_percent(row['net_excess'])}）"
+             for name, row in (fund.get("benchmarks") or {}).items()]
+    if marks:
+        text += "；同期 " + "、".join(marks)
+    pace = (fund.get("cost_pace") or {}).get("share_of_equity_per_year")
+    if pace is not None:
+        text += (f"。按最近 {fund['cost_pace']['sessions']} 个交易日的花费，系统一年的费用约占资金 {_percent(pace)}，"
+                 "要跑赢基准至少得多赚这么多")
+    cash = fund.get("cash") or {}
+    if cash.get("annual_net_of_cost_pace") is not None:
+        text += (f"；全拿现金（{cash['symbol']} 年化约 {_percent(cash['annual_yield'])}）扣费后年化约 "
+                 f"{_percent(cash['annual_net_of_cost_pace'])}")
+    return text + "。"
+
+
 def evidence_lines(card):
     from .stability import INPUT_SCOPE
 
     lines = []
+    fund = fund_scoreboard_line((card or {}).get("fund"))
+    if fund:
+        lines.append(fund)
     stability = (card or {}).get("stability")
     if stability and stability.get("input_scope") == INPUT_SCOPE and stability.get("checks"):
         lines.append(f"决策稳定性（复用任务和策略上下文，运行状态实时更新）：{stability['checks']} 次，两次目标组合平均有 "
@@ -215,6 +252,13 @@ def attribution_lines(result):
              f"基准 {result['benchmark']} {_percent(result.get('benchmark_return'))}）"]
     lines += [f"- {ATTRIBUTION_LABELS[key]}：{_percent(value)}" for key, value in result["components"].items()]
     lines.append(f"- 未解释（收盘前估值、分红、公司行为等，不强行配平）：{_percent(result['unexplained'])}")
+    costs = result.get("fund_costs")
+    if costs and costs.get("share") is not None:
+        text = (f"- AI 和数据费用（账户本身不付，基金承担）：{_percent(costs['share'])}"
+                f"（${costs['model_usd'] + (costs.get('data_usd') or 0):.2f}）；扣费后当日收益 {_percent(result.get('net_return'))}")
+        if costs.get("unpriced_calls"):
+            text += f"（另有 {costs['unpriced_calls']} 次调用未定价、未计入，实际更低）"
+        lines.append(text)
     groups = result.get("selection_by_group") or {}
     if groups:
         lines.append("- 选股按组：" + "；".join(f"{name} {_percent(value)}" for name, value in groups.items()))
@@ -444,7 +488,8 @@ def readable(kind, details, sequence=None, *, now=None):
         account = details.get("account")
         if account:
             from .status import account_lines
-            lines += ["", *account_lines(account, details.get("recent_trades"), now=now), ""]
+            lines += ["", *account_lines(account, details.get("recent_trades"), now=now,
+                                         costs=details.get("fund_costs")), ""]
         if details.get("research_summary"):
             lines.append(f"今日盘前研究要点：{details['research_summary']}")
         if details.get("close"):
@@ -487,7 +532,8 @@ def readable(kind, details, sequence=None, *, now=None):
             lines.append(f"价位调整：{change['symbol']}（{'，'.join(parts)}）")
         lines.append(f"目标现金约 {percent(details.get('cash_weight') or 0)}")
         from .status import account_lines
-        lines += ["", *account_lines(details.get("account"), details.get("recent_trades"), now=now)]
+        lines += ["", *account_lines(details.get("account"), details.get("recent_trades"), now=now,
+                                     costs=details.get("fund_costs"))]
         if details.get("rationale"):
             lines += ["", f"理由：{details['rationale']}"]
         if details.get("next_review_at"):
@@ -498,7 +544,8 @@ def readable(kind, details, sequence=None, *, now=None):
         from .status import account_lines
         title = "✅ 成交已确认，账户快照待更新" if details.get("account_pending") else "✅ 成交后账户更新"
         text = "\n".join([f"{title}（{_when(details.get('at'))}）", "",
-                           *account_lines(details.get("account"), details.get("recent_trades"), now=now)])
+                           *account_lines(details.get("account"), details.get("recent_trades"), now=now,
+                                          costs=details.get("fund_costs"))])
     elif kind == "stop_active" and isinstance(details, dict):
         label, hint = _stop_text(details)
         text = f"⏸ 交易已停止（{label}）——{hint}；期间不会下新单。"
@@ -553,6 +600,17 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "model_cost_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型费用已到上限（约 ${details.get('cost_usd')} / ${details.get('limit_usd')}）："
                 "当天不再发起新决策、反方审查和盘前研究；已有目标和止损照常执行，明天恢复。")
+    elif kind == "fund_cost_alert" and isinstance(details, dict):
+        spent = (details.get("model_usd") or 0) + (details.get("data_usd") or 0)
+        text = (f"💸 AI 和数据费用累计已占起始资金 {_percent(details.get('share'))}（${spent:.2f}，"
+                f"{details.get('since')} 以来）：账户收益 {_percent(details.get('account_return'))}，"
+                f"扣除这些费用后的净收益 {_percent(details.get('net_return'))}")
+        if details.get("unpriced_calls"):
+            text += f"（另有 {details['unpriced_calls']} 次调用未定价、未计入，实际更低）"
+        if details.get("pace") is not None:
+            text += f"；按最近的花费节奏，一年约占资金 {_percent(details['pace'])}"
+        text += (f"。\n这只是提醒，交易照常。要限制花费，可在 .env 设置 FUND_MAX_DAILY_COST_USD（每个交易日上限）；"
+                 f"费用每再增加起始资金的 {_percent(details.get('threshold'))} 会再提醒一次。")
     elif kind == "drawdown_pause":
         text = "🚨 回撤触及上限，暂停增加仓位；卖出和止损照常。确认后由人工复位（reset-drawdown）。"
     elif kind == "construction_switched" and isinstance(details, dict):
@@ -887,6 +945,15 @@ def weekly_document(root, sequence):
         origin = "上周最后一次估值" if facts["start_from_previous_week"] else "本周第一次估值（没有上周估值）"
         lines.append(f"- 净值 {facts['start_equity']:.2f} → {facts['end_equity']:.2f}，本周收益 "
                      f"{_percent(facts['week_return'])}（起点：{origin}，{facts['start_day']}）")
+        model = facts.get("model") or {}
+        if model.get("calls") and facts.get("start_equity"):
+            # The account never pays its models: the fund's own return is what is left after them.
+            spent = model.get("usd") or 0.0
+            text = (f"- 本周 AI 费用 ${spent:.2f}（{model['calls']} 次调用），扣除后本周收益 "
+                    f"{_percent(facts['week_return'] - spent / facts['start_equity'])}")
+            if model.get("unpriced"):
+                text += f"（另有 {model['unpriced']} 次调用未定价、未计入，实际更低）"
+            lines.append(text)
         lines.append("- 每日：" + ("；".join(f"{d} {_percent(r)}" for d, r in facts["daily"]) or NO_DATA))
         lines.append(f"- 本周最大回撤（按每日估值）：{_percent(facts['max_drawdown'])}")
         for benchmark, value in facts["benchmarks"].items():

@@ -143,7 +143,9 @@ CRITIC_PROMPT = (
     "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
     "AGAINST the research's main ideas and the current portfolio: contrary evidence, crowded or already-priced "
     "theses, valuation, event and liquidity risks, correlation between ideas, and evidence that is stale, "
-    "undated or unverified. Use read-only research tools to check claims. Return concerns by symbol (\"\" for "
+    "undated or unverified. When the portfolio or the plan is mostly cash, also argue the case against staying in "
+    "cash: the return given up against the benchmarks and the costs the fund pays regardless (fund_scoreboard). "
+    "Use read-only research tools to check claims. Return concerns by symbol (\"\" for "
     "portfolio-level) with evidence, and list missing evidence. Never fabricate; say when the research holds up. "
     "Keep the summary under 3000 characters, each concern and its evidence under 800, at most 10 concerns. "
     "You do not decide or trade; the manager weighs your critique. In historical mode use only information "
@@ -151,7 +153,16 @@ CRITIC_PROMPT = (
 ) + SQL_RESEARCH_PROMPT
 MANAGER_PROMPT = (
     "You are the sole investment decision maker for this long-only paper portfolio. "
-    "Pursue long-term risk-adjusted returns, without a fixed signal or obligation to trade. "
+    "Your objective is long-term risk-adjusted return net of every cost, above the predefined benchmarks in "
+    "fund_scoreboard.benchmarks. You have no fixed signal or obligation to trade, but no choice is free: the fund "
+    "pays model and data costs whatever you decide, and cash earns only the bill rate, which those costs can "
+    "exceed (fund_scoreboard.cost_pace and fund_scoreboard.cash). An all-cash portfolio therefore loses money net "
+    "of costs and, in expectation, falls behind benchmarks that hold equities: holding cash instead of "
+    "benchmark-like market exposure is an active bet against the market, to be justified with evidence like any "
+    "purchase. Never take risk merely to win back costs already paid; turnover costs count too. "
+    "Costs are reported so you judge results net of them, not to make you economize: never cut research, tool use "
+    "or the depth of your analysis to save model costs, and never lengthen reviews for that reason; spending "
+    "limits are the operator's (model_budget). "
     "Review the research, the devil's-advocate critique (when present), account and risks; independently use "
     "read-only research tools. Address the critique's material concerns in the rationale. "
     "During regular sessions research_status describes saved premarket research and its original times. "
@@ -165,7 +176,7 @@ MANAGER_PROMPT = (
     "reset daily and decay when held, so use them as short-term hedges or tactical complements with a stated exit. "
     "Selling what you hold is ordinary and never restricted: reduce, exit, take profits or cut losses whenever your "
     "analysis says so; sales execute automatically without approval. "
-    "Choose cash freely: idle cash is swept automatically into the operator's cash-equivalent ETF (account "
+    "Cash is allowed: idle cash is swept automatically into the operator's cash-equivalent ETF (account "
     "cash_equivalents) and already counts as cash in account.cash; never target that symbol. "
     "Write rationale in Chinese: explain each proposed buy, reduction, "
     "sale (including omitted holdings) and hold by symbol, evidence, selection/timing thesis, "
@@ -436,9 +447,16 @@ class ModelBudget:
     # USD per New York trading day (estimated from model_prices_per_million): beyond it no new decision,
     # critique or pre-open research starts that day; the once-a-day post-market review still runs.
     max_daily_cost_usd: str | None = None
+    # A notice (never a trading stop) each time the fund's accrued model and data costs pass another
+    # multiple of this share of its starting equity (fund_scoreboard); None turns it off.
+    cost_alert_share: str | None = "0.02"
 
     def __post_init__(self):
         object.__setattr__(self, "failure_backoff_minutes", tuple(self.failure_backoff_minutes))
+        if self.cost_alert_share is not None:
+            object.__setattr__(self, "cost_alert_share", str(self.cost_alert_share))
+            if not number("0") < number(self.cost_alert_share) <= number("1"):
+                raise RiskError("cost_alert_share must be above 0 and at most 1")
         if type(self.max_agent_runs_per_day) is not int or not 4 <= self.max_agent_runs_per_day <= 1000:
             raise RiskError("max_agent_runs_per_day must be 4..1000")
         if type(self.reserved_review_runs) is not int or not 0 <= self.reserved_review_runs < self.max_agent_runs_per_day:
@@ -1053,6 +1071,10 @@ class AutonomousFund(Strategy):
             self._probe_models(self.get_datetime())
         except Exception as exc:  # The next close asks again.
             self._disclose_failure("model_probe_error", exc, phase="postmarket_review")
+        try:
+            self._check_fund_cost_alert(self.get_datetime())
+        except Exception as exc:  # A notice only: the next close checks again.
+            self._disclose_failure("fund_cost_alert_error", exc, phase="postmarket_review")
 
     def _check_stale_holdings(self, now):
         """Held stocks the provider stopped serving bars for (acquired, delisted, halted): tell the operator.
@@ -1239,6 +1261,7 @@ class AutonomousFund(Strategy):
                 "cash_weight": str(max(number(0), 1 - sum(new.values(), number(0)))),
                 "account": asdict(account) if account is not None else None,
                 "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
+                "fund_costs": self._accrued_costs(now),
                 "rationale": str(decision.get("rationale") or ""), "next_review_at": decision.get("next_review_at")}
             self.journal.notification_with_meta(now, "decision_changed", details, {
                 "notified_targets": {s: str(w) for s, w in new.items()}, "notified_targets_day": day,
@@ -1272,6 +1295,7 @@ class AutonomousFund(Strategy):
                 "stop": {"class": record["class"], "reason": record["reason"]} if record else None,
                 "account": asdict(account) if account is not None else None,
                 "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
+                "fund_costs": self._accrued_costs(now),
                 "research_summary": (research.get("summary") or "")[:600] or None})
         except Exception as exc:  # An announcement must never cost the iteration.
             self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
@@ -1311,6 +1335,7 @@ class AutonomousFund(Strategy):
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
                        "market_history_bounds": self._market_history(now),
+                       "fund_scoreboard": self._fund_scoreboard(now),
                        "affordability": self._affordability((account or {}).get("equity"), (account or {}).get("positions")
                                                             or {}, now) if "unavailable" not in account else None,
                        # Warms today's earnings calendar before the open, off the trading path.
@@ -2079,6 +2104,8 @@ class AutonomousFund(Strategy):
                    "macro": self._macro_context(now),
                    # Whether today's market is outside the history the risk estimates came from.
                    "market_history_bounds": self._market_history(now),
+                   # Since inception, net of every cost, against the benchmarks; cash is not free.
+                   "fund_scoreboard": self._fund_scoreboard(now),
                    "learning_validation": self.journal.get_meta("learning_evaluation"),
                    "execution_levels_supported": {
                        "entry_limit": "buy only while the ask is at or below this price",
@@ -2953,6 +2980,7 @@ class AutonomousFund(Strategy):
                   "timing": score_timing(timing, closes, sessions=sessions),
                   "consistency": score_consistency(validated, triggers), "claims": score_claims(validated),
                   "stability": score_stability(stability_checks, [body for _, body in validated]),
+                  "fund": self._fund_scoreboard(now),
                   # Every reviewed session, not only the last 40: large down days are rare.
                   "down_days": score_down_days(all_reviews, protective, closes, sessions=sessions)}
         settings = getattr(self, "construction", None)
@@ -3038,10 +3066,30 @@ class AutonomousFund(Strategy):
             for name, _, members in self.quant.groups:
                 for member in members:
                     groups.setdefault(member, name)
-            return attribute(start, end, fills, closes, local_day(before), day, groups)
+            result = attribute(start, end, fills, closes, local_day(before), day, groups)
+            if result.get("status") in {"complete", "partial"}:
+                self._attribute_fund_costs(result, before["at"], ending["at"])
+            return result
         except Exception as exc:
             return {"status": "unavailable", "session_date": day,
                     "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+
+    def _attribute_fund_costs(self, result, start_at, end_at):
+        """Add the session's model and data costs, which the account never pays, and the return after them.
+
+        Kept beside the components: they explain the account's own return, and these costs are not part of it.
+        """
+        from .scoreboard import accrued_costs
+        with self.journal.connection() as db:
+            before, after = accrued_costs(db, instant(start_at).isoformat()), accrued_costs(db, instant(end_at).isoformat())
+        model = after["model_usd"] - before["model_usd"]
+        data = (after["data_usd"] - before["data_usd"]) if after["data_usd"] is not None and before["data_usd"] is not None else None
+        equity = result["start_equity"]
+        result["fund_costs"] = {"model_usd": round(model, 4), "data_usd": round(data, 4) if data is not None else None,
+                                "unpriced_calls": after["unpriced_calls"] - before["unpriced_calls"],
+                                "share": -(model + (data or 0)) / equity if equity else None}
+        result["net_return"] = (result["observed_return"] + result["fund_costs"]["share"]
+                                if result["fund_costs"]["share"] is not None else None)
 
     def _market_regimes(self, now):
         """{session: regime} of SPY from its full completed history (trend needs 200 sessions); {} if unavailable."""
@@ -3904,6 +3952,101 @@ class AutonomousFund(Strategy):
         if not result["deferred"]:  # A partly fetched calendar continues in the next iteration.
             self._earnings_cache = (day, result)
         return result
+
+    def _check_fund_cost_alert(self, now):
+        """After the close: one notice each time the accrued costs pass another multiple of cost_alert_share.
+
+        A reminder for the operator only; it never pauses trading (FUND_MAX_DAILY_COST_USD limits spending).
+        """
+        share = getattr(getattr(self, "model_budget", None), "cost_alert_share", None)
+        if share is None:
+            return None
+        board = self._fund_scoreboard(now)
+        spent = board.get("costs_share_of_starting_equity") if board.get("status") == "computed" else None
+        if spent is None:
+            return None
+        level = int(spent // float(share))
+        if level < 1 or level <= (self.journal.get_meta("fund_cost_alert_level") or 0):
+            return None
+        details = {"share": spent, "threshold": float(share), "since": board["since"],
+                   "model_usd": board["model_costs_usd"], "data_usd": board.get("data_costs_usd"),
+                   "unpriced_calls": board.get("unpriced_calls"), "account_return": board["account_return"],
+                   "net_return": board["net_return"], "pace": (board.get("cost_pace") or {}).get("share_of_equity_per_year")}
+        self._notify_fund("fund_cost_alert", details)
+        self.journal.set_meta("fund_cost_alert_level", level)
+        return details
+
+    def _accrued_costs(self, now):
+        """scoreboard.accrued_costs through `now`, or None; for notifications, never raises."""
+        from .scoreboard import accrued_costs
+        try:
+            with self.journal.connection() as db:
+                return accrued_costs(db, instant(now).isoformat())
+        except Exception:
+            return None
+
+    def _fund_scoreboard(self, now):
+        """Since inception, net of every cost, against the benchmarks (scoreboard.py); once per completed session.
+
+        Reads closing account marks, benchmark marks and model call costs only (light fields),
+        never raises: a context that cannot be computed says why.
+        """
+        from .market_data import completed_daily_cutoff
+        key = (trading_day(now), completed_daily_cutoff(now))
+        cached = getattr(self, "_fund_scoreboard_cache", None)
+        if cached and cached[0] == key:
+            return cached[1]
+        try:
+            result = self._compute_fund_scoreboard(now, key[1])
+        except Exception as exc:  # Context and reports only: never costs the iteration.
+            return {"status": "unavailable", "reason": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__}
+        self._fund_scoreboard_cache = (key, result)
+        return result
+
+    def _compute_fund_scoreboard(self, now, cutoff):
+        from .costs import scripted
+        from .evaluation import nav_marks
+        from .ledger_audit import audit_connection
+        from .performance import SESSIONS_PER_MONTH, PerformanceSettings
+        from .scoreboard import compute
+        from .validation import session_pairs
+        zone, moment = ZoneInfo("America/New_York"), instant(now)
+        with self.journal.connection() as db:
+            db.execute("BEGIN")
+            integrity = audit_connection(db)
+            if integrity["status"] == "failed":
+                return {"status": "unavailable", "reason": "the ledger audit failed; account marks are not trusted"}
+            closing = {}
+            for _, at, _, equity, close, _ in nav_marks(db, until=moment, excluded=set(
+                    integrity.get("invalid_account_sequences", []))):
+                when = close or at
+                day = instant(when).astimezone(zone).date()
+                if day < cutoff and equity is not None:
+                    closing[day] = (when, {"equity": equity})  # The session's last mark wins.
+            # Benchmarks are marked about every 30 seconds: only each day's last mark is read.
+            rows = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+                "SELECT at,kind,body FROM events WHERE sequence IN (SELECT MAX(sequence) FROM events "
+                "WHERE kind='benchmark' AND julianday(at)<=julianday(?) GROUP BY substr(at,1,10)) "
+                "OR (kind IN ('benchmark_action','operator_reserve_adjusted') AND julianday(at)<=julianday(?)) "
+                "ORDER BY sequence", (moment.isoformat(), moment.isoformat()))]
+            calls = []
+            for at, cost, mock, model, cache_hit in db.execute(
+                    "SELECT at,json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
+                    "json_extract(body,'$.cache_hit') FROM events WHERE kind='agent' AND json_valid(body) "
+                    "AND julianday(at)<=julianday(?)", (moment.isoformat(),)):
+                if not cache_hit and not scripted({"mock": mock, "model": model}):
+                    calls.append((instant(at), float(cost) if cost is not None else None))
+        events = [(when, "account", body) for when, body in closing.values()] + rows
+        pairs, marks = session_pairs(sorted(events, key=lambda row: instant(row[0])), set(closing), zone)
+        actions = {}
+        for _, kind, body in rows:
+            if kind == "benchmark_action":
+                actions.setdefault(body["symbol"], []).append(body)
+        settings = getattr(self, "performance", None) or PerformanceSettings()
+        monthly = settings.data_costs_usd_per_month
+        sweep = getattr(getattr(self, "cash_sweep", None), "symbol", None)
+        return compute(pairs, calls, float(monthly) / SESSIONS_PER_MONTH if monthly is not None else None,
+                       settings.definitions(), marks, actions, sweep=sweep)
 
     def _market_history(self, now):
         """Whether the latest completed session is outside the fund's history (history_bounds.py), once per cutoff.

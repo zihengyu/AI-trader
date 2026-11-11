@@ -354,7 +354,7 @@ def _evidence_catalog(saved):
         refs.extend((ref, evidence["source"]))  # Exact original names remain valid for older callers.
         catalog.append({"ref": ref, "context_path": f"research.evidence[{index - 1}]", **evidence})
     for key in ("session", "factor_lab", "scorecards", "attribution", "strategy_memory", "strategy_followup",
-                "operator_mandate", "limits", "eligible_universe", "cash_management"):
+                "operator_mandate", "limits", "eligible_universe", "cash_management", "fund_scoreboard"):
         if original.get(key) is not None:
             ref = f"context:{key}"
             refs.append(ref)
@@ -404,6 +404,7 @@ def review_after_close(strategy):
                "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
                "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
+               "fund_scoreboard": strategy._fund_scoreboard(now) if hasattr(strategy, "_fund_scoreboard") else None,
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}
