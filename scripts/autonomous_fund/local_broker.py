@@ -575,19 +575,26 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         if policy is not None and order.asset.symbol not in policy["universe"]:
             raise VirtualRiskCancellation("ineligible_asset")
         reserve = self.journal.reserve_cash()
-        paused, marks, equity = False, {}, number(0)
+        paused, marks, equity, mark_evidence = False, {}, number(0), []
         if buy:
             # Admitting a purchase needs the whole book valued from fresh source observations.
             _, _, equity = self._get_balances_at_broker(None, order.strategy)
             balance_marks = self._last_balance_marks
+            mark_evidence.extend(ObservedPrice(number(mark["price"]), instant(mark["as_of"]))
+                                 for mark in balance_marks.values())
             equity = number(equity) - reserve
             positions = self._book_positions(order.strategy)  # Reconciled by the balance read above.
             for position in positions:
                 quote = self.data_source.get_quote(position.asset)
-                age = (self.data_source.get_datetime() - instant(quote.timestamp)).total_seconds()
-                if not 0 <= age <= self.limits.quote_max_seconds:
-                    raise MarketDataUnavailable("Stale holding mark; virtual fills paused")
-                marks[position.asset.symbol] = number(position.quantity) * number(quote.ask)
+                mark = observed_quote(quote, self.data_source.get_datetime(), self.limits)
+                try:
+                    bid, ask = number(quote.bid), number(quote.ask)
+                    if not 0 < bid <= ask:
+                        raise RiskError("Invalid bid/ask")
+                except RiskError:
+                    raise MarketDataUnavailable("Invalid holding bid/ask; virtual fills paused") from None
+                mark_evidence.append(mark)
+                marks[position.asset.symbol] = number(position.quantity) * max(ask, mark.price)
             if policy is not None:
                 from .holdings import split_holdings
                 holdings, external, external_value, shared = split_holdings(
@@ -600,7 +607,10 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                     raise VirtualRiskCancellation("external_holding")
                 equity -= external_value
                 marks = {s: value for s, value in marks.items() if s in holdings}
-            paused = self.journal.mark_equity(self.data_source.get_datetime(), equity, self.limits)
+            checked_at = self.data_source.get_datetime()
+            for mark in mark_evidence:
+                mark.validate(checked_at, self.limits)
+            paused = self.journal.mark_equity(checked_at, equity, self.limits)
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             from .ledger_audit import require_consistent
@@ -608,6 +618,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             row = self._matchable(db, identifier, start)
             if row is None:
                 return
+            # Ledger checks and later symbols' I/O can age earlier source marks.
+            # Revalidate before consuming this bar or changing cash/shares.
+            checked_at = self.data_source.get_datetime()
+            for mark in mark_evidence:
+                mark.validate(checked_at, self.limits)
             db.execute("UPDATE local_orders SET last_bar=? WHERE id=?", (start.isoformat(), identifier))
             if (buy and price > number(order.limit_price)) or (not buy and price < number(order.limit_price)):
                 return

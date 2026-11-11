@@ -281,6 +281,7 @@ class YahooRealtimeData(DataSource):
         self.tape, self.live_seconds = tape, live_seconds
         self._quote_kinds = {"live": 0, "completed_bar": 0}
         self._quote_observations = OrderedDict()
+        self._chart_trades = OrderedDict()
 
     def diagnostics(self):
         with self._request_lock:
@@ -388,6 +389,10 @@ class YahooRealtimeData(DataSource):
         # Network and slot waits may cross a minute/close boundary. Trim forming
         # bars against the receipt clock, never an earlier request's clock.
         now = self.get_datetime()
+        if interval == "1m" and isinstance(frame, pd.DataFrame):
+            # Last-trade evidence is independent of OHLCV completeness. Keep it
+            # before rejecting missing/forming/broken bars, with its source time.
+            self._retain_chart_trade(symbol, frame, now)
         if frame.empty or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
             raise RiskError(f"Yahoo returned empty or undated data for {symbol}")
         if frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
@@ -493,6 +498,9 @@ class YahooRealtimeData(DataSource):
             live = self._live_quote(asset, None, None) if self.tape is not None else None
             if live is not None:
                 return self._remember_quote(asset, live)
+            chart = self._chart_quote(asset, None, None)
+            if chart is not None:
+                return self._remember_quote(asset, chart)
             raise
         start, last = frame.index[-1], frame.iloc[-1]
         end = start + pd.Timedelta(minutes=1)
@@ -518,6 +526,32 @@ class YahooRealtimeData(DataSource):
         return (instant(raw_stamp) if isinstance(raw_stamp, (datetime, str)) else
                 datetime.fromtimestamp(float(number(raw_stamp)), timezone.utc))
 
+    def _parse_chart_trade(self, trade):
+        if not isinstance(trade, dict):
+            return None
+        try:
+            price, stamp = number(trade.get("price")), self._trade_stamp(trade.get("as_of"))
+            if price > 0 and np.isfinite(float(price)):
+                return {"price": price, "as_of": stamp}
+        except (ValueError, TypeError, OverflowError):
+            pass
+        return None
+
+    def _retain_chart_trade(self, symbol, frame, now):
+        trade = self._parse_chart_trade(frame.attrs.get("yahoo_last_trade"))
+        session = self.session.status()
+        if (trade is None or not session["open"]
+                or not 0 <= (now - trade["as_of"]).total_seconds() <= self.live_seconds
+                or trade["as_of"] < instant(session["next_open"])):
+            return
+        with self._request_lock:
+            previous = self._chart_trades.get(symbol)
+            if previous is None or trade["as_of"] >= previous["as_of"]:
+                self._chart_trades[symbol] = trade
+            self._chart_trades.move_to_end(symbol)
+            while len(self._chart_trades) > 60:
+                self._chart_trades.popitem(last=False)
+
     def _remember_quote(self, asset, quote, frame=None):
         """Bounded per-symbol source clocks: totals cannot explain a missing stream symbol."""
         now = self.get_datetime()
@@ -529,6 +563,11 @@ class YahooRealtimeData(DataSource):
         if tick:
             detail.update(stream_as_of=tick["time"].isoformat(), stream_age_seconds=(now - tick["time"]).total_seconds())
         trade = frame.attrs.get("yahoo_last_trade") if frame is not None else None
+        if quote.raw_data["price_kind"] == "chart_last_trade_with_spread_proxy":
+            trade = {"as_of": stamp}
+        elif trade is None:
+            with self._request_lock:
+                trade = self._chart_trades.get(asset.symbol)
         if isinstance(trade, dict):
             try:
                 chart_stamp = self._trade_stamp(trade.get("as_of"))
@@ -544,18 +583,24 @@ class YahooRealtimeData(DataSource):
 
     def _chart_quote(self, asset, frame, bar_end):
         """Use the chart's own last-trade price/time pair, never a forming bar's close."""
-        trade = frame.attrs.get("yahoo_last_trade")
-        if not isinstance(trade, dict):
-            return None
-        try:
-            price, raw_stamp = number(trade.get("price")), trade.get("as_of")
-            stamp = self._trade_stamp(raw_stamp)
-        except (ValueError, TypeError, OverflowError):
-            return None
         now, session = self.get_datetime(), self.session.status()
-        if (not session["open"] or price <= 0 or not 0 <= (now - stamp).total_seconds() <= self.live_seconds
-                or stamp <= bar_end or stamp < instant(session["next_open"])):
+        if not session["open"]:
             return None
+        with self._request_lock:
+            candidates = [self._chart_trades.get(asset.symbol)]
+        if frame is not None:
+            candidates.append(frame.attrs.get("yahoo_last_trade"))
+        usable = []
+        for candidate in candidates:
+            trade = self._parse_chart_trade(candidate)
+            if (trade is not None and 0 <= (now - trade["as_of"]).total_seconds() <= self.live_seconds
+                    and (bar_end is None or trade["as_of"] > bar_end)
+                    and trade["as_of"] >= instant(session["next_open"])):
+                usable.append(trade)
+        if not usable:
+            return None
+        latest = max(usable, key=lambda trade: trade["as_of"])
+        price, stamp = latest["price"], latest["as_of"]
         self._quote_kinds["chart_quote"] = self._quote_kinds.get("chart_quote", 0) + 1
         return Quote(asset, price=float(price), bid=float(price * (1 - self.spread / 2)),
                      ask=float(price * (1 + self.spread / 2)), timestamp=stamp, volume=None, raw_data={

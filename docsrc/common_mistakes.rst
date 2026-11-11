@@ -664,6 +664,14 @@ Absent, stale, future, naive or nonpositive source observations still fall back
 to completed bars and remain subject to the normal freshness checks. Cached
 metadata retains its original source time. Matching still requires new bars.
 
+A valid chart last-trade pair is retained before OHLCV validation, so an empty
+history, forming-only response, invalid bars or history backoff cannot discard
+independent fresh quote evidence. At most 60 recently observed symbols retain
+such evidence; symbols never share a price, older responses do not overwrite
+newer valid trades, and each read rechecks source age and the regular session.
+Stream priority remains intact. These quotes supply no fabricated volume and
+cannot replace the completed bars required for simulated fills.
+
 An invalid completed OHLCV row is omitted as a gap, preserving other real
 daily/minute observations. No interpolation, forward fill or replacement
 volume is added. If every completed row is invalid, that series remains
@@ -702,6 +710,14 @@ timestamp unchanged. Explicit refreshes, ``get_cash()`` and direct AI/order
 snapshots still attempt a strict read immediately; the source's own backoff
 remains effective. Retained native display values do not become fresh
 account evidence.
+
+Local buy-time checks also require original source timestamps for each held
+position's risk mark, rather than Quote's potentially synthesized receipt
+time. Bid/ask must be finite, positive and uncrossed; capacity uses the higher
+of ask and the observed price. Original balance marks and subsequent holding
+quotes are revalidated after other symbols' I/O and ledger checks, before a
+bar is consumed or cash/shares change. A failed observation remains retryable
+on that bar. Sales still require only their own valid execution data.
 
 An intraday manager's stale, future or expired decision in local or paper mode
 can use the same single correction opportunity as a malformed answer. The
