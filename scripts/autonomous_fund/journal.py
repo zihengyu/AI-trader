@@ -232,11 +232,14 @@ class Journal:
         """Carve the operator's capital sleeve out of the account; return reserved cash.
 
         First start: reserve = (cash + sleeve holdings value) - capital, so the AI
-        starts with exactly `capital`. A later change of the configured capital
-        is queued as a subscription or redemption of the difference (capital.py),
-        which the running fund applies at its next valuation: a change is never
-        a gain or a loss, and a smaller capital raises its cash like any
-        redemption instead of blocking the fund. External holdings (outside the
+        starts with exactly `capital`. A later change of the configured value
+        sets the target net capital: the difference from the current capital
+        plus waiting requests (subscriptions made with the script included) is
+        queued as a subscription or redemption (capital.py), which the running
+        fund applies at its next valuation. A change is never a gain or a loss,
+        and a smaller capital raises its cash like any redemption instead of
+        blocking the fund. An unchanged value queues nothing, however far the
+        script has moved the capital since. External holdings (outside the
         universe) are frozen at their first observed quantities; any change
         needs operator review. Nothing is inferred: an account smaller than the
         mandate is refused.
@@ -260,10 +263,11 @@ class Journal:
                 event = ("mandate_initialized", {"capital_usd": str(capital), "reserved_cash": str(reserve),
                                                  "external_holdings": rows["mandate_external"]})
             elif number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"])) != capital:
-                # The basis follows applied flows; the configured value is what .env said last.
+                # The basis follows applied flows; the configured value is what .env said last. A new value is
+                # the capital the operator wants: measured from where the fund will be, never from the old value.
                 configured = number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"]))
-                from .capital import CENT, enqueue
-                delta = capital - configured
+                from .capital import CENT, enqueue, target_basis
+                delta = capital - target_basis(db)
                 rows["mandate_configured_capital"] = str(capital)
                 if abs(delta).quantize(CENT) > 0:
                     queued = enqueue(db, now, "subscription" if delta > 0 else "redemption",

@@ -1334,7 +1334,7 @@ class AutonomousFund(Strategy):
                 return
             context = {"as_of": now.isoformat(), "historical": False, "phase": slot,
                        "market": market, "orders_enabled": False,
-                       "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
+                       "operator_mandate": self._mandate_context(),
                        "news": self._news_context(None, now),
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "leveraged_etfs": self._leveraged_context(),
@@ -2113,7 +2113,7 @@ class AutonomousFund(Strategy):
                    "cash_management": policy_context(getattr(self, "cash_sweep", None)),
                    "market_snapshot": self._market_snapshot(now),
                    "data_desk": self._desk_context(now),
-                   "operator_mandate": (getattr(self, "mandate", None) or Mandate()).context(),
+                   "operator_mandate": self._mandate_context(),
                    "watch_triggers": list(getattr(self, "_triggers", [])),
                    **({"event_triage": self._triage_note} if getattr(self, "_triage_note", None) else {}),
                    "news": self._news_context(account, now),
@@ -4513,6 +4513,26 @@ class AutonomousFund(Strategy):
         return quote
 
     # ----- Operator subscriptions and redemptions (capital.py) -----------------------
+    def _mandate_context(self):
+        """The operator mandate as the manager sees it: capital_usd is the capital now managed, not .env's value.
+
+        After script subscriptions and redemptions the configured FUND_CAPITAL_USD can differ from the
+        capital the fund actually manages; the manager must plan with the latter. Never raises.
+        """
+        mandate = getattr(self, "mandate", None) or Mandate()
+        context = mandate.context()
+        if mandate.capital_usd is not None:
+            try:
+                with self.journal.connection() as db:
+                    row = db.execute("SELECT value FROM meta WHERE key='mandate_capital_basis'").fetchone()
+            except Exception:
+                row = None
+            if row is not None and number(row[0]) != number(mandate.capital_usd):
+                context = {**context, "capital_usd": row[0], "configured_capital_usd": mandate.capital_usd,
+                           "capital_note": "capital_usd is the net capital after operator subscriptions and "
+                                           "redemptions (fund_capital); the configured value is not current"}
+        return context
+
     def _capital_context(self):
         """The manager's view of operator flows; None without a capital mandate. Never raises."""
         mandate = getattr(self, "mandate", None)
@@ -4534,12 +4554,18 @@ class AutonomousFund(Strategy):
         return bool(row) and str(row[0]).startswith("redemption:")
 
     def _capital_wait(self, now, reason, detail=None):
-        """Recorded once per trading day and reason: idle iterations ask every minute."""
+        """Recorded once per trading day and reason: idle iterations ask every minute.
+
+        A redemption that cannot progress is also told to the operator (once a day and reason): purchases
+        wait while it does, so a silent stall would quietly keep the fund from investing.
+        """
         noted = self.__dict__.setdefault("_capital_noted", set())
         key = (trading_day(now), reason)
         if key not in noted:
             noted.add(key)
             self.journal.event(now, "capital_waiting", {"reason": reason, **(detail or {})})
+            if reason.startswith("redemption_"):
+                self._notify_fund("redemption_waiting", {"reason": reason, **(detail or {})})
 
     def _capital_step(self, account, now):
         """Apply the oldest operator subscription or redemption at this live valuation; True when it acted.

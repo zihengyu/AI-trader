@@ -289,6 +289,18 @@ def idea_text(ideas):
             f"待验证 {ideas['pending']}")
 
 
+def _decimal(value, places):
+    """A stored decimal string for reading (e.g. 10003.123456789 -> 10,003.12); unreadable values unchanged."""
+    try:
+        return f"{float(value):,.{places}f}"
+    except (TypeError, ValueError):
+        return value
+
+
+def _usd(value):
+    return _decimal(value, 2)
+
+
 def _percent(value):
     return "暂无" if value is None else f"{value * 100:.2f}%"
 
@@ -744,29 +756,40 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"{_percent(details.get('median'))}。最短复核间隔恢复为 {details.get('min_review_minutes')} 分钟。")
     elif kind == "capital_flow" and isinstance(details, dict):
         subscription = details.get("kind") == "subscription"
-        text = (f"{'💰 申购' if subscription else '🏦 赎回'}已确认：{details.get('amount')} 美元，单位净值 "
-                f"{details.get('nav_per_unit')}；基金 {details.get('equity_before')} → {details.get('equity_after')} 美元，"
-                f"份额 {details.get('units_before')} → {details.get('units_after')}。"
+        text = (f"{'💰 申购' if subscription else '🏦 赎回'}已确认：{_usd(details.get('amount'))} 美元，单位净值 "
+                f"{_decimal(details.get('nav_per_unit'), 4)}；基金 {_usd(details.get('equity_before'))} → "
+                f"{_usd(details.get('equity_after'))} 美元，份额 {_decimal(details.get('units_before'), 2)} → "
+                f"{_decimal(details.get('units_after'), 2)}。"
                 + ("（来自 .env 里 FUND_CAPITAL_USD 的变化）" if details.get("source") == "configuration" else "")
                 + "\n这笔钱不算收益也不算亏损：收益率、回撤和记分卡都按单位净值计算，回撤锁和当日亏损暂停不受影响。")
         if subscription:
             text += "已请基金经理按新的规模重新复核。"
         elif details.get("mode") == "local":
             text += "本地虚拟账户已扣除这笔现金。"
+        elif details.get("mode") == "paper":
+            text += (f"模拟盘的钱不会离开券商账户：已转入保留现金（现在 {_usd(details.get('reserved_cash_after'))} 美元），"
+                     "AI 不会再动用。")
         else:
-            text += (f"这笔钱已转入保留现金（现在 {details.get('reserved_cash_after')} 美元），AI 不会再动用。"
+            text += (f"这笔钱已转入保留现金（现在 {_usd(details.get('reserved_cash_after'))} 美元），AI 不会再动用。"
                      "要从券商转出：先停止基金（bash scripts/fund-stop.sh），转账，再登记 "
                      f"bash scripts/fund-capital.sh withdraw {details.get('amount')}，然后重新启动。"
                      "卖出所得可能要等结算后才能转出。")
     elif kind == "redemption_liquidating" and isinstance(details, dict):
-        text = (f"🏦 赎回 {details.get('amount')} 美元正在筹集现金：可用现金 {details.get('cash')} 美元不够，"
+        text = (f"🏦 赎回 {_usd(details.get('amount'))} 美元正在筹集现金：可用现金 {_usd(details.get('cash'))} 美元不够，"
                 f"或者直接付现金会让股票仓位比赎回前高出 5 个百分点以上。"
-                f"系统会先按比例卖出每个持仓的一小部分（约 {details.get('stock_sale')} 美元，保持组合权重），"
-                f"不够再卖现金替代 ETF（现有 {details.get('cash_equivalent')} 美元），筹够后完成赎回。\n"
+                f"系统会先按比例卖出每个持仓的一小部分（约 {_usd(details.get('stock_sale'))} 美元，保持组合权重），"
+                f"不够再卖现金替代 ETF（现有 {_usd(details.get('cash_equivalent'))} 美元），筹够后完成赎回。\n"
                 "处理期间暂停买入和现金停泊；卖出、止损和基金经理的决策照常。")
+    elif kind == "redemption_waiting" and isinstance(details, dict):
+        why = {"redemption_sale_budget": "今天的卖出次数已经用完，下一个交易日继续卖出",
+               "redemption_quote_unavailable": f"暂时拿不到可用的报价（{details.get('error')}），会自动重试",
+               "redemption_waits_for_cash": "已经没有可卖的持仓，等应收的股息等到账变成现金后完成"
+               }.get(details.get("reason"), details.get("reason"))
+        text = (f"⏳ 赎回还在进行：{why}。期间暂停买入，卖出和止损照常；不需要操作，"
+                "要放弃这笔赎回可以 bash scripts/fund-capital.sh cancel <编号>（查看编号：bash scripts/fund-capital.sh）。")
     elif kind == "capital_request_rejected" and isinstance(details, dict):
         name = "申购" if details.get("kind") == "subscription" else "赎回"
-        text = (f"⚠️ {name} {details.get('amount')} 美元没有执行：{details.get('reason')}。\n"
+        text = (f"⚠️ {name} {_usd(details.get('amount'))} 美元没有执行：{details.get('reason')}。\n"
                 "基金和持仓都没有变化。查看：bash scripts/fund-capital.sh")
     if text is None:
         return None

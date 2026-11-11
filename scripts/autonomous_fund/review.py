@@ -411,7 +411,9 @@ def review_after_close(strategy):
                "cash_management": policy_context(getattr(strategy, "cash_sweep", None)),
                "limits": asdict(strategy.limits), "strategy_memory": memory,
                "strategy_followup": strategy._strategy_evaluations(),
-               "scorecards": scorecards, "operator_mandate": mandate.context() if mandate else None,
+               "scorecards": scorecards,
+               "operator_mandate": (None if not mandate else strategy._mandate_context()
+                                    if hasattr(strategy, "_mandate_context") else mandate.context()),
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
                "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
                "fund_scoreboard": strategy._fund_scoreboard(now) if hasattr(strategy, "_fund_scoreboard") else None,

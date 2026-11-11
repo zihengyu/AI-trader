@@ -1467,9 +1467,10 @@ pass another multiple of that share of the fund's starting equity, default 0.02)
 desk (``FUND_DATA_DESK`` for the always-on service that keeps news, intraday prices, FRED,
 earnings dates and daily bars current for the agents, ``FUND_DESK_INTRADAY_SECONDS`` for its
 intraday refresh interval), user limits
-(``FUND_CAPITAL_USD``: changing it after the first start queues a subscription or redemption of the
-difference, which the running fund applies at the NAV per unit, so the flow is never a gain or a loss;
-``bash scripts/fund-capital.sh subscribe|redeem`` does the same without editing the file,
+(``FUND_CAPITAL_USD``: changing it after the first start sets the target net capital; the difference
+from the current capital, waiting requests included, is queued as a subscription or redemption, which
+the running fund applies at the NAV per unit, so the flow is never a gain or a loss; an unchanged value
+queues nothing; ``bash scripts/fund-capital.sh subscribe|redeem`` does the same without editing the file,
 ``FUND_ALLOW_EXTERNAL_HOLDINGS``, ``FUND_LOCAL_ACCOUNT_USD``,
 ``FUND_MAX_POSITION``, ``FUND_MAX_EXPOSURE``, ``FUND_MAX_DRAWDOWN``,
 ``FUND_DAILY_ORDERS``, ``FUND_DAILY_LOSS_LIMIT``, ``FUND_TARGET_VOL``,

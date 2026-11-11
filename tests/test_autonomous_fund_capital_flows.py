@@ -218,6 +218,11 @@ def test_redemption_waits_for_the_daily_sale_budget_and_a_quote(tmp_path):
     assert strategy._capital_step(sleeve(1000, {"ALFA": 90}), NOW) is False
     reasons = [row["body"]["reason"] for row in strategy.journal.all_events() if row["kind"] == "capital_waiting"]
     assert reasons == ["redemption_sale_budget", "redemption_quote_unavailable"]
+    # Purchases wait meanwhile, so the operator is told (once a day and reason), not left with a silent stall.
+    waiting = [details["reason"] for kind, details in strategy.notices if kind == "redemption_waiting"]
+    assert waiting == reasons
+    assert strategy._capital_step(sleeve(1000, {"ALFA": 90}), NOW) is False
+    assert len([kind for kind, _ in strategy.notices if kind == "redemption_waiting"]) == 2
 
 
 def test_redemption_above_the_fund_share_is_refused_and_nothing_moves(tmp_path):
@@ -393,7 +398,7 @@ def test_fund_capital_script_queues_shows_and_cancels_requests(tmp_path):
             ("mandate_capital_basis", "10000"), ("mandate_reserve_cash", "0")])
     result = script("fund-capital.sh", tmp_path, env, "subscribe", "2500")
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "申购请求" in result.stdout and "等待中：申购 2500.00 美元" in result.stdout
+    assert "申购请求" in result.stdout and "等待中：申购 2,500.00 美元" in result.stdout
     assert "单位净值 1.0000" in result.stdout
     [request] = capital.pending(Journal(book, "synthetic-script-account"))
     result = script("fund-capital.sh", tmp_path, env, "cancel", request["id"])
@@ -402,3 +407,87 @@ def test_fund_capital_script_queues_shows_and_cancels_requests(tmp_path):
     assert result.returncode != 0 and "two decimals" in result.stdout + result.stderr
     result = script("fund-capital.sh", tmp_path, env, "redeem")
     assert result.returncode == 2 and "需要一个值" in result.stderr
+
+
+def test_script_records_broker_transfers_in_one_step(tmp_path):
+    from .test_autonomous_fund_scripts import account_book, script
+    book, env = account_book(tmp_path)
+    with Journal(book, "synthetic-script-account").connection() as db:
+        db.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", [
+            ("mandate_capital_basis", "10000"), ("mandate_reserve_cash", "0")])
+    result = script("fund-capital.sh", tmp_path, env, "deposit", "3000")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "已登记转入 3,000.00 美元" in result.stdout and "同时登记了申购" in result.stdout
+    journal = Journal(book, "synthetic-script-account")
+    [request] = capital.pending(journal)
+    assert (request["kind"], request["source"]) == ("subscription", "deposit") and journal.reserve_cash() == 3000
+    result = script("fund-capital.sh", tmp_path, env, "deposit", "500", "--reserve-only")
+    assert result.returncode == 0 and "留在保留现金" in result.stdout
+    assert len(capital.pending(journal)) == 1 and journal.reserve_cash() == 3500
+    result = script("fund-capital.sh", tmp_path, env, "withdraw", "4000")
+    assert result.returncode != 0 and "redeem first" in result.stdout + result.stderr
+    result = script("fund-capital.sh", tmp_path, env, "withdraw", "500")
+    assert result.returncode == 0 and journal.reserve_cash() == 3000
+
+
+def test_local_books_refuse_broker_transfer_records(tmp_path):
+    from .test_autonomous_fund_local import NOW as LOCAL_NOW, setup_book
+    _, _, journal, _ = setup_book(tmp_path)
+    journal.apply_mandate(LOCAL_NOW, "10000", number(10000), number(10000), {}, False, {}, True)
+    with pytest.raises(RiskError, match="subscribe / redeem"):
+        capital.deposit(journal, LOCAL_NOW, "1000")
+    with pytest.raises(RiskError, match="subscribe / redeem"):
+        capital.withdraw(journal, LOCAL_NOW, "1000")
+    assert journal.reserve_cash() == 0 and capital.pending(journal) == []
+
+
+def test_a_changed_env_capital_is_the_target_net_capital_after_script_flows(tmp_path):
+    journal = mandate_journal(tmp_path)
+    request = capital.request(journal, NOW, "subscription", "10000")
+    capital.apply(journal, NOW, request["id"], equity=number(10000), cash=number(10000), mode="paper")
+    # .env still says 10000: unchanged, so nothing is queued, although the fund now manages 20000.
+    journal.apply_mandate(NOW, "10000", number(50000), number(50000), {}, False, {}, True)
+    assert capital.pending(journal) == []
+    # Editing it to 15000 means "I want 15000": a 5000 redemption, not a 5000 subscription.
+    journal.apply_mandate(NOW, "15000", number(50000), number(50000), {}, False, {}, True)
+    [request] = capital.pending(journal)
+    assert (request["kind"], number(request["amount"])) == ("redemption", 5000)
+    # Waiting requests count: 18000 while 15000 is already on its way adds 3000.
+    journal.apply_mandate(NOW, "18000", number(50000), number(50000), {}, False, {}, True)
+    assert [(r["kind"], number(r["amount"])) for r in capital.pending(journal)] == [
+        ("redemption", 5000), ("subscription", 3000)]
+
+
+def test_a_redemption_the_fund_could_not_pay_is_refused_when_requested(tmp_path):
+    journal = mandate_journal(tmp_path)
+    journal.event(NOW, "account", {"as_of": NOW.isoformat(), "cash": "10000", "equity": "10000", "positions": {}})
+    with pytest.raises(RiskError, match="95%"):
+        capital.request(journal, NOW, "redemption", "9600")
+    capital.request(journal, NOW, "redemption", "5000")
+    with pytest.raises(RiskError, match="waiting requests included"):
+        capital.request(journal, NOW, "redemption", "4600")
+    capital.request(journal, NOW, "subscription", "1000")
+    assert capital.request(journal, NOW, "redemption", "4600")["kind"] == "redemption"
+
+
+def test_the_manager_plans_with_the_capital_it_manages_not_the_configured_value(tmp_path):
+    strategy = running(tmp_path)
+    assert strategy._mandate_context()["capital_usd"] == "10000"
+    request = capital.request(strategy.journal, NOW, "subscription", "5000")
+    capital.apply(strategy.journal, NOW, request["id"], equity=number(10000), cash=number(10000), mode="paper")
+    context = strategy._mandate_context()
+    assert number(context["capital_usd"]) == 15000 and context["configured_capital_usd"] == "10000"
+
+
+@pytest.mark.parametrize("mode, expected, absent", [
+    ("local", "本地虚拟账户已扣除", "fund-stop.sh"),
+    ("paper", "模拟盘的钱不会离开券商账户", "fund-stop.sh"),
+    ("live", "withdraw 5000.00", "模拟盘")])
+def test_redemption_notice_tells_each_mode_what_happens_to_the_money(mode, expected, absent):
+    from scripts.autonomous_fund.notifications import readable
+    text = readable("capital_flow", {"kind": "redemption", "amount": "5000.00", "nav_per_unit": "1.012345",
+                                     "equity_before": "10123.456789", "equity_after": "5123.456789",
+                                     "units_before": "10000", "units_after": "5060.97", "mode": mode,
+                                     "reserved_cash_after": "45000.00"})
+    assert expected in text and absent not in text
+    assert "10,123.46" in text and "1.0123" in text  # Readable money and NAV, not stored decimals.

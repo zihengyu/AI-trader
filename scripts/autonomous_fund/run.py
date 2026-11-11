@@ -334,6 +334,8 @@ def main(argv=None):
                                          "subscribe/redeem: USD added to or taken from the fund; "
                                          "deposit/withdraw: USD moved into or out of the broker account")
     parser.add_argument("--cancel", metavar="REQUEST_ID", help="capital: cancel a waiting subscription or redemption")
+    parser.add_argument("--reserve-only", action="store_true",
+                        help="deposit: keep the transferred money in reserved cash instead of subscribing it")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
     parser.add_argument("--symbol", help="settle-position: the local holding that was acquired or delisted")
@@ -629,11 +631,9 @@ def main(argv=None):
             adjust_reserve(args)
             return
         if args.mode in {"deposit", "withdraw"}:
-            # A broker transfer, recorded with the runner stopped (it holds runner.lock).
-            from .capital import parse_amount
-            amount = parse_amount(args.amount)
-            args.amount, args.rebaseline_external = str(amount if args.mode == "deposit" else -amount), False
-            adjust_reserve(args)
+            # A broker transfer, recorded with the runner stopped (it holds runner.lock): the fund must never
+            # observe the account between the transfer and its record, or the transfer would look like P&L.
+            print(record_transfer(args))
             return
         if args.mode == "settle-position":
             settle_position(args)
@@ -759,6 +759,25 @@ def _existing_journal(run_dir):
     return Journal(run_dir, binding[0])
 
 
+def record_transfer(args):
+    from . import capital
+    from .notifications import _usd
+    journal = _existing_journal(args.run_dir)
+    now = datetime.now(timezone.utc)
+    if args.amount is None:
+        raise RiskError("Provide --amount in US dollars")
+    if args.mode == "withdraw":
+        reserve = capital.withdraw(journal, now, args.amount)
+        return f"已登记转出 {_usd(args.amount)} 美元；保留现金现在 {_usd(reserve)} 美元。AI 管理的规模不变。"
+    reserve, queued = capital.deposit(journal, now, args.amount, subscribe=not args.reserve_only)
+    text = f"已登记转入 {_usd(args.amount)} 美元；保留现金现在 {_usd(reserve)} 美元。"
+    if queued:
+        text += (f"同时登记了申购 {queued['id']}：重新启动后，基金在下一个交易时段按单位净值把这笔钱转入 AI 管理。")
+    else:
+        text += "这笔钱留在保留现金，AI 不会动用；以后要交给 AI，用 subscribe。"
+    return text
+
+
 def capital_command(args):
     """Operator: queue a subscription or redemption, cancel one, or show units and NAV (fund may be running)."""
     from . import capital
@@ -781,17 +800,21 @@ def capital_command(args):
             lines.append(f"赎回请求 {request['id']} 已登记：{request['amount']} 美元。基金在下一个交易时段处理："
                          "现金够就直接支付；不够时先按比例卖出每个持仓的一小部分（保持组合权重），再卖现金替代 ETF。"
                          "处理期间暂停买入，卖出和止损照常。完成后 Telegram 通知。")
+    from .notifications import _decimal, _usd
     state = capital.status(journal)
-    lines.append(f"单位份额 {state['units'] or '—'}；单位净值 {state['nav_per_unit'] or '—'}"
-                 f"（最近估值 {state['equity'] or '—'} 美元，{state['equity_at'] or '—'}）；"
-                 f"净投入本金 {state['capital_basis'] or '—'} 美元；保留现金 {state['reserved_cash'] or '—'} 美元。")
+    missing = "—"
+    lines.append(f"份额 {_decimal(state['units'], 2) if state['units'] else missing}；单位净值 "
+                 f"{state['nav_per_unit'] or missing}（最近估值 {_usd(state['equity']) if state['equity'] else missing} 美元，"
+                 f"{state['equity_at'] or missing}）；AI 管理的净投入本金 "
+                 f"{_usd(state['capital_basis']) if state['capital_basis'] else missing} 美元；保留现金 "
+                 f"{_usd(state['reserved_cash']) if state['reserved_cash'] else missing} 美元。")
     names = {"subscription": "申购", "redemption": "赎回"}
     for row in state["pending"]:
-        lines.append(f"等待中：{names[row['kind']]} {row['amount']} 美元（{row['id']}，{row['requested_at']}，"
-                     f"{'处理中：正在筹集现金' if row.get('state') == 'liquidating' else '等待下一个估值点'}）")
+        lines.append(f"等待中：{names[row['kind']]} {_usd(row['amount'])} 美元（编号 {row['id']}，{row['requested_at']}，"
+                     f"{'处理中：正在筹集现金' if row.get('state') == 'liquidating' else '等待下一个交易时段的估值点'}）")
     for row in state["recent_flows"]:
-        lines.append(f"已确认：{row['at']} {names.get(row['kind'], row['kind'])} {row['amount']} 美元，"
-                     f"单位净值 {row['nav_per_unit']}，确认后基金 {row['equity_after']} 美元")
+        lines.append(f"已确认：{row['at']} {names.get(row['kind'], row['kind'])} {_usd(row['amount'])} 美元，"
+                     f"单位净值 {_decimal(row['nav_per_unit'], 4)}，确认后基金 {_usd(row['equity_after'])} 美元")
     return "\n".join(lines)
 
 

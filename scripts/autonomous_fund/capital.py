@@ -108,10 +108,76 @@ def enqueue(db, now, kind, amount, *, source="operator"):
     return request
 
 
+def signed_amount(row):
+    return number(row["amount"]) * (-1 if row["kind"] == "redemption" else 1)
+
+
+def target_basis(db):
+    """The net capital once every waiting request is applied (None without a mandate)."""
+    row = db.execute("SELECT value FROM meta WHERE key='mandate_capital_basis'").fetchone()
+    if row is None:
+        return None
+    return number(row[0]) + sum((signed_amount(r) for r in _load(db, REQUESTS, [])), Decimal(0))
+
+
 def request(journal, now, kind, amount, *, source="operator"):
+    """Queue an operator request; a redemption the fund could not pay is refused at once, not at the next session.
+
+    The fund still checks it again against its live valuation when it applies it.
+    """
     with journal.connection() as db:
         db.execute("BEGIN IMMEDIATE")
+        if kind == "redemption":
+            mark = db.execute("SELECT body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
+            equity = number(json.loads(mark[0])["equity"]) if mark else None
+            waiting = sum((signed_amount(r) for r in _load(db, REQUESTS, [])), Decimal(0))
+            if equity is not None and parse_amount(amount) - waiting > equity * MAX_REDEMPTION_SHARE:
+                raise RiskError(f"A redemption may take at most {MAX_REDEMPTION_SHARE:.0%} of the fund (last valued at "
+                                f"{equity.quantize(CENT)} USD, waiting requests included); to close the fund, "
+                                "STOP it and liquidate")
         return enqueue(db, now, kind, amount, source=source)
+
+
+def _broker_reserve(db):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='local_account'").fetchone():
+        raise RiskError("A local virtual book has no broker transfers: use subscribe / redeem")
+    row = db.execute("SELECT value FROM meta WHERE key='mandate_reserve_cash'").fetchone()
+    if row is None:
+        raise RiskError("No mandate reserve is recorded for this account yet")
+    return number(row[0])
+
+
+def deposit(journal, now, amount, *, subscribe=True):
+    """Broker account (fund stopped): record money transferred in as reserved cash and, by default, subscribe it.
+
+    One transaction: the reserve, its `operator_reserve_adjusted` event and the
+    subscription request (applied by the fund at its next valuation once restarted).
+    """
+    amount = parse_amount(amount)
+    with journal.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        reserve = _broker_reserve(db) + amount
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('mandate_reserve_cash',?)", (str(reserve),))
+        _event(db, now, "operator_reserve_adjusted", {"amount": str(amount), "reserved_cash": str(reserve),
+                                                      "external_rebaselined": False, "transfer": "deposit"})
+        queued = enqueue(db, now, "subscription", amount, source="deposit") if subscribe else None
+    return reserve, queued
+
+
+def withdraw(journal, now, amount):
+    """Broker account (fund stopped): record money transferred out of reserved cash (a redemption puts it there)."""
+    amount = parse_amount(amount)
+    with journal.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        reserve = _broker_reserve(db)
+        if amount > reserve:
+            raise RiskError(f"Reserved cash is only {reserve.quantize(CENT)} USD: redeem first (fund-capital.sh redeem), "
+                            "wait for the confirmation, then transfer and record the withdrawal")
+        reserve -= amount
+        db.execute("INSERT OR REPLACE INTO meta VALUES ('mandate_reserve_cash',?)", (str(reserve),))
+        _event(db, now, "operator_reserve_adjusted", {"amount": str(-amount), "reserved_cash": str(reserve),
+                                                      "external_rebaselined": False, "transfer": "withdrawal"})
+    return reserve
 
 
 def pending(journal):
@@ -217,7 +283,8 @@ def apply(journal, now, request_id, *, equity, cash, mode):
             reserve -= signed
             if reserve < 0:
                 raise RiskError(f"Reserved cash ({(reserve + signed).quantize(CENT)} USD) is below the subscription: "
-                                "transfer the money into the broker account and record it with deposit first")
+                                "the money must already be in the broker account (paper: its unused balance; live: "
+                                "transfer it in and record it with deposit)")
             updates["mandate_reserve_cash"] = str(reserve)
         # Ratios stay what they were: the drawdown from the peak and the day's loss are unchanged by a flow.
         factor = after / equity
