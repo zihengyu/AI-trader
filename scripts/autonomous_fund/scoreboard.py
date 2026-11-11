@@ -22,6 +22,8 @@ Evidence for the manager and the reports; never a trading rule.
 """
 from __future__ import annotations
 
+import json
+
 from .performance import benchmark_series
 
 TRADING_DAYS = 252
@@ -92,3 +94,34 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
                        "cost_pace.share_of_equity_per_year is the recent spend a year as a share of equity, the "
                        "excess return a year needed just to cover it; cash.annual_net_of_cost_pace is what an "
                        "all-cash portfolio earns a year net of that pace. Evidence, not a trading rule"}
+
+
+def accrued_costs(db, until):
+    """Model and data costs the fund has accrued through `until` (an ISO instant), read from the journal.
+
+    Paid model calls only (scripted test answers and LumiBot cache hits cost nothing); a call
+    without a price is counted, never taken as free. Data costs are the latest startup's monthly
+    subscription per recorded session (sessions with a benchmark mark), None when unknown.
+    """
+    from .costs import scripted
+    from .performance import SESSIONS_PER_MONTH, PerformanceSettings
+    model, unpriced = 0.0, 0
+    for cost, mock, name, cache_hit in db.execute(
+            "SELECT json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
+            "json_extract(body,'$.cache_hit') FROM events WHERE kind='agent' AND json_valid(body) "
+            "AND julianday(at)<=julianday(?)", (until,)):
+        if cache_hit or scripted({"mock": mock, "model": name}):
+            continue
+        if cost is None:
+            unpriced += 1
+        else:
+            model += float(cost)
+    row = db.execute("SELECT body FROM events WHERE kind='startup' AND json_valid(body) "
+                     "AND julianday(at)<=julianday(?) ORDER BY sequence DESC LIMIT 1", (until,)).fetchone()
+    settings = (json.loads(row[0]).get("performance") or {}) if row else {}
+    monthly = settings.get("data_costs_usd_per_month", PerformanceSettings().data_costs_usd_per_month)
+    sessions = db.execute("SELECT count(DISTINCT substr(at,1,10)) FROM events WHERE kind='benchmark' "
+                          "AND julianday(at)<=julianday(?)", (until,)).fetchone()[0]
+    data = float(monthly) / SESSIONS_PER_MONTH * sessions if monthly is not None else None
+    return {"model_usd": round(model, 4), "unpriced_calls": unpriced,
+            "data_usd": round(data, 4) if data is not None else None, "as_of": until}

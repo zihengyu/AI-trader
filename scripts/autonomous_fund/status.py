@@ -243,8 +243,29 @@ def cost_line(costs):
     return text
 
 
-def account_lines(account, recent_trades=None, *, now=None):
-    """Separate observed holdings from AI targets, retaining the snapshot's own time."""
+def fund_value_line(account, costs):
+    """The account equity less the fund's accrued model and data costs (scoreboard.accrued_costs); None without both."""
+    from .risk import number
+    if not costs or not account or account.get("unavailable") or account.get("equity") is None:
+        return None
+    try:
+        equity = float(number(account["equity"]))
+    except (TypeError, ValueError):
+        return None
+    spent = costs["model_usd"] + (costs.get("data_usd") or 0)
+    text = (f"扣除 AI 费用后的基金净值 ${equity - spent:,.2f}（成立以来模型费用 ${costs['model_usd']:,.2f}"
+            + (f"、数据费用 ${costs['data_usd']:,.2f}" if costs.get("data_usd") else "") + "）")
+    if costs.get("unpriced_calls"):
+        text += f"，另有 {costs['unpriced_calls']} 次调用未定价、未计入，实际更低"
+    if costs.get("data_usd") is None:
+        text += "，数据费用未知、未计入"
+    return text
+
+
+def account_lines(account, recent_trades=None, *, now=None, costs=None):
+    """Separate observed holdings from AI targets, retaining the snapshot's own time.
+
+    costs: scoreboard.accrued_costs, for the fund's value after them (the account itself never pays them)."""
     from zoneinfo import ZoneInfo
     from .risk import number
     now = now or datetime.now(timezone.utc)
@@ -282,6 +303,9 @@ def account_lines(account, recent_trades=None, *, now=None):
     lines = [f"📌 当前实际持仓（快照：{when(at)}）",
              f"账户：净值 {money(account.get('equity'))}（{updated}）"
              f" ｜ 现金 {money(account.get('cash'))}"]
+    value = fund_value_line(account, costs) if available else None
+    if value:
+        lines.append(value)
     if not available:
         lines = ["📌 当前实际持仓：暂无可用账户快照"]
     quote_times = [mark.get("as_of") for mark in (account.get("valuation", {}).get("quotes") or {}).values()]
@@ -390,7 +414,7 @@ def summary(root, mode, now=None):
     elif integrity.get("status") == "verified":
         lines.append("账务校验：通过（现金、持仓、成交、费用及模拟执行依据一致）")
     if account:
-        lines += ["", *account_lines(account, data.get("recent_trades"), now=now), ""]
+        lines += ["", *account_lines(account, data.get("recent_trades"), now=now, costs=data.get("fund_costs")), ""]
     if data.get("return") is not None:
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")

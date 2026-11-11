@@ -86,6 +86,9 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         # time): ordering, the closing-mark rule, the daily curve and drawdown
         # use light fields of every mark; bodies are read only for marks shown.
         from .evaluation import benchmark_events, event_bodies, nav_marks, outcome_inputs
+        from .scoreboard import accrued_costs
+        # What the fund has spent on models and data; the account itself never pays it.
+        fund_costs = accrued_costs(db, (cutoff or datetime.now(timezone.utc)).isoformat())
         marks = nav_marks(db, until=cutoff, excluded=invalid_accounts)
         light = sorted(marks, key=lambda mark: mark[2])  # Stable: sequence order within one instant.
         if light and light[-1][4]:
@@ -292,7 +295,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                                     last_account["equity"] if light else None, as_of or now, prices),
         "unfinished_model_calls": list(unfinished.values()),
         "model_cost_estimate_usd": estimate, "model_cost_estimate_by_model_usd": estimates_by_model,
-        "latest_account": last_account,
+        "latest_account": last_account, "fund_costs": fund_costs,
         "recent_trades": recent_trades(events, last_account["as_of"]) if light else [],
         "ledger_audit": integrity,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "

@@ -1461,7 +1461,9 @@ and postmarket reviews (1–899 seconds, default 300, applied on restart), ``FUN
 ``FUND_MIN_REVIEW_MINUTES``, ``FUND_SKIP_QUIET_REVIEWS`` to skip a scheduled
 manager review when nothing changed since its allocation completed,
 ``FUND_MAX_QUIET_MINUTES`` for the longest such quiet stretch, ``FUND_MODEL_PRICES_JSON`` with
-optional ``cached_input`` rates, ``FUND_MAX_DAILY_COST_USD`` for a daily model cost cap), the data
+optional ``cached_input`` rates, ``FUND_MAX_DAILY_COST_USD`` for a daily model cost cap,
+``FUND_COST_ALERT_SHARE`` for a notice, never a trading stop, each time accrued model and data costs
+pass another multiple of that share of the fund's starting equity, default 0.02), the data
 desk (``FUND_DATA_DESK`` for the always-on service that keeps news, intraday prices, FRED,
 earnings dates and daily bars current for the agents, ``FUND_DESK_INTRADAY_SECONDS`` for its
 intraday refresh interval), user limits

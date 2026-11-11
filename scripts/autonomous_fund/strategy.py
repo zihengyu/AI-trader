@@ -444,9 +444,16 @@ class ModelBudget:
     # USD per New York trading day (estimated from model_prices_per_million): beyond it no new decision,
     # critique or pre-open research starts that day; the once-a-day post-market review still runs.
     max_daily_cost_usd: str | None = None
+    # A notice (never a trading stop) each time the fund's accrued model and data costs pass another
+    # multiple of this share of its starting equity (fund_scoreboard); None turns it off.
+    cost_alert_share: str | None = "0.02"
 
     def __post_init__(self):
         object.__setattr__(self, "failure_backoff_minutes", tuple(self.failure_backoff_minutes))
+        if self.cost_alert_share is not None:
+            object.__setattr__(self, "cost_alert_share", str(self.cost_alert_share))
+            if not number("0") < number(self.cost_alert_share) <= number("1"):
+                raise RiskError("cost_alert_share must be above 0 and at most 1")
         if type(self.max_agent_runs_per_day) is not int or not 4 <= self.max_agent_runs_per_day <= 1000:
             raise RiskError("max_agent_runs_per_day must be 4..1000")
         if type(self.reserved_review_runs) is not int or not 0 <= self.reserved_review_runs < self.max_agent_runs_per_day:
@@ -1061,6 +1068,10 @@ class AutonomousFund(Strategy):
             self._probe_models(self.get_datetime())
         except Exception as exc:  # The next close asks again.
             self._disclose_failure("model_probe_error", exc, phase="postmarket_review")
+        try:
+            self._check_fund_cost_alert(self.get_datetime())
+        except Exception as exc:  # A notice only: the next close checks again.
+            self._disclose_failure("fund_cost_alert_error", exc, phase="postmarket_review")
 
     def _check_stale_holdings(self, now):
         """Held stocks the provider stopped serving bars for (acquired, delisted, halted): tell the operator.
@@ -1247,6 +1258,7 @@ class AutonomousFund(Strategy):
                 "cash_weight": str(max(number(0), 1 - sum(new.values(), number(0)))),
                 "account": asdict(account) if account is not None else None,
                 "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
+                "fund_costs": self._accrued_costs(now),
                 "rationale": str(decision.get("rationale") or ""), "next_review_at": decision.get("next_review_at")}
             self.journal.notification_with_meta(now, "decision_changed", details, {
                 "notified_targets": {s: str(w) for s, w in new.items()}, "notified_targets_day": day,
@@ -1280,6 +1292,7 @@ class AutonomousFund(Strategy):
                 "stop": {"class": record["class"], "reason": record["reason"]} if record else None,
                 "account": asdict(account) if account is not None else None,
                 "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
+                "fund_costs": self._accrued_costs(now),
                 "research_summary": (research.get("summary") or "")[:600] or None})
         except Exception as exc:  # An announcement must never cost the iteration.
             self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
@@ -3050,10 +3063,30 @@ class AutonomousFund(Strategy):
             for name, _, members in self.quant.groups:
                 for member in members:
                     groups.setdefault(member, name)
-            return attribute(start, end, fills, closes, local_day(before), day, groups)
+            result = attribute(start, end, fills, closes, local_day(before), day, groups)
+            if result.get("status") in {"complete", "partial"}:
+                self._attribute_fund_costs(result, before["at"], ending["at"])
+            return result
         except Exception as exc:
             return {"status": "unavailable", "session_date": day,
                     "reason": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+
+    def _attribute_fund_costs(self, result, start_at, end_at):
+        """Add the session's model and data costs, which the account never pays, and the return after them.
+
+        Kept beside the components: they explain the account's own return, and these costs are not part of it.
+        """
+        from .scoreboard import accrued_costs
+        with self.journal.connection() as db:
+            before, after = accrued_costs(db, instant(start_at).isoformat()), accrued_costs(db, instant(end_at).isoformat())
+        model = after["model_usd"] - before["model_usd"]
+        data = (after["data_usd"] - before["data_usd"]) if after["data_usd"] is not None and before["data_usd"] is not None else None
+        equity = result["start_equity"]
+        result["fund_costs"] = {"model_usd": round(model, 4), "data_usd": round(data, 4) if data is not None else None,
+                                "unpriced_calls": after["unpriced_calls"] - before["unpriced_calls"],
+                                "share": -(model + (data or 0)) / equity if equity else None}
+        result["net_return"] = (result["observed_return"] + result["fund_costs"]["share"]
+                                if result["fund_costs"]["share"] is not None else None)
 
     def _market_regimes(self, now):
         """{session: regime} of SPY from its full completed history (trend needs 200 sessions); {} if unavailable."""
@@ -3917,6 +3950,38 @@ class AutonomousFund(Strategy):
             self._earnings_cache = (day, result)
         return result
 
+    def _check_fund_cost_alert(self, now):
+        """After the close: one notice each time the accrued costs pass another multiple of cost_alert_share.
+
+        A reminder for the operator only; it never pauses trading (FUND_MAX_DAILY_COST_USD limits spending).
+        """
+        share = getattr(getattr(self, "model_budget", None), "cost_alert_share", None)
+        if share is None:
+            return None
+        board = self._fund_scoreboard(now)
+        spent = board.get("costs_share_of_starting_equity") if board.get("status") == "computed" else None
+        if spent is None:
+            return None
+        level = int(spent // float(share))
+        if level < 1 or level <= (self.journal.get_meta("fund_cost_alert_level") or 0):
+            return None
+        details = {"share": spent, "threshold": float(share), "since": board["since"],
+                   "model_usd": board["model_costs_usd"], "data_usd": board.get("data_costs_usd"),
+                   "unpriced_calls": board.get("unpriced_calls"), "account_return": board["account_return"],
+                   "net_return": board["net_return"], "pace": (board.get("cost_pace") or {}).get("share_of_equity_per_year")}
+        self._notify_fund("fund_cost_alert", details)
+        self.journal.set_meta("fund_cost_alert_level", level)
+        return details
+
+    def _accrued_costs(self, now):
+        """scoreboard.accrued_costs through `now`, or None; for notifications, never raises."""
+        from .scoreboard import accrued_costs
+        try:
+            with self.journal.connection() as db:
+                return accrued_costs(db, instant(now).isoformat())
+        except Exception:
+            return None
+
     def _fund_scoreboard(self, now):
         """Since inception, net of every cost, against the benchmarks (scoreboard.py); once per completed session.
 
@@ -3955,9 +4020,12 @@ class AutonomousFund(Strategy):
                 day = instant(when).astimezone(zone).date()
                 if day < cutoff and equity is not None:
                     closing[day] = (when, {"equity": equity})  # The session's last mark wins.
+            # Benchmarks are marked about every 30 seconds: only each day's last mark is read.
             rows = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-                "SELECT at,kind,body FROM events WHERE kind IN ('benchmark','benchmark_action',"
-                "'operator_reserve_adjusted') AND julianday(at)<=julianday(?) ORDER BY sequence", (moment.isoformat(),))]
+                "SELECT at,kind,body FROM events WHERE sequence IN (SELECT MAX(sequence) FROM events "
+                "WHERE kind='benchmark' AND julianday(at)<=julianday(?) GROUP BY substr(at,1,10)) "
+                "OR (kind IN ('benchmark_action','operator_reserve_adjusted') AND julianday(at)<=julianday(?)) "
+                "ORDER BY sequence", (moment.isoformat(), moment.isoformat()))]
             calls = []
             for at, cost, mock, model, cache_hit in db.execute(
                     "SELECT at,json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
