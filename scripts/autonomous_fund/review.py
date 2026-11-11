@@ -466,8 +466,11 @@ def review_after_close(strategy):
             else:
                 break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
+        # The input the saved research answered (with its refreshed costs), never the format-correction
+        # diagnostic of a rejected first answer: the review manager builds on this snapshot.
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
-            **session, "completed_at": strategy.get_datetime().isoformat(), "context": research_context,
+            **session, "completed_at": strategy.get_datetime().isoformat(),
+            "context": {key: value for key, value in research_context.items() if key != "structured_answer_correction"},
             "research": research, "model": result.model, "mock": strategy.scripted})
         if hasattr(strategy, "_call_outcome"):
             strategy._call_outcome()  # This researcher call's answer is the review's saved research.

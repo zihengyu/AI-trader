@@ -2623,10 +2623,12 @@ class AutonomousFund(Strategy):
             self.journal.event(now, "critic_skipped", {"reason": "model_cost_budget"})
             return None
         try:
+            critic_context = {**context, "research": research}
+            if hasattr(self, "_with_fund_cost_context"):  # Fresh cost evidence, inside the never-blocking guard.
+                critic_context = self._with_fund_cost_context(critic_context, self.get_datetime())
             critique = self._record_agent("critic", self._agent_call("critic",
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
-                context=self._with_fund_cost_context({**context, "research": research}, self.get_datetime())),
-                phase="critique")
+                context=critic_context), phase="critique")
             self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
             self._call_outcome()
             return critique
