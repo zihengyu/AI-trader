@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 import pandas_market_calendars as mcal
+import numpy as np
 
 from lumibot.data_sources import DataSource
 
@@ -271,19 +272,27 @@ class YahooRealtimeData(DataSource):
         self._request_lock = threading.RLock()
         self._key_locks = {}
         self._failures = {}
+        self._source_errors = OrderedDict()
         self._slots = threading.BoundedSemaphore(2)
-        self._stats = {"requests": 0, "cache_hits": 0, "failures": 0, "backoff_blocks": 0}
+        self._stats = {"requests": 0, "cache_hits": 0, "failures": 0, "backoff_blocks": 0, "discarded_rows": 0}
+        self._last_rejected_bar = None
         self.name = "yahoo-local-simulation"
         # Optional live tape: quotes prefer a fresh regular-session trade.
         self.tape, self.live_seconds = tape, live_seconds
         self._quote_kinds = {"live": 0, "completed_bar": 0}
+        self._quote_observations = OrderedDict()
 
     def diagnostics(self):
         with self._request_lock:
             result = {**self._stats, "cached_series": len(self._cache), "max_parallel_requests": 2,
                       "feed": ("stream_and_chart_last_trade_with_completed_bar_fallback" if self.tape
                                else "chart_last_trade_with_completed_bar_fallback"),
-                      "quotes_by_kind": dict(self._quote_kinds)}
+                      "quotes_by_kind": dict(self._quote_kinds),
+                      "quotes_by_symbol": {s: dict(row) for s, row in self._quote_observations.items()},
+                      "source_failures": [{**row, "retry_in_seconds": max(0, round(self._failures[key][1] - time.monotonic(), 1))}
+                                          for key, row in self._source_errors.items() if key in self._failures]}
+            if self._last_rejected_bar is not None:
+                result["last_rejected_bar"] = dict(self._last_rejected_bar)
         if self.tape:
             result["live_tape"] = self.tape.diagnostics()
         return result
@@ -336,7 +345,11 @@ class YahooRealtimeData(DataSource):
             failure = self._failures.get(key)
             if failure and time.monotonic() < failure[1]:
                 self._stats["backoff_blocks"] += 1
-                raise MarketDataUnavailable(f"Yahoo market data cooling down for {symbol}; no stale fallback")
+                previous = self._source_errors.get(key, {})
+                raise MarketDataUnavailable(f"Yahoo market data cooling down for {symbol}; no stale fallback", diagnostic={
+                    "reason": "source_backoff", "symbol": symbol, "interval": interval, "period": period,
+                    "checked_at": now.isoformat(), "last_error": previous.get("error"),
+                    "retry_after_seconds": max(0, failure[1] - time.monotonic())})
             try:
                 with self._slots:
                     self._stats["requests"] += 1
@@ -344,22 +357,37 @@ class YahooRealtimeData(DataSource):
             except Exception as exc:
                 count = (failure[0] if failure else 0) + 1
                 delay = min(300, 15 * 2 ** min(count - 1, 5))
-                self._failures[key] = (count, time.monotonic() + delay)
-                self._stats["failures"] += 1
+                error = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
+                diagnostic = {"reason": "source_unavailable", "symbol": symbol, "interval": interval,
+                              "period": period, "failed_at": self.get_datetime().isoformat(), "error": error,
+                              "consecutive_failures": count}
+                with self._request_lock:
+                    self._failures[key] = (count, time.monotonic() + delay)
+                    self._stats["failures"] += 1
+                    self._source_errors[key] = diagnostic
+                    self._source_errors.move_to_end(key)
+                    while len(self._source_errors) > 60:
+                        self._source_errors.popitem(last=False)
                 if self.on_backoff is not None:
                     try:
                         self.on_backoff(time.time() + delay)
                     except Exception:
                         pass  # Advisory only; never changes this request's outcome.
                 if isinstance(exc, RiskError):
-                    raise MarketDataUnavailable(str(exc)) from None
-                raise MarketDataUnavailable(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})") from None
-            self._failures.pop(key, None)
+                    raise MarketDataUnavailable(str(exc), diagnostic=diagnostic) from None
+                raise MarketDataUnavailable(f"Yahoo market data unavailable for {symbol} ({type(exc).__name__})",
+                                            diagnostic=diagnostic) from None
+            with self._request_lock:
+                self._failures.pop(key, None)
+                self._source_errors.pop(key, None)
             self._cache[key] = (time.monotonic(), frame.copy(), cutoff)
             return frame
 
     def _download(self, symbol, interval, period, now):
         frame = self.fetch(symbol, interval, period).copy()
+        # Network and slot waits may cross a minute/close boundary. Trim forming
+        # bars against the receipt clock, never an earlier request's clock.
+        now = self.get_datetime()
         if frame.empty or not isinstance(frame.index, pd.DatetimeIndex) or frame.index.tz is None:
             raise RiskError(f"Yahoo returned empty or undated data for {symbol}")
         if frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
@@ -369,9 +397,15 @@ class YahooRealtimeData(DataSource):
         if interval == "1d":
             actions = []
             for stamp, row in frame[frame.index.date <= now.date()].iterrows():
-                split, dividend = number(row.get("split", 0)), number(row.get("dividend", 0))
-                if split < 0 or dividend < 0:
-                    raise RiskError("Invalid corporate action")
+                values = {}
+                for field in ("split", "dividend"):
+                    try:
+                        values[field] = number(row.get(field, 0))
+                        if values[field] < 0:
+                            raise RiskError("Negative action")
+                    except RiskError:
+                        raise RiskError(f"Invalid corporate action for {symbol}: {field} at {stamp.isoformat()}") from None
+                split, dividend = values["split"], values["dividend"]
                 if split or dividend:
                     actions.append({"date": stamp.date().isoformat(), "split": str(split), "dividend": str(dividend)})
             self._actions[(symbol, period)] = actions
@@ -385,14 +419,30 @@ class YahooRealtimeData(DataSource):
             frame = frame[frame.index.date < completed_daily_cutoff(now)]
         if frame.empty:
             raise RiskError("No completed market observations")
+        valid = pd.Series(True, index=frame.index)
+        fields_valid = {}
         for column in required:
-            frame[column] = pd.to_numeric(frame[column], errors="raise")
-            if any(not number(value).is_finite() for value in frame[column]):
-                raise RiskError("Non-finite market data")
-        if (frame[["open", "high", "low", "close"]] <= 0).any().any() or (frame.volume < 0).any():
-            raise RiskError("Invalid prices or negative volume")
-        if (frame.low > frame[["open", "close"]].min(axis=1)).any() or (frame.high < frame[["open", "close"]].max(axis=1)).any():
-            raise RiskError("Invalid market OHLC envelope")
+            booleans = frame[column].map(lambda v: isinstance(v, (bool, np.bool_)))
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            fields_valid[column] = np.isfinite(frame[column]) & ~booleans & (frame[column] >= 0 if column == "volume" else frame[column] > 0)
+            valid &= fields_valid[column]
+        fields_valid["ohlc_envelope"] = ((frame.low <= frame[["open", "close"]].min(axis=1)) &
+                                          (frame.high >= frame[["open", "close"]].max(axis=1)))
+        valid &= fields_valid["ohlc_envelope"]
+        if not valid.all():
+            bad_at = frame.index[~valid][-1]
+            rejected_fields = [name for name, good in fields_valid.items() if not good.loc[bad_at]]
+            with self._request_lock:
+                self._stats["discarded_rows"] += int((~valid).sum())
+                self._last_rejected_bar = {"symbol": symbol, "interval": interval, "as_of": bad_at.isoformat(),
+                                           "reason": "invalid_ohlcv", "discarded_rows": int((~valid).sum()),
+                                           "fields": rejected_fields}
+            # A broken row is a gap, never a zero-volume or forward-filled bar.
+            # Other real bars remain usable, with their own original timestamps.
+            frame = frame.loc[valid].copy()
+            if frame.empty:
+                fields = ",".join(rejected_fields)
+                raise RiskError(f"No valid completed OHLCV observations for {symbol} ({interval}); invalid fields: {fields}")
         return frame
 
     def get_historical_prices(self, asset, length, timestep="minute", timeshift=None, quote=None,
@@ -442,25 +492,55 @@ class YahooRealtimeData(DataSource):
             # still uses execution_bars independently and cannot manufacture a fill.
             live = self._live_quote(asset, None, None) if self.tape is not None else None
             if live is not None:
-                return live
+                return self._remember_quote(asset, live)
             raise
         start, last = frame.index[-1], frame.iloc[-1]
         end = start + pd.Timedelta(minutes=1)
         if self.tape is not None:
             live = self._live_quote(asset, end, last)
             if live is not None:
-                return live
+                return self._remember_quote(asset, live, frame)
         chart = self._chart_quote(asset, frame, end)
         if chart is not None:
-            return chart
+            return self._remember_quote(asset, chart, frame)
         self._quote_kinds["completed_bar"] += 1
         price = number(last.close)
-        return Quote(asset, price=float(price), bid=float(price * (1 - self.spread / 2)),
+        result = Quote(asset, price=float(price), bid=float(price * (1 - self.spread / 2)),
                      ask=float(price * (1 + self.spread / 2)), timestamp=end,
                      volume=float(last.volume), raw_data={
                          "original_response": SimpleNamespace(timestamp=end), "source": self.SOURCE,
                          "price_kind": "completed_minute_close_with_spread_proxy", "bar_start": start.isoformat(),
                          "spread_bps": str(self.spread * 10000)})
+        return self._remember_quote(asset, result, frame)
+
+    @staticmethod
+    def _trade_stamp(raw_stamp):
+        return (instant(raw_stamp) if isinstance(raw_stamp, (datetime, str)) else
+                datetime.fromtimestamp(float(number(raw_stamp)), timezone.utc))
+
+    def _remember_quote(self, asset, quote, frame=None):
+        """Bounded per-symbol source clocks: totals cannot explain a missing stream symbol."""
+        now = self.get_datetime()
+        stamp = quote.raw_data["original_response"].timestamp
+        detail = {"price_kind": quote.raw_data["price_kind"], "source_as_of": stamp.isoformat(),
+                  "checked_at": now.isoformat(), "age_seconds": (now - stamp).total_seconds(),
+                  "stream_as_of": None, "chart_as_of": None}
+        tick = self.tape.tick(self._symbol(asset)) if self.tape is not None else None
+        if tick:
+            detail.update(stream_as_of=tick["time"].isoformat(), stream_age_seconds=(now - tick["time"]).total_seconds())
+        trade = frame.attrs.get("yahoo_last_trade") if frame is not None else None
+        if isinstance(trade, dict):
+            try:
+                chart_stamp = self._trade_stamp(trade.get("as_of"))
+                detail.update(chart_as_of=chart_stamp.isoformat(), chart_age_seconds=(now - chart_stamp).total_seconds())
+            except (ValueError, TypeError, OverflowError):
+                pass  # Never serialize an invalid provider field or guess its timestamp.
+        with self._request_lock:
+            self._quote_observations[asset.symbol] = detail
+            self._quote_observations.move_to_end(asset.symbol)
+            while len(self._quote_observations) > 60:
+                self._quote_observations.popitem(last=False)
+        return quote
 
     def _chart_quote(self, asset, frame, bar_end):
         """Use the chart's own last-trade price/time pair, never a forming bar's close."""
@@ -469,8 +549,7 @@ class YahooRealtimeData(DataSource):
             return None
         try:
             price, raw_stamp = number(trade.get("price")), trade.get("as_of")
-            stamp = (instant(raw_stamp) if isinstance(raw_stamp, (datetime, str)) else
-                     datetime.fromtimestamp(float(number(raw_stamp)), timezone.utc))
+            stamp = self._trade_stamp(raw_stamp)
         except (ValueError, TypeError, OverflowError):
             return None
         now, session = self.get_datetime(), self.session.status()

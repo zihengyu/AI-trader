@@ -381,7 +381,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         frame = self.data_source.execution_bars(asset, required_through=closed_at)
         rows = frame[frame.index + timedelta(minutes=1) == closed_at]
         if rows.empty:
-            raise RiskError("Closing minute unavailable; retaining the last observed valuation")
+            raise MarketDataUnavailable(f"Closing minute unavailable for {asset.symbol} at {closed_at.isoformat()}; retaining the last observed valuation")
         return ObservedPrice(number(rows.iloc[-1].close), closed_at).validate(closed_at, self.limits)
 
     def _submit_order(self, order):

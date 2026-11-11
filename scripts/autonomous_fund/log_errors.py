@@ -9,7 +9,8 @@ from datetime import datetime, timezone
 ERROR = re.compile(
     r"(?:^|\|\s*)(?:WARNING|ERROR|CRITICAL)\b|^(?:[\w.]+(?:Error|Exception)|KeyboardInterrupt|SystemExit):"
     r"|Main process exited|Failed to |Server supervision stopped"
-    r"|FUND (?:\w*error|stopped|stop_active|watchdog_stop|server_supervision_stop|auto_resume_exhausted):"
+    r"|FUND (?:\w*error|stopped|stop_active|watchdog_stop|server_supervision_stop|auto_resume_exhausted"
+    r"|price_alert_unavailable|price_observation_rejected|local_market_data_pending|closing_valuation_pending):"
     r"|\[observability_warning\]"
 )
 TRACE = re.compile(

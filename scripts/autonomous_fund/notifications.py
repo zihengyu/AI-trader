@@ -524,6 +524,11 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
     elif kind == "local_market_data_pending":
         text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
+    elif kind == "closing_valuation_pending":
+        text = (f"⏳ 收盘估值等待有效行情：{details}\n后台会继续重试；盘后复盘可使用已有观测，暂不认定收盘净值。"
+                "\n诊断：bash scripts/fund-logs.sh errors")
+    elif kind == "report_error":
+        text = f"⚠️ 收盘账户核对或估值失败：{details}\n具体位置：bash scripts/fund-logs.sh errors"
     elif kind == "bookkeeping_error":
         text = f"⚠️ 记账步骤出错，下一轮自动重试：{details}"
     elif kind == "postmarket_review_error":

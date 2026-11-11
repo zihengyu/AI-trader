@@ -21,7 +21,7 @@ from .cash import policy_context
 from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
-from .risk import (Account, DecisionTimingError, Intent, Limits, ObservedPrice, Price, RiskError,
+from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnavailable, ObservedPrice, Price, RiskError,
                    bounded_list, bounded_text, decision_levels,
                    desired_shares, instant, number, plan,
                    observed_quote, trading_day, validate_decision, validate_evidence)
@@ -955,7 +955,7 @@ class AutonomousFund(Strategy):
     def _disclose(self, kind, details):
         """App notice, but even a broken journal or logger cannot raise from here."""
         try:
-            self._notify_fund(kind, details)
+            return self._notify_fund(kind, details)
         except Exception:
             try:
                 import logging
@@ -963,9 +963,9 @@ class AutonomousFund(Strategy):
             except Exception:
                 pass
 
-    def _disclose_failure(self, kind, error, *, phase):
+    def _disclose_failure(self, kind, error, *, phase, include_risk=False):
         """Retain a safe failure location without breaking the notification contract."""
-        if not isinstance(error, RiskError):
+        if include_risk or not isinstance(error, RiskError):
             try:
                 from .diagnostics import exception_diagnostic
                 detail = {"notification": kind, **exception_diagnostic(error, phase=phase)}
@@ -1491,6 +1491,25 @@ class AutonomousFund(Strategy):
     def _verify_local_account_read(self):
         if getattr(self, "mode", None) == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
             self.broker.ledger_audit()
+
+    def update_broker_balances(self, force_update=True):
+        """Bound failed background refreshes; explicit reads keep native semantics.
+
+        Native cached-cash access checks once a second after a failed refresh,
+        because only a successful read advances last_broker_balances_update.
+        This application's background retry must not imply a fresh balance.
+        Its order/AI snapshots still read the local broker directly.
+        """
+        if getattr(self, "mode", None) != "local":
+            return super().update_broker_balances(force_update=force_update)
+        if not force_update and monotonic() < getattr(self, "_local_balance_retry_at", 0):
+            return False
+        updated = super().update_broker_balances(force_update=force_update)
+        if updated is False:
+            self._local_balance_retry_at = monotonic() + 15
+        elif updated is True:
+            self._local_balance_retry_at = 0
+        return updated
 
     def get_cash(self):
         # Fail before native balance-refresh fallback can reuse cached values.
@@ -2774,8 +2793,20 @@ class AutonomousFund(Strategy):
                     observation = self._alert_price(alert["symbol"])
                 observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
             except Exception as exc:
-                self._disclose("price_alert_unavailable", {"symbol": alert["symbol"],
+                emitted = self._disclose("price_alert_unavailable", {"symbol": alert["symbol"],
                     "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+                if emitted is not False and getattr(exc, "diagnostic", None):
+                    # Keep changing source clocks out of the notification's
+                    # dedupe identity; retain evidence only with each notice.
+                    detail = {"symbol": alert["symbol"], **exc.diagnostic}
+                    try:
+                        self.journal.event(self.get_datetime(), "price_observation_rejected", detail)
+                    except Exception:
+                        pass
+                    try:
+                        self.log_message(f"FUND price_observation_rejected: {encode(detail)}", color="yellow")
+                    except Exception:
+                        pass
                 continue
             mark = observation.price
             crossed = ((alert.get("above") is not None and mark >= number(alert["above"])) or
@@ -4330,8 +4361,10 @@ class AutonomousFund(Strategy):
         try:
             self._reconcile()
             self._snapshot()
+        except MarketDataUnavailable as exc:
+            self._disclose_failure("closing_valuation_pending", exc, phase="closing_snapshot", include_risk=True)
         except Exception as exc:
-            self._disclose("report_error", type(exc).__name__)
+            self._disclose_failure("report_error", exc, phase="closing_snapshot", include_risk=True)
         finally:
             from . import report as reports
             # A failed closing mark must be disclosed, not block ordinary

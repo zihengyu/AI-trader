@@ -664,6 +664,45 @@ Absent, stale, future, naive or nonpositive source observations still fall back
 to completed bars and remain subject to the normal freshness checks. Cached
 metadata retains its original source time. Matching still requires new bars.
 
+An invalid completed OHLCV row is omitted as a gap, preserving other real
+daily/minute observations. No interpolation, forward fill or replacement
+volume is added. If every completed row is invalid, that series remains
+unavailable. Invalid split/dividend values still block accounting.
+``market_data.discarded_rows`` and ``last_rejected_bar`` record the symbol,
+interval, timestamp and affected fields. Completion is checked against the
+clock after the download, including requests that cross a minute boundary.
+
+``market_data.quotes_by_symbol`` retains at most 60 recently requested symbols
+with the selected price kind, source time, check time and age, plus separate
+stream/chart source times. Ages refer to the saved ``checked_at``, not the
+time the status file is read. A missing stream timestamp identifies an
+unobserved subscription; aggregate subscription counts cannot identify it.
+``price_observation_rejected`` retains the rejected source clock, age, limit
+and reason alongside each deduplicated alert notice. The errors log command
+includes these INFO-level failures. A fallback cannot supply fresh evidence
+when every real source is stale; freshness checks remain enforced.
+
+A missing final completed minute is disclosed as
+``closing_valuation_pending`` and retried by background valuation. Read-only
+review can proceed without claiming a closing NAV. Other closing account or
+valuation failures retain their risk reason in ``report_error`` and a safe
+location trace in ``operation_error``. Provider exception messages, source
+text, local variables and private paths are excluded from that trace.
+
+``market_data.source_failures`` retains up to 60 failing history series with
+symbol, interval, failure-attempt cause, failure time, consecutive failures
+and remaining retry delay. A cooling-down check retains that attempt's cause;
+only success of the same series clears it. SDK exception payloads are not
+copied into diagnostics.
+
+The local application's failed background balance refresh retries after 15
+seconds, rather than on every one-second cached-cash access. Both failure
+and a deferred retry report failure and leave the last successful refresh
+timestamp unchanged. Explicit refreshes, ``get_cash()`` and direct AI/order
+snapshots still attempt a strict read immediately; the source's own backoff
+remains effective. Retained native display values do not become fresh
+account evidence.
+
 An intraday manager's stale, future or expired decision in local or paper mode
 can use the same single correction opportunity as a malformed answer. The
 manager receives a refreshed account, risk and data-desk context and must

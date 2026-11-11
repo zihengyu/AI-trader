@@ -25,7 +25,10 @@ class RiskError(ValueError):
 
 class MarketDataUnavailable(RiskError):
     """An unusable source observation: wait for fresh data without changing the book."""
-    pass
+
+    def __init__(self, message, *, diagnostic=None):
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 class DecisionTimingError(RiskError):
@@ -108,9 +111,19 @@ class ObservedPrice:
     as_of: datetime
 
     def validate(self, now, limits):
-        if number(self.price) <= 0 or not 0 <= (instant(now) - instant(self.as_of)).total_seconds() <= limits.quote_max_seconds:
-            raise MarketDataUnavailable("Stale, future or nonpositive observation")
-        return self
+        now, stamp = instant(now), instant(self.as_of)
+        age = (now - stamp).total_seconds()
+        detail = {"source_as_of": stamp.isoformat(), "checked_at": now.isoformat(),
+                  "age_seconds": age, "max_age_seconds": limits.quote_max_seconds}
+        try:
+            price = number(self.price)
+        except RiskError:
+            raise MarketDataUnavailable("Invalid observed price", diagnostic={**detail, "reason": "invalid_price"}) from None
+        reason = "nonpositive" if price <= 0 else "future" if age < 0 else "stale" if age > limits.quote_max_seconds else None
+        if reason:
+            raise MarketDataUnavailable("Stale, future or nonpositive observation",
+                                        diagnostic={**detail, "reason": reason, "price": str(price)})
+        return ObservedPrice(price, stamp)
 
 
 def observed_quote(quote, now, limits):
@@ -126,7 +139,8 @@ def observed_quote(quote, now, limits):
         if not 0 < bid <= ask:
             raise MarketDataUnavailable("Invalid observed bid/ask")
         price = (bid + ask) / 2
-    return ObservedPrice(number(price), instant(stamp)).validate(now, limits)
+    # Validate here so non-finite prices also retain the actual observation clock.
+    return ObservedPrice(price, instant(stamp)).validate(now, limits)
 
 
 @dataclass(frozen=True)
