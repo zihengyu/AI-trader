@@ -763,7 +763,7 @@ def readable(kind, details, sequence=None, *, now=None):
                 + ("（来自 .env 里 FUND_CAPITAL_USD 的变化）" if details.get("source") == "configuration" else "")
                 + "\n这笔钱不算收益也不算亏损：收益率、回撤和记分卡都按单位净值计算，回撤锁和当日亏损暂停不受影响。")
         if subscription:
-            text += "已请基金经理按新的规模重新复核。"
+            text += "基金经理将按新的规模复核。"
         elif details.get("mode") == "local":
             text += "本地虚拟账户已扣除这笔现金。"
         elif details.get("mode") == "paper":
@@ -775,22 +775,24 @@ def readable(kind, details, sequence=None, *, now=None):
                      f"bash scripts/fund-capital.sh withdraw {details.get('amount')}，然后重新启动。"
                      "卖出所得可能要等结算后才能转出。")
     elif kind == "redemption_liquidating" and isinstance(details, dict):
-        text = (f"🏦 赎回 {_usd(details.get('amount'))} 美元正在筹集现金：可用现金 {_usd(details.get('cash'))} 美元不够，"
-                f"或者直接付现金会让股票仓位比赎回前高出 5 个百分点以上。"
-                f"系统会先按比例卖出每个持仓的一小部分（约 {_usd(details.get('stock_sale'))} 美元，保持组合权重），"
-                f"不够再卖现金替代 ETF（现有 {_usd(details.get('cash_equivalent'))} 美元），筹够后完成赎回。\n"
+        text = (f"🏦 赎回 {_usd(details.get('amount'))} 美元正在筹资。"
+                f"可用现金 {_usd(details.get('cash'))} 美元，现金替代 ETF {_usd(details.get('cash_equivalent'))} 美元。"
+                "先按单只证券和总敞口上限调整持仓，再按需卖出现金替代 ETF。\n"
                 "处理期间暂停买入和现金停泊；卖出、止损和基金经理的决策照常。")
     elif kind == "redemption_waiting" and isinstance(details, dict):
         why = {"redemption_sale_budget": "今天的卖出次数已经用完，下一个交易日继续卖出",
                "redemption_quote_unavailable": f"暂时拿不到可用的报价（{details.get('error')}），会自动重试",
-               "redemption_waits_for_cash": "已经没有可卖的持仓，等应收的股息等到账变成现金后完成"
+               "redemption_waits_for_cash": "可用现金和符合条件的整股不足，应收款未计入可用现金"
                }.get(details.get("reason"), details.get("reason"))
         text = (f"⏳ 赎回还在进行：{why}。期间暂停买入，卖出和止损照常；不需要操作，"
                 "要放弃这笔赎回可以 bash scripts/fund-capital.sh cancel <编号>（查看编号：bash scripts/fund-capital.sh）。")
+    elif kind == "subscription_waiting" and isinstance(details, dict):
+        text = (f"⏳ 申购 {_usd(details.get('amount'))} 美元正在等待保留现金（编号 {details.get('request_id')}）。"
+                "如果已单独调整模拟盘余额，停止基金后用 deposit --reserve-only 登记，再启动即可继续处理。")
     elif kind == "capital_request_rejected" and isinstance(details, dict):
         name = "申购" if details.get("kind") == "subscription" else "赎回"
         text = (f"⚠️ {name} {_usd(details.get('amount'))} 美元没有执行：{details.get('reason')}。\n"
-                "基金和持仓都没有变化。查看：bash scripts/fund-capital.sh")
+                "该请求未划转资金。已经成交的筹资卖单仍留在账本中。查看：bash scripts/fund-capital.sh")
     if text is None:
         return None
     return text + (f"\n（LumiBot 模拟账户 · 事件 #{sequence} · {kind}）" if sequence is not None else "")
@@ -844,13 +846,15 @@ def _weekly_facts(events, monday, sunday, zone):
     from .performance import PerformanceSettings, benchmark_series
     def local(at):
         return instant(at).astimezone(zone).date().isoformat()
-    from .capital import FLOW, Units
+    from .capital import FLOW, Units, signed_amount
     units = Units.from_events(events)  # Operator subscriptions and redemptions are not returns.
-    marks, dollars = {}, {}
-    for at, kind, body in events:
+    marks, dollars, mark_indexes = {}, {}, {}
+    for index, (at, kind, body) in enumerate(events):
         if kind == "account":
-            dollars[local(at)] = float(body["equity"])
-            marks[local(at)] = dollars[local(at)] * units.scale(instant(at))
+            day = local(at)
+            dollars[day] = float(body["equity"])
+            marks[day] = dollars[day] * units.scale(index)
+            mark_indexes[day] = index
     before = [d for d in sorted(marks) if d < monday]
     inside = [d for d in sorted(marks) if monday <= d <= sunday]
     facts = {"start_day": before[-1] if before else (inside[0] if inside else None),
@@ -860,10 +864,10 @@ def _weekly_facts(events, monday, sunday, zone):
     if facts["start_day"] and facts["end_day"] and marks[facts["start_day"]] > 0:
         facts["week_return"] = marks[facts["end_day"]] / marks[facts["start_day"]] - 1
         facts["start_equity"], facts["end_equity"] = dollars[facts["start_day"]], dollars[facts["end_day"]]
-        flows = [body for at, kind, body in events if kind == FLOW and facts["start_day"] < local(at) <= facts["end_day"]]
+        start, end = mark_indexes[facts["start_day"]], mark_indexes[facts["end_day"]]
+        flows = [signed_amount(body) for _, kind, body in events[start + 1:end] if kind == FLOW]
         if flows:
-            facts["capital_flows_usd"] = sum(float(b["amount"]) * (-1 if b["kind"] == "redemption" else 1)
-                                             for b in flows)
+            facts["capital_flows_usd"] = float(sum(flows))
     level, peak, worst = 1.0, 1.0, 0.0
     for _, r in facts["daily"]:
         level *= 1 + r
@@ -925,8 +929,8 @@ def _weekly_events(db, cutoff, zone):
     benchmark are written about every 30 seconds of market time.
     """
     events, marks, prices = [], {}, {}
-    for at, kind, body, equity in db.execute(
-            "SELECT at,kind,CASE WHEN kind='account' THEN NULL ELSE body END,"
+    for sequence, at, kind, body, equity in db.execute(
+            "SELECT sequence,at,kind,CASE WHEN kind='account' THEN NULL ELSE body END,"
             "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.equity') END "
             "FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)), WEEKLY_KINDS):
         moment = instant(at)
@@ -934,21 +938,21 @@ def _weekly_events(db, cutoff, zone):
             continue
         day = moment.astimezone(zone).date()
         if kind == "account":
-            marks[day] = (at, equity)
+            marks[day] = (sequence, at, equity)
         elif kind == "benchmark":
-            latest = prices.setdefault(day, [at, {}])
-            latest[0] = at
+            latest = prices.setdefault(day, [sequence, at, {}])
+            latest[:2] = sequence, at
             for symbol, value in json.loads(body).items():
                 try:
                     if float(value) > 0:
-                        latest[1][symbol] = float(value)
+                        latest[2][symbol] = float(value)
                 except (TypeError, ValueError):
                     pass
         else:
-            events.append((at, kind, event_body(kind, body)))
-    events += [(at, "account", {"equity": equity}) for at, equity in marks.values()]
-    events += [(at, "benchmark", values) for at, values in prices.values()]
-    return events
+            events.append((sequence, at, kind, event_body(kind, body)))
+    events += [(sequence, at, "account", {"equity": equity}) for sequence, at, equity in marks.values()]
+    events += [(sequence, at, "benchmark", values) for sequence, at, values in prices.values()]
+    return [(at, kind, body) for _, at, kind, body in sorted(events, key=lambda row: row[0])]
 
 
 def latest_weekly(root):
@@ -1004,7 +1008,7 @@ def weekly_document(root, sequence):
         origin = "上周最后一次估值" if facts["start_from_previous_week"] else "本周第一次估值（没有上周估值）"
         lines.append(f"- 净值 {facts['start_equity']:.2f} → {facts['end_equity']:.2f}，本周收益 "
                      f"{_percent(facts['week_return'])}（起点：{origin}，{facts['start_day']}）")
-        if facts.get("capital_flows_usd"):
+        if "capital_flows_usd" in facts:
             lines.append(f"- 本周申购/赎回净额 {facts['capital_flows_usd']:+.2f} 美元：已从收益里剔除（按单位净值计算）")
         model = facts.get("model") or {}
         if model.get("calls") and facts.get("start_equity"):

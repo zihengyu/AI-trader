@@ -212,11 +212,11 @@ def session_pairs(events, sessions, zone):
     from .risk import instant
     accounts, marks, adjusted = {}, {}, []
     units = Units.from_events(events)
-    for at, kind, body in events:
+    for index, (at, kind, body) in enumerate(events):
         moment = instant(at)
         day = moment.astimezone(zone).date()
         if kind == "account" and day in sessions:
-            accounts[day] = (moment, float(body["equity"]), units.scale(moment))
+            accounts[day] = (moment, float(body["equity"]), units.scale(index))
         elif kind == "benchmark" and day in sessions:
             for symbol, value in body.items():
                 try:
@@ -225,7 +225,7 @@ def session_pairs(events, sessions, zone):
                     continue
                 if price > 0:
                     marks.setdefault(symbol, {})[day.isoformat()] = price
-        elif kind == "operator_reserve_adjusted":
+        elif kind == "operator_reserve_adjusted" and body.get("transfer") not in {"deposit", "withdrawal"}:
             adjusted.append(moment)
     days, pairs = sorted(sessions), []
     for a, b in zip(days, days[1:]):
@@ -405,7 +405,8 @@ def acceptance(root, criteria=None, now=None):
     failures = sum(1 for b in agents if b.get("parse_error"))
     from .capital import Units
     units = Units.from_events(events)  # Subscriptions and redemptions are not drawdowns or recoveries.
-    equity = [float(b["equity"]) * units.scale(at) for at, b in accounts]
+    equity = [float(body["equity"]) * units.scale(index)
+              for index, (_, kind, body) in enumerate(events) if kind == "account"]
     peak, drawdown = 0.0, 0.0
     for value in equity:
         peak = max(peak, value)

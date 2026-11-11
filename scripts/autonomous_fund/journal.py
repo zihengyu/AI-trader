@@ -233,10 +233,10 @@ class Journal:
 
         First start: reserve = (cash + sleeve holdings value) - capital, so the AI
         starts with exactly `capital`. A later change of the configured value
-        sets the target net capital: the difference from the current capital
-        plus waiting requests (subscriptions made with the script included) is
-        queued as a subscription or redemption (capital.py), which the running
-        fund applies at its next valuation. A change is never a gain or a loss,
+        queues an absolute net capital target behind the existing operator
+        requests. The running fund calculates the difference again from the
+        applied capital when the target reaches the front of the queue.
+        A change is never a gain or a loss,
         and a smaller capital raises its cash like any redemption instead of
         blocking the fund. An unchanged value queues nothing, however far the
         script has moved the capital since. External holdings (outside the
@@ -266,15 +266,19 @@ class Journal:
                 # The basis follows applied flows; the configured value is what .env said last. A new value is
                 # the capital the operator wants: measured from where the fund will be, never from the old value.
                 configured = number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"]))
-                from .capital import CENT, enqueue, target_basis
-                delta = capital - target_basis(db)
-                rows["mandate_configured_capital"] = str(capital)
-                if abs(delta).quantize(CENT) > 0:
-                    queued = enqueue(db, now, "subscription" if delta > 0 else "redemption",
-                                     abs(delta).quantize(CENT), source="configuration")
-                    event = ("mandate_capital_change_requested", {
-                        "from": str(configured), "to": str(capital), "request_id": queued["id"],
-                        "kind": queued["kind"], "amount": queued["amount"]})
+                from .capital import QueueFull, queue_target
+                try:
+                    queued = queue_target(db, now, rows["mandate_capital_basis"], capital)
+                except QueueFull:
+                    # Keep valuing the sleeve so the runner can drain the queue.
+                    pass
+                else:
+                    rows["mandate_configured_capital"] = str(capital)
+                    if queued:
+                        event = ("mandate_capital_change_requested", {
+                            "from": str(configured), "to": str(capital), "request_id": queued["id"],
+                            "kind": queued["kind"], "amount": queued["amount"]})
+            rows.setdefault("mandate_configured_capital", rows["mandate_capital_basis"])
             baseline = {k: number(v) for k, v in json.loads(rows["mandate_external"]).items()}
             if baseline != {k: number(v) for k, v in external.items()}:
                 raise RiskError("External holdings changed; review the account and run adjust-reserve to re-baseline")

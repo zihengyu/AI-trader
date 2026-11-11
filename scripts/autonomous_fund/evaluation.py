@@ -125,22 +125,23 @@ def forward_outcomes(events):
         return []
     now = max(instant(at) for at, _, _ in events)
     reviews = [b for at, kind, b in events if kind == "postmarket_review" and instant(b["completed_at"]) <= now]
-    accounts = [(instant(at), body) for at, kind, body in events if kind == "account" and instant(at) <= now]
+    from .capital import Units
+    units = Units.from_events(events)
+    accounts = [(instant(at), float(body["equity"]) * units.scale(index))
+                for index, (at, kind, body) in enumerate(events) if kind == "account"]
     if not reviews or not accounts:
         return []
     benchmarks = {instant(at): b for at, kind, b in events if kind == "benchmark" and instant(at) <= now}
-    from .capital import Units
-    units = Units.from_events([row for row in events if instant(row[0]) <= now])  # Operator flows are not returns.
     zone = ZoneInfo("America/New_York")
     schedule = mcal.get_calendar("NYSE").schedule(start_date=min(at.date() for at, _ in accounts), end_date=now.date())
     completed = {day.date(): market.market_close for day, market in schedule.iterrows() if market.market_close <= now}
     # The last observation of each completed session, computed once. For a memo
     # available at time T, a session counts when its last observation is >= T.
     last_by_day = {}
-    for at, body in accounts:
+    for at, equity in accounts:
         day = at.astimezone(zone).date()
         if day in completed and (day not in last_by_day or at >= last_by_day[day][0]):
-            last_by_day[day] = (at, body)
+            last_by_day[day] = (at, equity)
     sessions = sorted(last_by_day.values(), key=lambda item: item[0])
     result = []
     for packet in reviews:
@@ -157,8 +158,7 @@ def forward_outcomes(events):
                 row["horizons"][str(horizon)] = {"status": "insufficient_observations", "needed": horizon + 1}
                 continue
             first, last = daily[0], daily[horizon]
-            baseline = float(first[1]["equity"]) * units.scale(first[0])
-            value = float(last[1]["equity"]) * units.scale(last[0])
+            baseline, value = first[1], last[1]
             comparison = {}
             for symbol in ("SPY", "QQQ"):
                 begin = benchmarks.get(first[0], {}).get(symbol)

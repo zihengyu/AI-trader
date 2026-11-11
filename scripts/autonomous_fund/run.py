@@ -336,6 +336,7 @@ def main(argv=None):
     parser.add_argument("--cancel", metavar="REQUEST_ID", help="capital: cancel a waiting subscription or redemption")
     parser.add_argument("--reserve-only", action="store_true",
                         help="deposit: keep the transferred money in reserved cash instead of subscribing it")
+    parser.add_argument("--operation-id", help="Reuse the same ID when retrying a subscribe, redeem, deposit or withdraw command")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
     parser.add_argument("--symbol", help="settle-position: the local holding that was acquired or delisted")
@@ -355,6 +356,10 @@ def main(argv=None):
     parser.add_argument("--stop-class", action="store_true",
                         help="status: print only the STOP class (operator, watchdog, service or none)")
     args = parser.parse_args(argv)
+    if args.operation_id is not None and args.mode not in {"subscribe", "redeem", "deposit", "withdraw"}:
+        parser.error("--operation-id requires subscribe, redeem, deposit or withdraw")
+    if args.reserve_only and args.mode != "deposit":
+        parser.error("--reserve-only requires deposit")
     if args.env_file:
         from .environment import load_environment
         from .settings import validate_env_file
@@ -767,10 +772,11 @@ def record_transfer(args):
     if args.amount is None:
         raise RiskError("Provide --amount in US dollars")
     if args.mode == "withdraw":
-        reserve = capital.withdraw(journal, now, args.amount)
-        return f"已登记转出 {_usd(args.amount)} 美元；保留现金现在 {_usd(reserve)} 美元。AI 管理的规模不变。"
-    reserve, queued = capital.deposit(journal, now, args.amount, subscribe=not args.reserve_only)
-    text = f"已登记转入 {_usd(args.amount)} 美元；保留现金现在 {_usd(reserve)} 美元。"
+        reserve = capital.withdraw(journal, now, args.amount, operation_id=args.operation_id)
+        return f"已登记转出 {_usd(args.amount)} 美元；该笔登记后保留现金 {_usd(reserve)} 美元。"
+    reserve, queued = capital.deposit(journal, now, args.amount, subscribe=not args.reserve_only,
+                                      operation_id=args.operation_id)
+    text = f"已登记转入 {_usd(args.amount)} 美元；该笔登记后保留现金 {_usd(reserve)} 美元。"
     if queued:
         text += (f"同时登记了申购 {queued['id']}：重新启动后，基金在下一个交易时段按单位净值把这笔钱转入 AI 管理。")
     else:
@@ -792,7 +798,7 @@ def capital_command(args):
         if args.amount is None:
             raise RiskError("Provide --amount in US dollars")
         request = capital.request(journal, now, "subscription" if args.mode == "subscribe" else "redemption",
-                                  args.amount)
+                                  args.amount, operation_id=args.operation_id)
         if request["kind"] == "subscription":
             lines.append(f"申购请求 {request['id']} 已登记：{request['amount']} 美元。基金在下一个交易时段的估值点"
                          "按当时的单位净值确认（不影响正在进行的投资），确认后 Telegram 通知。")
@@ -809,12 +815,24 @@ def capital_command(args):
                  f"{_usd(state['capital_basis']) if state['capital_basis'] else missing} 美元；保留现金 "
                  f"{_usd(state['reserved_cash']) if state['reserved_cash'] else missing} 美元。")
     names = {"subscription": "申购", "redemption": "赎回"}
+    pending_labels = {"liquidating": "处理中：正在筹集现金", "waiting_reserve": "等待保留现金"}
     for row in state["pending"]:
-        lines.append(f"等待中：{names[row['kind']]} {_usd(row['amount'])} 美元（编号 {row['id']}，{row['requested_at']}，"
-                     f"{'处理中：正在筹集现金' if row.get('state') == 'liquidating' else '等待下一个交易时段的估值点'}）")
+        operation = f"{names[row['kind']]} {_usd(row['amount'])} 美元"
+        if "target_capital" in row:
+            estimate = f"预计{operation}" if capital.signed_amount(row) else "预计无需划转"
+            operation = f"目标本金 {_usd(row['target_capital'])} 美元，{estimate}"
+        lines.append(f"等待中：{operation}（编号 {row['id']}，{row['requested_at']}，"
+                     f"{pending_labels.get(row.get('state'), '等待下一个交易时段的估值点')}）")
     for row in state["recent_flows"]:
         lines.append(f"已确认：{row['at']} {names.get(row['kind'], row['kind'])} {_usd(row['amount'])} 美元，"
-                     f"单位净值 {_decimal(row['nav_per_unit'], 4)}，确认后基金 {_usd(row['equity_after'])} 美元")
+                     f"编号 {row['request_id']}，单位净值 {_decimal(row['nav_per_unit'], 4)}，"
+                     f"确认后基金 {_usd(row['equity_after'])} 美元")
+    outcome_labels = {capital.REJECTED: "已拒绝", capital.CANCELLED: "已取消", capital.TARGET_REACHED: "已达到目标本金"}
+    reasons = {"configuration_changed": "目标配置已修改", "operator": "操作员取消"}
+    for row in state["recent_outcomes"]:
+        reason = row.get("reason")
+        detail = f"，{reasons.get(reason, reason)}" if reason else ""
+        lines.append(f"{outcome_labels[row['outcome']]}：{row['at']}，编号 {row['id']}{detail}")
     return "\n".join(lines)
 
 

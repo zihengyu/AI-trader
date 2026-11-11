@@ -702,7 +702,13 @@ def open_journal(root, mode, account, config):
             return False
         modes = [json.loads(row[0]).get("mode") for row in db.execute("SELECT body FROM events WHERE kind='startup'")]
         return bool(modes) and all(value == "local" for value in modes)
-    return Journal(root, account_digest(mode, account), (legacy_account_digest(mode, account, config),), local_book)
+    journal = Journal(root, account_digest(mode, account), (legacy_account_digest(mode, account, config),), local_book)
+    if (mode in {"local", "paper"} and (config.get("mandate") or {}).get("capital_usd") is None
+            and journal.get_meta("mandate_capital_basis") is not None):
+        # Whole-account valuation would silently absorb the sleeve's reserve and
+        # price it against the existing units and risk history.
+        raise RiskError("This journal has a numeric capital mandate. Set a numeric FUND_CAPITAL_USD to keep its sleeve")
+    return journal
 
 
 def assert_paper(broker):
@@ -1608,8 +1614,14 @@ class AutonomousFund(Strategy):
             if readmitted:
                 self.journal.event(start, "shared_symbols_readmitted", {"symbols": readmitted})
         # The account the AI and every risk rule see is the operator's capital sleeve.
+        position_prices = {
+            position.asset.symbol: position.current_price for position in positions
+            if position.asset.symbol in holdings and getattr(position, "current_price", None) is not None}
+        if local_marks is not None:
+            position_prices.update({symbol: local_marks[symbol]["price"] for symbol in holdings if symbol in local_marks})
         account = Account(broker_cash - reserve, broker_equity - external_value - reserve, holdings, start,
-                          open_orders, receivables, position_average_prices=average_prices(positions, holdings))
+                          open_orders, receivables, position_average_prices=average_prices(positions, holdings),
+                          position_prices=position_prices)
         if account.cash < 0:
             raise RiskError("Sleeve cash is negative: reserved cash or margin would be used; review the account")
         if self.mode == "local":
@@ -3241,6 +3253,15 @@ class AutonomousFund(Strategy):
             parking = cash_order and body["side"] == "buy"
             # A sale raising an operator redemption's cash is not part of any AI decision either.
             redemption = self._redemption_order(pending["id"])
+            if redemption or body["side"] == "buy":
+                from .capital import pending as capital_requests
+                waiting = {row["id"] for row in capital_requests(self.journal) if row["kind"] == "redemption"}
+                if redemption and redemption not in waiting:
+                    cancel(pending, order, "redemption_request_closed", {"request_id": redemption})
+                    continue
+                if body["side"] == "buy" and waiting:
+                    cancel(pending, order, "buy_canceled_for_redemption", {})
+                    continue
             if parking and latest and latest["state"] == "active" and not expired:
                 cancel(pending, order, "cash_parking_superseded", {"decision_id": latest["id"]})
                 continue
@@ -4096,24 +4117,24 @@ class AutonomousFund(Strategy):
             if integrity["status"] == "failed":
                 return {"status": "unavailable", "reason": "the ledger audit failed; account marks are not trusted"}
             closing = {}
-            for _, at, _, equity, close, _ in nav_marks(db, until=moment, excluded=set(
+            for sequence, at, _, equity, close, _ in nav_marks(db, until=moment, excluded=set(
                     integrity.get("invalid_account_sequences", []))):
                 when = close or at
                 day = instant(when).astimezone(zone).date()
                 if day < cutoff and equity is not None:
-                    closing[day] = (when, {"equity": equity})  # The session's last mark wins.
+                    closing[day] = (sequence, when, "account", {"equity": equity})
             # Benchmarks are marked about every 30 seconds: only each day's last mark is read.
-            rows = [(at, kind, json.loads(body)) for at, kind, body in db.execute(
-                "SELECT at,kind,body FROM events WHERE sequence IN (SELECT MAX(sequence) FROM events "
+            rows = [(sequence, at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
+                "SELECT sequence,at,kind,body FROM events WHERE sequence IN (SELECT MAX(sequence) FROM events "
                 "WHERE kind='benchmark' AND julianday(at)<=julianday(?) GROUP BY substr(at,1,10)) "
                 "OR (kind IN ('benchmark_action','operator_reserve_adjusted','capital_flow') "
                 "AND julianday(at)<=julianday(?)) "
                 "ORDER BY sequence", (moment.isoformat(), moment.isoformat()))]
             calls, data_charges = cost_ledger(db, moment.isoformat())
-        events = [(when, "account", body) for when, body in closing.values()] + rows
-        pairs, marks = session_pairs(sorted(events, key=lambda row: instant(row[0])), set(closing), zone)
+        events = [(at, kind, body) for _, at, kind, body in sorted([*closing.values(), *rows], key=lambda row: row[0])]
+        pairs, marks = session_pairs(events, set(closing), zone)
         actions = {}
-        for _, kind, body in rows:
+        for _, kind, body in events:
             if kind == "benchmark_action":
                 actions.setdefault(body["symbol"], []).append(body)
         settings = getattr(self, "performance", None) or PerformanceSettings()
@@ -4551,7 +4572,9 @@ class AutonomousFund(Strategy):
     def _redemption_order(self, intent_id):
         with self.journal.connection() as db:
             row = db.execute("SELECT decision_id FROM fund_orders WHERE intent_id=?", (intent_id,)).fetchone()
-        return bool(row) and str(row[0]).startswith("redemption:")
+        if row and str(row[0]).startswith("redemption:"):
+            return str(row[0]).split(":", 1)[1]
+        return None
 
     def _capital_wait(self, now, reason, detail=None):
         """Recorded once per trading day and reason: idle iterations ask every minute.
@@ -4559,13 +4582,18 @@ class AutonomousFund(Strategy):
         A redemption that cannot progress is also told to the operator (once a day and reason): purchases
         wait while it does, so a silent stall would quietly keep the fund from investing.
         """
-        noted = self.__dict__.setdefault("_capital_noted", set())
-        key = (trading_day(now), reason)
+        day = trading_day(now)
+        if getattr(self, "_capital_noted_day", None) != day:
+            self._capital_noted_day, self._capital_noted = day, set()
+        noted = self._capital_noted
+        key = (reason, (detail or {}).get("request_id"))
         if key not in noted:
             noted.add(key)
             self.journal.event(now, "capital_waiting", {"reason": reason, **(detail or {})})
             if reason.startswith("redemption_"):
                 self._notify_fund("redemption_waiting", {"reason": reason, **(detail or {})})
+            elif reason == "subscription_waits_for_reserve":
+                self._notify_fund("subscription_waiting", detail)
 
     def _capital_step(self, account, now):
         """Apply the oldest operator subscription or redemption at this live valuation; True when it acted.
@@ -4585,12 +4613,20 @@ class AutonomousFund(Strategy):
         if not requests or account.open_orders or not self.broker.is_market_open():
             return False
         request = requests[0]
+        try:
+            capital.require_fresh_valuation(account.as_of, self.get_datetime(), self.limits.quote_max_seconds)
+        except capital.ValuationChanged as exc:
+            self._capital_wait(now, "capital_valuation_stale", {"request_id": request["id"], "error": str(exc)})
+            return True
         mandate = getattr(self, "mandate", None)
         if mandate is None or mandate.capital_usd is None:
             return self._capital_rejected(request, now, "the fund has no capital mandate (FUND_CAPITAL_USD=account)")
         equity, cash, amount = number(account.equity), real_cash(account), number(request["amount"])
+        if amount > capital.MAX_AMOUNT:
+            return self._capital_rejected(request, now, "The difference to the target exceeds 10,000,000 USD. "
+                                          "Adjust the sleeve in smaller subscriptions or redemptions")
         if request["kind"] == "subscription":
-            return self._apply_capital_flow(request, now, equity, cash)
+            return self._apply_capital_flow(request, now, account, cash)
         if amount > equity * capital.MAX_REDEMPTION_SHARE:
             return self._capital_rejected(request, now, (
                 f"it exceeds {capital.MAX_REDEMPTION_SHARE:.0%} of the fund's value ({equity.quantize(capital.CENT)} USD); "
@@ -4602,62 +4638,127 @@ class AutonomousFund(Strategy):
             if request is None:
                 return True  # Canceled meanwhile by the operator.
         sale = capital.stock_sale_needed(equity, stocks, amount, request["exposure_start"], self.limits.max_exposure)
-        enough = sale <= capital.EXPOSURE_TOLERANCE * (equity - amount)
-        if not request.get("plan") and cash >= amount and enough:
-            return self._apply_capital_flow(request, now, equity, cash)
+        remaining = equity - amount
+        within_exposure = (stocks <= number(self.limits.max_exposure) * remaining
+                           and sale <= capital.EXPOSURE_TOLERANCE * remaining)
+        try:
+            trims = self._redemption_name_trims(account, stocks, remaining)
+        except RiskError as exc:
+            self._capital_wait(now, "redemption_quote_unavailable", {"request_id": request["id"], "error": str(exc)})
+            return False
+        if cash >= amount and within_exposure and not trims:
+            return self._apply_capital_flow(request, now, account, cash)
+        day = trading_day(account.as_of)
+        if request.get("plan") or request.get("slice_sale"):
+            planned_day = request.get("plan_day") or trading_day(request["started_at"])
+            if planned_day != day:
+                # An overnight split can invalidate a saved share count. The
+                # reconciled opening book already reflects any earlier fills.
+                request = capital.update(self.journal, request["id"], plan={}, slice_sale=None, plan_day=day)
+                if request is None:
+                    return True
+        previous_sale = request.get("slice_sale")
+        if previous_sale:
+            # This snapshot follows order reconciliation. Unfilled shares stay in
+            # the slice after a partial fill, cancel, rejection or restart.
+            symbol = previous_sale["symbol"]
+            held = number(account.positions.get(symbol, 0))
+            sold = max(number(0), number(previous_sale["held_before"]) - held)
+            outstanding = max(0, int(number(previous_sale["quantity"]) - sold))
+            plan = dict(request.get("plan") or {})
+            if outstanding and held >= 1:
+                plan[symbol] = min(outstanding, int(held))
+            request = capital.update(self.journal, request["id"], plan=plan, slice_sale=None)
+            if request is None:
+                return True
         if not request.get("notified"):
-            capital.update(self.journal, request["id"], notified=True)
+            if capital.update(self.journal, request["id"], notified=True) is None:
+                return True
             self._notify_fund("redemption_liquidating", {
                 "request_id": request["id"], "amount": str(amount), "cash": str(cash.quantize(capital.CENT)),
                 "stock_sale": str(sale.quantize(capital.CENT)),
+                "position_trims": trims,
                 "cash_equivalent": str(number(account.cash_equivalent_value).quantize(capital.CENT)),
                 "exposure_start": request["exposure_start"]})
         try:
-            intent, rest = self._next_redemption_sale(request, account, None if enough else sale, amount - cash, now)
+            intent, rest, quote = self._next_redemption_sale(
+                request, account, number(0) if within_exposure else sale, trims, amount - cash, now)
         except RiskError as exc:
             # A missing or stale quote: the redemption continues on a later iteration.
             self._capital_wait(now, "redemption_quote_unavailable", {"request_id": request["id"], "error": str(exc)})
             return False
         if intent is None and rest is None:
-            # Nothing left to sell (e.g. dividends receivable): paid once they arrive as cash.
-            self._capital_wait(now, "redemption_waits_for_cash", {"request_id": request["id"],
-                                                                   "cash": str(cash), "amount": str(amount)})
+            self._capital_wait(now, "redemption_waits_for_cash", {
+                "request_id": request["id"], "cash": str(cash), "amount": str(amount),
+                "receivables": str(account.receivables)})
             return False
-        if intent is not None and not self._redemption_sale(request, intent, now):
-            return False
-        if rest is not None:
-            capital.update(self.journal, request["id"], plan=rest)
+        if intent is not None:
+            return self._redemption_sale(request, intent, rest, account, quote)
+        capital.update(self.journal, request["id"], plan=rest)
         return True
 
-    def _next_redemption_sale(self, request, account, stock_sale, cash_short, now):
-        """(the next sale, the slice plan left after it); (None, plan) when a planned holding is already gone.
+    def _redemption_name_trims(self, account, stocks, remaining):
+        """Whole shares that must be sold to respect the single-security cap after payment."""
+        cap = number(self.limits.max_position) * remaining
+        if stocks <= cap:
+            return {}  # Each long holding is bounded by the whole portfolio's stock value.
+        trims = {}
+        for symbol, held in account.positions.items():
+            quantity = number(held)
+            if quantity <= 0:
+                continue
+            price = self._redemption_mark(account, symbol)
+            excess = quantity * price - cap
+            if excess > 0:
+                trims[symbol] = min(int(quantity), int((excess / price).to_integral_value(rounding="ROUND_CEILING")))
+        return trims
 
-        A slice planned earlier finishes first. Then the stock part (stock_sale, None
-        when within the drift), then the cash part: the cash-equivalent ETF, and a
-        slice of the holdings when there is none.
-        """
+    def _next_redemption_sale(self, request, account, stock_sale, trims, cash_short, now):
+        """Return the next sale, the remaining slice and the sale's executable quote."""
+        sweep = getattr(self, "cash_sweep", None)
+        held = int(number(account.cash_equivalents.get(sweep.symbol, 0))) if sweep is not None else 0
+        if not stock_sale and not trims and cash_short > 0 and held > 0:
+            # Once the exposure checks pass, use the cash sleeve and retire
+            # any remaining risk-reduction slice instead of selling more stock.
+            quote = self._sweep_quote(now)
+            limit = self._redemption_limit(quote)
+            net = limit * (1 - self.limits.fee_buffer)
+            quantity = min(held, int((cash_short / net).to_integral_value(rounding="ROUND_CEILING")))
+            return Intent(sweep.symbol, "sell", quantity, limit), {}, quote
+
         plan = dict(request.get("plan") or {})
-        if not plan and stock_sale is not None:
-            plan = self._redemption_plan(account, stock_sale)
+        if not plan and (stock_sale > 0 or trims):
+            plan = self._redemption_plan(account, stock_sale, trims)
+            if not plan and trims:
+                return None, None, None  # A fractional position needs operator attention.
         if not plan and cash_short > 0:
-            sweep = getattr(self, "cash_sweep", None)
-            held = int(number(account.cash_equivalents.get(sweep.symbol, 0))) if sweep is not None else 0
-            if held > 0:
-                limit = self._redemption_limit(self._sweep_quote(now))
-                need = cash_short * (1 + self.limits.fee_buffer)
-                quantity = min(held, int((need / limit).to_integral_value(rounding="ROUND_CEILING")))
-                return Intent(sweep.symbol, "sell", quantity, limit), None
             plan = self._redemption_plan(account, cash_short)
         if not plan:
-            return None, None
-        symbol = sorted(plan)[0]
-        rest = {s: q for s, q in plan.items() if s != symbol}
-        quantity = min(int(plan[symbol]), int(number(account.positions.get(symbol, 0))))
-        if quantity <= 0:  # Sold meanwhile (an AI sale or a stop): nothing left to take from it.
-            return None, rest
-        return Intent(symbol, "sell", quantity, self._redemption_limit(self._redemption_quote(symbol, now))), rest
+            return None, None, None
+        saleable = {symbol: min(int(quantity), int(number(account.positions.get(symbol, 0))))
+                    for symbol, quantity in plan.items() if number(account.positions.get(symbol, 0)) >= 1}
+        unavailable = []
+        for symbol in sorted(saleable):
+            try:
+                quote = self._redemption_quote(symbol)
+                limit = self._redemption_limit(quote)
+            except RiskError:
+                unavailable.append(symbol)
+                continue
+            quantity = saleable.pop(symbol)
+            return Intent(symbol, "sell", quantity, limit), saleable, quote
+        if unavailable:
+            raise RiskError("No executable bid for planned holdings: " + ", ".join(unavailable))
+        return None, {}, None  # Every planned holding was sold by another path.
 
-    def _redemption_quote(self, symbol, now):
+    def _redemption_mark(self, account, symbol):
+        mark = account.position_prices.get(symbol)
+        price = number(mark) if mark is not None else number(self._redemption_quote(symbol).ask)
+        if price <= 0:
+            raise RiskError(f"No positive valuation for {symbol}")
+        return price
+
+    def _redemption_quote(self, symbol):
         quote = self._price(symbol)
         quote.validate(self.get_datetime(), self.limits, False)
         return quote
@@ -4668,24 +4769,52 @@ class AutonomousFund(Strategy):
             raise RiskError("No usable bid for a redemption sale")
         return limit
 
-    def _redemption_plan(self, account, target):
-        """A pro-rata slice of every AI holding raising `target` after fees, at sellable limit prices."""
+    def _redemption_plan(self, account, target, trims=None):
+        """Size the slice from account marks. Only the submitted leg needs an executable bid."""
         from .capital import slice_plan
-        now = self.get_datetime()
-        prices = {symbol: self._redemption_limit(self._redemption_quote(symbol, now))
-                  for symbol, quantity in account.positions.items() if number(quantity) > 0}
-        return slice_plan(account.positions, prices, number(target) * (1 + self.limits.fee_buffer))
+        required = {symbol: quantity for symbol, quantity in (trims or {}).items() if quantity > 0}
+        if target <= 0:
+            return required
+        proceeds_factor = (1 - self.limits.limit_buffer) * (1 - self.limits.fee_buffer)
+        prices = {symbol: self._redemption_mark(account, symbol) * proceeds_factor
+                  for symbol, quantity in account.positions.items() if number(quantity) >= 1}
+        holdings = {symbol: number(quantity) - required.get(symbol, 0)
+                    for symbol, quantity in account.positions.items()}
+        raised = sum(quantity * prices[symbol] for symbol, quantity in required.items())
+        extra = slice_plan(holdings, prices, number(target) - raised)
+        for symbol, quantity in extra.items():
+            required[symbol] = required.get(symbol, 0) + quantity
+        return required
 
-    def _redemption_sale(self, request, intent, now):
+    def _redemption_sale(self, request, intent, rest, account, quote):
         """One sale on the ordinary submission path (STOP, monitor, market hours, one unresolved intent, daily cap)."""
+        from .capital import ValuationChanged, guard_redemption_sale, require_fresh_valuation
+        now = self.get_datetime()
         with self.journal.connection() as db:
             if self.journal.blocked(db, intent, now, self.limits.daily_orders):
                 self._capital_wait(now, "redemption_sale_budget", {"request_id": request["id"]})
                 return False
-        self._submit(intent, now, f"redemption:{request['id']}", kind="redemption")
+        sale = ({"symbol": intent.symbol, "quantity": intent.quantity,
+                 "held_before": str(account.positions[intent.symbol])}
+                if intent.symbol in account.positions else None)
+
+        def guard(db):
+            checked_at = self.get_datetime()
+            require_fresh_valuation(account.as_of, checked_at, self.limits.quote_max_seconds)
+            try:
+                quote.validate(checked_at, self.limits, False)
+            except RiskError as exc:
+                raise ValuationChanged("The redemption bid expired before reservation") from exc
+            guard_redemption_sale(db, request["id"], rest=rest, sale=sale, day=trading_day(checked_at))
+
+        try:
+            self._submit(intent, now, f"redemption:{request['id']}", kind="redemption",
+                         guard=guard, quote=quote)
+        except ValuationChanged as exc:
+            self._capital_wait(now, "capital_reservation_deferred", {"request_id": request["id"], "error": str(exc)})
         return True
 
-    def _apply_capital_flow(self, request, now, equity, cash):
+    def _apply_capital_flow(self, request, now, account, cash):
         from contextlib import nullcontext
         from . import capital
         # The local broker's poll publishes NAV marks and updates the peak under _poll_lock: holding it, no
@@ -4693,10 +4822,29 @@ class AutonomousFund(Strategy):
         lock = getattr(getattr(self, "broker", None), "_poll_lock", None) if self.mode == "local" else None
         try:
             with lock if lock is not None else nullcontext():
-                flow = capital.apply(self.journal, now, request["id"], equity=equity, cash=cash, mode=self.mode)
+                if self.halt_path.exists() or not self.broker.is_market_open():
+                    return True
+                flow = capital.apply(self.journal, self.get_datetime(), request["id"], equity=account.equity,
+                                     cash=cash, mode=self.mode, observed_at=account.as_of,
+                                     max_age_seconds=self.limits.quote_max_seconds)
+        except capital.ValuationChanged as exc:
+            self._capital_wait(now, "capital_valuation_stale", {"request_id": request["id"], "error": str(exc)})
+            return True
+        except capital.CapitalLedgerError:
+            raise  # Surface the blocked ledger and keep the request for recovery.
+        except capital.InsufficientReserve as exc:
+            if request["source"] != "configuration":
+                return self._capital_rejected(request, now, str(exc))
+            if request["state"] != "waiting_reserve":
+                if capital.update(self.journal, request["id"], state="waiting_reserve") is None:
+                    return True
+            self._capital_wait(now, "subscription_waits_for_reserve", {
+                "request_id": request["id"], "amount": request["amount"], "error": str(exc)})
+            return False
         except RiskError as exc:
             return self._capital_rejected(request, now, str(exc))
-        self._notify_fund("capital_flow", flow)
+        if flow is None:
+            return True  # The earlier requests already reached the configured target.
         # Weights are fractions of equity: the manager re-plans with the new capital.
         self._request_review(now, "capital_flow", {"kind": flow["kind"], "amount": flow["amount"]})
         return True
@@ -4707,8 +4855,6 @@ class AutonomousFund(Strategy):
             capital.reject(self.journal, now, request["id"], reason)
         except RiskError:
             return True  # Canceled meanwhile by the operator: nothing to reject.
-        self._notify_fund("capital_request_rejected", {"request_id": request["id"], "kind": request["kind"],
-                                                       "amount": request["amount"], "reason": reason})
         return True
 
     def _execute(self, intent, now, account=None, prices=None):
@@ -4735,7 +4881,7 @@ class AutonomousFund(Strategy):
                      guard=self.execution.guard(active, intent, now, result["requirement"], self.universe, self.limits))
 
     def _submit(self, intent, now, decision_id, *, requirement=None, guard=None, until=None, kind="allocation",
-                max_submissions=None):
+                max_submissions=None, quote=None):
         """The single durable submission path: reserve, final STOP/monitor checks, send."""
         if getattr(self, "observe_only", False):
             raise RiskError("Observation-only mode cannot submit orders")
@@ -4755,7 +4901,16 @@ class AutonomousFund(Strategy):
             # Do not ask the operator to approve an order a hard rule forbids.
             # The atomic reservation independently rechecks this after approval.
             raise RiskError("Unresolved intent or daily submission limit reached")
-        key = self.journal.reserve(intent, now, self.limits, guard=guard, max_submissions=cap)
+        reservation_guard = guard
+        if intent.side == "buy" and self.mode in {"local", "paper"}:
+            from .capital import guard_purchase
+
+            def reservation_guard(db):
+                guard_purchase(db)
+                if guard is not None:
+                    guard(db)
+
+        key = self.journal.reserve(intent, now, self.limits, guard=reservation_guard, max_submissions=cap)
         params = None
         if self.mode == "local":
             params = {"local_intent": key, **({"decision_expires_at": until} if until else {})}
@@ -4774,11 +4929,11 @@ class AutonomousFund(Strategy):
             # terminalize without guessing the outcome of a network request.
             self.journal.update(key, None, True, self.get_datetime())
             raise
-        try:
-            quote = self._price(intent.symbol, record=False)
-        except Exception as exc:
-            quote = None
-            self._disclose("execution_quote_unavailable", type(exc).__name__)
+        if quote is None:
+            try:
+                quote = self._price(intent.symbol, record=False)
+            except Exception as exc:
+                self._disclose("execution_quote_unavailable", type(exc).__name__)
         self.execution.record_submission(key, decision_id, intent, self.get_datetime(), quote=quote)
         if kind == "protective":
             self.execution.mark_protective(key, now)

@@ -19,6 +19,11 @@ def _rows(db, sql):
 _ZERO, _CENT_MILLIONTH = Decimal(0), Decimal("0.00000001")
 
 
+def _capital_projection(db):
+    meta = dict(db.execute("SELECT key,value FROM meta WHERE key IN ('fund_units','mandate_capital_basis')"))
+    return meta.get("fund_units"), meta.get("mandate_capital_basis")
+
+
 def account_observation(sequence, at, body):
     """Validate one derived NAV snapshot without scanning unrelated history.
 
@@ -110,10 +115,57 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
     # are derived projections, checked by the explicit audit/report path, not
     # dependencies of a new cash/share transaction.
     events = _rows(db, "SELECT sequence,at,kind,body FROM events WHERE kind IN "
-                       "('fill','local_corporate_action','local_ledger_origin','startup','local_cash_flow') "
+                       "('fill','local_corporate_action','local_ledger_origin','startup','local_cash_flow','capital_flow') "
                        "ORDER BY sequence")
     for event in events:
         event["body"] = json.loads(event["body"])
+    from .capital import NAV_PLACES, UNIT_PLACES, signed_amount
+    cash_flows, unit_flows = {}, {}
+    previous_units, previous_basis = None, None
+    for event in events:
+        kind, body, sequence = event["kind"], event["body"], event["sequence"]
+        if kind == "local_cash_flow":
+            request_id = body["request_id"]
+            check(request_id not in cash_flows, "duplicate_local_cash_flow", sequence=sequence)
+            cash_flows[request_id] = (sequence, number(body["amount"]))
+        elif kind == "capital_flow":
+            request_id = body["request_id"]
+            check(request_id not in unit_flows, "duplicate_capital_flow", sequence=sequence)
+            check(body["mode"] == "local" and body["kind"] in {"subscription", "redemption"}
+                  and number(body["amount"]) > 0, "invalid_capital_flow", sequence=sequence)
+            amount = signed_amount(body)
+            unit_flows[request_id] = (sequence, amount)
+            equity, units = number(body["equity_before"]), number(body["units_before"])
+            after = number(body["units_after"])
+            check(equity > 0 and units > 0 and after > 0 and equity + amount > 0,
+                  "invalid_capital_valuation", sequence=sequence)
+            check(equity + amount == number(body["equity_after"]), "capital_equity_mismatch", sequence=sequence)
+            if equity > 0 and units > 0:
+                nav = equity / units
+                check((units + amount / nav).quantize(UNIT_PLACES) == after,
+                      "capital_units_mismatch", sequence=sequence)
+                check(nav.quantize(NAV_PLACES) == number(body["nav_per_unit"]),
+                      "capital_nav_mismatch", sequence=sequence)
+            if previous_units is not None:
+                check(units == previous_units, "capital_units_discontinuity", sequence=sequence)
+            before_basis = units if previous_basis is None else previous_basis
+            after_basis = number(body["capital_basis_after"])
+            check(before_basis + amount == after_basis, "capital_basis_discontinuity", sequence=sequence)
+            previous_units, previous_basis = after, after_basis
+    check(set(cash_flows) == set(unit_flows), "unpaired_capital_flow")
+    for request_id in cash_flows.keys() & unit_flows.keys():
+        cash_sequence, cash_amount = cash_flows[request_id]
+        unit_sequence, unit_amount = unit_flows[request_id]
+        check(cash_sequence < unit_sequence and cash_amount == unit_amount,
+              "capital_cash_mismatch", sequence=unit_sequence)
+    recorded_units, recorded_basis = _capital_projection(db)
+    if previous_units is not None:
+        check(recorded_units is not None and number(json.loads(recorded_units)) == previous_units,
+              "capital_units_projection_mismatch")
+        check(recorded_basis is not None and number(recorded_basis) == previous_basis,
+              "capital_basis_projection_mismatch")
+    else:
+        check(recorded_units is None, "missing_capital_flow_history")
     if include_observations:
         notices, invalid, _ = observation_findings(db)
         warnings.extend(notices)
@@ -244,11 +296,12 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
         # Operator subscriptions (+) and redemptions (-) of the virtual book (capital.py).
         steps += [(event["sequence"], "cash_flow", event["body"]) for event in events if event["kind"] == "local_cash_flow"]
         seen = set()
-        for _, kind, body in sorted(steps, key=lambda step: step[0]):
+        for sequence, kind, body in sorted(steps, key=lambda step: step[0]):
             if kind == "cash_flow":
                 amount = number(body["amount"])
                 check(amount != 0, "invalid_cash_flow")
                 cash += amount
+                check(same(cash, body["cash_after"]), "local_cash_flow_balance_mismatch", sequence=sequence)
                 continue
             symbol = body["symbol"]
             position = positions.setdefault(symbol, {"quantity": number(0), "average": number(0)})
@@ -346,7 +399,7 @@ def stamp(result):
 # from any connection or tool, bumps meta 'ledger_version' through these triggers.
 LEDGER_TABLES = ("local_account", "local_positions", "local_orders", "local_fills", "local_actions", "intents",
                  "fund_orders", "fund_order_quotes")
-LEDGER_EVENT_KINDS = ("fill", "local_corporate_action", "local_ledger_origin", "startup", "local_cash_flow")
+LEDGER_EVENT_KINDS = ("fill", "local_corporate_action", "local_ledger_origin", "startup", "local_cash_flow", "capital_flow")
 _BUMP = "UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='ledger_version';"
 
 
@@ -409,11 +462,13 @@ def ledger_result(db, cache):
     """
     import copy
     version = ledger_version(db)
-    if version is not None and cache.get("version") == version:
+    capital_projection = _capital_projection(db)
+    if (version is not None and cache.get("version") == version
+            and cache.get("capital_projection") == capital_projection):
         return copy.deepcopy(cache["result"])
     result = audit_connection(db, include_observations=False)
     if version is not None and result["status"] != "failed":
-        cache.update(version=version, result=copy.deepcopy(result))
+        cache.update(version=version, capital_projection=capital_projection, result=copy.deepcopy(result))
     else:
         cache.clear()
     return result
