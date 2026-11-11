@@ -131,7 +131,7 @@ def fund_scoreboard_line(fund):
             return "SPY"
         parts = " + ".join(f"{float(w) * 100:.0f}% {s}" for s, w in weights.items())
         return f"{'风险匹配基准' if name == 'risk_matched' else name}（{parts}）"
-    costs = fund["model_costs_usd"] + (fund.get("data_costs_usd") or 0)
+    costs = fund["model_costs_usd"] + fund.get("known_data_costs_usd", fund.get("data_costs_usd") or 0)
     text = (f"扣除全部成本后的基金收益（{fund['since']} 至 {fund['through']}，{fund['sessions']} 个交易日）："
             f"账户收益 {_percent(fund['account_return'])}（已扣交易费用和滑点，含现金利息），"
             f"模型和数据费用 ${costs:.2f}（占起始资金 {_percent(fund.get('costs_share_of_starting_equity'))}），"
@@ -254,10 +254,13 @@ def attribution_lines(result):
     lines.append(f"- 未解释（收盘前估值、分红、公司行为等，不强行配平）：{_percent(result['unexplained'])}")
     costs = result.get("fund_costs")
     if costs and costs.get("share") is not None:
+        from .scoreboard import known_cost_total
         text = (f"- AI 和数据费用（账户本身不付，基金承担）：{_percent(costs['share'])}"
-                f"（${costs['model_usd'] + (costs.get('data_usd') or 0):.2f}）；扣费后当日收益 {_percent(result.get('net_return'))}")
+                f"（${known_cost_total(costs):.2f}）；扣费后当日收益 {_percent(result.get('net_return'))}")
         if costs.get("unpriced_calls"):
             text += f"（另有 {costs['unpriced_calls']} 次调用未定价、未计入，实际更低）"
+        if costs.get("data_usd") is None:
+            text += "（另有未知数据费用未计入，净收益仅为上限）"
         lines.append(text)
     groups = result.get("selection_by_group") or {}
     if groups:

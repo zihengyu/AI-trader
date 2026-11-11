@@ -279,6 +279,17 @@ def benchmark_report(events, pairs, marks, startups):
     monthly = (configured[-1].get("data_costs_usd_per_month") if configured
                else PerformanceSettings().data_costs_usd_per_month)
     per_session = float(monthly) / SESSIONS_PER_MONTH if monthly is not None else None
+    from .risk import instant
+    from .scoreboard import session_data_charges
+    charges = session_data_charges(
+        (instant(at) for at, kind, _ in events if kind == "benchmark"),
+        [(instant(at), index, (body.get("performance") or {}).get(
+            "data_costs_usd_per_month", PerformanceSettings().data_costs_usd_per_month))
+         for index, (at, kind, body) in enumerate(events) if kind == "startup"])
+    data_costs = []
+    for pair in pairs:
+        inside = [cost for at, cost in charges if pair["start"] < at <= pair["end"]]
+        data_costs.append(None if any(cost is None for cost in inside) else sum(inside))
     returns = [p["return"] for p in pairs]
     window = [(p["start_day"], p["end_day"]) for p in pairs]
     current_ids = {d["id"] for d in current}
@@ -292,7 +303,7 @@ def benchmark_report(events, pairs, marks, startups):
         row["dividends"] = ("included" if set(definition["weights"]) <= recorded else
                             "excluded: no dividend records for " + ", ".join(sorted(set(definition["weights"]) - recorded)))
         comparisons.append(row)
-    return ({"returns": net_returns(pairs, interval_model_costs(events, pairs), per_session),
+    return ({"returns": net_returns(pairs, interval_model_costs(events, pairs), per_session, data_costs=data_costs),
              "data_costs_usd_per_month": monthly, "benchmarks": comparisons}, matched_pairs)
 
 

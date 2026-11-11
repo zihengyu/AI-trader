@@ -193,9 +193,11 @@ def test_daily_document_keeps_its_original_capital_after_a_later_change(tmp_path
 
 def test_recent_model_cost_call_count_uses_the_same_window_as_costs():
     def call(at, cost):
+        # This test prices complete usage within a time window. Missing output
+        # usage now stays unknown; an observed zero must be explicit instead.
         return {"at": at.isoformat(), "kind": "agent",
                 "body": {"model": "synthetic/model", "name": "manager",
-                         "usage": {"prompt_tokens": 100}, "cost_usd": cost}}
+                         "usage": {"prompt_tokens": 100, "completion_tokens": 0}, "cost_usd": cost}}
     rows = [call(NOW - timedelta(days=31), 2), call(NOW - timedelta(days=30), 1),
             call(NOW, None), call(NOW + timedelta(seconds=1), 9)]
     summary = cost_summary(rows, equity=10000, now=NOW)

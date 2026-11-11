@@ -317,7 +317,7 @@ def path_statistics(returns):
             "autocorrelation_lag1": autocorrelation(returns, 1)}
 
 
-def net_returns(pairs, model_costs, data_cost_per_session):
+def net_returns(pairs, model_costs, data_cost_per_session, *, data_costs=None):
     """Account and system returns for each session pair.
 
     pairs: [{"return", "equity_start", ...}]; model_costs: per pair, USD or None when a
@@ -326,12 +326,20 @@ def net_returns(pairs, model_costs, data_cost_per_session):
     """
     account = [p["return"] for p in pairs]
     system, unknown = [], 0
-    for pair, cost in zip(pairs, model_costs):
-        if cost is None or data_cost_per_session is None:
+    data_costs = [data_cost_per_session] * len(pairs) if data_costs is None else data_costs
+    growth, accrued = 1.0, 0.0
+    for pair, cost, data in zip(pairs, model_costs, data_costs):
+        previous = growth - accrued
+        # Like the displayed fund value, costs accrue outside the account.
+        # Derive per-period returns from that net value rather than treating
+        # yesterday's fee as a broker withdrawal that no longer earns returns.
+        accrued += growth * ((cost or 0) + (data or 0)) / pair["equity_start"]
+        growth *= 1 + pair["return"]
+        if cost is None or data is None or previous <= 0:
             system.append(None)
             unknown += 1
         else:
-            system.append(pair["return"] - (cost + data_cost_per_session) / pair["equity_start"])
+            system.append((growth - accrued) / previous - 1)
     known = [r for r in system if r is not None]
     return {"account": {**path_statistics(account), "meaning": "after the account's own fees and slippage"},
             "system": ({**path_statistics(known), "meaning": "after fees, slippage, model and data costs"}
@@ -339,7 +347,7 @@ def net_returns(pairs, model_costs, data_cost_per_session):
                                             "meaning": "a model call was unpriced or data costs are unknown; "
                                                        "the system return is not estimated"}),
             "costs_usd": {"model": sum(c for c in model_costs if c is not None),
-                          "data": data_cost_per_session * len(pairs) if data_cost_per_session is not None else None,
+                          "data": sum(data_costs) if all(data is not None for data in data_costs) else None,
                           "complete": not unknown}}
 
 

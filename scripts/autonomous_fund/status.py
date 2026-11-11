@@ -246,15 +246,17 @@ def cost_line(costs):
 def fund_value_line(account, costs):
     """The account equity less the fund's accrued model and data costs (scoreboard.accrued_costs); None without both."""
     from .risk import number
+    from .scoreboard import known_cost_total
     if not costs or not account or account.get("unavailable") or account.get("equity") is None:
         return None
     try:
         equity = float(number(account["equity"]))
     except (TypeError, ValueError):
         return None
-    spent = costs["model_usd"] + (costs.get("data_usd") or 0)
+    spent = known_cost_total(costs)
+    data = costs.get("known_data_usd", costs.get("data_usd"))
     text = (f"扣除 AI 费用后的基金净值 ${equity - spent:,.2f}（成立以来模型费用 ${costs['model_usd']:,.2f}"
-            + (f"、数据费用 ${costs['data_usd']:,.2f}" if costs.get("data_usd") else "") + "）")
+            + (f"、数据费用 ${data:,.2f}" if data else "") + "）")
     if costs.get("unpriced_calls"):
         text += f"，另有 {costs['unpriced_calls']} 次调用未定价、未计入，实际更低"
     if costs.get("data_usd") is None:

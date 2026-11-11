@@ -408,6 +408,8 @@ def review_after_close(strategy):
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}
+    if hasattr(strategy, "_with_fund_cost_context"):
+        context = strategy._with_fund_cost_context(context, strategy.get_datetime())
     if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
         context["ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
@@ -437,6 +439,8 @@ def review_after_close(strategy):
         research_prompt += CASH_MANAGEMENT_GUIDANCE
         research_context = context
         for attempt in range(2):
+            if attempt and hasattr(strategy, "_with_fund_cost_context"):
+                research_context = strategy._with_fund_cost_context(research_context, strategy.get_datetime())
             result = _run_stage(strategy, "researcher", task_prompt=research_prompt,
                                 context=research_context, output_schema=Research)
             try:
@@ -463,7 +467,7 @@ def review_after_close(strategy):
                 break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
-            **session, "completed_at": strategy.get_datetime().isoformat(), "context": context,
+            **session, "completed_at": strategy.get_datetime().isoformat(), "context": research_context,
             "research": research, "model": result.model, "mock": strategy.scripted})
         if hasattr(strategy, "_call_outcome"):
             strategy._call_outcome()  # This researcher call's answer is the review's saved research.
@@ -478,6 +482,11 @@ def review_after_close(strategy):
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
                "research_completed_at": saved["completed_at"], "allowed_evidence_refs": refs,
                "evidence_catalog": catalog}
+    if hasattr(strategy, "_with_fund_cost_context"):
+        # Current costs include the completed researcher call. They are separate
+        # evidence from the saved market/session snapshot, with their own cutoff.
+        context["allowed_evidence_refs"] = [*refs, "context:fund_costs"]
+        allowed_refs.add("context:fund_costs")
     if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
         context["current_ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
@@ -516,6 +525,12 @@ def review_after_close(strategy):
     for attempt in range(2):
         now = instant(strategy.get_datetime())
         context = {**context, "as_of": now.isoformat()}
+        if hasattr(strategy, "_with_fund_cost_context"):
+            context = strategy._with_fund_cost_context(context, now)
+            catalog = [row for row in catalog if row["ref"] != "context:fund_costs"] + [{
+                "ref": "context:fund_costs", "context_path": "fund_costs",
+                "input_as_of": context["fund_costs"]["as_of"]}]
+            context["evidence_catalog"] = catalog
         result = _run_stage(strategy, "manager", task_prompt=manager_prompt, context=context,
                             output_schema=PostmarketReview)
         review = PostmarketReview.model_validate(
@@ -545,6 +560,7 @@ def review_after_close(strategy):
               "input_as_of": saved["context"]["as_of"], "completed_at": strategy.get_datetime().isoformat(),
               "models": {"researcher": saved["model"], "manager": result.model},
               "attribution": saved["context"].get("attribution"),
+              "fund_costs": context.get("fund_costs"),
               "evidence_catalog": catalog, "reference_correction_attempts": attempt,
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}

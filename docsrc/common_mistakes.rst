@@ -1368,3 +1368,37 @@ window and provider error details. An incomplete diagnostic is not an automatic
 backtest failure; a legitimate strategy can also produce no trades. Short daily
 requests include the full required history and calendar padding. Longer
 stock/index windows retain the five-year page cap and backward pagination.
+
+Fresh Fund Costs Versus Completed-Session Performance
+--------------------------------------------------------------------------------
+
+The optional autonomous fund provides ``fund_costs`` before research, critique,
+manager decisions and correction calls, including on the first day. A manager
+sees the costs of research and critique already completed in the current cycle.
+Post-market reviews receive refreshed cost evidence separately from their saved
+market inputs. Stability repetitions retain the accepted request's original
+context. The current call's final cost is not yet known when it starts.
+
+These are estimates at the operator's configured token rates, not provider
+bills. Missing or invalid input/output usage remains unpriced; explicit zero
+usage can be priced at zero. Unknown calls or data rates make net figures upper
+bounds. Trading fees and slippage already affect account equity and must not be
+deducted a second time. The cost cutoff and the account observation time remain
+separate; an absent account observation never becomes an invented net value.
+
+Data subscriptions accrue once per New York date with a benchmark observation,
+at the rate effective when that date's first observation was recorded (monthly
+rate divided by 21). A later restart or configuration change does not reprice
+past sessions. Known data charges are still deducted beside unknown ones.
+This allocation is not a reconstruction of the provider's billing calendar.
+
+``fund_scoreboard`` covers only its named, completed closing intervals; current
+``fund_costs`` covers all calls recorded through the request. Since model and
+data costs accrue outside the brokerage account, the scoreboard and acceptance
+statistics subtract accrued expenses from observed wealth, without assuming
+those dollars have already stopped earning account returns. With flat $10,000
+equity and two $100 expense intervals, the net return is -2%, not -1.99%.
+Cost feedback never reduces research or analysis, changes review frequency,
+or obliges the manager to trade to recover sunk costs. Operator budgets still
+apply. Cash loses money after costs only when its income is insufficient;
+benchmark-relative results must be observed, not assumed.

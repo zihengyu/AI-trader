@@ -28,14 +28,28 @@ CACHED_KEYS = ("cached_content_token_count", "cached_input_tokens", "cache_read_
 MISS_KEYS = ("prompt_cache_miss_tokens", "prompt_tokens_details.uncached_tokens")
 
 
-def _value(raw, keys):
+def _usage_value(raw, keys):
     for key in keys:
         node = raw
         for part in key.split("."):
             node = node.get(part) if isinstance(node, dict) else None
-        if isinstance(node, (int, float)) and not isinstance(node, bool) and node > 0:
+        if (isinstance(node, (int, float)) and not isinstance(node, bool)
+                and math.isfinite(node) and node >= 0 and node == int(node)):
             return int(node)
-    return 0
+    return None
+
+
+def _value(raw, keys):
+    return _usage_value(raw, keys) or 0
+
+
+def usage_known(raw):
+    """Both token sides must be observed; absent usage is different from an explicit zero."""
+    entered = _usage_value(raw, INPUT_KEYS)
+    if entered is None:
+        cached, missed = _usage_value(raw, CACHED_KEYS), _usage_value(raw, MISS_KEYS)
+        entered = cached + missed if cached is not None and missed is not None else None
+    return entered is not None and _usage_value(raw, OUTPUT_KEYS) is not None
 
 
 def token_counts(raw):
@@ -96,7 +110,7 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
         for key in tokens:
             tokens[key] += int(counts.get(key) or 0)
         cost = body.get("cost_usd")
-        if cost is None and body.get("usage"):
+        if cost is None and usage_known(body.get("usage")):
             cost = call_cost(counts, rate_for(prices, body.get("model"), len(models)))
         if cost is None:
             unpriced += 1

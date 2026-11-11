@@ -156,8 +156,11 @@ MANAGER_PROMPT = (
     "Your objective is long-term risk-adjusted return net of every cost, above the predefined benchmarks in "
     "fund_scoreboard.benchmarks. You have no fixed signal or obligation to trade, but no choice is free: the fund "
     "pays model and data costs whatever you decide, and cash earns only the bill rate, which those costs can "
-    "exceed (fund_scoreboard.cost_pace and fund_scoreboard.cash). An all-cash portfolio therefore loses money net "
-    "of costs and, in expectation, falls behind benchmarks that hold equities: holding cash instead of "
+    "exceed (fund_scoreboard.cost_pace and fund_scoreboard.cash). An all-cash portfolio loses money net "
+    "of costs when costs exceed its income; compare actual results with the benchmarks without assuming "
+    "equities must outperform. fund_costs shows accrued estimates through this request, even before completed "
+    "sessions exist; unpriced calls/data remain unknown. Trading fees and slippage are already in account equity. "
+    "Holding cash instead of "
     "benchmark-like market exposure is an active bet against the market, to be justified with evidence like any "
     "purchase. Never take risk merely to win back costs already paid; turnover costs count too. "
     "Costs are reported so you judge results net of them, not to make you economize: never cut research, tool use "
@@ -1342,6 +1345,7 @@ class AutonomousFund(Strategy):
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
+            context = self._with_fund_cost_context(context, self.get_datetime())
             self.log_message("Researching before the regular market opens; order submission is disabled.")
             result = self._agent_call("researcher",
                 task_prompt="Prepare or update market research for the next regular session. Review news, filings, "
@@ -1761,11 +1765,18 @@ class AutonomousFund(Strategy):
         return ObservedPrice(number(self.get_last_price(asset)), now).validate(now, self.limits)
 
     def _record_agent(self, name, result, phase=None):
-        from .costs import call_cost, rate_for, token_counts
+        from .costs import call_cost, rate_for, token_counts, usage_known
         now = self.get_datetime()
         tokens = token_counts(result.usage) if result.usage else None
+        usage, usage_diagnostic = result.usage, None
+        try:
+            encode(usage)
+        except (TypeError, ValueError):
+            # Malformed provider metadata must not lose a paid-call record or
+            # a valid decision. Token evidence and unknown pricing stay explicit.
+            usage, usage_diagnostic = None, "Provider usage could not be serialized as finite JSON"
         cost = None
-        if tokens is not None and not self.scripted and not result.cache_hit:
+        if tokens is not None and usage_known(result.usage) and not self.scripted and not result.cache_hit:
             # Priced once, here, so status, reports and the daily document need no price table.
             models = set((getattr(self, "agent_models", None) or {}).values()) or {result.model}
             if getattr(self, "triage_model", None):
@@ -1791,7 +1802,8 @@ class AutonomousFund(Strategy):
         self.journal.event(now, "agent", {
             **({"call_id": call["call_id"], "purpose": call["purpose"]} if call.get("role") == name else {}),
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
-            "usage": result.usage, "summary": result.summary, "parse_error": result.parse_error,
+            "usage": usage, "summary": result.summary, "parse_error": result.parse_error,
+            **({"usage_diagnostic": usage_diagnostic} if usage_diagnostic else {}),
             "mock": self.scripted, "phase": phase, "tokens": tokens,
             "cost_usd": round(cost, 6) if cost is not None else None,
             **({"served_models": served} if served else {}),
@@ -2122,6 +2134,7 @@ class AutonomousFund(Strategy):
                                     "max_quiet_minutes": budget.max_quiet_minutes}}
         if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
             context["ledger_audit"] = self.broker.ledger_audit()
+        context = self._with_fund_cost_context(context, self.get_datetime())
         champion = self._champion()
         failure_role = "manager" if live else "researcher"
         try:
@@ -2343,6 +2356,7 @@ class AutonomousFund(Strategy):
         still propagate. Both answers and rejected clock evidence are retained.
         """
         from .diagnostics import structured_answer_diagnostic
+        context = self._with_fund_cost_context(context, self.get_datetime())
         result = self._agent_call("manager", task_prompt=DECISION_TASK, context=context)
         correction_kind = "format"
         try:
@@ -2391,6 +2405,7 @@ class AutonomousFund(Strategy):
             raise failure
         now = self.get_datetime()
         corrected["as_of"] = now.isoformat()
+        corrected = self._with_fund_cost_context(corrected, now)
         self.journal.event(now, "decision_time_retry" if correction_kind == "timing" else "decision_format_retry",
                            {"diagnostic" if correction_kind == "timing" else "answer_diagnostic": diagnostic})
         retry = self._agent_call("manager", purpose="decision_correction", task_prompt=task,
@@ -2610,7 +2625,8 @@ class AutonomousFund(Strategy):
         try:
             critique = self._record_agent("critic", self._agent_call("critic",
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
-                context={**context, "research": research}), phase="critique")
+                context=self._with_fund_cost_context({**context, "research": research}, self.get_datetime())),
+                phase="critique")
             self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
             self._call_outcome()
             return critique
@@ -3079,15 +3095,21 @@ class AutonomousFund(Strategy):
 
         Kept beside the components: they explain the account's own return, and these costs are not part of it.
         """
-        from .scoreboard import accrued_costs
+        from .scoreboard import cost_ledger
         with self.journal.connection() as db:
-            before, after = accrued_costs(db, instant(start_at).isoformat()), accrued_costs(db, instant(end_at).isoformat())
-        model = after["model_usd"] - before["model_usd"]
-        data = (after["data_usd"] - before["data_usd"]) if after["data_usd"] is not None and before["data_usd"] is not None else None
+            calls, charges = cost_ledger(db, instant(end_at).isoformat())
+        start = instant(start_at)
+        model_costs = [cost for at, cost in calls if at > start]
+        data_costs = [cost for at, cost in charges if at > start]
+        model = sum(cost for cost in model_costs if cost is not None)
+        data = sum(cost for cost in data_costs if cost is not None)
+        unknown_data = sum(cost is None for cost in data_costs)
         equity = result["start_equity"]
-        result["fund_costs"] = {"model_usd": round(model, 4), "data_usd": round(data, 4) if data is not None else None,
-                                "unpriced_calls": after["unpriced_calls"] - before["unpriced_calls"],
-                                "share": -(model + (data or 0)) / equity if equity else None}
+        result["fund_costs"] = {"model_usd": round(model, 4), "data_usd": round(data, 4) if not unknown_data else None,
+                                "known_data_usd": round(data, 4), "unpriced_data_sessions": unknown_data,
+                                "unpriced_calls": sum(cost is None for cost in model_costs),
+                                "share": -(model + data) / equity if equity else None}
+        result["net_is_upper_bound"] = bool(unknown_data or result["fund_costs"]["unpriced_calls"])
         result["net_return"] = (result["observed_return"] + result["fund_costs"]["share"]
                                 if result["fund_costs"]["share"] is not None else None)
 
@@ -3985,6 +4007,40 @@ class AutonomousFund(Strategy):
         except Exception:
             return None
 
+    def _with_fund_cost_context(self, context, now):
+        """Fresh paid-call feedback; never mutate saved inputs or revalue the trading account.
+
+        Called before research, critique, decisions and corrections. Stability
+        repetitions retain their original exact input, including original costs.
+        """
+        from .scoreboard import known_cost_total
+        costs = self._accrued_costs(now)
+        context = dict(context)
+        if costs is None:
+            context["fund_costs"] = {"status": "unavailable", "as_of": instant(now).isoformat()}
+            return context
+        account = context.get("account") or {}
+        equity = account.get("equity")
+        try:
+            equity = float(number(equity)) if equity is not None and not account.get("unavailable") else None
+        except (TypeError, ValueError):
+            equity = None
+        context["fund_costs"] = {**costs, "status": "estimated", "account_equity_usd": equity,
+            "account_as_of": account.get("as_of"),
+            "net_fund_value_usd": equity - known_cost_total(costs) if equity is not None else None,
+            "net_is_upper_bound": bool(costs["unpriced_calls"]) or costs["data_usd"] is None,
+            "meaning": "USD estimates from recorded calls and historical data rates, not a provider bill; "
+                       "costs are accrued outside the broker, not debited from buying power; trading fees and "
+                       "slippage are already in account equity and must not be subtracted twice. "
+                       "Account time is retained separately from the cost cutoff; this request's own final cost "
+                       "is not yet known. Unknown costs are not free. Never take risk to recover costs already "
+                       "paid, or reduce research, tools, analysis depth or review frequency to save model costs."}
+        if isinstance(context.get("model_budget"), dict):
+            context["model_budget"] = {**context["model_budget"],
+                "runs_today": self.journal.counter("agent_runs", now),
+                "cost_today_usd": round(self.journal.counter("model_cost_microusd", now) / 1e6, 4)}
+        return context
+
     def _fund_scoreboard(self, now):
         """Since inception, net of every cost, against the benchmarks (scoreboard.py); once per completed session.
 
@@ -4004,11 +4060,10 @@ class AutonomousFund(Strategy):
         return result
 
     def _compute_fund_scoreboard(self, now, cutoff):
-        from .costs import scripted
         from .evaluation import nav_marks
         from .ledger_audit import audit_connection
-        from .performance import SESSIONS_PER_MONTH, PerformanceSettings
-        from .scoreboard import compute
+        from .performance import PerformanceSettings
+        from .scoreboard import compute, cost_ledger
         from .validation import session_pairs
         zone, moment = ZoneInfo("America/New_York"), instant(now)
         with self.journal.connection() as db:
@@ -4029,13 +4084,7 @@ class AutonomousFund(Strategy):
                 "WHERE kind='benchmark' AND julianday(at)<=julianday(?) GROUP BY substr(at,1,10)) "
                 "OR (kind IN ('benchmark_action','operator_reserve_adjusted') AND julianday(at)<=julianday(?)) "
                 "ORDER BY sequence", (moment.isoformat(), moment.isoformat()))]
-            calls = []
-            for at, cost, mock, model, cache_hit in db.execute(
-                    "SELECT at,json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
-                    "json_extract(body,'$.cache_hit') FROM events WHERE kind='agent' AND json_valid(body) "
-                    "AND julianday(at)<=julianday(?)", (moment.isoformat(),)):
-                if not cache_hit and not scripted({"mock": mock, "model": model}):
-                    calls.append((instant(at), float(cost) if cost is not None else None))
+            calls, data_charges = cost_ledger(db, moment.isoformat())
         events = [(when, "account", body) for when, body in closing.values()] + rows
         pairs, marks = session_pairs(sorted(events, key=lambda row: instant(row[0])), set(closing), zone)
         actions = {}
@@ -4043,10 +4092,9 @@ class AutonomousFund(Strategy):
             if kind == "benchmark_action":
                 actions.setdefault(body["symbol"], []).append(body)
         settings = getattr(self, "performance", None) or PerformanceSettings()
-        monthly = settings.data_costs_usd_per_month
         sweep = getattr(getattr(self, "cash_sweep", None), "symbol", None)
-        return compute(pairs, calls, float(monthly) / SESSIONS_PER_MONTH if monthly is not None else None,
-                       settings.definitions(), marks, actions, sweep=sweep)
+        return compute(pairs, calls, None, settings.definitions(), marks, actions, sweep=sweep,
+                       data_charges=data_charges)
 
     def _market_history(self, now):
         """Whether the latest completed session is outside the fund's history (history_bounds.py), once per cutoff.

@@ -3,8 +3,8 @@
 A professional manager is judged on the return left after every cost, against a
 benchmark, and the fund pays its model calls and data whatever the manager decides.
 Cash is therefore not neutral: it earns only the bill rate, which those costs can
-exceed, so an all-cash portfolio loses money net of costs and, in expectation, falls
-behind benchmarks that hold equities. From completed sessions only:
+exceed; cash loses money net of costs only when its income is insufficient.
+Benchmark-relative results must be measured, not assumed. From completed sessions only:
 
 - account_return: the account's own return (after trading fees and slippage,
   including the cash-equivalent's interest);
@@ -23,6 +23,9 @@ Evidence for the manager and the reports; never a trading rule.
 from __future__ import annotations
 
 import json
+import math
+from bisect import bisect_right
+from zoneinfo import ZoneInfo
 
 from .performance import benchmark_series
 
@@ -40,7 +43,8 @@ def _chained(definition, window, marks, actions):
     return growth - 1
 
 
-def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *, sweep=None, equity=None):
+def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *, sweep=None, equity=None,
+            data_charges=None):
     """pairs: validation.session_pairs output; calls: [(instant, cost_usd or None)] of paid model calls.
 
     data_cost_per_session: USD per session, or None when the operator's data costs are unknown.
@@ -48,17 +52,26 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
     if not pairs:
         return {"status": "insufficient_sample", "sessions": 0,
                 "meaning": "no two completed sessions with account marks yet"}
-    account = net = 1.0
-    model_total, unpriced, session_costs = 0.0, 0, []
-    data = data_cost_per_session or 0.0
+    account, normalized_costs = 1.0, 0.0
+    model_total, data_total, unpriced, session_costs = 0.0, 0.0, 0, []
+    unknown_data = False
     for pair in pairs:
         inside = [cost for moment, cost in calls if pair["start"] < moment <= pair["end"]]
         known = sum(cost for cost in inside if cost is not None)
         unpriced += sum(cost is None for cost in inside)
+        charges = ([cost for moment, cost in data_charges if pair["start"] < moment <= pair["end"]]
+                   if data_charges is not None else [data_cost_per_session])
+        data = sum(cost for cost in charges if cost is not None)
+        unknown_data |= any(cost is None for cost in charges)
+        # These expenses accrue outside the broker: money already spent still
+        # earns the account's observed return. Do not compound a fictitious debit.
+        # Rebase each matched interval to preserve flow-adjusted comparisons.
+        normalized_costs += account * (known + data) / pair["equity_start"]
         account *= 1 + pair["return"]
-        net *= 1 + pair["return"] - (known + data) / pair["equity_start"]
         model_total += known
+        data_total += data
         session_costs.append(known + data)
+    net = account - normalized_costs
     window = [(p["start_day"], p["end_day"]) for p in pairs]
     capital = pairs[0]["equity_start"]
     current = float(equity) if equity else pairs[-1]["equity_start"] * (1 + pairs[-1]["return"])
@@ -80,10 +93,11 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
     return {"status": "computed", "since": pairs[0]["start_day"], "through": pairs[-1]["end_day"],
             "sessions": len(pairs), "starting_equity": capital,
             "account_return": account - 1, "model_costs_usd": round(model_total, 4),
-            "data_costs_usd": round(data * len(pairs), 4) if data_cost_per_session is not None else None,
-            "costs_share_of_starting_equity": (model_total + data * len(pairs)) / capital if capital else None,
+            "data_costs_usd": round(data_total, 4) if not unknown_data else None,
+            "known_data_costs_usd": round(data_total, 4),
+            "costs_share_of_starting_equity": (model_total + data_total) / capital if capital else None,
             "net_return": net - 1, "unpriced_calls": unpriced,
-            "net_is_upper_bound": bool(unpriced) or data_cost_per_session is None,
+            "net_is_upper_bound": bool(unpriced) or unknown_data,
             "benchmarks": benchmarks,
             "cost_pace": {"sessions": len(recent), "usd_per_session": sum(recent) / len(recent),
                           "share_of_equity_per_year": pace},
@@ -97,32 +111,81 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
                        "a reason to research or think less: spending limits are the operator's"}
 
 
-def accrued_costs(db, until):
-    """Model and data costs the fund has accrued through `until` (an ISO instant), read from the journal.
+def cost_ledger(db, until):
+    """Paid calls and one data accrual per New York session, strictly visible at `until`.
 
-    Paid model calls only (scripted test answers and LumiBot cache hits cost nothing); a call
-    without a price is counted, never taken as free. Data costs are the latest startup's monthly
-    subscription per recorded session (sessions with a benchmark mark), None when unknown.
+    A session locks its rate at its first recorded benchmark. Later startups do
+    not reprice earlier sessions, including sessions whose rate was unknown.
+    Read lightweight fields; do not load model transcripts or benchmark bodies.
     """
     from .costs import scripted
-    from .performance import SESSIONS_PER_MONTH, PerformanceSettings
-    model, unpriced = 0.0, 0
-    for cost, mock, name, cache_hit in db.execute(
-            "SELECT json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
+    from .performance import PerformanceSettings
+    from .risk import instant
+    if not db.in_transaction:
+        db.execute("BEGIN")  # All projections share one SQLite read snapshot.
+    cutoff, calls = instant(until), []
+    for at, cost, mock, name, cache_hit in db.execute(
+            "SELECT at,json_extract(body,'$.cost_usd'),json_extract(body,'$.mock'),json_extract(body,'$.model'),"
             "json_extract(body,'$.cache_hit') FROM events WHERE kind='agent' AND json_valid(body) "
             "AND julianday(at)<=julianday(?)", (until,)):
-        if cache_hit or scripted({"mock": mock, "model": name}):
+        moment = instant(at)
+        if moment > cutoff or cache_hit or scripted({"mock": mock, "model": name}):
             continue
-        if cost is None:
-            unpriced += 1
-        else:
-            model += float(cost)
-    row = db.execute("SELECT body FROM events WHERE kind='startup' AND json_valid(body) "
-                     "AND julianday(at)<=julianday(?) ORDER BY sequence DESC LIMIT 1", (until,)).fetchone()
-    settings = (json.loads(row[0]).get("performance") or {}) if row else {}
-    monthly = settings.get("data_costs_usd_per_month", PerformanceSettings().data_costs_usd_per_month)
-    sessions = db.execute("SELECT count(DISTINCT substr(at,1,10)) FROM events WHERE kind='benchmark' "
-                          "AND julianday(at)<=julianday(?)", (until,)).fetchone()[0]
-    data = float(monthly) / SESSIONS_PER_MONTH * sessions if monthly is not None else None
-    return {"model_usd": round(model, 4), "unpriced_calls": unpriced,
-            "data_usd": round(data, 4) if data is not None else None, "as_of": until}
+        calls.append((moment, _cost(cost)))
+    default = PerformanceSettings().data_costs_usd_per_month
+    rates = []
+    for sequence, at, body in db.execute(
+            "SELECT sequence,at,body FROM events WHERE kind='startup' AND json_valid(body) "
+            "AND julianday(at)<=julianday(?)", (until,)):
+        moment = instant(at)
+        if moment <= cutoff:
+            monthly = (json.loads(body).get("performance") or {}).get("data_costs_usd_per_month", default)
+            rates.append((moment, sequence, _cost(monthly)))
+    observations = (moment for at, in db.execute(
+        "SELECT at FROM events WHERE kind='benchmark' AND julianday(at)<=julianday(?)", (until,))
+        for moment in (instant(at),) if moment <= cutoff)
+    return calls, session_data_charges(observations, rates)
+
+
+def session_data_charges(observations, rates):
+    """Shared journal/report accrual rule; rates are (instant, sequence, monthly USD)."""
+    from .performance import SESSIONS_PER_MONTH, PerformanceSettings
+    rates = sorted(rates, key=lambda row: (row[0], row[1]))
+    times = [row[0] for row in rates]
+    zone, first = ZoneInfo("America/New_York"), {}
+    for moment in observations:
+        day = moment.astimezone(zone).date()
+        first[day] = min(first.get(day, moment), moment)
+    charges = []
+    for moment in sorted(first.values()):
+        index = bisect_right(times, moment) - 1
+        rate = _cost(rates[index][2]) if index >= 0 else _cost(PerformanceSettings().data_costs_usd_per_month)
+        charges.append((moment, rate / SESSIONS_PER_MONTH if rate is not None else None))
+    return charges
+
+
+def _cost(value):
+    """Invalid historical prices remain unknown instead of corrupting a net value."""
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+        return value if math.isfinite(value) and value >= 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def known_cost_total(costs):
+    """Known accrued USD, including priced data sessions beside unknown ones."""
+    return costs["model_usd"] + costs.get("known_data_usd", costs.get("data_usd") or 0)
+
+
+def accrued_costs(db, until):
+    """Estimated accrued costs; unknown prices remain explicit, never a free call/session."""
+    calls, charges = cost_ledger(db, until)
+    model = sum(cost for _, cost in calls if cost is not None)
+    data = sum(cost for _, cost in charges if cost is not None)
+    unknown_data = sum(cost is None for _, cost in charges)
+    return {"model_usd": round(model, 6), "unpriced_calls": sum(cost is None for _, cost in calls),
+            "data_usd": round(data, 6) if not unknown_data else None, "known_data_usd": round(data, 6),
+            "unpriced_data_sessions": unknown_data, "as_of": until}
