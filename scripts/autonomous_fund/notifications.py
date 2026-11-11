@@ -121,10 +121,47 @@ def _regime_note(group):
             f"95% 区间 {_percent(interval[0])} 至 {_percent(interval[1])}）")
 
 
+def fund_scoreboard_line(fund):
+    """One line: since inception, net of every cost, against each benchmark (scoreboard.py); None when not computed."""
+    if not fund or fund.get("status") != "computed":
+        return None
+
+    def label(name, weights):
+        if name == "spy":
+            return "SPY"
+        parts = " + ".join(f"{float(w) * 100:.0f}% {s}" for s, w in weights.items())
+        return f"{'风险匹配基准' if name == 'risk_matched' else name}（{parts}）"
+    costs = fund["model_costs_usd"] + (fund.get("data_costs_usd") or 0)
+    text = (f"扣除全部成本后的基金收益（{fund['since']} 至 {fund['through']}，{fund['sessions']} 个交易日）："
+            f"账户收益 {_percent(fund['account_return'])}（已扣交易费用和滑点，含现金利息），"
+            f"模型和数据费用 ${costs:.2f}（占起始资金 {_percent(fund.get('costs_share_of_starting_equity'))}），"
+            f"净收益 {_percent(fund['net_return'])}")
+    if fund.get("unpriced_calls"):
+        text += f"（另有 {fund['unpriced_calls']} 次调用未定价、未计入，实际更低）"
+    if fund.get("data_costs_usd") is None:
+        text += "（数据费用未知、未计入）"
+    marks = [f"{label(name, row['weights'])} {_percent(row['return'])}（净超额 {_percent(row['net_excess'])}）"
+             for name, row in (fund.get("benchmarks") or {}).items()]
+    if marks:
+        text += "；同期 " + "、".join(marks)
+    pace = (fund.get("cost_pace") or {}).get("share_of_equity_per_year")
+    if pace is not None:
+        text += (f"。按最近 {fund['cost_pace']['sessions']} 个交易日的花费，系统一年的费用约占资金 {_percent(pace)}，"
+                 "要跑赢基准至少得多赚这么多")
+    cash = fund.get("cash") or {}
+    if cash.get("annual_net_of_cost_pace") is not None:
+        text += (f"；全拿现金（{cash['symbol']} 年化约 {_percent(cash['annual_yield'])}）扣费后年化约 "
+                 f"{_percent(cash['annual_net_of_cost_pace'])}")
+    return text + "。"
+
+
 def evidence_lines(card):
     from .stability import INPUT_SCOPE
 
     lines = []
+    fund = fund_scoreboard_line((card or {}).get("fund"))
+    if fund:
+        lines.append(fund)
     stability = (card or {}).get("stability")
     if stability and stability.get("input_scope") == INPUT_SCOPE and stability.get("checks"):
         lines.append(f"决策稳定性（复用任务和策略上下文，运行状态实时更新）：{stability['checks']} 次，两次目标组合平均有 "
