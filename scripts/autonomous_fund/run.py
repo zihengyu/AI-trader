@@ -300,7 +300,8 @@ def run_local(args, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
-                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position"])
+                        choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position",
+                                 "subscribe", "redeem", "capital", "deposit", "withdraw"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -329,7 +330,10 @@ def main(argv=None):
     parser.add_argument("--heartbeat-seconds", type=int, default=180)
     parser.add_argument("--agent-seconds", type=int, default=900)
     parser.add_argument("--memory-file", type=Path, help="Frozen postmarket_review.json, available before a qualification window")
-    parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash")
+    parser.add_argument("--amount", help="adjust-reserve: USD deposited (+) to or withdrawn (-) from reserved cash; "
+                                         "subscribe/redeem: USD added to or taken from the fund; "
+                                         "deposit/withdraw: USD moved into or out of the broker account")
+    parser.add_argument("--cancel", metavar="REQUEST_ID", help="capital: cancel a waiting subscription or redemption")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
     parser.add_argument("--symbol", help="settle-position: the local holding that was acquired or delisted")
@@ -453,6 +457,10 @@ def main(argv=None):
             raise SystemExit(2)
         if result["status"] != "verified":
             raise SystemExit(3)
+        return
+    if args.mode in {"subscribe", "redeem", "capital"}:
+        # Only queues or cancels a request while the fund keeps running; the fund applies it (capital.py).
+        print(capital_command(args))
         return
     if args.mode == "status":
         # Read-only: never creates an account directory or journal.
@@ -620,6 +628,13 @@ def main(argv=None):
         if args.mode == "adjust-reserve":
             adjust_reserve(args)
             return
+        if args.mode in {"deposit", "withdraw"}:
+            # A broker transfer, recorded with the runner stopped (it holds runner.lock).
+            from .capital import parse_amount
+            amount = parse_amount(args.amount)
+            args.amount, args.rebaseline_external = str(amount if args.mode == "deposit" else -amount), False
+            adjust_reserve(args)
+            return
         if args.mode == "settle-position":
             settle_position(args)
             return
@@ -730,6 +745,54 @@ def adjust_reserve(args):
         external = {k: number(v) for k, v in latest[-1]["external_holdings"].items()}
     reserve = journal.adjust_reserve(datetime.now(timezone.utc), number(args.amount or 0), external)
     print(f"Reserved cash is now {reserve}; the AI capital sleeve is unchanged.")
+
+
+def _existing_journal(run_dir):
+    from .journal import Journal
+    path = Path(run_dir) / "state.sqlite3"
+    if not path.is_file():
+        raise RiskError("No existing account journal at the selected run directory: start the fund first")
+    with sqlite3.connect(path) as db:
+        binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+    if not binding:
+        raise RiskError("No existing account journal at the selected run directory")
+    return Journal(run_dir, binding[0])
+
+
+def capital_command(args):
+    """Operator: queue a subscription or redemption, cancel one, or show units and NAV (fund may be running)."""
+    from . import capital
+    journal = _existing_journal(args.run_dir)
+    now = datetime.now(timezone.utc)
+    lines = []
+    if args.mode == "capital" and args.cancel:
+        request = capital.cancel(journal, now, args.cancel)
+        lines.append(f"已取消{'申购' if request['kind'] == 'subscription' else '赎回'}请求 {request['id']}"
+                     f"（{request['amount']} 美元）。赎回已经卖出的部分留在基金里作为现金。")
+    elif args.mode in {"subscribe", "redeem"}:
+        if args.amount is None:
+            raise RiskError("Provide --amount in US dollars")
+        request = capital.request(journal, now, "subscription" if args.mode == "subscribe" else "redemption",
+                                  args.amount)
+        if request["kind"] == "subscription":
+            lines.append(f"申购请求 {request['id']} 已登记：{request['amount']} 美元。基金在下一个交易时段的估值点"
+                         "按当时的单位净值确认（不影响正在进行的投资），确认后 Telegram 通知。")
+        else:
+            lines.append(f"赎回请求 {request['id']} 已登记：{request['amount']} 美元。基金在下一个交易时段处理："
+                         "现金够就直接支付；不够时先按比例卖出每个持仓的一小部分（保持组合权重），再卖现金替代 ETF。"
+                         "处理期间暂停买入，卖出和止损照常。完成后 Telegram 通知。")
+    state = capital.status(journal)
+    lines.append(f"单位份额 {state['units'] or '—'}；单位净值 {state['nav_per_unit'] or '—'}"
+                 f"（最近估值 {state['equity'] or '—'} 美元，{state['equity_at'] or '—'}）；"
+                 f"净投入本金 {state['capital_basis'] or '—'} 美元；保留现金 {state['reserved_cash'] or '—'} 美元。")
+    names = {"subscription": "申购", "redemption": "赎回"}
+    for row in state["pending"]:
+        lines.append(f"等待中：{names[row['kind']]} {row['amount']} 美元（{row['id']}，{row['requested_at']}，"
+                     f"{'处理中：正在筹集现金' if row.get('state') == 'liquidating' else '等待下一个估值点'}）")
+    for row in state["recent_flows"]:
+        lines.append(f"已确认：{row['at']} {names.get(row['kind'], row['kind'])} {row['amount']} 美元，"
+                     f"单位净值 {row['nav_per_unit']}，确认后基金 {row['equity_after']} 美元")
+    return "\n".join(lines)
 
 
 def settle_position(args):

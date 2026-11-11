@@ -263,7 +263,15 @@ def _inputs(rows, session, now):
     ending = today[-1] if today else None
     start_value = float(baseline["body"]["equity"]) if baseline else None
     end_value = float(ending["body"]["equity"]) if ending else None
-    pnl = end_value - start_value if start_value is not None and end_value is not None else None
+    # Operator subscriptions and redemptions between the two marks are not profit (capital.py).
+    from .capital import FLOW, Units
+    flows = [r for r in rows if r["kind"] == FLOW and baseline and ending
+             and baseline["sequence"] < r["sequence"] < ending["sequence"]]
+    net_flow = sum(float(r["body"]["amount"]) * (-1 if r["body"]["kind"] == "redemption" else 1) for r in flows)
+    units = Units([(r["sequence"], r["body"]["units_before"], r["body"]["units_after"]) for r in flows])
+    pnl = end_value - start_value - net_flow if start_value is not None and end_value is not None else None
+    growth = (None if pnl is None or not start_value else pnl / start_value if not flows else
+              end_value * units.scale(ending["sequence"]) / (start_value * units.scale(baseline["sequence"])) - 1)
     gaps = []
     if not prior:
         gaps.append("没有前一交易日的账户估值；收益窗口从本日第一次账户观测开始。")
@@ -282,7 +290,7 @@ def _inputs(rows, session, now):
         benchmarks[symbol] = float(last[-1]["body"][symbol]) / float(first[-1]["body"][symbol]) - 1 if aligned else None
     kinds = {"account", "decision", "decision_validated", "fill", "fill_reconciled", "order_submitted",
              "order_observed", "notification", "market_observation", "local_corporate_action",
-             "decision_accepted", "allocation_complete", "operator_approval"}
+             "decision_accepted", "allocation_complete", "operator_approval", FLOW}
     evidence = [r for r in owned if r["kind"] in kinds or
                 (r["kind"] == "agent" and r["body"].get("name") == "researcher" and
                  r["body"].get("phase") != "postmarket_review")]
@@ -300,13 +308,15 @@ def _inputs(rows, session, now):
     return {**session, "input_as_of": now.isoformat(),
             "counts": dict(Counter(r["kind"] for r in owned)),
             "baseline_account": baseline, "last_observed_account": ending,
-            "observed_pnl_usd": pnl, "observed_return": pnl / start_value if pnl is not None and start_value else None,
+            "observed_pnl_usd": pnl, "observed_return": growth,
+            **({"capital_flows_usd": net_flow} if flows else {}),
             "account_observation_gaps": gaps,
             "benchmark_observed_price_returns": benchmarks,
             "events": selected, "omitted_events": len(evidence) - len(selected),
             "limitations": "Observed account marks, not guaranteed closing NAV. Source times are preserved. "
                             "Unrealized PnL is not realized profit. Cumulative broker observations are not additional fills. "
-                            "Fees can be unknown; use confirmed execution costs only. Cash flows are not adjusted. "
+                            "Fees can be unknown; use confirmed execution costs only. Operator subscriptions and redemptions "
+                            "are removed from observed_pnl_usd and observed_return (NAV per unit). "
                             "Incomplete or absent data must be disclosed; one day cannot validate a trading strategy."}
 
 
@@ -405,6 +415,7 @@ def review_after_close(strategy):
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
                "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
                "fund_scoreboard": strategy._fund_scoreboard(now) if hasattr(strategy, "_fund_scoreboard") else None,
+               "fund_capital": strategy._capital_context() if hasattr(strategy, "_capital_context") else None,
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
                "session": _inputs(rows, session, now)}

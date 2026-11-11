@@ -232,10 +232,14 @@ class Journal:
         """Carve the operator's capital sleeve out of the account; return reserved cash.
 
         First start: reserve = (cash + sleeve holdings value) - capital, so the AI
-        starts with exactly `capital`. A later capital change moves cash between
-        reserve and sleeve. External holdings (outside the universe) are frozen
-        at their first observed quantities; any change needs operator review.
-        Nothing is inferred: an account smaller than the mandate is refused.
+        starts with exactly `capital`. A later change of the configured capital
+        is queued as a subscription or redemption of the difference (capital.py),
+        which the running fund applies at its next valuation: a change is never
+        a gain or a loss, and a smaller capital raises its cash like any
+        redemption instead of blocking the fund. External holdings (outside the
+        universe) are frozen at their first observed quantities; any change
+        needs operator review. Nothing is inferred: an account smaller than the
+        mandate is refused.
         """
         capital = number(capital)
         with self.connection() as db:
@@ -251,19 +255,22 @@ class Journal:
                 if reserve > number(cash):
                     raise RiskError("Existing eligible positions exceed the mandate capital; reduce them or raise capital_usd")
                 rows = {"mandate_reserve_cash": str(reserve), "mandate_capital_basis": str(capital),
+                        "mandate_configured_capital": str(capital),
                         "mandate_external": encode({k: str(v) for k, v in sorted(external.items())})}
                 event = ("mandate_initialized", {"capital_usd": str(capital), "reserved_cash": str(reserve),
                                                  "external_holdings": rows["mandate_external"]})
-            elif number(rows["mandate_capital_basis"]) != capital:
-                delta = capital - number(rows["mandate_capital_basis"])
-                reserve = number(rows["mandate_reserve_cash"]) - delta
-                if reserve < 0:
-                    raise RiskError("Raised mandate capital exceeds the account's reserved cash")
-                if reserve > number(cash):
-                    raise RiskError("Lowered mandate capital exceeds the sleeve's cash; reduce positions first")
-                event = ("mandate_capital_changed", {"from": rows["mandate_capital_basis"], "to": str(capital),
-                                                     "reserved_cash": str(reserve)})
-                rows.update(mandate_reserve_cash=str(reserve), mandate_capital_basis=str(capital))
+            elif number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"])) != capital:
+                # The basis follows applied flows; the configured value is what .env said last.
+                configured = number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"]))
+                from .capital import CENT, enqueue
+                delta = capital - configured
+                rows["mandate_configured_capital"] = str(capital)
+                if abs(delta).quantize(CENT) > 0:
+                    queued = enqueue(db, now, "subscription" if delta > 0 else "redemption",
+                                     abs(delta).quantize(CENT), source="configuration")
+                    event = ("mandate_capital_change_requested", {
+                        "from": str(configured), "to": str(capital), "request_id": queued["id"],
+                        "kind": queued["kind"], "amount": queued["amount"]})
             baseline = {k: number(v) for k, v in json.loads(rows["mandate_external"]).items()}
             if baseline != {k: number(v) for k, v in external.items()}:
                 raise RiskError("External holdings changed; review the account and run adjust-reserve to re-baseline")

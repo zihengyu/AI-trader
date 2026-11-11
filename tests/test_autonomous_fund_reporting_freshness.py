@@ -12,6 +12,7 @@ from scripts.autonomous_fund.datastore import DailyStore
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.market_data import YahooRealtimeData
 from scripts.autonomous_fund.report import report
+from scripts.autonomous_fund.risk import number
 from scripts.autonomous_fund.status import cost_line
 from tests.test_autonomous_fund_quant import NOW, default_frames, harness
 
@@ -132,18 +133,21 @@ def test_scorecards_refresh_on_the_next_date_even_with_the_same_close_cutoff(tmp
 def test_historical_mandate_is_rebuilt_from_its_own_events(tmp_path):
     journal = Journal(tmp_path, "synthetic-mandate-history")
     start = datetime.fromisoformat("2026-11-02T15:00:00+00:00")
+    from scripts.autonomous_fund import capital
     journal.apply_mandate(start, "10000", "50000", "50000", {}, False, {}, True)
     journal.apply_mandate(start + timedelta(days=1), "15000", "50000", "50000", {}, False, {}, True)
+    [request] = capital.pending(journal)  # The capital change is a subscription, applied at a valuation.
+    capital.apply(journal, start + timedelta(days=1), request["id"], equity="10000", cash="10000", mode="paper")
     journal.adjust_reserve(start + timedelta(days=2), "2000")
     def snapshot(at):
         return report(tmp_path, write_files=False, as_of=at)["mandate"]
     assert snapshot(start)["capital_usd"] == "10000"
     assert snapshot(start)["reserved_cash"] == "40000"
-    assert snapshot(start + timedelta(days=1))["capital_usd"] == "15000"
-    assert snapshot(start + timedelta(days=1))["reserved_cash"] == "35000"
-    assert snapshot(start + timedelta(days=2))["reserved_cash"] == "37000"
+    assert number(snapshot(start + timedelta(days=1))["capital_usd"]) == 15000
+    assert number(snapshot(start + timedelta(days=1))["reserved_cash"]) == 35000
+    assert number(snapshot(start + timedelta(days=2))["reserved_cash"]) == 37000
     assert snapshot(start - timedelta(seconds=1))["capital_usd"] is None
-    assert report(tmp_path, write_files=False)["mandate"]["reserved_cash"] == "37000"
+    assert number(report(tmp_path, write_files=False)["mandate"]["reserved_cash"]) == 37000
 
 
 def test_missing_historical_mandate_evidence_never_uses_current_metadata(tmp_path):

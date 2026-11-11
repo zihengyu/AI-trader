@@ -375,8 +375,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 if any(row[0].rsplit(":", 2)[1] > trading_day(closed_at) for row in db.execute("SELECT id FROM local_actions")):
                     raise RiskError("Post-close corporate action prevents reconstructing the closing book")
                 if any(instant(row[0]) > closed_at for row in db.execute("SELECT at FROM events WHERE kind IN "
-                        "('mandate_capital_changed','operator_reserve_adjusted')")):
-                    raise RiskError("Post-close reserve change prevents reconstructing the closing sleeve")
+                        "('mandate_capital_changed','operator_reserve_adjusted','capital_flow','local_cash_flow')")):
+                    raise RiskError("Post-close reserve change or capital flow prevents reconstructing the closing sleeve")
             # Record when the evidence was obtained, retaining the price cutoff
             # separately. Historical reports cannot see later recovery evidence.
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "account", encode(body)))

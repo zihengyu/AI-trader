@@ -205,14 +205,18 @@ def session_pairs(events, sessions, zone):
     Skip pairs with a missing mark or an operator reserve adjustment. Moving cash in
     or out of the sleeve is not a return. Returns (pairs, marks) with pairs as dicts
     (start/end day and time, starting equity, return) and marks {symbol: {day: price}}.
+    An operator subscription or redemption (capital_flow events in `events`) is
+    removed: the return is the NAV per unit's (capital.py), equity_start stays in dollars.
     """
+    from .capital import Units
     from .risk import instant
     accounts, marks, adjusted = {}, {}, []
+    units = Units.from_events(events)
     for at, kind, body in events:
         moment = instant(at)
         day = moment.astimezone(zone).date()
         if kind == "account" and day in sessions:
-            accounts[day] = (moment, float(body["equity"]))
+            accounts[day] = (moment, float(body["equity"]), units.scale(moment))
         elif kind == "benchmark" and day in sessions:
             for symbol, value in body.items():
                 try:
@@ -227,11 +231,11 @@ def session_pairs(events, sessions, zone):
     for a, b in zip(days, days[1:]):
         if a not in accounts or b not in accounts:
             continue
-        (start, before), (end, after) = accounts[a], accounts[b]
+        (start, before, first), (end, after, last) = accounts[a], accounts[b]
         if any(start < t <= end for t in adjusted) or before <= 0:
             continue
         pairs.append({"start_day": a.isoformat(), "end_day": b.isoformat(), "start": start, "end": end,
-                      "equity_start": before, "return": after / before - 1})
+                      "equity_start": before, "return": (after * last) / (before * first) - 1})
     return pairs, marks
 
 
@@ -355,7 +359,7 @@ def acceptance(root, criteria=None, now=None):
                                           for kind in ("construction_variant", "shadow_decision"))
         events = rows(("startup", "account", "iteration_finished", "notification", "operator_approval",
                        "operator_drawdown_reset", "operator_attached_order", "operator_reserve_adjusted",
-                       "telegram_command", "order_submitted", "fill", "fill_reconciled", "fill_details_unavailable",
+                       "capital_flow", "telegram_command", "order_submitted", "fill", "fill_reconciled", "fill_details_unavailable",
                        "order_reprice_cancel", "buy_chase_limit", "protective_trigger", "agent", "decision_backoff",
                        "postmarket_review", "daily_loss_pause", "drawdown_pause", "learning_evaluation",
                        "auto_resume", "benchmark", "decision_validated", "benchmark_action",
@@ -399,7 +403,9 @@ def acceptance(root, criteria=None, now=None):
             slippage_unknown += 1
     agents = [b for _, k, b in events if k == "agent"]
     failures = sum(1 for b in agents if b.get("parse_error"))
-    equity = [float(b["equity"]) for _, b in accounts]
+    from .capital import Units
+    units = Units.from_events(events)  # Subscriptions and redemptions are not drawdowns or recoveries.
+    equity = [float(b["equity"]) * units.scale(at) for at, b in accounts]
     peak, drawdown = 0.0, 0.0
     for value in equity:
         peak = max(peak, value)

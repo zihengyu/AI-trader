@@ -110,7 +110,8 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
     # are derived projections, checked by the explicit audit/report path, not
     # dependencies of a new cash/share transaction.
     events = _rows(db, "SELECT sequence,at,kind,body FROM events WHERE kind IN "
-                       "('fill','local_corporate_action','local_ledger_origin','startup') ORDER BY sequence")
+                       "('fill','local_corporate_action','local_ledger_origin','startup','local_cash_flow') "
+                       "ORDER BY sequence")
     for event in events:
         event["body"] = json.loads(event["body"])
     if include_observations:
@@ -240,8 +241,15 @@ def _audit_connection(db, *, include_trades=False, include_observations=True):
             return quantity
         steps = [(sequence, "fill", fill) for sequence, fill in fill_steps]
         steps += [(event["sequence"], "action", event["body"]) for event in events if event["kind"] == "local_corporate_action"]
+        # Operator subscriptions (+) and redemptions (-) of the virtual book (capital.py).
+        steps += [(event["sequence"], "cash_flow", event["body"]) for event in events if event["kind"] == "local_cash_flow"]
         seen = set()
-        for _, kind, body in sorted(steps):
+        for _, kind, body in sorted(steps, key=lambda step: step[0]):
+            if kind == "cash_flow":
+                amount = number(body["amount"])
+                check(amount != 0, "invalid_cash_flow")
+                cash += amount
+                continue
             symbol = body["symbol"]
             position = positions.setdefault(symbol, {"quantity": number(0), "average": number(0)})
             if kind == "fill":
@@ -338,7 +346,7 @@ def stamp(result):
 # from any connection or tool, bumps meta 'ledger_version' through these triggers.
 LEDGER_TABLES = ("local_account", "local_positions", "local_orders", "local_fills", "local_actions", "intents",
                  "fund_orders", "fund_order_quotes")
-LEDGER_EVENT_KINDS = ("fill", "local_corporate_action", "local_ledger_origin", "startup")
+LEDGER_EVENT_KINDS = ("fill", "local_corporate_action", "local_ledger_origin", "startup", "local_cash_flow")
 _BUMP = "UPDATE meta SET value=CAST(value AS INTEGER)+1 WHERE key='ledger_version';"
 
 
@@ -358,17 +366,31 @@ def install_version_triggers(db):
             for op in ("insert", "update", "delete"):
                 db.execute(f"CREATE TRIGGER IF NOT EXISTS ledger_version_{table}_{op} AFTER {op.upper()} ON {table} "
                            f"BEGIN {_BUMP} END")
-    kinds = ",".join(f"'{kind}'" for kind in LEDGER_EVENT_KINDS)
-    for op, condition in (("insert", f"NEW.kind IN ({kinds})"), ("delete", f"OLD.kind IN ({kinds})"),
-                          ("update", f"OLD.kind IN ({kinds}) OR NEW.kind IN ({kinds})")):
-        db.execute(f"CREATE TRIGGER IF NOT EXISTS ledger_version_events_{op} AFTER {op.upper()} ON events "
+    existing = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND "
+                               "name LIKE 'ledger_version_events_%'"))
+    for op, condition in _event_conditions():
+        name = f"ledger_version_events_{op}"
+        if name in existing and condition not in (existing[name] or ""):
+            # Written by an earlier version for fewer event kinds: a new kind must bump the version too.
+            db.execute(f"DROP TRIGGER {name}")
+        db.execute(f"CREATE TRIGGER IF NOT EXISTS {name} AFTER {op.upper()} ON events "
                    f"WHEN {condition} BEGIN {_BUMP} END")
+
+
+def _event_conditions():
+    kinds = ",".join(f"'{kind}'" for kind in LEDGER_EVENT_KINDS)
+    return (("insert", f"NEW.kind IN ({kinds})"), ("delete", f"OLD.kind IN ({kinds})"),
+            ("update", f"OLD.kind IN ({kinds}) OR NEW.kind IN ({kinds})"))
 
 
 def ledger_version(db):
     """The ledger's change counter, or None when any trigger is missing (then nothing may be reused)."""
-    present = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND "
-                                            "name LIKE 'ledger_version_%'")}
+    triggers = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='trigger' AND "
+                               "name LIKE 'ledger_version_%'"))
+    # An events trigger from an earlier version misses newer event kinds: nothing may be reused then.
+    present = {name for name in triggers if not name.startswith("ledger_version_events_")} | {
+        f"ledger_version_events_{op}" for op, condition in _event_conditions()
+        if condition in (triggers.get(f"ledger_version_events_{op}") or "")}
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     expected = {name for name in _trigger_names()
                 if name.startswith("ledger_version_events_") or name.rsplit("_", 1)[0][len("ledger_version_"):] in tables}
