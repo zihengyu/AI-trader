@@ -93,7 +93,8 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
                        "is its total return over the same completed sessions and net_excess is net_return minus it; "
                        "cost_pace.share_of_equity_per_year is the recent spend a year as a share of equity, the "
                        "excess return a year needed just to cover it; cash.annual_net_of_cost_pace is what an "
-                       "all-cash portfolio earns a year net of that pace. Evidence, not a trading rule"}
+                       "all-cash portfolio earns a year net of that pace. Evidence, not a trading rule, and never "
+                       "a reason to research or think less: spending limits are the operator's"}
 
 
 def accrued_costs(db, until):

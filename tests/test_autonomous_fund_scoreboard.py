@@ -116,6 +116,9 @@ def test_reports_and_prompts_say_cash_is_not_free():
     assert "net of every cost" in MANAGER_PROMPT and "active bet against the market" in MANAGER_PROMPT
     assert "Choose cash freely" not in MANAGER_PROMPT and "win back costs" in MANAGER_PROMPT
     assert "against staying in cash" in CRITIC_PROMPT
+    # Costs inform the judgment; they never make the manager research, use tools or think less.
+    assert "never cut research, tool use or the depth of your analysis" in MANAGER_PROMPT
+    assert "never a reason to research or think less" in board["meaning"]
 
 
 def journal_with_costs(tmp_path):
