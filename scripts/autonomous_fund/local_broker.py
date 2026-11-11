@@ -338,24 +338,33 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             from .cash import merge
             sweep = policy["sweep"]
             account = merge(account, sweep, marks[sweep.symbol].price if sweep.symbol in marks else 0)
-        benchmarks = {}
+        benchmarks, benchmark_marks = {}, {}
         for symbol in policy["benchmark_symbols"]:
             try:
                 asset = Asset(symbol, asset_type="stock")
                 mark = marks.get(symbol) or (self._closing_quote(asset, closed_at) if closed_at is not None else
                     observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits))
-                benchmarks[symbol] = str(mark.price)
+                benchmark_marks[symbol] = mark
             except Exception:
                 continue  # Missing benchmark evidence must never invent a return.
         now = self.data_source.get_datetime()
         for mark in marks.values():
             mark.validate(closed_at or now, self.limits)
+        for symbol, mark in benchmark_marks.items():
+            try:
+                mark.validate(closed_at or now, self.limits)
+                benchmarks[symbol] = str(mark.price)
+            except RiskError:
+                continue  # Benchmark failure must not discard a valid account mark.
         account = replace(account, as_of=closed_at if closed_at is not None and book_existed else now)
         from .ledger_audit import stamp
         body = {**asdict(account), "ledger_audit": stamp(integrity), "valuation": {"source": "local_session_close" if closed_at else "local_broker_poll",
             **({"session_close": str(closed_at), "observed_at": str(now), "book_existed_at_close": book_existed} if closed_at else {}), "quotes": {
             symbol: {"price": str(mark.price), "as_of": str(mark.as_of)}
             for symbol, mark in marks.items() if symbol in holdings}}}
+        if benchmarks:
+            body["benchmark_observations"] = {symbol: {"price": benchmarks[symbol], "as_of": benchmark_marks[symbol].as_of.isoformat()}
+                                               for symbol in benchmarks}
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if self._valuation_book(db) != book:

@@ -711,6 +711,20 @@ snapshots still attempt a strict read immediately; the source's own backoff
 remains effective. Retained native display values do not become fresh
 account evidence.
 
+Account snapshot/event times are sampled after the account and quote reads,
+rather than before I/O. Locally held marks are revalidated before publication
+after optional benchmark work. Historical reports cannot see a newly returned
+valuation before its receipt time; genuine frozen closing NAVs keep their
+separate session-close and observed-at timestamps.
+
+Benchmark observations are independent per symbol, retain original source
+timestamps and are checked again after later reads. Missing or stale benchmarks
+do not discard other valid benchmarks or an otherwise valid cash account.
+Held benchmark assets reuse their existing valid valuation mark, avoiding a
+second request. ``benchmark_observations`` preserves accepted price/time pairs;
+historical/scripted modes retain native historical-price semantics. Existing
+snapshot timestamps are not rewritten or inferred retroactively.
+
 Local buy-time checks also require original source timestamps for each held
 position's risk mark, rather than Quote's potentially synthesized receipt
 time. Bid/ask must be finite, positive and uncrossed; capacity uses the higher
@@ -737,6 +751,13 @@ and a shared retry deadline cannot be shortened by another failure. Explicit
 simulation clocks remain deterministic. These checks preserve local delivery
 state; uncertain network outcomes still cannot guarantee remote exactly-once
 delivery.
+
+Future-dated notifications are persisted with their own due time so they do
+not block later ready notices or current watchdog alerts. They cannot justify
+deduplicating a current observation. Invalid or naive notice timestamps are
+suppressed as ``malformed_notification_timestamp`` while the original event
+is retained; an unusable timestamp in old deduplication history cannot block
+a valid new notice. Financial ledger evidence keeps its strict validation.
 
 An intraday manager's stale, future or expired decision in local or paper mode
 can use the same single correction opportunity as a malformed answer. The

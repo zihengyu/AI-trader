@@ -365,17 +365,21 @@ class Monitor:
             self._queue_weekly(db, reviews, now)
             self._queue_fill_updates(db, now)
             # Drop stale first-start alerts; retain recent requests and failures.
-            # A durable cursor bounds each poll to new notifications. It never
-            # advances past one stamped in the future, which is revisited later.
+            # Persist future notices as deferred outbox work, so their event
+            # position cannot block a later, already-due watchdog alert.
             cursor = db.execute("SELECT value FROM fund_monitor_meta WHERE key='notification_cursor'").fetchone()
             rows = db.execute("SELECT sequence,at,body FROM events WHERE kind='notification' AND sequence>? ORDER BY sequence",
                               (int(cursor[0]) if cursor else 0,)).fetchall()
             for row in rows:
-                if instant(row["at"]) > now:
-                    break
                 db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('notification_cursor',?)", (str(row["sequence"]),))
                 exists = db.execute("SELECT 1 FROM fund_deliveries WHERE sequence=?", (row["sequence"],)).fetchone()
                 if exists:
+                    continue
+                try:
+                    notice_at = instant(row["at"])
+                except (TypeError, ValueError):
+                    db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,?,NULL)", (
+                        row["sequence"], "suppressed", 0, now.isoformat(), "malformed_notification_timestamp"))
                     continue
                 body = notification_body(row["body"])
                 if body is None:
@@ -388,13 +392,21 @@ class Monitor:
                 prior_rows = [] if body.get("kind") in {"watchdog_stop", "watchdog_recovered", "approval_required"} else db.execute(
                     "SELECT e.at,e.body FROM events e JOIN fund_deliveries d ON e.sequence=d.sequence WHERE d.state!='suppressed' AND e.sequence<? ORDER BY e.sequence DESC LIMIT 30", (row["sequence"],))
                 for previous in prior_rows:
-                    if previous["body"] == row["body"] and abs((instant(row["at"]) - instant(previous["at"])).total_seconds()) < 1800:
+                    if previous["body"] != row["body"]:
+                        continue
+                    try:
+                        previous_at = instant(previous["at"])
+                    except (TypeError, ValueError):
+                        continue
+                    # Only an earlier observation can justify deduplication.
+                    if 0 <= (notice_at - previous_at).total_seconds() < 1800:
                         duplicate = True
                         break
                 stale = (body.get("kind") not in {"postmarket_report", "weekly_report"} and
-                         now - instant(row["at"]) > timedelta(hours=1))
+                         now - notice_at > timedelta(hours=1))
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
-                           (row["sequence"], "suppressed" if duplicate or stale else "pending", 0, now.isoformat()))
+                           (row["sequence"], "suppressed" if duplicate or stale else "pending", 0,
+                            max(now, notice_at).isoformat()))
             self._note_desk(db, now)
             self._note_decision_drought(db, now)
         if self.transport is not None:

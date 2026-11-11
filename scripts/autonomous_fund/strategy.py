@@ -2,7 +2,7 @@
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from time import monotonic
@@ -1525,7 +1525,6 @@ class AutonomousFund(Strategy):
         return super().get_positions(*args, **kwargs)
 
     def _snapshot_account(self):
-        start = self.get_datetime()
         orders = self._orders()
         if self.mode in {"paper", "local"}:
             cash, _, equity = self.broker._get_balances_at_broker(self.quote_asset, self)
@@ -1547,6 +1546,8 @@ class AutonomousFund(Strategy):
             baseline=baseline, initialized=baseline is not None,
             price=lambda symbol: number(local_marks[symbol]["price"]) if local_marks is not None else
                                  self.get_last_price(Asset(symbol, asset_type="stock")))
+        # Values returned by I/O were not available at request start.
+        start = self.get_datetime()
         # Orders on external symbols are the operator's own; orders on eligible
         # symbols, or any unresolved intent of ours, block new submissions.
         open_orders = any(not self._terminal(order) and (not mandate.allow_external_holdings or
@@ -1585,46 +1586,77 @@ class AutonomousFund(Strategy):
             from .cash import merge
             mark = local_marks[sweep.symbol]["price"] if local_marks is not None else self.get_last_price(Asset(sweep.symbol, asset_type="stock"))
             account = merge(account, sweep, mark or 0)
-        if reserve or external:
-            self.journal.event(start, "broker_account", {"cash": str(broker_cash), "equity": str(broker_equity),
-                               "reserved_cash": str(reserve), "external_holdings": {k: str(v) for k, v in external.items()},
-                               "external_value": str(external_value)})
-        body = asdict(account)
-        if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
-            from .ledger_audit import stamp
-            body["ledger_audit"] = stamp(self.broker.ledger_audit())  # Reconciled now; the verdict is stored.
+        broker_body = ({"cash": str(broker_cash), "equity": str(broker_equity), "reserved_cash": str(reserve),
+                        "external_holdings": {k: str(v) for k, v in external.items()}, "external_value": str(external_value)}
+                       if reserve or external else None)
         if (self.mode == "local" and getattr(self.broker, "_valuation_policy", None) is not None
                 and not self.broker.is_market_open()):
             # The returned book is a current account read for research. The
             # public NAV remains the one durable close, not a new off-hours mark.
+            if broker_body is not None:
+                self.journal.event(self.get_datetime(), "broker_account", broker_body)
             self.broker._publish_valuation()
-            return account
+            return replace(account, as_of=self.get_datetime())
+        known = {symbol: ObservedPrice(number(mark["price"]), instant(mark["as_of"]))
+                 for symbol, mark in (local_marks or {}).items()}
+        benchmark_marks, missing = self._snapshot_benchmarks(known)
+        integrity = None
+        if self.mode == "local" and hasattr(getattr(self, "broker", None), "ledger_audit"):
+            from .ledger_audit import stamp
+            integrity = stamp(self.broker.ledger_audit())
+        observed_at = self.get_datetime()
+        if known and self.mode == "local" and self.broker.is_market_open():
+            for mark in known.values():
+                mark.validate(observed_at, self.limits)
+        benchmarks = {}
+        for symbol, mark in benchmark_marks.items():
+            try:
+                mark.validate(observed_at, self.limits)
+                benchmarks[symbol] = str(mark.price)
+            except RiskError:
+                missing.add(symbol)
+        account = replace(account, as_of=observed_at)
+        if broker_body is not None:
+            self.journal.event(observed_at, "broker_account", broker_body)
+        body = asdict(account)
+        if integrity is not None:
+            body["ledger_audit"] = integrity
         if self.mode == "local":
             visible = set(account.positions) | set(account.cash_equivalents)
             body["valuation"] = {"source": "local_account_snapshot", "quotes": {
                 symbol: mark for symbol, mark in getattr(self.broker, "_last_balance_marks", {}).items()
                 if symbol in visible}}
-        self.journal.event(start, "account", body)
+        if benchmarks:
+            body["benchmark_observations"] = {symbol: {"price": benchmarks[symbol], "as_of": benchmark_marks[symbol].as_of.isoformat()}
+                                               for symbol in benchmarks}
+        self.journal.event(observed_at, "account", body)
         if getattr(self, "quant", None) is not None:
-            self.journal.mark_equity(start, account.equity, self.limits)
-            self.journal.observe_session(start, account, self.quant.daily_loss_limit)
-        try:
-            benchmarks = {symbol: str(self.get_last_price(Asset(symbol, asset_type="stock"))) for symbol in ("SPY", "QQQ")}
-            if all(number(value) > 0 for value in benchmarks.values()):
-                # The predefined benchmarks' other components (SGOV for risk_matched) when priced.
-                for symbol in getattr(getattr(self, "performance", None), "symbols", lambda: [])():
-                    if symbol not in benchmarks:
-                        try:
-                            value = self.get_last_price(Asset(symbol, asset_type="stock"))
-                        except Exception:
-                            value = None
-                        if value is not None and number(value) > 0:
-                            benchmarks[symbol] = str(value)
-                self.journal.event(start, "benchmark", benchmarks)
-        except Exception:
-            self.journal.event(start, "benchmark_unavailable", {})
-        self._record_benchmark_actions(start)
+            self.journal.mark_equity(observed_at, account.equity, self.limits)
+            self.journal.observe_session(observed_at, account, self.quant.daily_loss_limit)
+        if benchmarks:
+            self.journal.event(observed_at, "benchmark", benchmarks)
+        if missing:
+            self.journal.event(observed_at, "benchmark_unavailable", {"symbols": sorted(missing)})
+        self._record_benchmark_actions(observed_at)
         return account
+
+    def _snapshot_benchmarks(self, known):
+        """One missing benchmark loses only itself; retain each real source clock."""
+        symbols = dict.fromkeys(("SPY", "QQQ", *getattr(getattr(self, "performance", None), "symbols", lambda: [])()))
+        marks, missing = {}, set()
+        for symbol in symbols:
+            try:
+                if symbol in known:
+                    mark = known[symbol].validate(self.get_datetime(), self.limits)
+                elif self.mode in {"local", "paper"}:
+                    mark = observed_quote(self.get_quote(Asset(symbol, asset_type="stock")), self.get_datetime(), self.limits)
+                else:
+                    value = self.get_last_price(Asset(symbol, asset_type="stock"))
+                    mark = ObservedPrice(number(value), self.get_datetime()).validate(self.get_datetime(), self.limits)
+                marks[symbol] = mark
+            except Exception:
+                missing.add(symbol)
+        return marks, missing
 
     def _record_benchmark_actions(self, now):
         """Once a trading day: the benchmarks' recent dividends and splits, so they are total returns.
