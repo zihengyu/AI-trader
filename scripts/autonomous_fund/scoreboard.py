@@ -141,8 +141,13 @@ def cost_ledger(db, until):
         if moment <= cutoff:
             monthly = (json.loads(body).get("performance") or {}).get("data_costs_usd_per_month", default)
             rates.append((moment, sequence, _cost(monthly)))
-    observations = (moment for at, in db.execute(
-        "SELECT at FROM events WHERE kind='benchmark' AND julianday(at)<=julianday(?)", (until,))
+    # Benchmarks are marked about every 30 seconds, and only each session's first mark matters. The marks
+    # are grouped by the hour in their stored text (New York or UTC time: with any whole-hour offset these
+    # hours nest inside New York days) and SQLite returns each group's earliest row, so about 8 rows a day
+    # are parsed instead of about 780. The cutoff applies after grouping: a group's earliest mark is at or
+    # before it exactly when any of its marks is. The result is unchanged.
+    observations = (moment for at, _ in db.execute(
+        "SELECT at,MIN(julianday(at)) FROM events WHERE kind='benchmark' GROUP BY substr(at,1,13)")
         for moment in (instant(at),) if moment <= cutoff)
     return calls, session_data_charges(observations, rates)
 
