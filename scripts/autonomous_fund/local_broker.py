@@ -49,6 +49,9 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
+        # State commits and native events must agree, but cancellations must not
+        # wait for another thread's market-data I/O under the polling lock.
+        self._order_state_lock = threading.RLock()
         if not 0 <= self.fee_rate <= number("0.01") or not 0 <= self.slippage <= number("0.01") or not 0 < self.volume_fraction <= number("0.01"):
             raise RiskError("Invalid local simulation cost or volume parameters")
         if not 0 < number(starting_cash) <= number("10000000"):
@@ -385,16 +388,17 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         return ObservedPrice(number(rows.iloc[-1].close), closed_at).validate(closed_at, self.limits)
 
     def _submit_order(self, order):
-        if self.require_monitor:
-            from .monitor import require_monitor
-            require_monitor(self.journal.root, self.data_source.get_datetime())
-        if not self.matching_enabled or not self.is_market_open() or (self.journal.root / "STOP").exists():
-            raise RiskError("Local simulator is stopped or market is closed")
+        # Keep acceptance and native publication in the same ordering domain as
+        # fills/cancels; a poll must not publish a fill before NEW_ORDER.
+        with self._order_state_lock:
+            return self._accept_order(order)
+
+    def _accept_order(self, order):
         if str(order.asset.asset_type) != "stock" or str(order.order_type) != "limit" or str(order.side) not in {"buy", "sell"} or order.child_orders:
             raise RiskError("Local simulator only accepts simple long-only stock limit orders")
         key = (order.custom_params or {}).get("local_intent")
         identifier = "local-" + str(key)
-        now = self.data_source.get_datetime()
+        rejection = None
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM intents WHERE id=? AND status!='terminal'", (key,)).fetchone()
@@ -408,27 +412,53 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 raise RiskError("Local order differs from its reserved intent")
             if db.execute("SELECT 1 FROM local_orders WHERE intent_id=?", (key,)).fetchone():
                 raise RiskError("Local intent was already submitted")
-            if (self.journal.root / "STOP").exists():
-                raise RiskError("Emergency stop active")
-            db.execute("INSERT INTO local_orders(id,intent_id,strategy,body,created_at,expires_at,status) VALUES(?,?,?,?,?,?,?)", (
-                identifier, key, order.strategy, row["body"], str(now), str(min(
-                    instant(self.data_source.session.status()["close"]),
-                    instant((order.custom_params or {}).get("decision_expires_at", self.data_source.session.status()["close"]))
-                )), "new"))
-            db.execute("UPDATE intents SET broker_id=?,status='pending' WHERE id=?", (identifier, key))
-            self._event(db, "local_order_accepted", {"broker_id": identifier, "intent_id": key})
+            session = self.data_source.session.status()
+            now = self.data_source.get_datetime()  # Locks and audit may cross a decision/session deadline.
+            expires = min(instant(session["close"]),
+                          instant((order.custom_params or {}).get("decision_expires_at", session["close"])))
+            if not self.matching_enabled:
+                rejection = ("matching_disabled", "Local simulator is observation-only")
+            elif (self.journal.root / "STOP").exists():
+                rejection = ("stopped", "Emergency stop active")
+            elif not session["open"]:
+                rejection = ("market_closed", "Local simulator market is closed")
+            elif now >= expires:
+                rejection = ("expired", "Local order authority expired before acceptance")
+            if rejection is None and self.require_monitor:
+                from .monitor import require_monitor
+                try:
+                    require_monitor(self.journal.root, now)
+                except RiskError:
+                    rejection = ("monitor_unavailable", "Independent monitor unavailable or unhealthy; server execution blocked")
+                now = self.data_source.get_datetime()
+                if rejection is None and now >= expires:
+                    rejection = ("expired", "Local order authority expired before acceptance")
+            if rejection:
+                # Identity matched and no local order exists: this is a proven
+                # non-submission, not an ambiguous external broker outcome.
+                db.execute("UPDATE intents SET status='terminal' WHERE id=?", (key,))
+                self._event(db, "local_order_rejected", {"intent_id": key, "symbol": body["symbol"],
+                                                        "reason": rejection[0], "expires_at": str(expires)})
+            else:
+                db.execute("INSERT INTO local_orders(id,intent_id,strategy,body,created_at,expires_at,status) VALUES(?,?,?,?,?,?,?)", (
+                    identifier, key, order.strategy, row["body"], str(now), str(expires), "new"))
+                db.execute("UPDATE intents SET broker_id=?,status='pending' WHERE id=?", (identifier, key))
+                self._event(db, "local_order_accepted", {"broker_id": identifier, "intent_id": key})
+        if rejection:
+            raise RiskError(rejection[1])
         order.set_identifier(identifier)
         order.update_raw({"id": identifier})
         self._process_trade_event(order, self.NEW_ORDER)
         return order
 
     def cancel_order(self, order):
-        with self.journal.connection() as db:
-            changed = db.execute("UPDATE local_orders SET status='canceled' WHERE id=? AND status IN ('new','partial_fill')", (str(order.identifier),)).rowcount
+        with self._order_state_lock:
+            with self.journal.connection() as db:
+                changed = db.execute("UPDATE local_orders SET status='canceled' WHERE id=? AND status IN ('new','partial_fill')", (str(order.identifier),)).rowcount
+                if changed:
+                    self._event(db, "local_order_canceled", {"broker_id": str(order.identifier)})
             if changed:
-                self._event(db, "local_order_canceled", {"broker_id": str(order.identifier)})
-        if changed:
-            self._process_trade_event(order, self.CANCELED_ORDER)
+                self._process_trade_event(order, self.CANCELED_ORDER)
 
     def _modify_order(self, order, **kwargs):
         raise RiskError("Local orders cannot be modified; cancel and obtain a new risk reservation")
@@ -444,16 +474,21 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         try:
             if self._stop_event.is_set():
                 return
-            self._corporate_actions()
-            pending = []
+            pending, active = [], []
             for row in self._pull_broker_all_orders():
                 if row["status"] not in {"new", "partial_fill"}:
                     continue
-                order = self.get_tracked_order(row["id"]) or self._parse_broker_order(row, row["strategy"])
+                with self._order_state_lock:
+                    order = self.get_tracked_order(row["id"]) or self._parse_broker_order(row, row["strategy"])
                 now = self.data_source.get_datetime()
                 if (self.journal.root / "STOP").exists() or now >= instant(row["expires_at"]):
                     self.cancel_order(order)
                     continue
+                active.append((row, order))
+            # Risk-reducing STOP/expiry cancellations require no market data.
+            # An action-history outage must not leave those orders active.
+            self._corporate_actions()
+            for row, order in active:
                 if self.matching_enabled and self.is_market_open():
                     try:
                         self._match(row, order)
@@ -611,6 +646,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             for mark in mark_evidence:
                 mark.validate(checked_at, self.limits)
             paused = self.journal.mark_equity(checked_at, equity, self.limits)
+        with self._order_state_lock:
+            return self._commit_fill(identifier, order, start, bar, price=price, buy=buy, reserve=reserve,
+                                     equity=equity, marks=marks, paused=paused, mark_evidence=mark_evidence)
+
+    def _commit_fill(self, identifier, order, start, bar, *, price, buy, reserve, equity, marks, paused, mark_evidence):
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             from .ledger_audit import require_consistent

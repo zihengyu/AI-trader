@@ -719,6 +719,25 @@ quotes are revalidated after other symbols' I/O and ledger checks, before a
 bar is consumed or cash/shares change. A failed observation remains retryable
 on that bar. Sales still require only their own valid execution data.
 
+Local order acceptance rechecks STOP, matching enablement, the regular session,
+the declared expiry and any required monitor after acquiring the write lock
+and verifying the ledger. Creation time is the actual acceptance time; a bar
+that started during an earlier wait cannot become post-submission evidence.
+Known local non-submissions release their pending intent and retain an
+audited ``local_order_rejected`` attempt. Ambiguous external outcomes remain
+locked. Acceptance, fills and cancellations publish native callbacks in the
+same polling order. STOP/expiry cancellations run before corporate-action
+history reads, so an unavailable source cannot postpone them.
+
+Live notification delivery starts retry delays after a failed build or HTTP
+response, and claims each message using the current clock. Before HTTP it
+rechecks recipient binding, shared backoff and lease ownership, then renews
+its claim. Late build/HTTP results cannot overwrite a newer sender's state,
+and a shared retry deadline cannot be shortened by another failure. Explicit
+simulation clocks remain deterministic. These checks preserve local delivery
+state; uncertain network outcomes still cannot guarantee remote exactly-once
+delivery.
+
 An intraday manager's stale, future or expired decision in local or paper mode
 can use the same single correction opportunity as a malformed answer. The
 manager receives a refreshed account, risk and data-desk context and must

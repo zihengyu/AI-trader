@@ -403,7 +403,7 @@ class Monitor:
             # notifications cannot starve approvals, or vice versa.
             if replies and self._commands_first:
                 self._commands(now, deadline=deadline)
-            self._deliver(now, deadline=deadline)
+            self._deliver(now, deadline=deadline, realtime=realtime)
             if replies and not self._commands_first:
                 self._commands(now, deadline=deadline)
             self._commands_first = not self._commands_first
@@ -621,9 +621,10 @@ class Monitor:
         db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
             "kind": "data_desk_stale", "details": {"heartbeat_minutes_ago": round(age / 60)}})))
 
-    def _deliver(self, now, only=None, *, deadline=None):
+    def _deliver(self, now, only=None, *, deadline=None, realtime=False):
         if deadline is not None and self.clock() >= deadline:
             return
+        now = datetime.now(timezone.utc) if realtime else now
         with operator_connection(self.root) as db:
             recipient = db.execute("SELECT value FROM fund_monitor_meta WHERE key='recipient'").fetchone()
             if not recipient or recipient[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
@@ -659,14 +660,16 @@ class Monitor:
                 selected = db.execute("SELECT value FROM fund_monitor_meta WHERE key='recipient'").fetchone()
                 if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
                     raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
+                claimed_at = datetime.now(timezone.utc) if realtime else now
+                lease_until = (claimed_at + timedelta(seconds=60)).isoformat()
                 claimed = db.execute("UPDATE fund_deliveries SET state='sending',attempts=attempts+1,next_at=? "
                     "WHERE sequence=? AND state IN ('pending','retry','sending') AND next_at=?",
-                    ((now + timedelta(seconds=60)).isoformat(), row["sequence"], row["next_at"]))
+                    (lease_until, row["sequence"], row["next_at"]))
                 if claimed.rowcount != 1:
                     continue  # Another monitor/test sender already claimed it.
             built = None
             try:
-                outgoing = self._outgoing(body, row["sequence"], text, now)
+                outgoing = self._outgoing(body, row["sequence"], text, claimed_at)
             except Exception as exc:
                 # Building the message is local work (a report read from the journal).
                 # A failure here is about this one notice, so it must not hold back the
@@ -675,11 +678,32 @@ class Monitor:
                 built = f"message_unavailable_{type(exc).__name__}"
                 _disclose_build_failure(body.get("kind"), row["sequence"])
                 if row["attempts"] + 1 < MESSAGE_BUILD_ATTEMPTS:
+                    failed_at = datetime.now(timezone.utc) if realtime else now
                     with operator_connection(self.root) as db:
-                        db.execute("UPDATE fund_deliveries SET state='retry',next_at=?,last_error=? WHERE sequence=?", (
-                            (now + timedelta(seconds=30 * 2 ** row["attempts"])).isoformat(), built, row["sequence"]))
+                        db.execute("UPDATE fund_deliveries SET state='retry',next_at=?,last_error=? "
+                                   "WHERE sequence=? AND state='sending' AND next_at=?", (
+                            (failed_at + timedelta(seconds=30 * 2 ** row["attempts"])).isoformat(), built, row["sequence"], lease_until))
                     continue
                 outgoing = ("text", unavailable_message(body, row["sequence"], built, row["attempts"] + 1))
+            # Local report construction can outlast a lease. Renew only our own
+            # claim before HTTP; never send work reclaimed by another sender.
+            with operator_connection(self.root) as db:
+                db.execute("BEGIN IMMEDIATE")
+                selected = db.execute("SELECT value FROM fund_monitor_meta WHERE key='recipient'").fetchone()
+                if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
+                    raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
+                sending_at = datetime.now(timezone.utc) if realtime else now
+                gate = db.execute("SELECT value FROM fund_monitor_meta WHERE key='next_delivery_at'").fetchone()
+                if gate and instant(gate[0]) > sending_at:
+                    db.execute("UPDATE fund_deliveries SET state='retry',next_at=?,last_error='delivery_backoff' "
+                               "WHERE sequence=? AND state='sending' AND next_at=?", (gate[0], row["sequence"], lease_until))
+                    continue
+                renewed_until = (sending_at + timedelta(seconds=60)).isoformat()
+                claimed = db.execute("UPDATE fund_deliveries SET next_at=? WHERE sequence=? "
+                                     "AND state='sending' AND next_at=?", (renewed_until, row["sequence"], lease_until))
+                if claimed.rowcount != 1:
+                    continue
+            lease_until = renewed_until
             try:
                 if outgoing[0] == "text":
                     result = self.transport.send(outgoing[1])
@@ -689,14 +713,21 @@ class Monitor:
                 # Never persist third-party exceptions (may contain credentials).
                 result = {"ok": False, "error": "report_or_delivery_error", "retry_after": 30}
             delay = max(result.get("retry_after", 0), min(1800, 5 * 2 ** min(row["attempts"], 8)))
+            completed_at = datetime.now(timezone.utc) if realtime else now
+            retry_at = completed_at + timedelta(seconds=delay)
             with operator_connection(self.root) as db:
+                db.execute("BEGIN IMMEDIATE")
                 # A notice sent in place of its report keeps the build error, for status and audit.
-                db.execute("UPDATE fund_deliveries SET state=?,next_at=?,last_error=?,message_id=? WHERE sequence=?", (
-                    "sent" if result["ok"] else "retry", (now + timedelta(seconds=delay)).isoformat(),
-                    built if result["ok"] else result["error"], str(result.get("message_id", "")), row["sequence"]))
+                db.execute("UPDATE fund_deliveries SET state=?,next_at=?,last_error=?,message_id=? "
+                           "WHERE sequence=? AND state='sending' AND next_at=?", (
+                    "sent" if result["ok"] else "retry", retry_at.isoformat(),
+                    built if result["ok"] else result["error"], str(result.get("message_id", "")), row["sequence"], lease_until))
                 if not result["ok"]:
+                    prior = db.execute("SELECT value FROM fund_monitor_meta WHERE key='next_delivery_at'").fetchone()
+                    if prior:
+                        retry_at = max(retry_at, instant(prior[0]))
                     db.execute("INSERT OR REPLACE INTO fund_monitor_meta VALUES('next_delivery_at',?)",
-                               ((now + timedelta(seconds=delay)).isoformat(),))
+                               (retry_at.isoformat(),))
             if not result["ok"]:
                 break  # Respect rate limits and outages across the whole batch.
 
@@ -996,7 +1027,7 @@ def send_test(root):
             "kind": "operator_notification_test", "details": "模拟账户通知测试；本操作没有提交任何交易订单。"})))
         key = cursor.lastrowid
         db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)", (key, "pending", 0, now.isoformat()))
-    monitor._deliver(now, only=key)
+    monitor._deliver(now, only=key, realtime=True)
     with operator_connection(root) as db:
         row = dict(db.execute("SELECT * FROM fund_deliveries WHERE sequence=?", (key,)).fetchone())
     return {"event": key, "state": row["state"], "message_id": row["message_id"],
