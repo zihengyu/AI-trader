@@ -59,21 +59,30 @@ def accept(strategy, targets, alerts=(), when=None):
 # ----- Operator mandate: "the account has $50,000; the AI may use $10,000" ----------
 
 def test_mandate_carves_the_capital_sleeve_and_moves_cash_only_by_operator_policy(tmp_path):
+    from scripts.autonomous_fund import capital
     journal = Journal(tmp_path, "synthetic-mandate")
     reserve = journal.apply_mandate(NOW, "10000", number(50000), number(50000), {}, False, {}, True)
     assert reserve == number(40000)
     assert journal.apply_mandate(NOW, "10000", number(50000), number(50000), {}, False, {}, True) == number(40000)
-    assert journal.apply_mandate(NOW, "15000", number(50000), number(50000), {}, False, {}, True) == number(35000)
-    with pytest.raises(RiskError, match="exceeds the sleeve's cash"):
-        journal.apply_mandate(NOW, "5000", number(38000), number(50000), {"ALFA": 120}, False, {}, True)
-    with pytest.raises(RiskError, match="exceeds the account's reserved cash"):
-        journal.apply_mandate(NOW, "60000", number(50000), number(50000), {}, False, {}, True)
+    # A configured capital change is a subscription (or redemption) the running fund applies at its next
+    # valuation at the NAV per unit (capital.py); until then the sleeve is unchanged.
+    assert journal.apply_mandate(NOW, "15000", number(50000), number(50000), {}, False, {}, True) == number(40000)
+    [request] = capital.pending(journal)
+    assert (request["kind"], number(request["amount"]), request["source"]) == ("subscription", 5000, "configuration")
+    capital.apply(journal, NOW, request["id"], equity=number(10000), cash=number(10000), mode="paper")
+    assert journal.reserve_cash() == number(35000)
+    # Raising the capital above the reserved cash is refused when it is applied, never silently borrowed.
+    journal.apply_mandate(NOW, "60000", number(50000), number(50000), {}, False, {}, True)
+    [request] = capital.pending(journal)
+    with pytest.raises(RiskError, match="deposit"):
+        capital.apply(journal, NOW, request["id"], equity=number(15000), cash=number(15000), mode="paper")
+    capital.cancel(journal, NOW, request["id"])
     assert journal.adjust_reserve(NOW, number(-5000)) == number(30000)
     with pytest.raises(RiskError, match="negative"):
         journal.adjust_reserve(NOW, number(-40000))
     kinds = [row["kind"] for row in journal.all_events()]
-    assert kinds.count("mandate_initialized") == 1 and kinds.count("mandate_capital_changed") == 1
-    assert kinds.count("operator_reserve_adjusted") == 1
+    assert kinds.count("mandate_initialized") == 1 and kinds.count("mandate_capital_change_requested") == 2
+    assert kinds.count("capital_flow") == 1 and kinds.count("operator_reserve_adjusted") == 1
 
 
 @pytest.mark.parametrize("cash, value, holdings, orders, message", [

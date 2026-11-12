@@ -156,6 +156,8 @@ class Account:
     cash_equivalent_value: Decimal = Decimal("0")
     # Observed position cost only, for operator display; never substitute a target or quote.
     position_average_prices: dict = field(default_factory=dict)
+    # Observed position prices at account valuation, separate from entry cost.
+    position_prices: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -324,6 +326,10 @@ def desired_shares(equity, weight, ask, limits):
     return int((number(equity) * number(weight) / buy_limit).to_integral_value(rounding=ROUND_FLOOR))
 
 
+def fresh_account_snapshot(as_of, now, max_age_seconds):
+    return 0 <= (instant(now) - instant(as_of)).total_seconds() <= max_age_seconds
+
+
 def plan(targets, account, prices, universe, limits, now, paused=False, historical=False, *,
          buy_budget=None, min_trade=None, participation=None, blocked_buys=frozenset()):
     """Sell first; return candidates. The caller rechecks before EACH submission.
@@ -341,7 +347,7 @@ def plan(targets, account, prices, universe, limits, now, paused=False, historic
     now = instant(now)
     if account.open_orders:
         raise RiskError("Open or uncertain account orders require reconciliation")
-    if not 0 <= (now - instant(account.as_of)).total_seconds() <= limits.quote_max_seconds:
+    if not fresh_account_snapshot(account.as_of, now, limits.quote_max_seconds):
         raise RiskError("Stale account snapshot")
     cash, equity = number(account.cash), number(account.equity)
     if cash < 0 or equity <= 0:

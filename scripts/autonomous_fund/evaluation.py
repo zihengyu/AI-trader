@@ -109,8 +109,9 @@ def outcome_events(journal, now):
     with journal.connection() as db:
         db.execute("BEGIN")
         integrity = audit_connection(db)
-        reviews = [(sequence, at, "postmarket_review", json.loads(body)) for sequence, at, body in db.execute(
-            "SELECT sequence,at,body FROM events WHERE kind='postmarket_review' ORDER BY sequence") if instant(at) <= now]
+        reviews = [(sequence, at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
+            "SELECT sequence,at,kind,body FROM events WHERE kind IN ('postmarket_review','capital_flow') "
+            "ORDER BY sequence") if instant(at) <= now]
         # A failed reconciliation withholds every account mark, as review._events does.
         marks = [] if integrity["status"] == "failed" else nav_marks(
             db, until=now, excluded=set(integrity.get("invalid_account_sequences", [])))
@@ -124,7 +125,10 @@ def forward_outcomes(events):
         return []
     now = max(instant(at) for at, _, _ in events)
     reviews = [b for at, kind, b in events if kind == "postmarket_review" and instant(b["completed_at"]) <= now]
-    accounts = [(instant(at), body) for at, kind, body in events if kind == "account" and instant(at) <= now]
+    from .capital import Units
+    units = Units.from_events(events)
+    accounts = [(instant(at), float(body["equity"]) * units.scale(index))
+                for index, (at, kind, body) in enumerate(events) if kind == "account"]
     if not reviews or not accounts:
         return []
     benchmarks = {instant(at): b for at, kind, b in events if kind == "benchmark" and instant(at) <= now}
@@ -134,10 +138,10 @@ def forward_outcomes(events):
     # The last observation of each completed session, computed once. For a memo
     # available at time T, a session counts when its last observation is >= T.
     last_by_day = {}
-    for at, body in accounts:
+    for at, equity in accounts:
         day = at.astimezone(zone).date()
         if day in completed and (day not in last_by_day or at >= last_by_day[day][0]):
-            last_by_day[day] = (at, body)
+            last_by_day[day] = (at, equity)
     sessions = sorted(last_by_day.values(), key=lambda item: item[0])
     result = []
     for packet in reviews:
@@ -146,15 +150,15 @@ def forward_outcomes(events):
         row = {"version": packet["version"], "available_at": packet["completed_at"], "mock": packet["mock"],
                "observed_sessions": len(daily), "horizons": {},
                "interpretation": "Following portfolio observations include later decisions and memos; no causal attribution. "
-                                 "Marks may be intraday. Returns exclude model API charges and are not cash-flow adjusted."}
+                                 "Marks may be intraday. Returns exclude model API charges; operator subscriptions "
+                                 "and redemptions are removed (NAV per unit)."}
         for horizon in (5, 20):
             # Need a baseline PLUS horizon observed sessions, never pad missing dates.
             if len(daily) <= horizon:
                 row["horizons"][str(horizon)] = {"status": "insufficient_observations", "needed": horizon + 1}
                 continue
             first, last = daily[0], daily[horizon]
-            baseline = float(first[1]["equity"])
-            value = float(last[1]["equity"])
+            baseline, value = first[1], last[1]
             comparison = {}
             for symbol in ("SPY", "QQQ"):
                 begin = benchmarks.get(first[0], {}).get(symbol)

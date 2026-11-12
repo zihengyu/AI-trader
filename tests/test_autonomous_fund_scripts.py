@@ -45,7 +45,7 @@ def script(name, tmp_path, env, *args):
                           env=variables, timeout=300)
 
 
-@pytest.mark.parametrize("name", ["fund-start.sh", "fund-stop.sh", "fund-logs.sh", "fund-restart.sh"])
+@pytest.mark.parametrize("name", ["fund-start.sh", "fund-stop.sh", "fund-logs.sh", "fund-restart.sh", "fund-capital.sh"])
 def test_scripts_are_valid_bash(name):
     assert subprocess.run(["bash", "-n", str(ROOT / "scripts" / name)]).returncode == 0
 

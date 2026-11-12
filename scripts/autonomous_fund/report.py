@@ -16,7 +16,7 @@ REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_val
                 "agent_call_started", "agent_call_finished", "risk_overlay", "decision_backoff", "scorecard",
                 "protective_trigger", "price_alert", "review_triggered", "mandate_initialized",
                 "mandate_capital_changed", "operator_reserve_adjusted", "decision_accepted",
-                "allocation_complete", "operator_approval")
+                "allocation_complete", "operator_approval", "capital_flow")
 
 
 
@@ -40,6 +40,10 @@ def _historical_state(events, approvals, cutoff):
             mandate.update(mandate_capital_basis=body.get("to"), mandate_reserve_cash=body.get("reserved_cash"))
         elif kind == "operator_reserve_adjusted":
             mandate["mandate_reserve_cash"] = body.get("reserved_cash")
+        elif kind == "capital_flow":
+            mandate["mandate_capital_basis"] = body.get("capital_basis_after")
+            if body.get("mode") != "local":
+                mandate["mandate_reserve_cash"] = body.get("reserved_cash_after")
         elif kind == "decision_accepted":
             target = [body["id"], "active", body["until_at"], json.dumps(body["decision"])]
         elif kind == "allocation_complete" and target and body["decision_id"] == target[0]:
@@ -74,6 +78,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         db.execute("BEGIN")  # Events and immutable request bodies come from the same snapshot.
         from .ledger_audit import audit_connection
         integrity = audit_connection(db) if as_of is None else {"status": "not_checked", "reason": "Historical cutoff"}
+        trusted_ledger = integrity["status"] != "failed"
         # Only the kinds a report uses; per-minute liveness rows are skipped.
         invalid_accounts = set(integrity.get("invalid_account_sequences", []))
         cutoff = instant(as_of) if as_of is not None else None
@@ -90,6 +95,10 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         # What the fund has spent on models and data; the account itself never pays it.
         fund_costs = accrued_costs(db, (cutoff or datetime.now(timezone.utc)).isoformat())
         marks = nav_marks(db, until=cutoff, excluded=invalid_accounts)
+        # Operator subscriptions and redemptions are not returns: figures use the NAV per unit (capital.py).
+        from .capital import Units
+        units = Units.from_db(db, until=cutoff) if trusted_ledger else Units([])
+        adjusted = {mark[0]: float(mark[3]) * units.scale(mark[0]) for mark in marks}
         light = sorted(marks, key=lambda mark: mark[2])  # Stable: sequence order within one instant.
         if light and light[-1][4]:
             closing_mark, close_cutoff = light[-1], instant(light[-1][4])
@@ -135,7 +144,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         row["body"] = json.loads(row["body"])
         row["effective_state"] = "expired" if row["state"] in {"pending", "approved"} and instant(row["body"]["expires_at"]) <= now else row["state"]
     from .evaluation import forward_outcomes
-    outcomes = forward_outcomes(outcome_events)
+    outcomes = forward_outcomes(outcome_events) if trusted_ledger else []
     monitor = None
     if as_of is None and (root / "monitor.json").is_file():
         try:
@@ -152,7 +161,8 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     triggers = {name: [{"at": at, **body} for at, kind, body in events if kind == name]
                 for name in ("protective_trigger", "price_alert", "review_triggered")}
     mandate_events = [{"at": at, "kind": kind, **body} for at, kind, body in events
-                      if kind in {"mandate_initialized", "mandate_capital_changed", "operator_reserve_adjusted"}]
+                      if kind in {"mandate_initialized", "mandate_capital_changed", "operator_reserve_adjusted",
+                                  "capital_flow"}]
     backoffs = sum(kind == "decision_backoff" for _, kind, _ in events)
     reviews = [body for _, kind, body in events if kind == "postmarket_review"]
     for at, kind, body in events:
@@ -173,19 +183,39 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     fills = [row for row in fills if row["broker_id"] not in reconciled] + list(reconciled.values())
     curve = [shown_accounts[daily[day][0]] for day in sorted(daily)]
     peak, max_drawdown, previous = 0, 0, None
-    for row in curve:
-        peak = max(peak, row["equity"])
+    for day in sorted(daily):
+        row, value = shown_accounts[daily[day][0]], adjusted[daily[day][0]]
+        peak = max(peak, value)
         if peak > 0:
-            max_drawdown = max(max_drawdown, 1 - row["equity"] / peak)
+            max_drawdown = max(max_drawdown, 1 - value / peak)
         if previous is None:
-            row["daily_return"] = 0 if row["equity"] > 0 else None
+            row["daily_return"] = 0 if value > 0 else None
         else:
-            row["daily_return"] = row["equity"] / previous - 1 if previous > 0 else None
-        previous = row["equity"]
+            row["daily_return"] = value / previous - 1 if previous > 0 else None
+        previous = value
     initial = first_account["equity"] if light else None
+    growth = adjusted[light[-1][0]] / adjusted[light[0][0]] - 1 if light and adjusted[light[0][0]] > 0 else None
+    flow_rows = [(sequence, at, body) for sequence, at, kind, body in sequenced
+                 if kind == "capital_flow" and trusted_ledger]
+    flows = [body for _, _, body in flow_rows]
+    capital = {"flows": len(flows), "recent": flows[-10:],
+               "net_flows_usd": sum(float(b["amount"]) * (-1 if b["kind"] == "redemption" else 1) for b in flows),
+               "units": flows[-1]["units_after"] if flows else mandate_meta.get("mandate_capital_basis"),
+               "meaning": "subscriptions add and redemptions take money at the NAV per unit; returns, drawdowns "
+                          "and the Sharpe ratio exclude them, starting/ending equity are dollars and include them"}
+    capital_equity = last_account["equity"] if light else None
+    capital["equity_at"] = last_account["at"] if light else None
+    if flow_rows and (not light or flow_rows[-1][0] > light[-1][0]):
+        # The flow's committed post-transfer equity and units belong to the same valuation.
+        _, capital["equity_at"], latest_flow = flow_rows[-1]
+        capital_equity = float(latest_flow["equity_after"])
+    try:
+        capital["nav_per_unit"] = round(capital_equity / float(capital["units"]), 6)
+    except (TypeError, ValueError, ZeroDivisionError):
+        capital["nav_per_unit"] = None
     observed_peak, observed_drawdown = 0, 0
     for row in light:
-        equity = float(row[3])
+        equity = adjusted[row[0]]
         observed_peak = max(observed_peak, equity)
         if observed_peak > 0:
             observed_drawdown = max(observed_drawdown, 1 - equity / observed_peak)
@@ -282,8 +312,9 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                     "reserved_cash": mandate_meta.get("mandate_reserve_cash"), "events": mandate_events[-10:]},
         "decision_backoffs": backoffs,
         "observations": len(curve), "starting_equity": initial,
-        "ending_equity": last_account["equity"] if light else None,
-        "return": last_account["equity"] / initial - 1 if initial is not None and initial > 0 and light else None,
+        "ending_equity": capital_equity,
+        "return": growth,
+        "capital": capital,
         "max_observed_drawdown": observed_drawdown if observed_peak > 0 else None,
         "max_daily_drawdown": max_drawdown if peak > 0 else None,
         "daily_sharpe_zero_risk_free": sharpe,
@@ -299,7 +330,9 @@ def report(root, prices=None, write_files=True, *, as_of=None):
         "recent_trades": recent_trades(events, last_account["as_of"]) if light else [],
         "ledger_audit": integrity,
         "limitations": "Daily sampled drawdown; benchmark price returns exclude dividends and fees. "
-                        "No claim of predictive performance from scripted models. Cash flows are not return-adjusted; use a dedicated unfunded-during-run account."
+                        "No claim of predictive performance from scripted models. Operator subscriptions and redemptions "
+                        "are removed from return, drawdowns and Sharpe (NAV per unit); starting and ending equity are "
+                        "dollars that include them."
     }
     if integrity["status"] == "failed":
         # Retain the audit evidence, but do not publish disputed balances or
@@ -308,6 +341,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
                       "max_daily_drawdown", "daily_sharpe_zero_risk_free"):
             summary[field] = None
         summary["recent_trades"] = []
+        summary["capital"].update(flows=None, net_flows_usd=None, units=None, equity_at=None, nav_per_unit=None)
     if not write_files:
         return summary
     (root / "report.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")

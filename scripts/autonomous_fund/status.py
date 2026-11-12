@@ -419,6 +419,9 @@ def summary(root, mode, now=None):
         lines += ["", *account_lines(account, data.get("recent_trades"), now=now, costs=data.get("fund_costs")), ""]
     if data.get("return") is not None:
         lines.append(f"累计收益：{data['return'] * 100:.2f}%；最大观测回撤：{(data.get('max_observed_drawdown') or 0) * 100:.2f}%")
+        if (data.get("capital") or {}).get("flows"):
+            lines.append(f"（已剔除申购/赎回 {data['capital']['flows']} 笔，净额 {data['capital']['net_flows_usd']:+.2f} 美元；"
+                         f"单位净值 {data['capital'].get('nav_per_unit')}）")
     lines.append(f"待审批：{data.get('pending_approval_count', 0)} 个；已复盘：{data.get('postmarket_review_runs', 0)} 次")
     line = cost_line(data.get("model_costs"))
     if line:
@@ -431,6 +434,14 @@ def summary(root, mode, now=None):
         retries = {key: json.loads(value) for key, value in db.execute(
             "SELECT key,value FROM meta WHERE key IN ('decision_failures','decision_retry_at','decision_failure_role')")}
         rows = db.execute("SELECT at,body FROM events WHERE kind='notification' ORDER BY sequence DESC LIMIT 6").fetchall()
+        waiting = db.execute("SELECT value FROM meta WHERE key='capital_requests'").fetchone()
+        waiting = json.loads(waiting[0]) if waiting else []
+        if waiting:
+            names = {"subscription": "申购", "redemption": "赎回"}
+            lines.append("申购/赎回等待中：" + "；".join(
+                f"{names.get(row.get('kind'), row.get('kind'))} {row.get('amount')} 美元"
+                f"{'（正在筹集现金）' if row.get('state') == 'liquidating' else ''}" for row in waiting)
+                + "（查看：bash scripts/fund-capital.sh）")
         try:
             lines += weekly_lines(db, now, stopped=record is not None)
         except Exception as exc:  # A status line, never a reason to hide the rest of the summary.

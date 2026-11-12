@@ -232,10 +232,17 @@ class Journal:
         """Carve the operator's capital sleeve out of the account; return reserved cash.
 
         First start: reserve = (cash + sleeve holdings value) - capital, so the AI
-        starts with exactly `capital`. A later capital change moves cash between
-        reserve and sleeve. External holdings (outside the universe) are frozen
-        at their first observed quantities; any change needs operator review.
-        Nothing is inferred: an account smaller than the mandate is refused.
+        starts with exactly `capital`. A later change of the configured value
+        queues an absolute net capital target behind the existing operator
+        requests. The running fund calculates the difference again from the
+        applied capital when the target reaches the front of the queue.
+        A change is never a gain or a loss,
+        and a smaller capital raises its cash like any redemption instead of
+        blocking the fund. An unchanged value queues nothing, however far the
+        script has moved the capital since. External holdings (outside the
+        universe) are frozen at their first observed quantities; any change
+        needs operator review. Nothing is inferred: an account smaller than the
+        mandate is refused.
         """
         capital = number(capital)
         with self.connection() as db:
@@ -251,19 +258,27 @@ class Journal:
                 if reserve > number(cash):
                     raise RiskError("Existing eligible positions exceed the mandate capital; reduce them or raise capital_usd")
                 rows = {"mandate_reserve_cash": str(reserve), "mandate_capital_basis": str(capital),
+                        "mandate_configured_capital": str(capital),
                         "mandate_external": encode({k: str(v) for k, v in sorted(external.items())})}
                 event = ("mandate_initialized", {"capital_usd": str(capital), "reserved_cash": str(reserve),
                                                  "external_holdings": rows["mandate_external"]})
-            elif number(rows["mandate_capital_basis"]) != capital:
-                delta = capital - number(rows["mandate_capital_basis"])
-                reserve = number(rows["mandate_reserve_cash"]) - delta
-                if reserve < 0:
-                    raise RiskError("Raised mandate capital exceeds the account's reserved cash")
-                if reserve > number(cash):
-                    raise RiskError("Lowered mandate capital exceeds the sleeve's cash; reduce positions first")
-                event = ("mandate_capital_changed", {"from": rows["mandate_capital_basis"], "to": str(capital),
-                                                     "reserved_cash": str(reserve)})
-                rows.update(mandate_reserve_cash=str(reserve), mandate_capital_basis=str(capital))
+            elif number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"])) != capital:
+                # The basis follows applied flows; the configured value is what .env said last. A new value is
+                # the capital the operator wants: measured from where the fund will be, never from the old value.
+                configured = number(rows.get("mandate_configured_capital", rows["mandate_capital_basis"]))
+                from .capital import QueueFull, queue_target
+                try:
+                    queued = queue_target(db, now, rows["mandate_capital_basis"], capital)
+                except QueueFull:
+                    # Keep valuing the sleeve so the runner can drain the queue.
+                    pass
+                else:
+                    rows["mandate_configured_capital"] = str(capital)
+                    if queued:
+                        event = ("mandate_capital_change_requested", {
+                            "from": str(configured), "to": str(capital), "request_id": queued["id"],
+                            "kind": queued["kind"], "amount": queued["amount"]})
+            rows.setdefault("mandate_configured_capital", rows["mandate_capital_basis"])
             baseline = {k: number(v) for k, v in json.loads(rows["mandate_external"]).items()}
             if baseline != {k: number(v) for k, v in external.items()}:
                 raise RiskError("External holdings changed; review the account and run adjust-reserve to re-baseline")
