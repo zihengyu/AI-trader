@@ -586,6 +586,11 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
     elif kind == "local_market_data_pending":
         text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
+    elif kind == "price_alert_unavailable" and isinstance(details, dict):
+        reason = {"Stale, future or nonpositive observation": "报价过期、时间异常或价格无效",
+                  "Missing source quote timestamp": "报价缺少源时间戳"}.get(details.get("error"), details.get("error"))
+        text = (f"⏳ {details.get('symbol', '')} 的价位提醒等待有效报价：{reason}。"
+                "本次跳过该标的提醒检查，后续自动重试。")
     elif kind == "closing_valuation_pending":
         text = (f"⏳ 收盘估值等待有效行情：{details}\n后台会继续重试；盘后复盘可使用已有观测，暂不认定收盘净值。"
                 "\n诊断：bash scripts/fund-logs.sh errors")

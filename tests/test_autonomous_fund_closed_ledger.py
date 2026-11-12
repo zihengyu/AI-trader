@@ -85,7 +85,13 @@ def test_missing_final_minute_preserves_old_nav_then_recovers_without_a_fake_clo
     previous = report(tmp_path, write_files=False)["latest_account"]
     original = source.fetch
     clock.value = CLOSE + timedelta(seconds=5)
-    source.fetch = lambda *args: original(*args).loc[lambda frame: frame.index < CLOSE - timedelta(minutes=1)]
+    def missing_closes(symbol, interval, period):
+        frame = original(symbol, interval, period)
+        # Keep both closing sources unavailable; a completed daily close is
+        # now sufficient evidence even when the final minute is missing.
+        return (frame[frame.index < CLOSE - timedelta(minutes=1)] if interval == "1m" else
+                frame[frame.index.date < CLOSE.date()])
+    source.fetch = missing_closes
     broker.do_polling()
     assert report(tmp_path, write_files=False)["latest_account"] == previous
     assert broker._valuation_error

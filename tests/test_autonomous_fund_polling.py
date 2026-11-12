@@ -70,11 +70,16 @@ def test_backoff_never_serves_previous_cached_success_as_fresh(monkeypatch):
 
 def test_cache_does_not_refresh_source_timestamp_or_expose_forming_bar():
     clock = Clock()
-    source = YahooRealtimeData(now=clock, fetch=clock.fetch)
+    old = clock.fetch('ALFA', '1m', '5d')
+    old = old[old.index + timedelta(minutes=1) <= clock.value]
+    # A new minute now refreshes the cache. Keep the provider's observations
+    # unchanged to verify that a new receipt still cannot rejuvenate old data.
+    source = YahooRealtimeData(now=clock, fetch=lambda *args: old.copy())
     asset = Asset('ALFA', asset_type='stock')
     quote = source.get_quote(asset)
     clock.value += timedelta(seconds=75)
     repeated = source.get_quote(asset)
     assert repeated.timestamp == quote.timestamp
     assert (source.get_datetime() - repeated.timestamp).total_seconds() > 60
+    assert source.diagnostics()['requests'] == 2
     assert source.execution_bars(asset).index[-1] + timedelta(minutes=1) <= clock.value

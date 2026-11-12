@@ -140,7 +140,15 @@ def observed_quote(quote, now, limits):
             raise MarketDataUnavailable("Invalid observed bid/ask")
         price = (bid + ask) / 2
     # Validate here so non-finite prices also retain the actual observation clock.
-    return ObservedPrice(price, instant(stamp)).validate(now, limits)
+    try:
+        return ObservedPrice(price, instant(stamp)).validate(now, limits)
+    except MarketDataUnavailable as exc:
+        # Retain whether a stale observation was a completed-bar proxy or an
+        # actual last trade. Never log a full provider payload for diagnostics.
+        metadata = getattr(quote, "raw_data", None) or {}
+        exc.diagnostic = {**(exc.diagnostic or {}),
+                          **({"price_kind": metadata["price_kind"]} if metadata.get("price_kind") else {})}
+        raise
 
 
 @dataclass(frozen=True)

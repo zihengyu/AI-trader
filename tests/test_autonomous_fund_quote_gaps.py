@@ -235,6 +235,10 @@ def test_native_closing_hook_waits_for_valid_final_bar_then_background_valuation
             raw = original(symbol, interval, period)
             if interval == "1m":
                 raw.loc[raw.index == CLOSE - timedelta(minutes=1), "Close"] = float("nan")
+            else:
+                # A missing minute alone now recovers from a real daily close.
+                # This fixture exercises pending valuation with neither source.
+                raw = raw[raw.index.date < CLOSE.date()]
             return raw
 
         clock.value = CLOSE + timedelta(seconds=1)

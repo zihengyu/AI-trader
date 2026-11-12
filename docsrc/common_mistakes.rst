@@ -317,9 +317,22 @@ agent call is running. Marks include cash, receivables and observed position
 values, preserving reserved capital, external holdings and cash-equivalent
 classification. Quotes retain source times. Stale open-session quotes or a book
 change during the read prevent publication. Both cash-only and invested accounts
-save one closing valuation from the final completed regular-session minute and
-reuse it across polls, restarts and reviews until the next open. Missing final
-minutes are disclosed rather than labeling an old intraday mark as a close.
+save one closing valuation from the final completed regular-session minute or,
+when that minute is unavailable, the same session's completed unadjusted daily
+close. Daily recovery requires the actual exchange close, including early
+closes and daylight saving, and never admits a prior date or a forming bar.
+The selected interval, bar start, session close and receipt time remain in the
+valuation evidence. This supplies no minute bar for simulated fills. Marks are
+reused across polls, restarts and reviews until the next open. If neither source
+is available, retain the previous valuation and disclose the missing close.
+Verified closing quotes retain their original receipt time across native balance
+reads; the bounded cache is keyed by symbol and session close. A later session
+needs its own evidence. After-hours recovery cannot apply a queued subscription
+or redemption; capital flows still require an open session and fresh valuation.
+If the newly fetched daily response first reveals a split or dividend, reconcile
+its normalized actions through the existing ledger rules and retry valuation
+with the changed book. Old quantities or receivables cannot be frozen against
+the new close; late-split and action-revision reconciliation guards still apply.
 Status exposes valuation errors without relabeling old equity
 as a new observation. Paper accounts continue to use broker observations.
 
@@ -642,6 +655,15 @@ as indices without trading volume, when the configured source supplies a fresh
 positive price and its source timestamp. Missing, stale or future quotes are
 disclosed and retried. An observation alert never authorizes an order or target
 outside the tradable universe.
+
+During an open session, a minute-history cache is refreshed at each new minute
+even when its normal 15-second receipt TTL has not elapsed. Otherwise a quote
+aged 59.7 seconds can be reused at age 60.5 seconds and incorrectly miss newly
+available source evidence. Lagging source responses use a bounded five-second
+cache retry; the original source timestamp and freshness limit remain intact.
+Rejected observations include their price kind so completed-bar proxies can be
+distinguished from live trades. Telegram messages identify an unavailable price
+alert as a skipped alert check with automatic retry.
 
 The local Yahoo stream retains the 60 most recently requested symbols. At
 capacity it unsubscribes the least recently requested symbol and admits the

@@ -5,6 +5,7 @@ This module has no provider trading client, URL or authentication path.
 import json
 import os
 import threading
+from collections import OrderedDict
 from dataclasses import asdict, replace
 from datetime import datetime, time, timedelta
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
@@ -45,6 +46,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._next_valuation = None
         self._valuation_book_key = None
         self._closing_searched = None  # The session close whose saved closing valuation was looked up.
+        self._closing_sources = OrderedDict()
         self._ledger_cache = {}  # The last consistent ledger audit and the ledger_version it read.
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
@@ -215,7 +217,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 mark_day = trading_day(mark.as_of)
                 if mark_day < splits.get(position.asset.symbol, mark_day):
                     raise MarketDataUnavailable("Price predates applied split; valuation paused")
-                observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
+                observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of),
+                                                  **self._closing_sources.get(position.asset.symbol, {})}
                 value += number(position.quantity) * mark.price
                 continue
             quote = self.data_source.get_quote(position.asset)
@@ -360,8 +363,9 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         from .ledger_audit import stamp
         body = {**asdict(account), "ledger_audit": stamp(integrity), "valuation": {"source": "local_session_close" if closed_at else "local_broker_poll",
             **({"session_close": str(closed_at), "observed_at": str(now), "book_existed_at_close": book_existed} if closed_at else {}), "quotes": {
-            symbol: {"price": str(mark.price), "as_of": str(mark.as_of)}
-            for symbol, mark in marks.items() if symbol in holdings}}}
+            symbol: {"price": str(mark.price), "as_of": str(mark.as_of),
+                     **(self._closing_sources.get(symbol, {}) if closed_at else {})}
+            for symbol, mark in marks.items() if symbol in holdings or symbol in account.cash_equivalents}}}
         if benchmarks:
             body["benchmark_observations"] = {symbol: {"price": benchmarks[symbol], "as_of": benchmark_marks[symbol].as_of.isoformat()}
                                                for symbol in benchmarks}
@@ -388,13 +392,19 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._valuation_error = None
 
     def _closing_quote(self, asset, closed_at):
-        # Demand the final completed regular-session minute. A stale intraday
-        # mark must never acquire the label or timestamp of a closing price.
-        frame = self.data_source.execution_bars(asset, required_through=closed_at)
-        rows = frame[frame.index + timedelta(minutes=1) == closed_at]
-        if rows.empty:
-            raise MarketDataUnavailable(f"Closing minute unavailable for {asset.symbol} at {closed_at.isoformat()}; retaining the last observed valuation")
-        return ObservedPrice(number(rows.iloc[-1].close), closed_at).validate(closed_at, self.limits)
+        quote = self.data_source.get_closing_quote(asset, closed_at)
+        actions = quote.raw_data.get("corporate_actions")
+        if actions is not None and self._corporate_actions({asset.symbol: actions}):
+            # Lots and receivables were sampled before price I/O. Re-read the
+            # changed book instead of freezing pre-split shares at a new close.
+            raise MarketDataUnavailable("Closing corporate actions updated; retry valuation with the reconciled book")
+        mark = observed_quote(quote, closed_at, self.limits)
+        self._closing_sources[asset.symbol] = {key: quote.raw_data[key] for key in
+            ("source", "price_kind", "bar_start", "session_close", "observed_at")}
+        self._closing_sources.move_to_end(asset.symbol)
+        while len(self._closing_sources) > 60:
+            self._closing_sources.popitem(last=False)
+        return mark
 
     def _submit_order(self, order):
         # Keep acceptance and native publication in the same ordering domain as
@@ -734,16 +744,20 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         self._process_trade_event(order, self.FILLED_ORDER if status == "fill" else self.PARTIALLY_FILLED_ORDER,
                                   price=float(price), filled_quantity=quantity, multiplier=1)
 
-    def _corporate_actions(self):
+    def _corporate_actions(self, observations=None):
         # Splits adjust integer shares; dividends accrue as NON-SPENDABLE
         # receivables because Yahoo does not establish the actual payment date.
         with self.journal.connection() as db:
             positions = [dict(row) for row in db.execute("SELECT * FROM local_positions WHERE quantity>0")]
             # Read once; a write lock is only taken for an action not seen before.
             known = {row[0]: number(row[1]) for row in db.execute("SELECT id,amount FROM local_actions")}
+        changed = False
         for position in positions:
             asset = Asset(position["symbol"], asset_type="stock")
-            actions = self.data_source.corporate_actions(asset, since=position["opened_at"])
+            if observations is not None and asset.symbol not in observations:
+                continue
+            actions = (observations[asset.symbol] if observations is not None else
+                       self.data_source.corporate_actions(asset, since=position["opened_at"]))
             for action in actions:
                 if action["date"] <= trading_day(instant(position["opened_at"])):
                     continue
@@ -779,6 +793,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                         db.execute("INSERT INTO local_actions VALUES(?,?)", (key, str(amount)))
                         self._event(db, "local_corporate_action", {"symbol": asset.symbol, **action, "kind": kind,
                             **({"entitled_quantity": str(entitled)} if kind == "dividend" else {})})
+                        changed = True
+        return changed
 
     @staticmethod
     def _same_action(kind, recorded, amount, action, actions):

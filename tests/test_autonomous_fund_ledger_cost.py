@@ -319,7 +319,13 @@ def test_the_saved_closing_valuation_is_searched_once_per_close(tmp_path, monkey
     broker.do_polling()
     original = source.fetch
     clock.value = CLOSE + timedelta(seconds=5)
-    source.fetch = lambda *args: original(*args).loc[lambda frame: frame.index < CLOSE - timedelta(minutes=1)]
+    def missing_closes(symbol, interval, period):
+        frame = original(symbol, interval, period)
+        # Both closing sources must be absent to exercise the pending/retry
+        # path: a completed same-day daily close now legitimately recovers it.
+        return (frame[frame.index < CLOSE - timedelta(minutes=1)] if interval == "1m" else
+                frame[frame.index.date < CLOSE.date()])
+    source.fetch = missing_closes
     with traced_statements(monkeypatch) as statements:
         for _ in range(6):  # The closing minute is missing for these polls.
             broker.do_polling()

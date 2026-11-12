@@ -2,6 +2,7 @@
 import threading
 import time
 import os
+from copy import deepcopy
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
@@ -282,6 +283,7 @@ class YahooRealtimeData(DataSource):
         self._quote_kinds = {"live": 0, "completed_bar": 0}
         self._quote_observations = OrderedDict()
         self._chart_trades = OrderedDict()
+        self._closing_quotes = OrderedDict()
 
     def diagnostics(self):
         with self._request_lock:
@@ -329,16 +331,24 @@ class YahooRealtimeData(DataSource):
     def _history(self, asset, interval, period, required_through=None):
         symbol, now = self._symbol(asset), self.get_datetime()
         key = (symbol, interval, period)
-        cutoff = completed_daily_cutoff(now) if interval == "1d" else None
+        opened = self.session.status()["open"]
+        cutoff = (completed_daily_cutoff(now) if interval == "1d" else
+                  now.replace(second=0, microsecond=0) if opened else None)
         # A five-second broker poll does not require another identical history
         # download. Source timestamps, never cache age, still gate execution.
-        ttl = (15 if self.session.status()["open"] else 300) if interval == "1m" else 900
+        ttl = (15 if opened else 300) if interval == "1m" else 900
         with self._request_lock:
             lock = self._key_locks.setdefault(key, threading.RLock())
         # Single flight per series; never hold a global lock during network I/O.
         with lock:
             cached = self._cache.get(key)
-            through = cached[1].index[-1] + timedelta(minutes=1) if cached and interval == "1m" else None
+            through = ((cached[1].index[-1] + timedelta(minutes=1) if interval == "1m" else
+                        cached[1].index[-1].date()) if cached else None)
+            if cached and interval == "1m" and opened and through < cutoff:
+                ttl = 5  # Retry a lagging source, bounded across quote consumers.
+            # At a new minute, a cached mark can cross the freshness limit
+            # before its 15-second TTL expires. Re-read actual source evidence;
+            # the source stamp and the independent 60-second guard never move.
             if (cached and cached[2] == cutoff and time.monotonic() - cached[0] < ttl
                     and (required_through is None or (through is not None and through >= required_through))):
                 self._stats["cache_hits"] += 1
@@ -470,6 +480,65 @@ class YahooRealtimeData(DataSource):
 
     def execution_bars(self, asset, *, required_through=None):
         return self._history(asset, "1m", "5d", required_through=required_through)
+
+    def get_closing_quote(self, asset, closed_at):
+        """A completed session's unadjusted close, from its final minute or its daily bar.
+
+        Daily evidence is independent of intraday coverage. It is admitted only
+        after the actual exchange close, for exactly that session's date. Never
+        relabel an earlier minute, a prior daily close or an extended-hours tick.
+        """
+        closed_at = instant(closed_at)
+        day = closed_at.astimezone(ZoneInfo("America/New_York")).date()
+        now = self.get_datetime()
+        if _session_close(day) != closed_at or now < closed_at:
+            raise MarketDataUnavailable("Closing price requires an already completed exchange session")
+        key = (self._symbol(asset), closed_at)
+        with self._request_lock:
+            cached = self._closing_quotes.get(key)
+            if cached is not None:
+                self._closing_quotes.move_to_end(key)
+                return deepcopy(cached)
+        row, start, kind = None, None, None
+        try:
+            minute = self.execution_bars(asset, required_through=closed_at)
+            exact = minute[minute.index + timedelta(minutes=1) == closed_at]
+            if not exact.empty:
+                row, start, kind = exact.iloc[-1], exact.index[-1], "completed_minute_close"
+        except MarketDataUnavailable:
+            pass  # A real daily close can remain available during minute backoff.
+        if row is None:
+            try:
+                daily = self._history(asset, "1d", "6mo", required_through=day)
+                exact = daily[daily.index.date == day]
+                if not exact.empty:
+                    row, start, kind = exact.iloc[-1], exact.index[-1], "completed_daily_close"
+            except MarketDataUnavailable:
+                pass
+        if row is None:
+            raise MarketDataUnavailable(
+                f"Closing minute unavailable for {asset.symbol} at {closed_at.isoformat()}; "
+                "completed daily close also unavailable; retaining the last observed valuation",
+                diagnostic={"reason": "closing_price_unavailable", "symbol": asset.symbol,
+                            "session_close": closed_at.isoformat(), "checked_at": self.get_datetime().isoformat()})
+        price = float(number(row.close))
+        result = Quote(asset, price=price, bid=price, ask=price, timestamp=closed_at, volume=float(row.volume),
+                       raw_data={"original_response": SimpleNamespace(timestamp=closed_at), "source": self.SOURCE,
+                                 "price_kind": kind, "bar_start": start.isoformat(),
+                                 "session_close": closed_at.isoformat(), "observed_at": self.get_datetime().isoformat()})
+        if kind == "completed_daily_close":
+            # The forced daily refresh may reveal a split/dividend that the
+            # earlier action check did not yet see. Keep the same response's
+            # normalized actions with its unadjusted close for reconciliation.
+            result.raw_data["corporate_actions"] = deepcopy(self._actions.get((asset.symbol, "6mo"), []))
+        with self._request_lock:
+            # A valid recovered close is frozen just like its published NAV;
+            # repeated native balance reads need not retry missing minutes all night.
+            retained = self._closing_quotes.setdefault(key, deepcopy(result))
+            self._closing_quotes.move_to_end(key)
+            while len(self._closing_quotes) > 60:
+                self._closing_quotes.popitem(last=False)
+        return deepcopy(retained)
 
     def session_bars(self, asset):
         """Today's completed minutes only: a fifth of execution_bars' download, for research views."""

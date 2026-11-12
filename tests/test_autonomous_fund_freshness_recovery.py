@@ -233,7 +233,9 @@ def test_cached_chart_trade_is_not_retimestamped_and_cannot_outlive_freshness():
     clock.value += timedelta(seconds=70)  # Cache receipt age is still short; source age is not.
     with pytest.raises(RiskError):
         observed_quote(source.get_quote(Asset("GAMMA")), clock(), LIMITS)
-    assert source.diagnostics()["requests"] == 1
+    # Crossing a minute boundary now refreshes source evidence even before the
+    # normal receipt-cache TTL expires. The returned old trade still expires.
+    assert source.diagnostics()["requests"] == 2
 
 
 def test_an_older_chart_quote_cannot_replace_a_more_recent_completed_bar():
