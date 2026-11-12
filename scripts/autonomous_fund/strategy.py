@@ -21,7 +21,8 @@ from .cash import policy_context
 from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
-from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnavailable, ObservedPrice, Price, RiskError,
+from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnavailable, ObservedPrice,
+                   OpeningValuationPending, Price, RiskError,
                    bounded_list, bounded_text, decision_levels,
                    desired_shares, instant, number, plan,
                    observed_quote, trading_day, validate_decision, validate_evidence)
@@ -1023,6 +1024,16 @@ class AutonomousFund(Strategy):
                 pass  # Diagnostic failures must never stop the strategy.
         self._disclose(kind, str(error) if isinstance(error, RiskError) else type(error).__name__)
 
+    def _record_price_observation_rejected(self, detail):
+        try:
+            self.journal.event(self.get_datetime(), "price_observation_rejected", detail)
+        except Exception:
+            pass
+        try:
+            self.log_message(f"FUND price_observation_rejected: {encode(detail)}", color="yellow")
+        except Exception:
+            pass
+
     def on_bot_crash(self, error):
         # Last line of defense: the separately running monitor sees this outbox
         # entry (and its own stale heartbeat) and alerts the operator.
@@ -1959,7 +1970,24 @@ class AutonomousFund(Strategy):
                 # this new clock, before its memo can inform today's decision.
                 self._review_after_close()
             self._reconcile()
-            account = self._snapshot()
+            try:
+                account = self._snapshot()
+            except OpeningValuationPending as exc:
+                detail = exc.diagnostic
+                emitted = self._disclose("opening_valuation_pending", {
+                    "symbol": detail["symbol"], "first_bar_at": detail["first_bar_at"],
+                })
+                if emitted is not False:
+                    self._record_price_observation_rejected({**detail, "phase": "opening_valuation"})
+                return
+            except MarketDataUnavailable as exc:
+                detail = exc.diagnostic or {}
+                if detail.get("symbol"):
+                    if self._disclose("blocked", f"{detail['symbol']} 估值报价不可用（{exc}）") is not False:
+                        self._record_price_observation_rejected({**detail, "phase": "account_snapshot"})
+                else:
+                    self._disclose_failure("blocked", exc, phase="trading_iteration")
+                return
             now = self.get_datetime()
             self._announce_session_open(now, account)
             if self.mode == "local":
@@ -2906,15 +2934,7 @@ class AutonomousFund(Strategy):
                 if emitted is not False and getattr(exc, "diagnostic", None):
                     # Keep changing source clocks out of the notification's
                     # dedupe identity; retain evidence only with each notice.
-                    detail = {"symbol": alert["symbol"], **exc.diagnostic}
-                    try:
-                        self.journal.event(self.get_datetime(), "price_observation_rejected", detail)
-                    except Exception:
-                        pass
-                    try:
-                        self.log_message(f"FUND price_observation_rejected: {encode(detail)}", color="yellow")
-                    except Exception:
-                        pass
+                    self._record_price_observation_rejected({"symbol": alert["symbol"], **exc.diagnostic})
                 continue
             mark = observation.price
             crossed = ((alert.get("above") is not None and mark >= number(alert["above"])) or
@@ -3671,7 +3691,11 @@ class AutonomousFund(Strategy):
                    "unavailable": latest.get("*", {}).get("error"),
                    "corporate_actions": {"examples": [{"symbol": s, **item} for s in sorted(action_disputed)
                                                       for item in actions[s]["discrepancies"]][:8],
-                                         "unconfirmed": action_unconfirmed, "unavailable": action_unavailable}}
+                                          "unconfirmed": action_unconfirmed,
+                                          "unconfirmed_examples": [
+                                              {"symbol": s, **item} for s in sorted(action_unconfirmed)
+                                              for item in actions[s]["unconfirmed"]
+                                          ][:20], "unavailable": action_unavailable}}
         self._notify_fund("bar_quality_issues", details)
         self.journal.set_meta("bar_quality_notified", day)
         return details

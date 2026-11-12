@@ -586,6 +586,10 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
     elif kind == "local_market_data_pending":
         text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
+    elif kind == "opening_valuation_pending" and isinstance(details, dict):
+        text = (f"⏳ 开盘估值等待 {details['symbol']} 的本交易日有效报价。"
+                f"首根一分钟线最早于 {_when(details['first_bar_at'])} 收完。"
+                "新鲜成交价或已完成分钟线到达后，系统会继续检查。")
     elif kind == "price_alert_unavailable" and isinstance(details, dict):
         reason = {"Stale, future or nonpositive observation": "报价过期、时间异常或价格无效",
                   "Missing source quote timestamp": "报价缺少源时间戳"}.get(details.get("error"), details.get("error"))
@@ -704,13 +708,28 @@ def readable(kind, details, sequence=None, *, now=None):
             kind = {"split": "拆股比例", "dividend": "每股现金分红（除权日股数口径）"}[item["kind"]]
             parts.append(f"{item['symbol']} {item['date']} {kind}："
                          f"Yahoo {item.get('yahoo_ex_date_basis', item['yahoo'])}，Alpaca {item['alpaca']}。")
-        if actions.get("unconfirmed"):
+        unconfirmed = actions.get("unconfirmed") or {}
+        unconfirmed_examples = actions.get("unconfirmed_examples") or []
+        if unconfirmed_examples:
+            parts.append(f"{sum(unconfirmed.values())} 条公司行动待核对。")
+            for item in unconfirmed_examples:
+                kind = {"split": "拆股", "dividend": "现金分红"}.get(item["kind"], item["kind"])
+                if item.get("reason") == "one_source_only":
+                    missing = "Yahoo" if item.get("yahoo") is None else "Alpaca"
+                    reason = f"{missing} 缺少同日记录"
+                else:
+                    reason = "每股计价口径待确认"
+                parts.append(f"{item['symbol']} {item['date']} {kind} · {reason}")
+            remaining = sum(unconfirmed.values()) - len(unconfirmed_examples)
+            if remaining > 0:
+                parts.append(f"另有 {remaining} 条待核对。")
+        elif unconfirmed:
             parts.append("公司行动只有单一来源或计价口径未确认："
-                         + "、".join(f"{s} {n} 项" for s, n in sorted(actions["unconfirmed"].items())))
+                         + "、".join(f"{s} {n} 项" for s, n in sorted(unconfirmed.items())))
         if actions.get("unavailable"):
             parts.append(f"{actions['unavailable']} 个证券的公司行动核对暂不可用。")
         text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
-        text += "\n不需要操作；明天会重新核对。持续出现时，检查该证券是否刚拆股或数据源有误。"
+        text += "\n数据台会重新核对。持续出现时，按标的和日期查发行方公告或数据源记录。"
     elif kind == "market_out_of_history" and isinstance(details, dict):
         labels = {"benchmark_vol_20d": "基准近 20 日波动率（年化）", "benchmark_return_1d": "基准单日涨跌",
                   "benchmark_drawdown": "基准从高点回撤", "stock_mean_correlation_20d": "股票之间近 20 日平均相关性"}

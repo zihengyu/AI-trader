@@ -70,3 +70,18 @@ def test_published_corporate_mismatch_invalidates_cached_research_and_notifies(t
     notice = strategy._report_bar_quality(NOW)
     assert notice["withheld"] == ["ALFA"] and notice["corporate_actions"]["unconfirmed"] == {"BETA": 1}
     assert "拆股比例" in readable("bar_quality_issues", notice)
+    assert "BETA 2026-10-30 拆股 · Yahoo 缺少同日记录" in readable("bar_quality_issues", notice)
+
+
+def test_unconfirmed_notice_identifies_missing_alpaca_and_uncertain_share_basis():
+    from scripts.autonomous_fund.notifications import readable
+
+    notice = {"corporate_actions": {"unconfirmed": {"ALFA": 1, "BETA": 1}, "unconfirmed_examples": [
+        {"symbol": "ALFA", "date": "2026-10-26", "kind": "dividend", "reason": "one_source_only",
+         "yahoo": "1.25", "alpaca": None},
+        {"symbol": "BETA", "date": "2026-10-27", "kind": "dividend", "reason": "uncertain_share_basis",
+         "yahoo": "0.25", "alpaca": "0.5"},
+    ]}}
+    text = readable("bar_quality_issues", notice)
+    assert "ALFA 2026-10-26 现金分红 · Alpaca 缺少同日记录" in text
+    assert "BETA 2026-10-27 现金分红 · 每股计价口径待确认" in text

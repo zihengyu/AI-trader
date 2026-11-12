@@ -17,7 +17,8 @@ from lumibot.trading_builtins import PollingStream
 
 from .journal import encode
 from .market_data import CachedMarketHours
-from .risk import Account, MarketDataUnavailable, ObservedPrice, RiskError, instant, number, observed_quote, trading_day
+from .risk import (Account, MarketDataUnavailable, ObservedPrice, OpeningValuationPending, RiskError, instant, number,
+                   observed_quote, trading_day)
 
 
 class VirtualRiskCancellation(RiskError):
@@ -221,11 +222,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                                                   **self._closing_sources.get(position.asset.symbol, {})}
                 value += number(position.quantity) * mark.price
                 continue
-            quote = self.data_source.get_quote(position.asset)
-            mark_day = trading_day(instant(quote.timestamp))
-            if mark_day < splits.get(position.asset.symbol, mark_day):
-                raise MarketDataUnavailable("Price predates applied split; valuation paused")
-            mark = observed_quote(quote, self.data_source.get_datetime(), self.limits)
+            mark = self._live_holding_mark(position.asset, split_day=splits.get(position.asset.symbol))
             observed[position.asset.symbol] = {"price": str(mark.price), "as_of": str(mark.as_of)}
             value += number(position.quantity) * number(observed[position.asset.symbol]["price"])
         if market_open:
@@ -236,6 +233,36 @@ class LocalPaperBroker(CachedMarketHours, Broker):
 
     def get_historical_account_value(self):
         return {}
+
+    def _live_holding_mark(self, asset, *, split_day=None):
+        quote = None
+        try:
+            quote = self.data_source.get_quote(asset)
+            if split_day:
+                raw = (getattr(quote, "raw_data", None) or {}).get("original_response")
+                stamp = getattr(raw, "timestamp", None)
+                if stamp is not None and trading_day(stamp) < split_day:
+                    raise MarketDataUnavailable("Price predates applied split; valuation paused", diagnostic={
+                        "reason": "pre_split", "source_as_of": instant(stamp).isoformat(),
+                    })
+            return observed_quote(quote, self.data_source.get_datetime(), self.limits)
+        except MarketDataUnavailable as exc:
+            detail = {**(exc.diagnostic or {}), "symbol": asset.symbol}
+            source = (getattr(quote, "raw_data", None) or {}).get("source")
+            if source:
+                detail["source"] = source
+            exc.diagnostic = detail
+            if detail.get("reason") == "stale" and detail.get("price_kind") == "completed_minute_close_with_spread_proxy":
+                session = self.data_source.session.status()
+                opened = instant(session["next_open"])
+                first_bar = opened + timedelta(minutes=1)
+                if (session["open"] and opened <= instant(detail["checked_at"]) < first_bar
+                        and instant(detail["source_as_of"]) < opened):
+                    raise OpeningValuationPending(
+                        f"{asset.symbol} is waiting for a current-session valuation quote",
+                        diagnostic={**detail, "first_bar_at": first_bar.isoformat()},
+                    ) from exc
+            raise
 
     def configure_valuation(self, *, universe, mandate, sweep=None, daily_loss_limit=None,
                             interval_seconds=30, benchmark_symbols=()):
@@ -315,7 +342,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         for row in book["positions"]:
             asset = Asset(row["symbol"], asset_type="stock")
             marks[row["symbol"]] = (self._closing_quote(asset, closed_at) if closed_at is not None else
-                observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits))
+                                    self._live_holding_mark(asset))
             positions.append(Position("local-valuation", asset, row["quantity"], avg_fill_price=float(number(row["average"]))))
         now = self.data_source.get_datetime()
         for symbol, mark in marks.items():
@@ -539,6 +566,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 self._market_data_error = None
             try:
                 self._publish_valuation()
+            except OpeningValuationPending as exc:
+                self._valuation_error = str(exc)
+                # The regular broker poll can see a fresh trade before a minute closes.
+                retry_at = self.data_source.get_datetime() + timedelta(seconds=5)
+                self._next_valuation = min(self._next_valuation, retry_at)
             except Exception as exc:
                 self._valuation_error = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
         except MarketDataUnavailable as exc:

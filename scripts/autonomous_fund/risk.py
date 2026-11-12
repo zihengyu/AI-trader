@@ -35,6 +35,10 @@ class NoCompletedMinute(MarketDataUnavailable):
     """A minute-history response arrived before any of its bars had closed."""
 
 
+class OpeningValuationPending(MarketDataUnavailable):
+    """A holding has only a prior-session mark before the first minute closes."""
+
+
 class DecisionTimingError(RiskError):
     """A rejected answer with safe clock evidence for one bounded reassessment."""
 

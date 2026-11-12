@@ -132,6 +132,21 @@ over 15 minutes old, future-dated or missing when read. A partial breadth sample
 describes the covered symbols. The snapshot update time and each original
 bar time are reported separately, along with any refresh error.
 
+Opening Valuation and Corporate-Action Notices
+---------------------------------------------------------------------------------
+
+In the local autonomous fund, opening valuation can wait for the first fresh
+holding quote. When the opening minute is still forming and only a prior
+session's completed bar is available, the opening notice names the holding
+and gives the earliest time the first minute can close. The broker poll retries
+valuation and the next strategy iteration checks the account again. Inspect
+``price_observation_rejected`` for the source time, quote age and rejection reason.
+
+The daily Yahoo and Alpaca cross-check lists dates and event types for
+unconfirmed corporate actions and identifies which provider lacked a
+same-date match. The notice includes up to 20 items. The complete detail is
+in the New York trading day's ``corporate_action_quality.json`` cache.
+
 Concurrent Autonomous Fund Daily-Cache Refreshes
 --------------------------------------------------------------------------------
 

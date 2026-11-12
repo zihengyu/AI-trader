@@ -108,6 +108,80 @@ def test_independent_valuation_discloses_stale_marks_and_recovers_without_retime
     assert report(tmp_path, write_files=False)["latest_account"]["equity"] == pytest.approx(previous["cash"] + 520)
 
 
+def test_local_iteration_waits_for_the_opening_quote_and_resumes_with_current_evidence(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.journal import Journal
+    from scripts.autonomous_fund.local_broker import LocalPaperBroker
+    from scripts.autonomous_fund.market_data import YahooRealtimeData
+    from scripts.autonomous_fund.risk import Limits
+    from scripts.autonomous_fund.run import ScriptedRuntime
+    from scripts.autonomous_fund.strategy import account_digest
+    from .test_autonomous_fund_local import Clock
+
+    monkeypatch.setenv("IS_BACKTESTING", "false")
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    clock = Clock()
+    opened = clock.value.replace(day=3, hour=14, minute=30, second=0)
+    previous_minute = clock.value.replace(hour=20, minute=59, second=0)
+    received_completed = False
+
+    def fetch(symbol, interval, period):
+        data = clock.fetch(symbol, interval, period)
+        if interval == "1m" and clock.value >= opened:
+            # The first regular-session bar appears after the provider's delay.
+            recent = opened if received_completed else clock.value.replace(second=0)
+            data = data.iloc[-2:].copy()
+            data.index = type(data.index)([previous_minute, recent])
+        return data
+
+    source = YahooRealtimeData(now=clock, fetch=fetch)
+    config = {"model": "deepseek/deepseek-flash", "limits": {}, "mandate": {"capital_usd": None},
+              "universe": {"ALFA": "stock"}}
+    journal = Journal(tmp_path, account_digest("local", "local-virtual-account", config))
+    broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
+    strategy = AutonomousFund(broker=broker, name="OpeningValuation", parameters={
+        "config": config, "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account",
+        "runtime": ScriptedRuntime()})
+    decisions = []
+    try:
+        strategy._executor._initialize()
+        submit(broker, journal, clock.value)
+        advance(clock, source)
+        broker.do_polling()
+        previous = broker._last_valuation
+        strategy._decide = lambda account, now, paused: decisions.append(account)
+
+        clock.value = opened + timedelta(seconds=1)
+        strategy.on_trading_iteration()
+        strategy.on_trading_iteration()
+        pending = [row["body"]["details"] for row in journal.all_events() if row["kind"] == "notification"
+                   and row["body"]["kind"] == "opening_valuation_pending"]
+        [notice] = pending
+        assert notice["symbol"] == "ALFA" and "开盘估值等待 ALFA" in readable("opening_valuation_pending", notice)
+        [detail] = [row["body"] for row in journal.all_events() if row["kind"] == "price_observation_rejected"]
+        assert detail["phase"] == "opening_valuation" and detail["reason"] == "stale"
+        assert detail["source"] == source.SOURCE and detail["age_seconds"] > detail["max_age_seconds"]
+        assert broker._last_valuation == previous and not decisions
+        assert broker._next_valuation == clock.value + timedelta(seconds=5)
+
+        # Once the first minute should be available, continued lag is a regular failure with evidence.
+        clock.value = opened + timedelta(seconds=61)
+        strategy.on_trading_iteration()
+        notices = [row["body"]["kind"] for row in journal.all_events() if row["kind"] == "notification"]
+        assert notices.count("opening_valuation_pending") == 1 and "blocked" in notices
+        assert not decisions
+
+        received_completed = True
+        # Supply a newly completed bar while it is still within the quote-age limit.
+        clock.value = opened + timedelta(seconds=90)
+        source._cache.pop(("ALFA", "1m", "5d"))
+        strategy.on_trading_iteration()
+        assert len(decisions) == 1 and decisions[0].positions == {"ALFA": 5}
+        assert journal.get_meta("session_open_notified") == "2026-11-03"
+        assert not journal.pending()
+    finally:
+        broker._close_connection()
+
+
 def test_independent_marks_preserve_reserved_capital_and_operator_positions(tmp_path):
     clock, source, journal, broker = setup_book(tmp_path)
     with journal.connection() as db:
