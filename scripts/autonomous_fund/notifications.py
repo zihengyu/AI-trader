@@ -717,6 +717,8 @@ def readable(kind, details, sequence=None, *, now=None):
                 if item.get("reason") == "one_source_only":
                     missing = "Yahoo" if item.get("yahoo") is None else "Alpaca"
                     reason = f"{missing} 缺少同日记录"
+                elif item.get("reason") == "currency_not_comparable":
+                    reason = "Alpaca 有同日记录，币种口径待核对"
                 else:
                     reason = "每股计价口径待确认"
                 parts.append(f"{item['symbol']} {item['date']} {kind} · {reason}")

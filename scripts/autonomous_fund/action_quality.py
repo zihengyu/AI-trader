@@ -11,29 +11,38 @@ DIVIDEND_ABSOLUTE = number("0.005")
 
 
 def _events(rows, start, end):
-    events = {}
+    events, unresolved_currency = {}, {}
     for row in rows:
         day = date.fromisoformat(row["date"])
         if not start <= day <= end:
             continue
+        if evidence := row.get("unverified_dividend"):
+            unresolved_currency.setdefault((day, "dividend"), []).append(evidence)
         for kind in ("split", "dividend"):
             amount = number(row.get(kind, 0))
             if amount > 0:
                 key = (day, kind)
                 events[key] = (events.get(key, number(1)) * amount if kind == "split"
                                else events.get(key, number(0)) + amount)
-    return events
+    return events, unresolved_currency
 
 
 def compare(primary, reference, start, end):
-    yahoo, alpaca = (_events(rows, start, end) for rows in (primary, reference))
+    yahoo, _ = _events(primary, start, end)
+    alpaca, alpaca_currency = _events(reference, start, end)
     discrepancies, unconfirmed = [], []
     splits = {key for key in yahoo.keys() | alpaca.keys() if key[1] == "split"}
-    for day, kind in sorted(yahoo.keys() | alpaca.keys()):
+    for day, kind in sorted(yahoo.keys() | alpaca.keys() | alpaca_currency.keys()):
         key = (day, kind)
         a, b = yahoo.get(key), alpaca.get(key)
         item = {"date": day.isoformat(), "kind": kind, "yahoo": str(a) if a is not None else None,
                 "alpaca": str(b) if b is not None else None}
+        if key in alpaca_currency:
+            # One same-day payment in a different or unknown currency makes the
+            # aggregate incomparable, even when another payment is in USD.
+            unconfirmed.append({**item, "reason": "currency_not_comparable",
+                                "alpaca_currency_observations": alpaca_currency[key]})
+            continue
         if a is None or b is None:
             unconfirmed.append({**item, "reason": "one_source_only"})
             continue

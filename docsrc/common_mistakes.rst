@@ -146,6 +146,11 @@ The daily Yahoo and Alpaca cross-check lists dates and event types for
 unconfirmed corporate actions and identifies which provider lacked a
 same-date match. The notice includes up to 20 items. The complete detail is
 in the New York trading day's ``corporate_action_quality.json`` cache.
+An Alpaca cash dividend with an unknown or different currency remains in the
+audit as currency evidence. The comparison waits for compatible currency
+information before comparing the same-date total, including when a separate
+same-date payment is in USD. An explicitly USD amount from a foreign issuer
+can be compared.
 
 Concurrent Autonomous Fund Daily-Cache Refreshes
 --------------------------------------------------------------------------------

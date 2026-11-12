@@ -24,6 +24,31 @@ class NoDailyBars(RiskError):
     """The reference returned no completed sessions for this symbol."""
 
 
+def _cash_dividend(action):
+    foreign = action.get("foreign")
+    # Legacy domestic records omit currency. An explicitly reported USD rate
+    # is also comparable for a foreign issuer.
+    currency = action.get("currency", None if foreign else "USD")
+    if isinstance(currency, str):
+        currency = currency.strip().upper()
+    try:
+        rate = number(action.get("rate"))
+        if rate <= 0:
+            raise RiskError("Invalid Alpaca corporate action amount")
+    except RiskError:
+        if currency == "USD":
+            raise
+        rate = None  # An unusable amount still proves that Alpaca returned a record.
+    if currency == "USD":
+        return {"dividend": str(rate)}
+    valid_code = isinstance(currency, str) and len(currency) == 3 and currency.isascii() and currency.isalpha()
+    return {"unverified_dividend": {
+        "rate": str(rate) if rate is not None else None,
+        "currency": currency if valid_code else None,
+        "foreign": foreign if isinstance(foreign, bool) else None,
+    }}
+
+
 class AlpacaDailyHistory:
     def __init__(self, key, secret, get=None):
         import requests
@@ -76,7 +101,7 @@ class AlpacaDailyHistory:
         return sorted(rows)[-length:]
 
     def corporate_actions(self, symbols, start, end):
-        """Split and USD cash-dividend observations by symbol, dated by ex-date."""
+        """Split and cash-dividend observations by ex-date, including unresolved currency evidence."""
         symbols = sorted(set(symbols))
         kinds = {"forward_splits": "split", "reverse_splits": "split", "cash_dividends": "dividend"}
         result = {symbol: [] for symbol in symbols}
@@ -100,23 +125,22 @@ class AlpacaDailyHistory:
                         day = date.fromisoformat(action["ex_date"])
                         if not start <= day <= end:
                             continue
-                        if kind == "dividend" and (action.get("foreign") or action.get("currency", "USD") != "USD"):
-                            continue  # A foreign amount has no established USD basis here.
                         if kind == "split":
                             old = number(action["old_rate"])
                             if old <= 0:
                                 raise RiskError("Invalid Alpaca split ratio")
                             amount = number(action["new_rate"]) / old
+                            if amount <= 0:
+                                raise RiskError("Invalid Alpaca corporate action amount")
+                            values = {"split": str(amount)}
                         else:
-                            amount = number(action["rate"])
-                        if amount <= 0:
-                            raise RiskError("Invalid Alpaca corporate action amount")
+                            values = _cash_dividend(action)
                         identifier = action.get("id")
                         if identifier and identifier in seen:
                             continue
                         if identifier:
                             seen.add(identifier)
-                        result[symbol].append({"date": day.isoformat(), kind: str(amount)})
+                        result[symbol].append({"date": day.isoformat(), **values})
                 token = payload.get("next_page_token")
                 if not token:
                     break
