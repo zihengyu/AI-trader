@@ -47,6 +47,7 @@ sources did not provide is absent and reported as such.
 """
 import json
 import os
+import sqlite3
 import threading
 import time
 from contextlib import contextmanager
@@ -55,7 +56,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from .risk import RiskError, instant, trading_day
+from .risk import NoCompletedMinute, RiskError, instant, trading_day
 
 NEW_YORK = ZoneInfo("America/New_York")
 ALIVE_SECONDS = 180  # A heartbeat older than this means the desk is not running.
@@ -168,6 +169,7 @@ def suspect(item, key):
 
 
 INTRADAY_SECONDS_PER_SYMBOL = 5  # About 12 Yahoo requests a minute for the pulse.
+INTRADAY_RETRY_SECONDS = 60
 
 
 class Idle(Exception):
@@ -235,7 +237,11 @@ class DeskStatus:
         state = self.read()
         if not self.alive(now, state):
             return False
-        age = self._age(((state.get("jobs") or {}).get(job) or {}).get("ok_at"), now)
+        result = (state.get("jobs") or {}).get(job) or {}
+        coverage = (result.get("result") or {}).get("coverage")
+        if job == "intraday" and (result.get("error") or (coverage and coverage["status"] != "complete")):
+            return False
+        age = self._age(result.get("ok_at"), now)
         return age is not None and 0 <= age <= max_age_seconds
 
     def summary(self, now=None):
@@ -273,11 +279,9 @@ class _JournalAccess:
         return _journal_connection(self.run_dir)
 
 
-def follow_list(run_dir, universe):
-    """(symbols, held, queries) the runner follows: holdings, the newest targets, alerts and news_watch phrases."""
-    from .execution import operator_connection
-    symbols, held, queries = set(universe), set(), []
-    with operator_connection(run_dir) as db:
+def _follow_inputs(run_dir):
+    held, targets, alerts, queries = set(), set(), set(), []
+    with _journal_connection(run_dir) as db:
         tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         account = db.execute("SELECT body FROM events WHERE kind='account' ORDER BY sequence DESC LIMIT 1").fetchone()
         if account:
@@ -286,12 +290,47 @@ def follow_list(run_dir, universe):
             latest = db.execute("SELECT body FROM fund_decisions ORDER BY rowid DESC LIMIT 1").fetchone()
             if latest:
                 body = json.loads(latest[0])
-                symbols |= {t["symbol"] for t in body.get("targets", [])} | {a["symbol"] for a in body.get("alerts", [])}
+                targets = {t["symbol"] for t in body.get("targets", [])}
+                alerts = {a["symbol"] for a in body.get("alerts", [])}
                 queries = [q["query"] for q in body.get("news_watch", [])]
-    return symbols | held, held, queries
+    return held, targets, alerts, queries
 
 
-def intraday_pulse(frames, previous_closes, now, gauges=GAUGES):
+def follow_list(run_dir, universe):
+    """(symbols, held, queries) the runner follows for news."""
+    held, targets, alerts, queries = _follow_inputs(run_dir)
+    return set(universe) | held | targets | alerts, held, queries
+
+
+def intraday_view(pulse, now, gauges=GAUGES):
+    """Recompute freshness and breadth at the reader's clock from original bar times."""
+    now = instant(now)
+    symbols = {}
+    for symbol, row in pulse["symbols"].items():
+        age = DeskStatus._age(row.get("at"), now)
+        stale = age is None or not 0 <= age <= STALE_QUOTE_MINUTES * 60
+        symbols[symbol] = {**row, "stale": stale, "age_seconds": round(age, 3) if age is not None else None}
+    expected = set(symbols) | set(pulse.get("unavailable", {})) | set(gauges)
+    usable = {s for s, row in symbols.items() if not row["stale"] and not row.get("suspect")}
+    breadth_excluded = set(gauges) | set(pulse.get("breadth_excluded", ()))
+    breadth_expected = len(expected - breadth_excluded)
+    moves = movers(symbols, breadth_excluded)
+    sample_size = sum(moves["breadth"].values())
+    coverage = {
+        "status": "complete" if usable == expected else "partial" if usable else "unavailable",
+        "usable_symbols": len(usable),
+        "expected_symbols": len(expected),
+        "missing_benchmarks": sorted(set(gauges) - usable),
+        "breadth_status": ("unavailable" if not sample_size else
+                           "complete" if sample_size == breadth_expected else "partial"),
+        "breadth_sample_size": sample_size,
+        "breadth_expected": breadth_expected,
+    }
+    return {**pulse, "symbols": symbols, "gauges": {s: symbols[s] for s in gauges if s in symbols},
+            **moves, "coverage": coverage}
+
+
+def intraday_pulse(frames, previous_closes, now, gauges=GAUGES, *, prior=None, breadth_excluded=()):
     """The session so far per symbol from completed minute bars; {symbol: frame} -> summary.
 
     previous_closes: {symbol: (date, close)} completed daily closes (the store);
@@ -301,13 +340,16 @@ def intraday_pulse(frames, previous_closes, now, gauges=GAUGES):
     """
     now = instant(now)
     today = now.astimezone(NEW_YORK).date()
-    symbols, unavailable = {}, {}
+    prior = prior or {}
+    symbols = {s: row for s, row in prior.get("symbols", {}).items() if s not in frames}
+    unavailable = {s: error for s, error in prior.get("unavailable", {}).items() if s not in frames}
     for symbol, frame in sorted(frames.items()):
         if isinstance(frame, Exception):
             unavailable[symbol] = str(frame)[:120] if isinstance(frame, RiskError) else type(frame).__name__
             continue
         dates = frame.index.tz_convert(NEW_YORK).date
-        session, before = frame[dates == today], frame[dates < today]
+        session = frame[(dates == today) & (frame.index + timedelta(minutes=1) <= now)]
+        before = frame[dates < today]
         if session.empty:
             unavailable[symbol] = "no completed minute today"
             continue
@@ -318,7 +360,6 @@ def intraday_pulse(frames, previous_closes, now, gauges=GAUGES):
             previous, source = (str(before.index[-1].date()), float(before["close"].iloc[-1])), "last_minute_close"
         last = float(session["close"].iloc[-1])
         item = {"last": round(last, 4), "at": last_at.isoformat(),
-                "stale": (now - last_at).total_seconds() > STALE_QUOTE_MINUTES * 60,
                 "day_open": round(float(session["open"].iloc[0]), 4),
                 "day_high": round(float(session["high"].max()), 4), "day_low": round(float(session["low"].min()), 4),
                 "day_volume": int(session["volume"].sum())}
@@ -328,9 +369,10 @@ def intraday_pulse(frames, previous_closes, now, gauges=GAUGES):
                          "gap_at_open": round(item["day_open"] / previous[1] - 1, 5)})
             suspect(item, "gap_at_open")
         symbols[symbol] = item
-    return {"as_of": now.isoformat(), "source": "Yahoo completed one-minute bars (research context, not a quote feed)",
-            "gauges": {s: symbols[s] for s in gauges if s in symbols}, **movers(symbols, gauges),
-            "symbols": symbols, "unavailable": unavailable}
+    return intraday_view({
+        "as_of": now.isoformat(), "source": "Yahoo completed one-minute bars (research context, not a quote feed)",
+        "symbols": symbols, "unavailable": unavailable, "breadth_excluded": sorted(breadth_excluded),
+    }, now, gauges)
 
 
 def premarket_moves(frames, previous_closes, now, gauges=GAUGES):
@@ -453,6 +495,7 @@ class DataDesk:
                       "alpaca": alpaca_get, "short_volume": short_volume_get, "index_history": index_history_get}
         self._sleep, self._closes = sleep, {}
         self.next_run, self.failures = {}, {}
+        self._intraday_retry = None
         self._lock = threading.Lock()
         previous = self.status.read() or {}
         self.state = {"started_at": self.clock().isoformat(), "heartbeat_at": None, "running": None,
@@ -504,8 +547,10 @@ class DataDesk:
         if name == "intraday":
             # One minute-bar request per symbol: a wide universe stretches the pulse instead of
             # raising the Yahoo request rate (about one request every INTRADAY_SECONDS_PER_SYMBOL s).
-            symbols = len(set(getattr(self, "tradable", ())) | set(GAUGES))
-            return max(self.settings.intraday_seconds, round(symbols * INTRADAY_SECONDS_PER_SYMBOL))
+            if outcome is not None and "next_poll_seconds" in outcome:
+                return outcome["next_poll_seconds"]
+            symbols = len(set(self.tradable) | set(GAUGES))
+            return max(self.settings.intraday_seconds, symbols * INTRADAY_SECONDS_PER_SYMBOL)
         if name == "macro":
             return self.settings.macro_minutes * 60 * (1 if working else 4)
         if name == "earnings":
@@ -544,7 +589,13 @@ class DataDesk:
         try:
             outcome = getattr(self, f"_job_{name}")(now)
             failures = 0
-            job.update({"ok_at": self.clock().isoformat(), "error": None, "note": None, "result": outcome})
+            coverage = (outcome or {}).get("coverage") if name == "intraday" else None
+            note = None
+            if coverage and coverage["status"] != "complete":
+                note = f'{coverage["status"]}: {coverage["usable_symbols"]}/{coverage["expected_symbols"]} usable prices'
+            else:
+                job["ok_at"] = self.clock().isoformat()
+            job.update({"error": None, "note": note, "result": outcome})
             wait = self.interval(name, now, outcome)
         except Idle as reason:
             failures, outcome = 0, None
@@ -602,7 +653,7 @@ class DataDesk:
             raise Idle(f"Yahoo is failing for the trading process; the desk waits until {until.isoformat()}")
 
     def _requests(self, symbols, fetch):
-        """{symbol: frame or exception}, paced; after three failures in a row the rest of the round is skipped."""
+        """Paced reads; three consecutive source failures stop the round."""
         frames, failures = {}, 0
         for index, symbol in enumerate(symbols):
             if failures >= MAX_FAILURES_IN_A_ROW:
@@ -611,6 +662,8 @@ class DataDesk:
             try:
                 frames[symbol] = fetch(symbol)
                 failures = 0
+            except NoCompletedMinute as exc:
+                frames[symbol], failures = exc, 0  # The provider responded; only the completed bar is pending.
             except Exception as exc:
                 frames[symbol], failures = exc, failures + 1
             if index < len(symbols) - 1:
@@ -667,22 +720,55 @@ class DataDesk:
                 "material": self._news.stats["material"] - before["material"],
                 "sources_with_errors": sorted(self._news.stats["errors"])}
 
+    def _intraday_priority(self):
+        held, alerts = set(), set()
+        if (self.run_dir / "state.sqlite3").is_file():
+            try:
+                held, _, alerts, _ = _follow_inputs(self.run_dir)
+            except (sqlite3.Error, ValueError):
+                pass  # The account snapshot is optional for fetching the research universe.
+        return list(dict.fromkeys([*GAUGES, *sorted(held), *sorted(alerts)]))
+
     def _job_intraday(self, now):
         from lumibot.entities import Asset
         self._yield_to_trading(now)
         day, source = trading_day(now), self._data()
         bars = getattr(source, "session_bars", None) or source.execution_bars  # Today only: a light request.
-        symbols = sorted(set(self.tradable) | set(GAUGES))
+        retry, self._intraday_retry = self._intraday_retry, None
+        prior = None
+        if retry:
+            retry_day, full_due, retry_symbols = retry
+            if retry_day == day and now < full_due:
+                prior = self.store.get(day, "intraday")
+        priority = self._intraday_priority()
+        symbols = retry_symbols if prior else list(dict.fromkeys([*priority, *self.tradable]))
         frames = self._requests(symbols, lambda symbol: bars(Asset(symbol, asset_type="stock")))
         # Previous closes only for symbols that answered: a failing Yahoo gets no extra requests.
         previous = {s: close for s in symbols if not isinstance(frames[s], Exception)
                     and (close := self._previous_close(s, day)) is not None}
-        pulse = intraday_pulse(frames, previous, now)
-        if not pulse["symbols"]:  # Never replace the last good pulse with an empty one.
+        observed_at = self.clock()
+        excluded = (set(symbols) - set(self.tradable) - set(GAUGES)) | set((prior or {}).get("breadth_excluded", ()))
+        pulse = intraday_pulse(frames, previous, observed_at, prior=prior,
+                               breadth_excluded=excluded)
+        pending = [s for s in priority if isinstance(frames.get(s), NoCompletedMinute)]
+        source_failed = any(isinstance(frame, Exception) and not isinstance(frame, NoCompletedMinute)
+                            for frame in frames.values())
+        if not pulse["symbols"] and (source_failed or not pending):
             raise RiskError("no symbol had a completed minute today: " + ", ".join(sorted(set(
                 pulse["unavailable"].values())))[:150])
         self.store.put(day, "intraday", pulse)
-        return {"symbols": len(pulse["symbols"]), "unavailable": len(pulse["unavailable"])}
+        # One paced retry for pending priority bars, without pulling the whole universe again.
+        normal = max(self.settings.intraday_seconds, len(symbols) * INTRADAY_SECONDS_PER_SYMBOL)
+        wait = (full_due - now).total_seconds() if prior else normal
+        if not prior and pending and not source_failed:
+            retry_at = observed_at + timedelta(seconds=max(INTRADAY_RETRY_SECONDS,
+                                                            len(pending) * INTRADAY_SECONDS_PER_SYMBOL))
+            full_due = now + timedelta(seconds=normal)
+            if retry_at < full_due:
+                self._intraday_retry = day, full_due, pending
+                wait = (retry_at - now).total_seconds()
+        return {"symbols": len(pulse["symbols"]), "unavailable": len(pulse["unavailable"]),
+                "coverage": pulse["coverage"], "next_poll_seconds": wait}
 
     def _job_premarket(self, now):
         self._yield_to_trading(now)

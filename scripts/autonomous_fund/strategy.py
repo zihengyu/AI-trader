@@ -206,6 +206,10 @@ MANAGER_PROMPT = (
     "pre-market prices, global markets, the economic release calendar (scheduled CPI, jobs, GDP, FOMC dates), "
     "news, macro and earnings; check desk_latest before acting on minutes-old context, and weigh scheduled "
     "releases and moves labeled suspect (possible splits or bad data) explicitly. "
+    "Intraday breadth describes only its usable sample. Check coverage.breadth_sample_size, "
+    "coverage.breadth_expected and coverage.missing_benchmarks before generalizing from it. "
+    "When coverage is partial or unavailable or a refresh failed, seek current evidence as needed "
+    "and identify the gap in any conclusion that depends on it. "
     "Sales execute automatically. Purchases run automatically inside a daily risk-increase "
     "envelope; purchases beyond it, or during market stress, wait for one operator approval "
     "of the whole plan. Choose next_review_at no earlier than min_review_minutes. "
@@ -3726,7 +3730,7 @@ class AutonomousFund(Strategy):
         """Read the data desk's newest version of one section, for example mid-run after minutes of research.
 
         Args:
-            section: intraday (session so far: last, change, day range and volume, movers, breadth),
+            section: intraday (completed minutes with source times, coverage, and breadth of the usable sample),
                 premarket (pre-market trades versus the previous close), global (index futures, VIX,
                 10-year yield, dollar, EUR, JPY, crude, gold, Tokyo, Hong Kong, Europe), calendar
                 (scheduled US releases such as CPI, jobs, GDP, FOMC), snapshot (daily returns,
@@ -3778,10 +3782,18 @@ class AutonomousFund(Strategy):
         return value
 
     def _intraday(self, now):
-        """The desk's newest intraday pulse of today's session (flagged stale when the desk stopped refreshing)."""
-        from .datadesk import DeskSettings
+        """The desk's newest intraday pulse, with freshness checked at this read."""
+        from .datadesk import DeskSettings, intraday_view
         interval = DeskSettings.from_config((getattr(self, "config", None) or {}).get("data_desk")).intraday_seconds
-        return self._desk_read(now, "intraday", max(15, 3 * interval / 60))
+        pulse = self._desk_read(now, "intraday", max(15, 3 * interval / 60))
+        desk = getattr(self, "desk_status", None)
+        job = ((desk.read() or {}).get("jobs") or {}).get("intraday", {}) if desk else {}
+        if isinstance(pulse, dict) and "symbols" in pulse:
+            pulse = intraday_view(pulse, now)
+        if job.get("error"):
+            saved = pulse if isinstance(pulse, dict) else {}
+            return {**saved, "refresh_error": job["error"], "refresh_failed_at": job.get("failed_at")}
+        return pulse
 
     def _premarket(self, now):
         return self._desk_read(now, "premarket", 60)

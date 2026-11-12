@@ -39,7 +39,7 @@ class CachedMarketHours:
         return cache[key]
 from lumibot.entities import Bars, Quote
 
-from .risk import MarketDataUnavailable, RiskError, instant, number
+from .risk import MarketDataUnavailable, NoCompletedMinute, RiskError, instant, number
 
 
 @lru_cache(maxsize=32)
@@ -365,6 +365,11 @@ class YahooRealtimeData(DataSource):
                 with self._slots:
                     self._stats["requests"] += 1
                     frame = self._download(symbol, interval, period, now)
+            except NoCompletedMinute:
+                with self._request_lock:
+                    self._failures.pop(key, None)
+                    self._source_errors.pop(key, None)
+                raise
             except Exception as exc:
                 count = (failure[0] if failure else 0) + 1
                 delay = min(300, 15 * 2 ** min(count - 1, 5))
@@ -433,6 +438,8 @@ class YahooRealtimeData(DataSource):
         else:
             frame = frame[frame.index.date < completed_daily_cutoff(now)]
         if frame.empty:
+            if interval == "1m" and period == "1d":
+                raise NoCompletedMinute("No completed market observations")
             raise RiskError("No completed market observations")
         valid = pd.Series(True, index=frame.index)
         fields_valid = {}

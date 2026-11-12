@@ -116,6 +116,22 @@ variables, source text, filenames or authenticated request contents. Use the
 retained location to diagnose the underlying fault; additional diagnostics alone
 do not remediate that fault.
 
+Intraday Market Coverage in the Autonomous Fund
+---------------------------------------------------------------------------------
+
+The optional autonomous fund's data desk prioritizes market benchmarks, holdings
+and price alerts. When the source responds with only forming minutes, the desk
+records those symbols as pending and can make one paced retry of the missing
+priority symbols before the next full scan. A series of source failures still
+ends the round.
+
+In ``desk_latest(section="intraday")``, use ``coverage`` to check the number of
+usable prices, the missing benchmarks and the size of the breadth sample.
+Breadth and movers exclude suspect prices and bars whose source timestamps are
+over 15 minutes old, future-dated or missing when read. A partial breadth sample
+describes the covered symbols. The snapshot update time and each original
+bar time are reported separately, along with any refresh error.
+
 Concurrent Autonomous Fund Daily-Cache Refreshes
 --------------------------------------------------------------------------------
 

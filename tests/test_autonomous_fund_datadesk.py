@@ -374,6 +374,52 @@ def test_desk_requests_are_paced_and_a_failing_round_stops_early():
     assert pauses and all(p == 0.3 for p in pauses)
 
 
+@pytest.mark.parametrize("mode", ["local", "paper"])
+def test_opening_minutes_do_not_trip_the_breaker_and_only_pending_priority_is_retried(tmp_path, mode):
+    from scripts.autonomous_fund.datadesk import GAUGES
+    from scripts.autonomous_fund.market_data import YahooRealtimeData
+
+    journal_with_holdings(tmp_path)
+    opening = NOW.replace(hour=14, minute=31, second=25)
+    clock, calls, pauses = [opening], [], []
+    pending = ["SPY", "QQQ", "IWM", "ALFA", "ZETA"]
+
+    def fetch(symbol, interval, period):
+        calls.append((symbol, interval, period))
+        minute_start = clock[0].replace(second=0)
+        if clock[0] != opening or symbol not in pending:
+            minute_start -= timedelta(minutes=1)
+        return minutes(minute_start, 1)
+
+    source = YahooRealtimeData(now=lambda: clock[0], fetch=fetch)
+    desk = DataDesk(tmp_path, config(), mode, source=source, clock=lambda: clock[0], environ={},
+                    sleep=pauses.append)
+    desk._previous_close = lambda symbol, day: ("2026-11-02", 99.0)
+    first = desk.run_job("intraday")
+    first_pulse = desk.store.get(DAY, "intraday")
+    assert [s for s, _, _ in calls][:6] == [*GAUGES, "ALFA", "ZETA"]
+    assert len(calls) == first["coverage"]["expected_symbols"] and first["unavailable"] == len(pending)
+    assert {value for value in first_pulse["unavailable"].values()} == {"No completed market observations"}
+    assert first["coverage"]["missing_benchmarks"] == ["IWM", "QQQ", "SPY"]
+    assert first["coverage"]["status"] == "partial" and first["coverage"]["breadth_status"] == "complete"
+    assert not DeskStatus(tmp_path).fresh("intraday", 600, opening)
+    assert source.diagnostics()["failures"] == 0
+    assert desk.next_run["intraday"] == opening + timedelta(minutes=1)
+    assert all(pause == 0.3 for pause in pauses)
+
+    calls.clear()
+    clock[0] = desk.next_run["intraday"]
+    recovered = desk.run_job("intraday")
+    pulse = desk.store.get(DAY, "intraday")
+    assert calls == [(s, "1m", "1d") for s in pending]
+    assert pulse["symbols"]["DIA"]["at"] == first_pulse["symbols"]["DIA"]["at"]
+    assert pulse["symbols"]["SPY"]["at"] != pulse["symbols"]["DIA"]["at"]
+    assert recovered["coverage"]["status"] == "complete" and not pulse["unavailable"]
+    assert recovered["coverage"]["breadth_sample_size"] == first["coverage"]["breadth_sample_size"]
+    assert DeskStatus(tmp_path).fresh("intraday", 600, clock[0])
+    assert desk.next_run["intraday"] == opening + timedelta(seconds=5 * first["coverage"]["expected_symbols"])
+
+
 def test_the_pulse_uses_todays_minutes_only_and_reads_closes_from_the_store(tmp_path):
     asked = {"session": 0, "execution": 0}
     today = minutes("2026-11-03 14:30", 20, first=101.0)
@@ -409,6 +455,43 @@ def test_a_stale_pulse_is_labeled_not_shown_as_current(tmp_path):
     assert stale["stale"] and stale["age_minutes"] == 40 and "symbols" not in stale
     strategy.daily_store.put(DAY, "intraday", {"as_of": (NOW - timedelta(minutes=5)).isoformat(), "symbols": {}})
     assert not strategy._intraday(NOW).get("stale")
+
+
+def test_desk_latest_rechecks_legacy_bar_times_and_labels_partial_breadth(tmp_path):
+    strategy = runner(tmp_path)
+    written_at = NOW - timedelta(minutes=14)
+    old_mark = NOW - timedelta(minutes=28)
+    new_mark = NOW - timedelta(minutes=14)
+    # Legacy snapshots only recorded the stale flag at collection time.
+    pulse = {
+        "as_of": written_at.isoformat(),
+        "symbols": {
+            "ALFA": {"at": old_mark.isoformat(), "stale": False, "last": 101, "change": .01},
+            "BETA": {"at": new_mark.isoformat(), "stale": False, "last": 99, "change": -.01},
+            "GAMMA": {"at": (NOW + timedelta(seconds=1)).isoformat(), "stale": False, "change": .02},
+        },
+        "unavailable": {"SPY": "skipped"},
+        "breadth": {"up": 2, "down": 1, "unchanged": 0},
+    }
+    strategy.daily_store.put(DAY, "intraday", pulse)
+    strategy.desk_status.write({"jobs": {"intraday": {"error": "source unavailable", "failed_at": NOW.isoformat()}}})
+    served = strategy.desk_latest("intraday")["data"]
+    assert served["symbols"]["ALFA"]["stale"] and served["symbols"]["ALFA"]["age_seconds"] == 28 * 60
+    assert served["symbols"]["GAMMA"]["stale"] and not served["symbols"]["BETA"]["stale"]
+    assert served["breadth"] == {"up": 0, "down": 1, "unchanged": 0}
+    assert served["coverage"]["breadth_status"] == "partial"
+    assert served["coverage"]["breadth_sample_size"] == 1 and served["coverage"]["breadth_expected"] == 3
+    assert served["coverage"]["missing_benchmarks"] == ["DIA", "IWM", "QQQ", "SPY"]
+    assert served["refresh_error"] == "source unavailable"
+    assert strategy.daily_store.get(DAY, "intraday") == pulse
+
+
+def test_desk_latest_reports_source_failure_before_any_snapshot(tmp_path):
+    strategy = runner(tmp_path)
+    strategy.desk_status.write({"jobs": {"intraday": {"error": "source unavailable", "failed_at": NOW.isoformat()}}})
+    assert strategy.desk_latest("intraday")["data"] == {
+        "refresh_error": "source unavailable", "refresh_failed_at": NOW.isoformat(),
+    }
 
 
 def test_daily_bars_are_stored_only_after_six_in_the_morning_new_york(tmp_path):

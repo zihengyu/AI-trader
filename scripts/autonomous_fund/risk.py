@@ -31,6 +31,10 @@ class MarketDataUnavailable(RiskError):
         self.diagnostic = diagnostic
 
 
+class NoCompletedMinute(MarketDataUnavailable):
+    """A minute-history response arrived before any of its bars had closed."""
+
+
 class DecisionTimingError(RiskError):
     """A rejected answer with safe clock evidence for one bounded reassessment."""
 
