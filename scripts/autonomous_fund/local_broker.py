@@ -418,6 +418,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         key = (order.custom_params or {}).get("local_intent")
         identifier = "local-" + str(key)
         rejection = None
+        capital_rejection = None
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM intents WHERE id=? AND status!='terminal'", (key,)).fetchone()
@@ -452,6 +453,12 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 now = self.data_source.get_datetime()
                 if rejection is None and now >= expires:
                     rejection = ("expired", "Local order authority expired before acceptance")
+            if rejection is None:
+                from .capital import OrderAuthorityChanged, require_order_authority
+                try:
+                    require_order_authority(db, key, body["side"])
+                except OrderAuthorityChanged as exc:
+                    capital_rejection, rejection = exc, (exc.reason, str(exc))
             if rejection:
                 # Identity matched and no local order exists: this is a proven
                 # non-submission, not an ambiguous external broker outcome.
@@ -464,6 +471,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 db.execute("UPDATE intents SET broker_id=?,status='pending' WHERE id=?", (identifier, key))
                 self._event(db, "local_order_accepted", {"broker_id": identifier, "intent_id": key})
         if rejection:
+            if capital_rejection is not None:
+                raise capital_rejection
             raise RiskError(rejection[1])
         order.set_identifier(identifier)
         order.update_raw({"id": identifier})
@@ -503,8 +512,16 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 if (self.journal.root / "STOP").exists() or now >= instant(row["expires_at"]):
                     self.cancel_order(order)
                     continue
+                from .capital import OrderAuthorityChanged, require_order_authority
+                try:
+                    with self.journal.connection() as db:
+                        db.execute("BEGIN")
+                        require_order_authority(db, row["intent_id"], str(order.side))
+                except OrderAuthorityChanged as exc:
+                    self._cancel_for_risk(order, exc.reason)
+                    continue
                 active.append((row, order))
-            # Risk-reducing STOP/expiry cancellations require no market data.
+            # STOP, expiry and capital-authority cancellations require no market data.
             # An action-history outage must not leave those orders active.
             self._corporate_actions()
             for row, order in active:
@@ -570,10 +587,13 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             try:
                 self._fill_bar(row["id"], order, start, bar)
             except VirtualRiskCancellation as exc:
-                self.cancel_order(order)
-                self.journal.event(self.data_source.get_datetime(), "local_risk_canceled", {
-                    "broker_id": row["id"], "symbol": order.asset.symbol, "reason": exc.reason})
+                self._cancel_for_risk(order, exc.reason)
                 return
+
+    def _cancel_for_risk(self, order, reason):
+        self.cancel_order(order)
+        self.journal.event(self.data_source.get_datetime(), "local_risk_canceled", {
+            "broker_id": str(order.identifier), "symbol": order.asset.symbol, "reason": reason})
 
     def _matchable(self, db, identifier, start):
         """The order row while this completed bar may still be applied to it, otherwise None."""
@@ -584,6 +604,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return None
         if not self.is_market_open() or self.data_source.get_datetime() >= instant(row["expires_at"]):
             return None
+        from .capital import OrderAuthorityChanged, require_order_authority
+        try:
+            require_order_authority(db, row["intent_id"], str(json.loads(row["body"])["side"]))
+        except OrderAuthorityChanged as exc:
+            raise VirtualRiskCancellation(exc.reason) from None
         age = (self.data_source.get_datetime() - (start + timedelta(minutes=1))).total_seconds()
         if not 0 <= age <= self.limits.quote_max_seconds:
             return None

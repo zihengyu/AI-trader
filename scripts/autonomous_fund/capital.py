@@ -72,6 +72,14 @@ class ValuationChanged(RiskError):
     """Retry the request after a fresh account observation."""
 
 
+class OrderAuthorityChanged(ValuationChanged):
+    """Capital-request changes revoked an order's authority before execution."""
+
+    def __init__(self, reason, message):
+        self.reason = reason
+        super().__init__(message)
+
+
 class QueueFull(RiskError):
     """The existing requests must make progress before adding another."""
 
@@ -318,7 +326,30 @@ def guard_redemption_sale(db, request_id, *, rest=None, sale=None, day=None):
 
 def guard_purchase(db):
     if any(row["kind"] == "redemption" for row in _requests(db)):
-        raise RiskError("Purchases wait for the pending redemption")
+        raise OrderAuthorityChanged("redemption_pending", "Purchases wait for the pending redemption")
+
+
+def redemption_order(db, intent_id):
+    """The request attached to this persisted submission, or None for other orders."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_orders'").fetchone():
+        return None  # Standalone local books can have ordinary orders without fund metadata.
+    row = db.execute("SELECT decision_id FROM fund_orders WHERE intent_id=?", (intent_id,)).fetchone()
+    if row and str(row[0]).startswith("redemption:"):
+        return str(row[0]).split(":", 1)[1]
+    return None
+
+
+def require_order_authority(db, intent_id, side):
+    """Recheck capital authority in the transaction that accepts or fills an order."""
+    if side == "buy":
+        guard_purchase(db)
+        return
+    request_id = redemption_order(db, intent_id)
+    if request_id is not None:
+        try:
+            guard_redemption_sale(db, request_id)
+        except ValuationChanged as exc:
+            raise OrderAuthorityChanged("redemption_request_closed", str(exc)) from None
 
 
 def update(journal, request_id, **fields):
@@ -377,17 +408,31 @@ def fund_units(db):
     raise CapitalLedgerError("Saved units or net capital disagree with confirmed flows. Review the account journal")
 
 
-def apply(journal, now, request_id, *, equity, cash, mode, observed_at=None, max_age_seconds=float("inf")):
+def apply(journal, now, request_id, *, equity, cash, mode, observed_at=None, max_age_seconds=float("inf"),
+          check_authority=None):
     """Apply one request and return its flow, or None when its target is already met.
 
     equity / cash: the sleeve's equity and real cash (without the cash-equivalent
     ETF) from this iteration's snapshot. A redemption needs that cash to cover it.
     The cash move, the capital basis, the units, the scaled risk state and the
     `capital_flow` event commit together or not at all.
+    check_authority runs after acquiring the write lock, returns the current
+    instant or raises, and must not perform provider I/O while holding the lock.
     """
     equity, cash = number(equity), number(cash)
     with journal.connection() as db:
         db.execute("BEGIN IMMEDIATE")
+
+        def current_valuation_time():
+            checked_at = check_authority() if check_authority is not None else now
+            if observed_at is not None:
+                require_fresh_valuation(observed_at, checked_at, max_age_seconds)
+                _, last_at = latest_valuation(db)
+                if last_at is not None and instant(last_at) > instant(observed_at):
+                    raise ValuationChanged("A newer account valuation is available")
+            return checked_at
+
+        now = current_valuation_time()  # Locks can cross STOP, close or snapshot expiry.
         requests = _requests(db)
         request = next((row for row in requests if row["id"] == request_id), None)
         if request is None:
@@ -395,16 +440,12 @@ def apply(journal, now, request_id, *, equity, cash, mode, observed_at=None, max
         if requests[0]["id"] != request_id or db.execute(
                 "SELECT 1 FROM intents WHERE status != 'terminal' LIMIT 1").fetchone():
             raise ValuationChanged("Another request or order is ahead of this capital flow")
-        if observed_at is not None:
-            require_fresh_valuation(observed_at, now, max_age_seconds)
-            _, last_at = latest_valuation(db)
-            if last_at is not None and instant(last_at) > instant(observed_at):
-                raise ValuationChanged("A newer account valuation is available")
         units_before, basis = fund_units(db)
         if basis is None:
             raise RiskError("No capital mandate is recorded for this account")
         amount = number(request["amount"])
         if not amount and "target_capital" in request:
+            now = current_valuation_time()
             _store(db, REQUESTS, requests[1:])
             _event(db, now, TARGET_REACHED, request)
             return None
@@ -427,8 +468,16 @@ def apply(journal, now, request_id, *, equity, cash, mode, observed_at=None, max
         units_after = (units_before + signed / nav).quantize(UNIT_PLACES)
         if units_after <= 0:
             raise RiskError("The request would round the remaining fund units to zero")
+        if units_after == units_before or abs((units_after - units_before) * nav - signed) >= CENT / 2:
+            # No cash may move for zero units, or for ownership whose rounded
+            # value materially differs from the operator's cent-denominated amount.
+            raise RiskError("The amount cannot be represented at the fund's unit precision at this NAV; "
+                            "use a representable amount")
         after = equity + signed
         updates = {"mandate_capital_basis": str(basis + signed)}
+        # Reads and unit calculations also take time. Recheck at the mutation
+        # boundary, so stale input is never used to change cash or ownership.
+        now = current_valuation_time()
         # A pre-flow journal only knew the original configured amount as its basis.
         db.execute("INSERT OR IGNORE INTO meta VALUES ('mandate_configured_capital',?)", (str(basis),))
         if mode == "local":

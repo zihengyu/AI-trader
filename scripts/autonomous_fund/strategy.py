@@ -4574,11 +4574,9 @@ class AutonomousFund(Strategy):
         return redemption_pending(self.journal)
 
     def _redemption_order(self, intent_id):
+        from .capital import redemption_order
         with self.journal.connection() as db:
-            row = db.execute("SELECT decision_id FROM fund_orders WHERE intent_id=?", (intent_id,)).fetchone()
-        if row and str(row[0]).startswith("redemption:"):
-            return str(row[0]).split(":", 1)[1]
-        return None
+            return redemption_order(db, intent_id)
 
     def _capital_wait(self, now, reason, detail=None):
         """Recorded once per trading day and reason: idle iterations ask every minute.
@@ -4821,6 +4819,17 @@ class AutonomousFund(Strategy):
     def _apply_capital_flow(self, request, now, account, cash):
         from contextlib import nullcontext
         from . import capital
+        from .market_data import regular_session_open
+
+        def check_authority():
+            checked_at = self.get_datetime()
+            # The broker's open status is checked before the transaction. Use
+            # the application's regular-session calendar here, with no network
+            # call under SQLite's write lock, and resample STOP after any wait.
+            if self.halt_path.exists() or not regular_session_open(checked_at):
+                raise capital.ValuationChanged("STOP or the session boundary deferred the capital flow")
+            return checked_at
+
         # The local broker's poll publishes NAV marks and updates the peak under _poll_lock: holding it, no
         # pre-flow mark can be recorded after the flow has scaled the peak and the day's starting equity.
         lock = getattr(getattr(self, "broker", None), "_poll_lock", None) if self.mode == "local" else None
@@ -4830,9 +4839,9 @@ class AutonomousFund(Strategy):
                     return True
                 flow = capital.apply(self.journal, self.get_datetime(), request["id"], equity=account.equity,
                                      cash=cash, mode=self.mode, observed_at=account.as_of,
-                                     max_age_seconds=self.limits.quote_max_seconds)
+                                     max_age_seconds=self.limits.quote_max_seconds, check_authority=check_authority)
         except capital.ValuationChanged as exc:
-            self._capital_wait(now, "capital_valuation_stale", {"request_id": request["id"], "error": str(exc)})
+            self._capital_wait(self.get_datetime(), "capital_valuation_stale", {"request_id": request["id"], "error": str(exc)})
             return True
         except capital.CapitalLedgerError:
             raise  # Surface the blocked ledger and keep the request for recovery.
@@ -4850,7 +4859,7 @@ class AutonomousFund(Strategy):
         if flow is None:
             return True  # The earlier requests already reached the configured target.
         # Weights are fractions of equity: the manager re-plans with the new capital.
-        self._request_review(now, "capital_flow", {"kind": flow["kind"], "amount": flow["amount"]})
+        self._request_review(self.get_datetime(), "capital_flow", {"kind": flow["kind"], "amount": flow["amount"]})
         return True
 
     def _capital_rejected(self, request, now, reason):
@@ -4939,6 +4948,39 @@ class AutonomousFund(Strategy):
             except Exception as exc:
                 self._disclose("execution_quote_unavailable", type(exc).__name__)
         self.execution.record_submission(key, decision_id, intent, self.get_datetime(), quote=quote)
+        if self.mode in {"local", "paper"}:
+            from .capital import require_order_authority
+            from .market_data import regular_session_open
+            revoked = None
+            with self.journal.connection() as db:
+                db.execute("BEGIN IMMEDIATE")
+                try:
+                    require_order_authority(db, key, intent.side)
+                    if getattr(self, "require_monitor", False):
+                        from .monitor import require_monitor
+                        require_monitor(self.run_dir, self.get_datetime())
+                    checked_at = self.get_datetime()
+                    if self.halt_path.exists():
+                        raise RiskError("Emergency stop activated before submission")
+                    if not regular_session_open(checked_at):
+                        raise RiskError("Orders require an open regular market session")
+                    if until is not None and checked_at >= instant(until):
+                        raise RiskError("Order authority expired before submission")
+                except RiskError as exc:
+                    # The native send has not started. Release only this proven
+                    # non-submission, retaining its attempt and quote evidence.
+                    # The transaction keeps capital requests stable during the
+                    # final provider-free checks; no broker I/O holds this lock.
+                    checked_at = self.get_datetime()
+                    changed = db.execute("UPDATE intents SET status='terminal',updated_at=? "
+                        "WHERE id=? AND broker_id IS NULL AND status='reserved'", (str(checked_at), key)).rowcount
+                    if changed:
+                        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(checked_at),
+                            "order_submission_aborted", encode({"intent_id": key,
+                                "reason": getattr(exc, "reason", type(exc).__name__)})))
+                    revoked = exc
+            if revoked is not None:
+                raise revoked
         if kind == "protective":
             self.execution.mark_protective(key, now)
         # Call the native implementation, with the only accepted intent schema.

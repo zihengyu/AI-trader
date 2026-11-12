@@ -336,6 +336,32 @@ the new close; late-split and action-revision reconciliation guards still apply.
 Status exposes valuation errors without relabeling old equity
 as a new observation. Paper accounts continue to use broker observations.
 
+Subscriptions and redemptions recheck STOP, the regular-session calendar and
+valuation freshness after the journal write lock is acquired, and again before
+the first mutation. A wait can cross the close or expire a snapshot. Such a
+request stays pending without changes to cash, units or risk baselines. The
+transaction checks a local calendar, with broker status checked beforehand, so
+no provider request holds the SQLite write lock. Confirmations use the actual
+post-wait clock.
+
+Units have eight decimal places. If rounding would issue/cancel zero units or
+misprice the requested amount by at least half a cent, the flow is refused
+before cash moves. An operator can submit an amount representable at the
+current unit NAV. Ordinary one-cent transfers at a normal NAV remain supported.
+
+An order reservation does not freeze capital authority. After quote I/O and
+before the native send, local/Paper orders recheck pending redemptions, the
+specific request authorizing a redemption sale, STOP, monitor health, the
+regular session and explicit order expiry. A proven non-submission releases
+its reservation while retaining attempt history. Once a Paper send starts,
+broker acknowledgements and cancellation results remain authoritative.
+Local acceptance and atomic fills also check the persisted request: cancellation
+stops further redemption sales, and a queued redemption stops old purchases and
+cash parking. These cancellations precede corporate-action history I/O, retain
+committed partial fills and survive restart. A different request cannot revive
+an old sale. Ordinary/protective sales remain eligible, and a pending
+subscription alone does not block purchases.
+
 Local simulated purchases and sales each deduct a fee of 0.1 percent of traded
 notional. It is already reflected in cash and equity; spread and slippage are
 additional execution-price assumptions. Paper fees follow broker evidence and
