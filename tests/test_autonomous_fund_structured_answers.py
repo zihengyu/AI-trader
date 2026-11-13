@@ -185,6 +185,24 @@ def test_critic_accepts_only_the_empty_placeholder_without_discarding_the_critiq
     assert body == original
 
 
+def test_critic_concerns_copying_research_evidence_refs_keep_the_critique():
+    # 2026-11-12: the critic added "evidence_refs": [] to every concern (the research ideas it reads carry
+    # that field), and the whole paid critique was discarded on "Extra inputs are not permitted".
+    concern = {"symbol": "DIA", "concern": "Breadth is narrow", "evidence": "Advancers fell"}
+    body = {"summary": "Synthetic counterargument", "missing_evidence": [],
+            "concerns": [{**concern, "evidence_refs": []}, {**concern, "evidence_refs": [1, 3]},
+                         {**concern, "evidence": "", "evidence_refs": [2]}]}
+    original = deepcopy(body)
+    result = result_for(body, Critique)
+    assert result.parse_error is None and body == original
+    evidence = [row.evidence for row in result.parsed.concerns]
+    assert evidence == ["Advancers fell", "Advancers fell (research evidence #1, #3)", "research evidence #2"]
+    # Anything that is not a list of positions is still invalid, as is any other extra field.
+    for refs in ("see research", [1.5], {"a": 1}):
+        assert result_for({**body, "concerns": [{**concern, "evidence_refs": refs}]}, Critique).parse_error
+    assert result_for({**body, "concerns": [{**concern, "source": "x"}]}, Critique).parse_error
+
+
 @pytest.mark.parametrize("placeholder", ["Unverified claim", "", [], {}, False])
 def test_critic_never_discards_content_in_the_placeholder(placeholder):
     assert result_for({"summary": "Synthetic counterargument",
