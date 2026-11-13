@@ -1821,7 +1821,7 @@ class AutonomousFund(Strategy):
         return ObservedPrice(number(self.get_last_price(asset)), now).validate(now, self.limits)
 
     def _record_agent(self, name, result, phase=None):
-        from .costs import call_cost, rate_for, token_counts, usage_known
+        from .costs import call_cost, rate_for, token_counts, unpriced_reason, usage_known
         now = self.get_datetime()
         tokens = token_counts(result.usage) if result.usage else None
         usage, usage_diagnostic = result.usage, None
@@ -1855,6 +1855,8 @@ class AutonomousFund(Strategy):
             diagnostic = structured_answer_diagnostic(result, schema)
         call = getattr(self, "_current_call", None) or {}
         served = list(getattr(result, "served_models", None) or [])
+        missing_cost = unpriced_reason({"cost_usd": cost, "usage": usage, "usage_diagnostic": usage_diagnostic,
+                                        "mock": self.scripted, "cache_hit": result.cache_hit, "model": result.model})
         self.journal.event(now, "agent", {
             **({"call_id": call["call_id"], "purpose": call["purpose"]} if call.get("role") == name else {}),
             "name": name, "model": result.model, "cache_hit": result.cache_hit,
@@ -1862,6 +1864,7 @@ class AutonomousFund(Strategy):
             **({"usage_diagnostic": usage_diagnostic} if usage_diagnostic else {}),
             "mock": self.scripted, "phase": phase, "tokens": tokens,
             "cost_usd": round(cost, 6) if cost is not None else None,
+            **({"cost_unavailable_reason": missing_cost} if missing_cost else {}),
             **({"served_models": served} if served else {}),
             **({"answer_diagnostic": diagnostic} if diagnostic else {})})
         if served and not self.scripted and not result.cache_hit and getattr(self, "mode", None) in {"local", "paper"}:
@@ -1923,7 +1926,8 @@ class AutonomousFund(Strategy):
             self.journal.event(self.get_datetime(), "agent", {
                 "name": name, "model": model, "cache_hit": False, "usage": None,
                 "summary": "Agent attempt failed; provider usage unknown.", "parse_error": type(exc).__name__,
-                "mock": self.scripted, "phase": phase, "call_id": key, "purpose": purpose})
+                "mock": self.scripted, "phase": phase, "call_id": key, "purpose": purpose,
+                "cost_unavailable_reason": "usage_missing"})
             raise
         finally:
             self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
@@ -2311,6 +2315,7 @@ class AutonomousFund(Strategy):
             self._identity_changes(observe_probe(self.model_identity, model, answer,
                                                  instant(now).astimezone(ZoneInfo("America/New_York")).date(),
                                                  instant(now).isoformat()), now)
+            self._call_outcome(model_probe=True, model=model)
         if results:
             self.journal.event(self.get_datetime(), "model_probe", {"day": day, "answers": results})
             return results
@@ -2625,9 +2630,13 @@ class AutonomousFund(Strategy):
         record = {"id": uuid4().hex[:12], "at": now.isoformat(), "verdict": verdict, "triggers": len(triggers),
                   "profile_id": (getattr(self, "triage_profile", None) or {}).get("id"),
                   "reasons": sorted({t.get("reason") for t in triggers})}
+        call = getattr(self, "_current_call", None) or {}
+        if call.get("role") == "triage":
+            record["call_id"] = call["call_id"]
         if now >= deadline:
             record["action"] = "deadline"
             self.journal.event(now, "event_triage", record)
+            self._call_outcome(valid=False, triage_id=record["id"], action=record["action"], reason="mandatory_review_due")
             return False
         if verdict["escalate"]:
             record["action"] = "escalated" if enforcing else "shadow"
@@ -2642,6 +2651,7 @@ class AutonomousFund(Strategy):
             settings = self.triage
             record["action"] = "audit" if count % settings.audit_every == 0 else "dismissed"
         self.journal.event(now, "event_triage", record)
+        self._call_outcome(triage_id=record["id"], action=record["action"])
         if record["action"] != "dismissed":
             self._pending_triage = record  # Scored once the manager has answered.
             return False

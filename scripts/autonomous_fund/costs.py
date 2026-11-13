@@ -26,6 +26,8 @@ CACHED_KEYS = ("cached_content_token_count", "cached_input_tokens", "cache_read_
                "cached_tokens", "prompt_cache_hit_tokens", "prompt_tokens_details.cached_tokens",
                "input_tokens_details.cached_tokens")
 MISS_KEYS = ("prompt_cache_miss_tokens", "prompt_tokens_details.uncached_tokens")
+UNPRICED_LABELS = {"usage_missing": "用量缺失", "usage_incomplete": "用量不全",
+                   "usage_invalid": "用量格式异常", "rate_missing": "缺少费率"}
 
 
 def _usage_value(raw, keys):
@@ -86,6 +88,27 @@ def scripted(body):
     return bool(body.get("mock")) or str(body.get("model") or "").startswith("scripted/")
 
 
+def unpriced_reason(body):
+    """Why a real, uncached call has no cost; missing usage never implies a free call."""
+    if body.get("cost_usd") is not None or scripted(body) or body.get("cache_hit"):
+        return None
+    saved = body.get("cost_unavailable_reason")
+    if isinstance(saved, str) and saved in UNPRICED_LABELS:
+        return saved
+    if body.get("usage_diagnostic"):
+        return "usage_invalid"
+    raw = body.get("usage")
+    if raw is None or raw == {}:
+        return "usage_missing"
+    if not isinstance(raw, dict):
+        return "usage_invalid"
+    return "rate_missing" if usage_known(raw) else "usage_incomplete"
+
+
+def unpriced_text(reasons):
+    return "、".join(f"{label} {reasons[key]}" for key, label in UNPRICED_LABELS.items() if reasons.get(key))
+
+
 def cost_summary(rows, equity=None, now=None, prices=None, days=30):
     """Recent model cost per day and role, its annual pace and the break-even excess return.
 
@@ -102,7 +125,7 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
     # Counts, unknown-price notices and token totals must describe the same window as costs.
     calls = [row for row in calls if start is None or start <= instant(row["at"]) <= now]
     models = {r["body"].get("model") for r in calls}
-    by_day, by_role, unpriced, tokens = {}, {}, 0, {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+    by_day, by_role, unpriced, reasons, tokens = {}, {}, 0, {}, {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
     for row in calls:
         at = instant(row["at"])
         body = row["body"]
@@ -114,6 +137,8 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
             cost = call_cost(counts, rate_for(prices, body.get("model"), len(models)))
         if cost is None:
             unpriced += 1
+            reason = unpriced_reason(body)
+            reasons[reason] = reasons.get(reason, 0) + 1
             continue
         day = at.astimezone(zone).date().isoformat()
         by_day[day] = by_day.get(day, 0.0) + cost
@@ -124,7 +149,7 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
     annual = per_day * TRADING_DAYS if per_day is not None else None
     equity = float(equity) if equity else None
     return {
-        "window_days": days, "calls": len(calls), "unpriced_calls": unpriced, "tokens": tokens,
+        "window_days": days, "calls": len(calls), "unpriced_calls": unpriced, "unpriced_by_reason": reasons, "tokens": tokens,
         "today_usd": round(by_day.get(today, 0.0), 4) if today else None,
         "window_usd": round(sum(by_day.values()), 4), "days_with_calls": len(by_day),
         "by_day_usd": {d: round(v, 4) for d, v in sorted(by_day.items())},

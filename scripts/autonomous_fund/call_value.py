@@ -6,14 +6,17 @@ postmarket_review). Where the call's result is actually used, the strategy
 writes an `agent_outcome` event for that call_id: a validated decision (and
 whether it changed the target portfolio), saved research (and how many
 verifiable ideas it registered), a saved review (and its predictions), a
-scored shadow decision, a critique the manager saw. A call without an outcome
-was not used: it failed, its answer was rejected, or a later step failed. A
+scored shadow decision, a critique the manager saw, an event screen applied to
+scheduling or a saved model-identity observation. A missing outcome alone does
+not prove non-use: older instrumentation or a failed outcome write can leave
+adoption unknown. Explicit failure/refusal outcomes remain non-adoptions. A
 correction retry is a call of its own, so a first attempt that needed one
 shows as not used.
 
 Calls journaled before call ids existed are not counted. Output length is
 never used as a measure of quality.
 """
+from .costs import scripted, unpriced_reason
 
 PURPOSE_LABELS = {"decision": "决策复核", "shadow": "影子对照", "critique": "反方审查",
                   "premarket_research": "盘前研究", "research": "研究（回放）", "postmarket_review": "盘后复盘",
@@ -23,10 +26,11 @@ PURPOSES = tuple(PURPOSE_LABELS)
 
 def summarize(agents, outcomes, *, quiet_skips=0, critiques_reused=0):
     """Per-purpose value of the calls in `agents` (agent event bodies) given `outcomes` (agent_outcome bodies)."""
-    used = {}
+    recorded = {}
     for outcome in outcomes:
-        if outcome.get("call_id") and outcome.get("valid"):
-            used[outcome["call_id"]] = outcome
+        if outcome.get("call_id"):
+            recorded[outcome["call_id"]] = outcome
+    used = {key: outcome for key, outcome in recorded.items() if outcome.get("valid")}
     groups = {}
     for call in agents:
         identifier = call.get("call_id")
@@ -35,21 +39,27 @@ def summarize(agents, outcomes, *, quiet_skips=0, critiques_reused=0):
         purpose = call.get("purpose") or "unknown"
         group = groups.setdefault(purpose, {"calls": 0, "paid": 0, "cache_hits": 0, "failed": 0, "used": 0,
                                             "changed": 0, "ideas": 0, "predictions": 0, "cost_usd": 0.0,
-                                            "unpriced": 0, "unused_cost_usd": 0.0})
+                                            "unpriced": 0, "unused_cost_usd": 0.0, "outcome_unknown": 0})
         group["calls"] += 1
         cost = call.get("cost_usd")
         if call.get("cache_hit"):
             group["cache_hits"] += 1
-        elif cost is not None:
+        elif cost is not None and not scripted(call):
             group["paid"] += 1
             group["cost_usd"] += float(cost)
-        elif not call.get("mock") and (call.get("usage") or call.get("parse_error")):
-            group["unpriced"] += 1  # Usage without a price, or a failure with unknown usage: never 0.
-        if call.get("parse_error"):
+        elif unpriced_reason(call) is not None:
+            group["unpriced"] += 1  # Includes a successful response with no usage at all.
+        failed = bool(call.get("parse_error") or call.get("answer_diagnostic"))
+        if failed:
             group["failed"] += 1
         outcome = used.get(identifier)
         if outcome is None:
-            group["unused_cost_usd"] += float(cost or 0)
+            if identifier not in recorded and not failed:
+                group["outcome_unknown"] += 1
+            # Retain the legacy field name; it means costs without a recorded
+            # adoption, which cannot by itself establish that a call was wasted.
+            if not call.get("cache_hit") and not scripted(call):
+                group["unused_cost_usd"] += float(cost or 0)
             continue
         group["used"] += 1
         group["changed"] += bool(outcome.get("changed_targets"))
@@ -58,16 +68,18 @@ def summarize(agents, outcomes, *, quiet_skips=0, critiques_reused=0):
     for group in groups.values():
         group["used_share"] = group["used"] / group["calls"] if group["calls"] else None
         group["changed_share"] = group["changed"] / group["used"] if group["used"] else None
-        group["cost_per_used_call"] = group["cost_usd"] / group["used"] if group["used"] and not group["unpriced"] else None
+        complete = not group["unpriced"] and not group["outcome_unknown"]
+        group["cost_per_used_call"] = group["cost_usd"] / group["used"] if group["used"] and complete else None
         group["cost_per_change"] = (group["cost_usd"] / group["changed"]
-                                    if group["changed"] and not group["unpriced"] else None)
+                                    if group["changed"] and complete else None)
         group["cost_usd"] = round(group["cost_usd"], 6)
         group["unused_cost_usd"] = round(group["unused_cost_usd"], 6)
     return {"by_purpose": groups, "calls_saved": {"quiet_reviews_skipped": quiet_skips,
                                                   "critiques_reused": critiques_reused},
             "interpretation": "used: the call's result was validated and used; changed: a used decision changed the "
                               "target portfolio (a symbol added or removed, or a weight moved by at least one point). "
-                              "Calls journaled before call ids are not counted; unpriced calls make cost ratios unknown."}
+                              "Calls journaled before call ids are not counted; missing outcomes do not prove non-use. "
+                              "Unpriced calls or unknown adoption make cost ratios unknown."}
 
 
 def from_events(events):
@@ -89,6 +101,9 @@ def lines(result):
     for purpose in [p for p in PURPOSES if p in groups] + sorted(set(groups) - set(PURPOSES)):
         g = groups[purpose]
         text = f"- {PURPOSE_LABELS.get(purpose, purpose)}：{g['calls']} 次，被采用 {g['used']} 次"
+        if g.get("outcome_unknown"):
+            text = (f"- {PURPOSE_LABELS.get(purpose, purpose)}：{g['calls']} 次，已记录采用 {g['used']} 次，"
+                    f"采用结果未记录 {g['outcome_unknown']} 次")
         if purpose == "decision":
             text += f"，其中改变目标组合 {g['changed']} 次"
             if g["changed_share"] is not None:
@@ -108,7 +123,8 @@ def lines(result):
             if g["cost_per_change"] is not None:
                 text += f"，每次改变组合 {g['cost_per_change']:.4f} 美元"
             if g["unused_cost_usd"]:
-                text += f"，未被采用的调用花了 {g['unused_cost_usd']:.4f} 美元"
+                label = "未记录采用的调用已知费用" if g.get("outcome_unknown") else "未被采用的调用花了"
+                text += f"，{label} {g['unused_cost_usd']:.4f} 美元"
         out.append(text)
     saved = result["calls_saved"]
     if saved["quiet_reviews_skipped"] or saved["critiques_reused"]:

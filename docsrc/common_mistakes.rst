@@ -499,10 +499,27 @@ switching and retirement rules are unchanged.
 a ``call_id`` and a purpose, and an ``agent_outcome`` is written when its result
 is actually used. That is a validated decision (and whether it changed the
 target portfolio), saved research (and its ideas), a saved review (and its
-predictions), a scored shadow decision or a critique the manager saw. The
+predictions), a scored shadow decision, a critique the manager saw, an event
+screen used for scheduling or a saved model-identity observation. A screen
+that returns after the mandatory manager deadline is explicitly not adopted;
+it cannot defer that review. Missing outcome records alone do not prove that
+a call was discarded. Older instrumentation and failed outcome writes remain
+unknown; the report never matches old calls to outcomes by nearby timestamps. The
 weekly report lists, per purpose, the calls, how many were used, how many
 changed the portfolio, and the cost per used call and per change. Unpriced calls
-make the cost ratios unknown rather than zero.
+or incomplete adoption records make the cost ratios unknown rather than zero.
+Status and the weekly report distinguish absent usage, incomplete usage,
+invalid usage and missing rates. A response without usage is still an unpriced
+call, even when it has no parse error. Whole-history SQL counts and a weekly
+report's cutoff can cover different calls; neither rewrites recorded costs.
+
+The decision timeline keeps the manager's actual portfolio-change result
+separate from the event screen's miss result. A screen that escalated cannot
+miss, even when the manager then changes the portfolio. Append ``--event N`` to
+``bash scripts/fund-logs.sh decisions YYYY-MM-DD`` to print that event's complete
+rationale, including text after an account-check preamble. Selection is limited
+to the configured account and date and rejects an unmatched sequence. This
+read-only command does not infer, send notifications or change the journal.
 
 **Reading the acceptance reports.** ``acceptance`` writes two independent
 reports. ``acceptance.md`` says whether the system runs reliably.

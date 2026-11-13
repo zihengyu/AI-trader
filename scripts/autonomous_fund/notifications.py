@@ -868,7 +868,7 @@ def week_calendar(day):
 
 def _weekly_facts(events, monday, sunday, zone):
     """Account, benchmark, trading and model-cost facts of one week, from the journal only."""
-    from .costs import scripted
+    from .costs import scripted, unpriced_reason
     from .performance import PerformanceSettings, benchmark_series
     def local(at):
         return instant(at).astimezone(zone).date().isoformat()
@@ -939,8 +939,9 @@ def _weekly_facts(events, monday, sunday, zone):
     for body in calls:
         if body.get("cost_usd") is not None:
             by_role[body.get("name") or "unknown"] = by_role.get(body.get("name") or "unknown", 0.0) + float(body["cost_usd"])
+    reasons = Counter(unpriced_reason(b) for b in calls if b.get("cost_usd") is None)
     facts["model"] = {"calls": len(calls), "usd": sum(by_role.values()), "by_role": by_role,
-                      "unpriced": sum(b.get("cost_usd") is None and bool(b.get("usage")) for b in calls)}
+                      "unpriced": sum(reasons.values()), "unpriced_by_reason": dict(reasons)}
     facts["health"] = Counter(b.get("kind") for at, kind, b in events if kind == "notification"
                               and b.get("kind") in HEALTH_KINDS and monday <= local(at) <= sunday)
     return facts
@@ -1060,6 +1061,9 @@ def weekly_document(root, sequence):
                + ("；按角色：" + "、".join(f"{r} {v:.4f}" for r, v in sorted(model["by_role"].items()))
                   if model["by_role"] else "")) if model["calls"] else f"- 模型调用：{NO_DATA}"]
     from .holdings import day_trades
+    from .costs import unpriced_text
+    if model.get("unpriced_by_reason"):
+        lines.append("- 未定价原因：" + unpriced_text(model["unpriced_by_reason"]) + "；未知费用未计入，不按零计算。")
     week_trades = day_trades([(at, kind, body) for at, kind, body in events if kind in {"fill", "fill_reconciled"}],
                              cutoff)["by_day"]
     lines.append(f"- 日内交易（同一天买入又卖出，估算）：本周 "
@@ -1069,7 +1073,8 @@ def weekly_document(root, sequence):
             "critic_reused"} and monday <= instant(at).astimezone(zone).date().isoformat() <= sunday]
     value = value_lines(from_events(week))
     if value:
-        lines += ["", "AI 调用价值（被采用＝结果通过校验并被使用；改变目标组合＝增删证券或权重变动至少 1 个百分点）："] + value
+        lines += ["", "AI 调用价值（被采用＝已记录结果通过校验并被使用；未记录采用结果不能证明未使用；"
+                  "改变目标组合＝增删证券或权重变动至少 1 个百分点）："] + value
     lines += ["", "## 三、本周归因合计【事实，代码按收盘价计算】", ""]
     usable = [r.get("attribution") for r in reviews if (r.get("attribution") or {}).get("status") in {"complete", "partial"}]
     if usable:

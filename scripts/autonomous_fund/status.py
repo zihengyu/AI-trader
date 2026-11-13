@@ -228,18 +228,25 @@ def desk_line(root, now):
 
 def cost_line(costs):
     """模型费用一行：今天、近 30 天、年化节奏占净值的比例（AI 每年至少要跑赢基准这么多才能打平费用）。"""
-    from .costs import fraction_text
+    from .costs import fraction_text, unpriced_text
     if not costs or not costs.get("calls"):
         return None
+    reasons = costs.get("unpriced_by_reason") or {}
+    detail = unpriced_text(reasons)
     if not costs.get("days_with_calls"):
-        return (f"模型费用：近 {costs['window_days']} 天 {costs['calls']} 次调用都没有单价，无法估算"
-                "（在 .env 设置 FUND_MODEL_PRICES_JSON）")
+        text = f"模型费用：近 {costs['window_days']} 天 {costs['calls']} 次调用费用未定，无法估算"
+        if detail:
+            text += f"（{detail}）"
+        if reasons.get("rate_missing") or not reasons:
+            text += "；核对模型费率 FUND_MODEL_PRICES_JSON 和提供方用量"
+        return text
     text = (f"模型费用（估算）：今天 ${costs['today_usd']:.2f}；近 {costs['window_days']} 天 ${costs['window_usd']:.2f}"
             f"（{costs['days_with_calls']} 个交易日，日均 ${costs['average_per_day_usd']:.2f}）；按此速度一年约 "
             f"${costs['annual_pace_usd']:.0f}，占净值 {fraction_text(costs['break_even_excess_return'])}"
             "——AI 每年至少要跑赢基准这么多才能打平模型费用")
     if costs.get("unpriced_calls"):
-        text += f"（另有 {costs['unpriced_calls']} 次调用没有单价，未计入）"
+        text += f"（另有 {costs['unpriced_calls']} 次调用没有单价或完整用量，未计入"
+        text += f"：{detail}）" if detail else "）"
     return text
 
 

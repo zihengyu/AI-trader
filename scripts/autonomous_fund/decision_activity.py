@@ -131,7 +131,16 @@ def activity(root, session_date=None, now=None):
         item["waits"] = pending.get(key, [])
         item["risk_binding"] = (overlays.get(key) or {}).get("binding") or []
         for screen in item["screens"]:
-            screen["miss"] = (scored.get(screen.get("id")) or {}).get("miss")
+            score = scored.get(screen.get("id")) or {}
+            screen["miss"] = score.get("miss")
+            screen["manager_changed"] = score.get("manager_changed")
+            # An escalated screen cannot miss, whether or not the manager
+            # changes targets. Only a dismissal's score allows this legacy inference.
+            if screen["manager_changed"] is None:
+                if screen["miss"] is True:
+                    screen["manager_changed"] = True
+                elif screen["miss"] is False and (screen.get("verdict") or {}).get("escalate") is False:
+                    screen["manager_changed"] = False
     counts = Counter(item["change"] for item in decisions)
     return {"session_date": day.isoformat(), "cumulative_validated": total, "decisions": decisions,
             "changes": dict(counts), "validated": len(decisions),
@@ -141,7 +150,12 @@ def activity(root, session_date=None, now=None):
             "notifications": len(notices), "deliveries": dict(Counter(item["state"] for item in notices))}
 
 
-def lines(data, timeline=False):
+def lines(data, timeline=False, *, event_sequence=None):
+    decisions = data["decisions"]
+    if event_sequence is not None:
+        decisions = [item for item in decisions if item["sequence"] == event_sequence]
+        if not decisions:
+            raise RiskError("No validated decision with that event sequence in the selected account/date")
     counts = data["changes"]
     result = [f"AI 复核（纽约日期 {data['session_date']}）：通过校验 {data['validated']} 次，"
               f"失败尝试 {data['failures']} 次，静默跳过 {data['quiet_skips']} 次",
@@ -151,7 +165,9 @@ def lines(data, timeline=False):
                   "；".join(f"{DELIVERY.get(state, state)} {count} 条" for state, count in data["deliveries"].items())
                   or "没有调仓通知")]
     if timeline:
-        for item in data["decisions"]:
+        if event_sequence is not None:
+            result.append(f"以下仅展开事件 #{event_sequence}，上方统计仍为当日合计。")
+        for item in decisions:
             targets = "、".join(f"{row['symbol']} {number(row['weight']) * 100:g}%"
                                for row in item["decision"].get("targets", []) if number(row["weight"]) > 0) or "现金"
             delivered = "、".join(DELIVERY.get(n["state"], n["state"]) for n in item["notifications"]) or "未发调仓通知"
@@ -167,13 +183,22 @@ def lines(data, timeline=False):
                               + "".join(f"｜{text[:60]}" for text in examples if text))
             for screen in item["screens"][-2:]:
                 verdict = screen.get("verdict") or {}
-                note = {True: "（抽查结果：基金经理改了组合，算漏判）", False: "（抽查结果：基金经理没改组合）"}.get(
-                    screen.get("miss"), "")
+                changed = screen.get("manager_changed")
+                note = ""
+                if changed is not None:
+                    label = {"audit": "抽查结果", "shadow": "对照结果"}.get(screen.get("action"), "复核结果")
+                    note = f"（{label}：基金经理{'改了' if changed else '没改'}组合"
+                    note += "，算漏判）" if screen.get("miss") else "）"
                 result.append(f"  事件判断：{TRIAGE.get(screen.get('action'), screen.get('action'))}{note}"
                               + (f"｜{str(verdict.get('reason'))[:80]}" if verdict.get("reason") else ""))
-            rationale = " ".join(str(item["decision"].get("rationale") or "").split())
+            original = str(item["decision"].get("rationale") or "")
+            rationale = " ".join(original.split())
             if rationale:
-                result.append(f"  理由：{rationale[:160]}{'…' if len(rationale) > 160 else ''}")
+                if event_sequence is not None:
+                    result.append("  完整理由（模型原文）：")
+                    result.extend("  " + line for line in original.splitlines())
+                else:
+                    result.append(f"  理由：{rationale[:160]}{'…' if len(rationale) > 160 else ''}")
             for wait in item["waits"]:
                 label = {"entry_waiting": "等待入场价", "stop_breached_no_buy": "已触及止损，停止买入",
                          "buy_chase_limit": "达到追价上限"}[wait["kind"]]

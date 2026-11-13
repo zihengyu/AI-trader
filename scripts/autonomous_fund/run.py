@@ -311,6 +311,8 @@ def main(argv=None):
     parser.add_argument("--end", default="2025-02-14")
     parser.add_argument("--data-dir", type=Path)
     parser.add_argument("--session-date", help="decisions: New York date YYYY-MM-DD (default: today in New York)")
+    parser.add_argument("--event", dest="decision_event", type=int,
+                        help="decisions: expand one validated event's complete rationale in the selected account/date")
     parser.add_argument("--scripted", action="store_true", help="Historical mechanical tests only; never paper")
     parser.add_argument("--intent-id")
     parser.add_argument("--broker-order-id")
@@ -356,6 +358,8 @@ def main(argv=None):
     parser.add_argument("--stop-class", action="store_true",
                         help="status: print only the STOP class (operator, watchdog, service or none)")
     args = parser.parse_args(argv)
+    if args.decision_event is not None and (args.mode != "decisions" or args.decision_event <= 0):
+        parser.error("--event requires decisions and a positive validated event sequence")
     if args.operation_id is not None and args.mode not in {"subscribe", "redeem", "deposit", "withdraw"}:
         parser.error("--operation-id requires subscribe, redeem, deposit or withdraw")
     if args.reserve_only and args.mode != "deposit":
@@ -442,7 +446,7 @@ def main(argv=None):
         return
     if args.mode == "decisions":
         from .decision_activity import activity, lines
-        print("\n".join(lines(activity(args.run_dir, args.session_date), timeline=True)))
+        print("\n".join(lines(activity(args.run_dir, args.session_date), timeline=True, event_sequence=args.decision_event)))
         return
     if args.mode == "prune":
         from .retention import lines, prune
