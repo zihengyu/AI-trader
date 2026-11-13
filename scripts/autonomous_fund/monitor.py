@@ -404,9 +404,10 @@ class Monitor:
                         break
                 stale = (body.get("kind") not in {"postmarket_report", "weekly_report"} and
                          now - notice_at > timedelta(hours=1))
-                db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,NULL,NULL)",
-                           (row["sequence"], "suppressed" if duplicate or stale else "pending", 0,
-                            max(now, notice_at).isoformat()))
+                obsolete = self._approval_notice_error(db, body, now) if notice_at <= now else None
+                db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,?,NULL)",
+                           (row["sequence"], "suppressed" if duplicate or stale or obsolete else "pending", 0,
+                            max(now, notice_at).isoformat(), obsolete))
             self._note_desk(db, now)
             self._note_decision_drought(db, now)
         if self.transport is not None:
@@ -635,6 +636,42 @@ class Monitor:
         db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
             "kind": "data_desk_stale", "details": {"heartbeat_minutes_ago": round(age / 60)}})))
 
+    def _approval_notice_error(self, db, body, now):
+        """Pending action notices must still name live authority; resolutions remain history."""
+        if body.get("kind") not in {"approval_required", "ai_approval_pending"}:
+            return None
+        details = body.get("details")
+        if not isinstance(details, dict) or not details.get("id") or not details.get("digest"):
+            return None  # Older informational notices contain no digest-bound action request.
+        if not isinstance(details["id"], str) or not isinstance(details["digest"], str):
+            return "approval_invalid_scope"
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_approvals'").fetchone():
+            return "approval_missing"
+        row = db.execute("SELECT * FROM fund_approvals WHERE id=?", (details["id"],)).fetchone()
+        if not row or row["state"] != "pending":
+            return "approval_not_pending"
+        from .execution import digest
+        from .risk import trading_day
+        try:
+            request = json.loads(row["body"])
+            if not isinstance(request, dict):
+                return "approval_invalid_scope"
+            binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+            policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
+            decision = db.execute("SELECT * FROM fund_decisions WHERE id=?", (row["decision_id"],)).fetchone()
+            if (details["digest"] != row["digest"] or digest(request) != row["digest"] or
+                    request.get("id") != details["id"] or not binding or request.get("binding") != binding[0] or
+                    not decision or decision["state"] != "active" or request.get("policy") != decision["policy"] or
+                    policy is not None and json.loads(policy[0]) != decision["policy"]):
+                return "approval_scope_changed"
+            if (not instant(request["created_at"]) <= now < instant(request["expires_at"]) or
+                    not instant(decision["accepted_at"]) <= now < instant(decision["until_at"]) or
+                    request.get("day") != trading_day(now)):
+                return "approval_expired_or_not_current"
+        except (KeyError, TypeError, ValueError, RiskError):
+            return "approval_invalid_scope"
+        return None
+
     def _deliver(self, now, only=None, *, deadline=None, realtime=False):
         if deadline is not None and self.clock() >= deadline:
             return
@@ -675,6 +712,12 @@ class Monitor:
                 if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
                     raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
                 claimed_at = datetime.now(timezone.utc) if realtime else now
+                obsolete = self._approval_notice_error(db, body, claimed_at)
+                if obsolete:
+                    db.execute("UPDATE fund_deliveries SET state='suppressed',last_error=? "
+                        "WHERE sequence=? AND state IN ('pending','retry','sending') AND next_at=?",
+                        (obsolete, row["sequence"], row["next_at"]))
+                    continue
                 lease_until = (claimed_at + timedelta(seconds=60)).isoformat()
                 claimed = db.execute("UPDATE fund_deliveries SET state='sending',attempts=attempts+1,next_at=? "
                     "WHERE sequence=? AND state IN ('pending','retry','sending') AND next_at=?",
@@ -707,6 +750,11 @@ class Monitor:
                 if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
                     raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
                 sending_at = datetime.now(timezone.utc) if realtime else now
+                obsolete = self._approval_notice_error(db, body, sending_at)
+                if obsolete:
+                    db.execute("UPDATE fund_deliveries SET state='suppressed',last_error=? "
+                        "WHERE sequence=? AND state='sending' AND next_at=?", (obsolete, row["sequence"], lease_until))
+                    continue
                 gate = db.execute("SELECT value FROM fund_monitor_meta WHERE key='next_delivery_at'").fetchone()
                 if gate and instant(gate[0]) > sending_at:
                     db.execute("UPDATE fund_deliveries SET state='retry',next_at=?,last_error='delivery_backoff' "

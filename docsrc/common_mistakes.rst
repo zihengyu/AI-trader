@@ -521,6 +521,31 @@ rationale, including text after an account-check preamble. Selection is limited
 to the configured account and date and rejects an unmatched sequence. This
 read-only command does not infer, send notifications or change the journal.
 
+For new decisions, ``decision_basis`` binds the accepted plan ID to the actual
+prior-plan, critique and recent-fill inputs, including after a timing correction.
+The selected event view shows the critique as model judgment, with its source
+call ID, original time and reuse flag. Older missing links remain explicit;
+nearby calls are never substituted. Failure to write this diagnostic does not
+block an accepted plan.
+
+**The manager buys and soon reverses after another critique.** The original
+plan is already included in each request. Intraday requests also provide the
+latest six confirmed fills visible at the account snapshot, with recorded fees
+and cumulative-observation deduplication. A timing reassessment refreshes those
+fills with the new account cutoff. Critique reuse requires unchanged research,
+holdings, triggers, prior plan, recent fills and prompt version; reused evidence
+keeps its original time and source call.
+
+The critic compares retaining and changing the plan over the same forward
+horizon. The manager must identify new evidence or a newly recognized error,
+address the earlier thesis and distinguish paid costs from prospective friction.
+Shared model/data overhead is not an incremental benefit of either alternative,
+and annual cost coverage alone does not select an exposure direction. These
+instructions do not impose a holding period, require new news before correcting
+an error, restrict sales or prevent research. They improve the information and
+review contract; fewer reversals or better returns require later observed
+decisions and are not established by deterministic handoff tests.
+
 **Reading the acceptance reports.** ``acceptance`` writes two independent
 reports. ``acceptance.md`` says whether the system runs reliably.
 ``investment_acceptance.md`` says whether there is an excess return after
@@ -1469,6 +1494,51 @@ window and provider error details. An incomplete diagnostic is not an automatic
 backtest failure; a legitimate strategy can also produce no trades. Short daily
 requests include the full required history and calendar padding. Longer
 stock/index windows retain the five-year page cap and backward pagination.
+
+Paper Fund Automation and Purchase Authority
+--------------------------------------------------------------------------------
+
+The optional autonomous fund defaults to ``FUND_AUTOMATION_MODE=full``. A
+separate read-only risk reviewer approves or rejects exception purchases;
+``semi`` preserves operator approval. The manager cannot approve its own
+proposal. Both modes retain the same automatic envelope, quantitative hard
+limits, STOP, independent monitoring and account permissions. Full automation
+does not authorize funding, credentials, live-money trading or changing limits.
+
+A pending exception request can coexist with purchases inside the automatic
+envelope. The selected ``decisions ... --event N`` view shows the recorded
+authority and computed envelope per order, rather than treating the manager's
+rationale as proof of approval. Older missing receipts remain unknown. Status
+shows the mode loaded at startup; editing the environment requires a restart
+and changes the policy digest, retiring old allocations and approvals.
+
+AI approval binds the exact account, request, digest, policy, scope and expiry.
+Invalid or late results, denials and timeouts never become approval. Attempts
+and retry delays persist across restart and consume normal model/cost budgets.
+Approval waits for a fresh account/quote/risk check on the next iteration.
+Submission and local simulated fills recheck authority; revocation or expiry
+cancels the remainder while preserving fills already committed. Paper orders
+already sent still depend on the broker's cancel and fill acknowledgements.
+Buy-turnover cash includes fees; notional budgets reserve the configured fee
+buffer and at least the local broker's known fee.
+
+A small NAV increase can raise the theoretical daily cash ceiling without
+changing the remaining purchases. Plan approval reuse checks whether the old
+cash scope still covers observed spending plus the current remaining buys,
+including fee reserves. It preserves the original ID, digest, limits and expiry;
+actual purchases beyond that immutable cash scope still need new approval.
+
+Digest-bound pending approval notices are revalidated when queued, when claimed
+for delivery and after message construction. Requests already resolved,
+superseded, expired or invalidated by a policy/account change are suppressed with
+an ``approval_*`` delivery reason, while resolution notices and original audit
+records remain available. Transport retries use the same checks; older
+informational notices without a digest retain their compatibility behavior.
+
+A restarted observer also preserves the last AI review attempt's unexpired
+lease. Reaching the attempt count alone does not justify waking a replacement
+manager while that attempt is running. A completed failure or abandoned lease
+can trigger one reassessment without extending the retry budget.
 
 Fresh Fund Costs Versus Completed-Session Performance
 --------------------------------------------------------------------------------

@@ -16,7 +16,7 @@ REPORT_KINDS = ("account", "benchmark", "fill", "fill_reconciled", "decision_val
                 "agent_call_started", "agent_call_finished", "risk_overlay", "decision_backoff", "scorecard",
                 "protective_trigger", "price_alert", "review_triggered", "mandate_initialized",
                 "mandate_capital_changed", "operator_reserve_adjusted", "decision_accepted",
-                "allocation_complete", "operator_approval", "capital_flow")
+                "allocation_complete", "operator_approval", "ai_approval", "capital_flow")
 
 
 
@@ -48,8 +48,8 @@ def _historical_state(events, approvals, cutoff):
             target = [body["id"], "active", body["until_at"], json.dumps(body["decision"])]
         elif kind == "allocation_complete" and target and body["decision_id"] == target[0]:
             target[1] = "complete"
-        if kind not in {"decision_accepted", "operator_approval"} and not (
-                kind == "notification" and body.get("kind") == "approval_required"):
+        if kind not in {"decision_accepted", "operator_approval", "ai_approval"} and not (
+                kind == "notification" and body.get("kind") in {"approval_required", "ai_approval_pending"}):
             continue
         replacement_id = (body.get("details") or {}).get("id") if kind == "notification" else None
         replacement = plans.get(replacement_id)
@@ -62,7 +62,7 @@ def _historical_state(events, approvals, cutoff):
                           replacement.get("decision_id") == plan.get("decision_id"))
             if superseded and row["state"] in {"pending", "approved"}:
                 row["state"] = "superseded"
-            elif kind == "operator_approval" and body["id"] == row["id"]:
+            elif kind in {"operator_approval", "ai_approval"} and body["id"] == row["id"]:
                 row["state"] = body["state"]
                 if body["state"] == "rejected" and target and plan.get("decision_id") == target[0]:
                     target[1] = "rejected"
@@ -287,6 +287,7 @@ def report(root, prices=None, write_files=True, *, as_of=None):
     summary = {
         "mode": startup.get("mode"), "scripted_model": startup.get("mock_model"),
         "models": startup.get("models"),
+        "automation": startup.get("automation"),
         "execution_revision": startup.get("execution_revision"),
         "active_allocation": {"id": target[0], "state": target[1], "until_at": target[2], "decision": json.loads(target[3])} if target else None,
         "approval_requests": approval_rows,

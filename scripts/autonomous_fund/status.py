@@ -409,6 +409,12 @@ def summary(root, mode, now=None):
         lines.append(f"账本：读取失败（{type(exc).__name__}）")
         return "\n".join(lines)
     account = data.get("latest_account") or {}
+    automation = data.get("automation") or {}
+    if automation.get("mode") in {"full", "semi"}:
+        lines.append("自动化模式：" + ("全自动（独立 AI 风控审批例外买入）" if automation["mode"] == "full"
+                                     else "半自动（人工审批例外买入）"))
+    else:
+        lines.append("自动化模式：旧运行未记录；重启新版本后核对实际加载模式")
     integrity = data.get("ledger_audit") or {}
     if integrity.get("status") == "failed":
         lines.append("账务校验失败：" + ", ".join(sorted({r["code"] for r in integrity.get("errors", [])}))

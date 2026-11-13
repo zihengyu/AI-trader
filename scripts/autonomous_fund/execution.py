@@ -1,4 +1,4 @@
-"""Durable target execution and exception-based, plan-level operator approvals.
+"""Durable target execution and exception-based, plan-level AI/operator approvals.
 
 Approval principle (quantitative pre-trade control, not per-order notional):
 - Hard limits are enforced by code and can never be approved away.
@@ -7,7 +7,7 @@ Approval principle (quantitative pre-trade control, not per-order notional):
   gross exposure may rise by `auto_daily_exposure_increase` above the session
   start and observed purchase cash may reach `auto_daily_buy_turnover` of equity.
 - Only purchases beyond that envelope, or any purchase during benchmark market
-  stress, need ONE operator approval covering the whole current plan, bounded by
+  stress, need ONE selected approver's approval covering the current plan, bounded by
   the hard envelope, a price collar and an expiry.
 """
 import hashlib
@@ -29,6 +29,61 @@ TOLERANCE = number("0.002")
 
 class ApprovalPending(RiskError):
     pass
+
+
+class OrderAuthorizationChanged(RiskError):
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(f"Order authorization changed ({reason})")
+
+
+def require_submission_authority(db, intent_id, now):
+    """Check recorded purchase authority at send, local acceptance and fill boundaries."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_order_authority'").fetchone():
+        return None
+    row = db.execute("SELECT body FROM fund_order_authority WHERE intent_id=?", (intent_id,)).fetchone()
+    if not row:
+        # A pre-upgrade allocation still loses authority on a policy change or
+        # rejection. Use its exact submission event, never infer ownership from
+        # a ticker or fabricate the missing original approval receipt. System
+        # cash parking and standalone orders retain their existing lifecycle.
+        event = db.execute("SELECT body FROM events WHERE kind='order_submitted' "
+                           "AND json_extract(body,'$.intent_id')=? ORDER BY sequence DESC LIMIT 1",
+                           (intent_id,)).fetchone()
+        submitted = json.loads(event[0]) if event else {}
+        if submitted.get("kind") == "allocation" and submitted.get("side") == "buy":
+            decision = db.execute("SELECT * FROM fund_decisions WHERE id=?",
+                                  (submitted.get("decision_id"),)).fetchone()
+            policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
+            if decision and (decision["state"] != "active" or not policy or
+                    decision["policy"] != json.loads(policy[0]) or
+                    not instant(decision["accepted_at"]) <= instant(now) < instant(decision["until_at"])):
+                raise OrderAuthorizationChanged("legacy_allocation_changed_or_expired")
+        return None  # Legacy/standalone orders have no fabricated authorization evidence.
+    proof = json.loads(row[0])
+    if proof["source"] in {"risk_reducing", "system_cash_management", "unattributed"}:
+        return proof
+    now = instant(now)
+    decision = db.execute("SELECT * FROM fund_decisions WHERE id=?", (proof["decision_id"],)).fetchone()
+    policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
+    binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()
+    if (not decision or decision["state"] != "active" or decision["policy"] != proof["policy"] or
+            not binding or binding[0] != proof.get("binding") or
+            not policy or json.loads(policy[0]) != proof["policy"] or
+            not instant(decision["accepted_at"]) <= now < instant(decision["until_at"])):
+        raise OrderAuthorizationChanged("allocation_changed_or_expired")
+    if proof.get("approval_id"):
+        approval = db.execute("SELECT * FROM fund_approvals WHERE id=?", (proof["approval_id"],)).fetchone()
+        if not approval or approval["state"] != "approved":
+            raise OrderAuthorizationChanged("approval_revoked")
+        body = json.loads(approval["body"])
+        if (approval["digest"] != proof["approval_digest"] or digest(body) != approval["digest"] or
+                body["decision_id"] != proof["decision_id"] or body["policy"] != proof["policy"] or
+                body["binding"] != proof["binding"]):
+            raise OrderAuthorizationChanged("approval_scope_changed")
+        if not instant(body["created_at"]) <= now < instant(body["expires_at"]):
+            raise OrderAuthorizationChanged("approval_expired")
+    return proof
 
 
 def _section(cls, section):
@@ -145,7 +200,11 @@ class ExecutionState:
                 CREATE TABLE IF NOT EXISTS fund_refs (
                     decision_id TEXT NOT NULL, symbol TEXT NOT NULL, price TEXT NOT NULL,
                     at TEXT NOT NULL, PRIMARY KEY(decision_id, symbol));
+                CREATE TABLE IF NOT EXISTS fund_order_authority (intent_id TEXT PRIMARY KEY, body TEXT NOT NULL);
             """)
+            from .risk_review import install
+            install(db)
+            db.execute("INSERT OR REPLACE INTO meta VALUES('execution_policy_digest',?)", (encode(self.digest),))
             from .ledger_audit import install_version_triggers
             install_version_triggers(db)  # fund_orders and fund_order_quotes are read by the ledger audit.
 
@@ -325,6 +384,40 @@ class ExecutionState:
                 db.execute("INSERT OR IGNORE INTO fund_order_quotes VALUES(?,?,?,?,?)",
                            (intent_id, str(bid), str(ask), str(stamp), str(now)))
 
+    def record_authority(self, db, intent_id, decision_id, intent, now, *, kind, requirement, audit=None):
+        """Bind the independent final preflight to this exact intent before native send."""
+        source, approved = "unattributed", None
+        decision = db.execute("SELECT * FROM fund_decisions WHERE id=?", (decision_id,)).fetchone()
+        if intent.side == "sell":
+            source = "risk_reducing"
+        elif kind == "cash_sweep":
+            source = "system_cash_management"
+        elif decision is not None:
+            source = "automatic"
+            current_policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
+            if (decision["state"] != "active" or decision["policy"] != self.digest or
+                    not current_policy or json.loads(current_policy[0]) != self.digest or
+                    not instant(decision["accepted_at"]) <= instant(now) < instant(decision["until_at"])):
+                raise OrderAuthorizationChanged("allocation_changed_or_expired")
+            if requirement is not None:
+                approved = self.approved({"id": decision_id}, intent, now, requirement, db)
+                if approved is None:
+                    raise OrderAuthorizationChanged("approval_missing_or_expired")
+                event = db.execute("SELECT body FROM events WHERE kind IN ('operator_approval','ai_approval') "
+                    "AND json_extract(body,'$.id')=? AND json_extract(body,'$.state')='approved' "
+                    "ORDER BY sequence DESC LIMIT 1", (approved["id"],)).fetchone()
+                actor = json.loads(event[0]).get("authority", "") if event else ""
+                source = "ai" if actor == "ai_risk_reviewer" else "operator" if actor else "approved"
+        elif requirement is not None:
+            raise OrderAuthorizationChanged("allocation_missing")
+        proof = {"intent_id": intent_id, "decision_id": decision_id, "source": source, "kind": kind,
+                 "binding": db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()[0],
+                 "policy": self.digest, "at": instant(now).isoformat(), "audit": audit,
+                 "requirement": requirement, "approval_id": approved["id"] if approved else None,
+                 "approval_digest": approved["digest"] if approved else None}
+        db.execute("INSERT INTO fund_order_authority VALUES(?,?)", (intent_id, encode(proof)))
+        return proof
+
     def mark_protective(self, intent_id, now):
         with self.journal.connection() as db:
             db.execute("INSERT OR IGNORE INTO fund_protective_orders VALUES(?,?)", (intent_id, str(now)))
@@ -377,26 +470,35 @@ class ExecutionState:
                 return dict(row)
         return None
 
-    def request(self, active, envelope, now):
+    def request(self, active, envelope, now, *, approver="operator"):
         """Commit (or reuse) one immutable plan request; never reserves or sends orders."""
+        if approver not in {"operator", "ai"}:
+            raise RiskError("Unknown plan approver")
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()[0]
             old = db.execute("SELECT * FROM fund_approvals WHERE decision_id=? AND state IN ('pending','approved') "
                              "ORDER BY rowid DESC", (active["id"],)).fetchall()
             for row in old:
                 body = json.loads(row["body"])
-                if (body.get("buys") is not None and instant(now) < instant(body["expires_at"]) and
+                if (body.get("buys") is not None and row["digest"] == digest(body) and
+                        body.get("binding") == binding and body.get("policy") == self.digest and
+                        body.get("approver", "operator") == approver and
+                        instant(body["created_at"]) <= instant(now) < instant(body["expires_at"]) and
                         body.get("day") == trading_day(now) and set(envelope["reasons"]) <= set(body["reasons"]) and
-                        # covers() also checks these: reusing a plan that cannot cover would stall silently.
+                        # Reuse only when the immutable scope still covers the
+                        # remaining plan. A NAV tick can raise its theoretical
+                        # hard cash cap without increasing required purchases;
+                        # never widen the old approval merely to follow that cap.
                         number(envelope["max_exposure_after"]) <= number(body["max_exposure_after"]) + TOLERANCE and
-                        number(envelope["max_buy_turnover_usd"]) <= number(body["max_buy_turnover_usd"]) and
+                        0 <= number(envelope.get("required_buy_turnover_usd", envelope["max_buy_turnover_usd"]))
+                          <= number(body["max_buy_turnover_usd"]) and
                         all(symbol in body["buys"] and
                             number(scope["max_weight"]) <= number(body["buys"][symbol]["max_weight"]) + TOLERANCE and
                             number(scope["reference_limit"]) <= number(body["buys"][symbol]["max_limit"])
                             for symbol, scope in envelope["buys"].items())):
                     return dict(row)
                 db.execute("UPDATE fund_approvals SET state='superseded' WHERE id=?", (row["id"],))
-            binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()[0]
             key = uuid4().hex
             from .market_data import SessionClock
             close = instant(SessionClock(now=lambda: instant(now)).status()["close"])
@@ -406,12 +508,12 @@ class ExecutionState:
                     for symbol, scope in envelope["buys"].items()}
             body = {"id": key, "binding": binding, "decision_id": active["id"], "policy": self.digest,
                     "day": trading_day(now), "created_at": instant(now).isoformat(), "expires_at": expires.isoformat(),
-                    "kind": "plan", **envelope, "buys": buys,
+                    "kind": "plan", "approver": approver, **envelope, "buys": buys,
                     "target_portfolio": active["decision"]["targets"], "rationale": active["decision"]["rationale"]}
             checksum = digest(body)
             db.execute("INSERT INTO fund_approvals VALUES(?,?,?,?,?,NULL)", (key, active["id"], encode(body), checksum, "pending"))
             db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (str(now), "notification", encode({
-                "kind": "approval_required", "details": {
+                    "kind": "ai_approval_pending" if approver == "ai" else "approval_required", "details": {
                     "id": key, "digest": checksum, "kind": "plan", "expires_at": body["expires_at"],
                     "reasons": body["reasons"], "buys": buys, "observed_equity": body["observed_equity"],
                     "start_exposure": body["start_exposure"], "current_exposure": body["current_exposure"],
@@ -491,10 +593,12 @@ def resolve_approval(root, key, checksum, approve, now, authority="local_operato
         body = json.loads(row["body"])
         binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()[0]
         decision = db.execute("SELECT * FROM fund_decisions WHERE id=?", (row["decision_id"],)).fetchone()
+        policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
         if (checksum != row["digest"] or checksum != digest(body) or body["binding"] != binding or
                 not instant(body["created_at"]) <= instant(now) < instant(body["expires_at"]) or
                 body["day"] != trading_day(now) or not decision or decision["state"] != "active" or
-                instant(now) >= instant(decision["until_at"])):
+                instant(now) >= instant(decision["until_at"]) or body.get("policy") != decision["policy"] or
+                policy is not None and json.loads(policy[0]) != decision["policy"]):
             raise RiskError("Approval digest, account, session or validity does not match")
         if approve and (Path(root) / "STOP").exists():
             raise RiskError("STOP is active; approval cannot enable trading")

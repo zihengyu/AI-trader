@@ -482,9 +482,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                     rejection = ("expired", "Local order authority expired before acceptance")
             if rejection is None:
                 from .capital import OrderAuthorityChanged, require_order_authority
+                from .execution import OrderAuthorizationChanged, require_submission_authority
                 try:
                     require_order_authority(db, key, body["side"])
-                except OrderAuthorityChanged as exc:
+                    require_submission_authority(db, key, self.data_source.get_datetime())
+                except (OrderAuthorityChanged, OrderAuthorizationChanged) as exc:
                     capital_rejection, rejection = exc, (exc.reason, str(exc))
             if rejection:
                 # Identity matched and no local order exists: this is a proven
@@ -540,11 +542,13 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                     self.cancel_order(order)
                     continue
                 from .capital import OrderAuthorityChanged, require_order_authority
+                from .execution import OrderAuthorizationChanged, require_submission_authority
                 try:
                     with self.journal.connection() as db:
                         db.execute("BEGIN")
                         require_order_authority(db, row["intent_id"], str(order.side))
-                except OrderAuthorityChanged as exc:
+                        require_submission_authority(db, row["intent_id"], self.data_source.get_datetime())
+                except (OrderAuthorityChanged, OrderAuthorizationChanged) as exc:
                     self._cancel_for_risk(order, exc.reason)
                     continue
                 active.append((row, order))
@@ -637,9 +641,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         if not self.is_market_open() or self.data_source.get_datetime() >= instant(row["expires_at"]):
             return None
         from .capital import OrderAuthorityChanged, require_order_authority
+        from .execution import OrderAuthorizationChanged, require_submission_authority
         try:
             require_order_authority(db, row["intent_id"], str(json.loads(row["body"])["side"]))
-        except OrderAuthorityChanged as exc:
+            require_submission_authority(db, row["intent_id"], self.data_source.get_datetime())
+        except (OrderAuthorityChanged, OrderAuthorizationChanged) as exc:
             raise VirtualRiskCancellation(exc.reason) from None
         age = (self.data_source.get_datetime() - (start + timedelta(minutes=1))).total_seconds()
         if not 0 <= age <= self.limits.quote_max_seconds:

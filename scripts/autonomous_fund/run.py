@@ -30,6 +30,10 @@ class ScriptedRuntime:
         elif request.agent_name == "critic":
             body = {"summary": "SCRIPTED critique; no research was challenged.", "concerns": [],
                     "missing_evidence": ["Scripted fixture: no real evidence was reviewed."]}
+        elif request.agent_name == "risk_reviewer":
+            pending = context["approval_request"]
+            body = {"approval_id": pending["id"], "request_digest": pending["digest"], "approve": True,
+                    "reason": "SCRIPTED mechanical approval fixture; not an investment assessment."}
         elif context.get("phase") == "postmarket_review":
             body = {"session_date": context["session"]["session_date"], "as_of": now.isoformat(),
                     "summary": "SCRIPTED 复盘流程测试；未进行真实模型研究或策略优化。",
@@ -67,7 +71,14 @@ def model_ready(model):
 
 def selected_models(args, config):
     from .strategy import model_selection
-    return model_selection(config, args.model, args.research_model, args.decision_model)
+    from .risk_review import AutomationSettings
+    selected = model_selection(config, args.model, args.research_model, args.decision_model)
+    automation = AutomationSettings.from_config(config.get("automation"))
+    # Historical experiments do not create this live exception-review role.
+    # Do not demand credentials for a provider they will never invoke.
+    if automation.mode == "full" and getattr(args, "mode", None) not in {"backtest", "mock", "qualify"}:
+        selected["risk_reviewer"] = automation.model or selected["manager"]
+    return selected
 
 
 def models_ready(args, config):

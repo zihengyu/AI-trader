@@ -88,6 +88,7 @@
       "alternatives": {"limit": "0.20", "members": ["BTAL", "DBMF", "TAIL", "UUP"]}
     }
   },
+  "automation": {"mode": "full", "model": "deepseek/deepseek-flash"},
   "approval": {"auto_daily_exposure_increase": "0.25", "max_daily_exposure_increase": "0.50", "auto_daily_buy_turnover": "0.40", "max_daily_buy_turnover": "1.00", "stress_requires_approval": true, "valid_minutes": 60, "price_collar": "0.02"},
   "execution": {"reprice_after_seconds": 180, "max_buy_chase": "0.0075", "report_interval_seconds": 300, "review_on_move": "0.03", "iteration_seconds": 30,
                 "protective_limit_buffer": "0.005", "protective_reprice_seconds": 60},

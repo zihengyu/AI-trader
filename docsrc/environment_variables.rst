@@ -1486,8 +1486,12 @@ default 0.15 and 0.05), ``FUND_RESEARCH_SYMBOLS`` (research-only stocks for the 
 ``FUND_GROUP_LIMITS`` (``group:limit`` pairs, for example ``technology:0.40``, changing existing groups'
 combined weight caps; each above 0 and at most 1),
 ``FUND_EXCLUDE_SYMBOLS``,
-``FUND_INSTRUCTIONS``), the approval
-envelope (``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER``,
+``FUND_INSTRUCTIONS``), ``FUND_AUTOMATION_MODE`` (``full`` by default: the manager
+chooses investments and a separate read-only risk AI approves or rejects exception
+purchases; ``semi`` retains operator approval of those exceptions), the approval
+model (``FUND_APPROVAL_MODEL``, default ``deepseek/deepseek-flash``, independently
+selectable using any supported ``provider/model`` ID), the approval envelope
+(``FUND_AUTO_DAILY_EXPOSURE_INCREASE``, ``FUND_AUTO_DAILY_BUY_TURNOVER``,
 ``FUND_STRESS_REQUIRES_APPROVAL``, ``FUND_APPROVAL_VALID_MINUTES``) and external
 parameters (``FUND_ITERATION_SECONDS``, ``FUND_LIVE_STREAM``,
 ``FUND_RESEARCH_RESOLVER``, ``FUND_NEWS_ENABLED``, ``FUND_NEWS_POLL_SECONDS``,
@@ -1502,6 +1506,24 @@ with a suggestion, and ``show-config`` prints effective values and their sources
 secrets shown only as set or missing. ``FUND_DAILY_ORDERS`` counts every submission of
 the day for purchases; sales count only sales against their own budget of the same size,
 with five more for protective exits, so purchases can never block de-risking.
+
+Automation changes the approver, not hard risk limits. Automatic-envelope
+purchases, risk-reducing sales and configured cash management retain their own
+rules. An AI result must match the immutable request ID/digest, account, policy,
+session, scope and expiry. Failures remain pending with bounded persisted retries;
+there is no automatic approval fallback. After approval the next iteration
+refreshes account/quotes and rechecks hard risk. ``FUND_APPROVAL_MODEL`` overrides
+``automation.model`` and defaults to ``deepseek/deepseek-flash`` independently of
+manager overrides. Another supported model may be selected freely. A blank
+environment value leaves the config value in place; a missing/null config model
+falls back to the manager. Calls share normal model/cost budgets. A separately
+selected provider needs its explicit provider key and, when a daily cost cap is
+enabled, its model needs configured token rates.
+Restart to load an environment-mode change; it changes the policy digest and
+retires old targets/approvals. ``fund-logs.sh status`` reports the loaded startup
+mode, while a pre-upgrade process is labeled unknown rather than assumed full.
+This setting does not authorize fund transfers, credential changes, risk-limit
+changes, STOP removal or live-money trading.
 
 The application's read-only ``schwab-check`` command uses the native Schwab
 variables (``SCHWAB_ACCOUNT_NUMBER``, ``SCHWAB_APP_KEY``, ``SCHWAB_APP_SECRET``,

@@ -14,7 +14,7 @@ ZONE = ZoneInfo("America/New_York")
 KINDS = ("decision_validated", "decision_accepted", "decision_backoff", "review_skipped", "notification",
          "order_submitted", "fill", "fill_reconciled", "allocation_complete", "entry_waiting",
          "stop_breached_no_buy", "buy_chase_limit", "risk_overlay", "review_triggered", "event_triage",
-         "triage_scored")
+         "triage_scored", "decision_basis")
 # Why the manager was woken before a decision, in the operator's words.
 WAKES = {"news": "资讯", "price_move": "价格异动", "price_alert": "价格提醒", "market_stress": "市场压力",
          "stop_loss": "止损", "take_profit": "止盈", "capital_flow": "申购/赎回", "entry": "入场价"}
@@ -70,11 +70,20 @@ def activity(root, session_date=None, now=None):
                            "AND julianday(at)<=julianday(?)", (now.isoformat(),)).fetchone()[0]
         tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         delivery = dict(db.execute("SELECT sequence,state FROM fund_deliveries")) if "fund_deliveries" in tables else {}
+        approvals = []
+        if "fund_approvals" in tables:
+            for row in db.execute("SELECT id,decision_id,state,body FROM fund_approvals"):
+                body = json.loads(row[3])
+                if instant(body["created_at"]) <= cutoff:
+                    approvals.append({"id": row[0], "decision_id": row[1], "state": row[2], "body": body})
 
     accepted, decisions, by_id, orders, notices = {}, [], {}, defaultdict(list), []
     complete, pending, overlays = set(), defaultdict(list), {}
-    wakes, screens, scored = [], [], {}
+    wakes, screens, scored, bases = [], [], {}, {}
     for seq, at, kind, body in rows:
+        if kind == "decision_basis":
+            bases[body.get("decision_id")] = body
+            continue
         if kind == "review_triggered":
             wakes.append(body)
             continue
@@ -130,6 +139,8 @@ def activity(root, session_date=None, now=None):
         item["completed"] = key in complete
         item["waits"] = pending.get(key, [])
         item["risk_binding"] = (overlays.get(key) or {}).get("binding") or []
+        item["basis"] = bases.get(key) if key is not None else None
+        item["approvals"] = [row for row in approvals if row["decision_id"] == key] if key is not None else []
         for screen in item["screens"]:
             score = scored.get(screen.get("id")) or {}
             screen["miss"] = score.get("miss")
@@ -199,6 +210,44 @@ def lines(data, timeline=False, *, event_sequence=None):
                     result.extend("  " + line for line in original.splitlines())
                 else:
                     result.append(f"  理由：{rationale[:160]}{'…' if len(rationale) > 160 else ''}")
+            if event_sequence is not None:
+                for order in item["orders"]:
+                    proof = order.get("authorization") or {}
+                    label = {"automatic": "自动额度内", "ai": "独立 AI 审批", "operator": "人工审批",
+                             "approved": "已批准（旧来源未记录）", "risk_reducing": "卖出／减仓，无需审批",
+                             "system_cash_management": "系统现金管理", "unattributed": "未记录独立审批依据"}
+                    result.append(f"  订单授权：{order.get('symbol')} {order.get('side')} {order.get('quantity')} 股，"
+                                  + label.get(proof.get("source"), "旧记录缺少独立审批依据"))
+                    if proof.get("approval_id"):
+                        result.append("  使用审批：" + proof["approval_id"])
+                    if proof.get("audit"):
+                        audit = proof["audit"]
+                        result.append(f"  自动额度依据：开盘敞口 {audit.get('start_exposure')}，"
+                                      f"下单前敞口 {audit.get('exposure_before')}，"
+                                      f"剩余自动买入金额 ${audit.get('automatic_buy_budget_usd')}")
+                for approval in item.get("approvals", []):
+                    body = approval["body"]
+                    result.append(f"  关联审批请求 {approval['id']}：{'独立 AI' if body.get('approver') == 'ai' else '人工'}，"
+                                  f"查询时状态 {approval['state']}；自动额度 {json.dumps(body.get('auto_envelope'), ensure_ascii=False)}")
+                basis = item.get("basis")
+                if basis is None:
+                    result.append("  此记录未保存关联反方原文与上轮输入，不能按相邻调用补配。")
+                else:
+                    previous = basis.get("previous_decision")
+                    result.append("  上轮计划（本次实际输入）：" + json.dumps(previous, ensure_ascii=False))
+                    result.append("  近期成交（本次实际输入）：" + json.dumps(basis.get("recent_trades", []), ensure_ascii=False))
+                    critique, source = basis.get("critique"), basis.get("critique_source") or {}
+                    if critique is None:
+                        result.append("  本轮无可用反方审查。")
+                    else:
+                        result.append(f"  关联反方原文（模型判断，时间 {source.get('at')}，"
+                                      f"源调用 {source.get('call_id') or '未记录'}，复用 {bool(source.get('reused'))}）：")
+                        result.append("  " + str(critique.get("summary") or ""))
+                        for concern in critique.get("concerns", []):
+                            result.append(f"  {concern.get('symbol') or '组合'}：{concern.get('concern')}"
+                                          f"｜证据：{concern.get('evidence')}")
+                        if critique.get("missing_evidence"):
+                            result.append("  反方指出的缺项：" + "；".join(critique["missing_evidence"]))
             for wait in item["waits"]:
                 label = {"entry_waiting": "等待入场价", "stop_breached_no_buy": "已触及止损，停止买入",
                          "buy_chase_limit": "达到追价上限"}[wait["kind"]]

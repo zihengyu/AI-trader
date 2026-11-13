@@ -58,6 +58,13 @@ def _optional(text):
     return value or None
 
 
+def _automation_mode(text):
+    value = str(text).strip().lower()
+    if value not in {"full", "semi"}:
+        raise RiskError("expected full (AI risk approval) or semi (operator approval)")
+    return value
+
+
 def _feeds(text):
     feeds = []
     for item in _list(text):
@@ -133,6 +140,8 @@ SETTINGS = {
     "FUND_EARNINGS_MAX_POSITION": (("events", "earnings_max_position"), _decimal, False, "约束", "财报前单只个股最大权重，例如 0.05"),
     "FUND_CONSTRUCTION_MODE": (("construction", "mode"), str, False, "约束", "组合构建：ai（AI 原始权重）、risk_budget（按 AI 权重分配风险贡献）或 auto（配对检验显著后自动切换）"),
     # ----- Approval envelope
+    "FUND_AUTOMATION_MODE": (("automation", "mode"), _automation_mode, False, "审批", "full（默认）：独立 AI 风控审批；semi：超额买入由人工审批；硬限制不变"),
+    "FUND_APPROVAL_MODEL": (("automation", "model"), _optional, False, "审批", "独立审批模型（提供方/模型ID），默认 deepseek/deepseek-flash；可自行更换，不随经理模型切换"),
     "FUND_AUTO_DAILY_EXPOSURE_INCREASE": (("approval", "auto_daily_exposure_increase"), _decimal, False, "审批", "无需审批的单日敞口增幅；0 表示所有买入都要审批"),
     "FUND_AUTO_DAILY_BUY_TURNOVER": (("approval", "auto_daily_buy_turnover"), _decimal, False, "审批", "无需审批的单日买入现金流（占净值）"),
     "FUND_STRESS_REQUIRES_APPROVAL": (("approval", "stress_requires_approval"), _bool, False, "审批", "市场压力下买入是否需要审批"),

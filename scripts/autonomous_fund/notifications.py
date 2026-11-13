@@ -54,6 +54,7 @@ def approval_message(details):
     if "buys" in details:
         code = str(details["id"])[:6].upper()
         lines = ["量化风控：调仓计划超出自动额度，待一次性审批（只覆盖新增买入；卖出/减仓已自动执行）",
+                 "仅超出自动额度的部分等待人工；额度内的买入仍可按规则执行。",
                  f"审批代码 {code}：直接回复本消息「同意」或「拒绝」，或发送「同意 {code}」／「拒绝 {code}」。",
                  f"审批触发：{reasons}",
                  f"参考净值：${details.get('observed_equity')}；开盘敞口 {_pct(details.get('start_exposure'))}，"
@@ -305,7 +306,7 @@ def _percent(value):
     return "暂无" if value is None else f"{value * 100:.2f}%"
 
 
-TRADE_KINDS = ("order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval")
+TRADE_KINDS = ("order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval", "ai_approval")
 WATCH_KINDS = ("protective_trigger", "price_alert", "review_triggered", "entry_waiting", "buy_chase_limit")
 DAILY_KINDS = TRADE_KINDS + WATCH_KINDS + ("notification",)
 
@@ -621,9 +622,24 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"（今天最近一次：{_when(last) if last else '还没有'}；今天决策失败重试 "
                 f"{details.get('decision_failures_today', 0)} 次）。进程是健康的，但没有做出决策，常见原因是模型持续失败或"
                 "订单一直未完成。查看：bash scripts/fund-logs.sh errors")
+    elif kind == "ai_approval_pending" and isinstance(details, dict):
+        text = (f"🤖 全自动：例外买入交给独立风控 AI 复核（请求 {str(details.get('id') or '')[:6].upper()}）。\n"
+                "自动额度内的交易和卖出按规则继续；超额部分尚未获准。AI 不能放宽代码硬上限。")
+    elif kind == "ai_approval_resolved" and isinstance(details, dict):
+        approved = details.get("state") == "approved"
+        text = (f"🤖 独立 AI 风控：{'批准' if approved else '拒绝'}例外买入"
+                f"（请求 {str(details.get('id') or '')[:6].upper()}，模型 {details.get('model')}）。\n"
+                f"理由（模型判断）：{details.get('reason')}\n" +
+                ("批准不是成交；下一轮仍会刷新账户和报价，重新执行代码硬风控。" if approved else
+                 "该计划不再继续买入，基金经理将重新评估；止损和减仓权限不变。"))
+    elif kind in {"ai_approval_error", "ai_approval_stale"} and isinstance(details, dict):
+        text = (f"⏳ AI 风控本轮没有产生有效批准（请求 {str(details.get('id') or '')[:6].upper()}）："
+                f"{details.get('error') or details.get('reason')}。不会自动放行。")
+        if details.get("retry_minutes"):
+            text += f"失败后至少等待 {details['retry_minutes']} 分钟再检查，达到重试上限后重新评估计划。"
     elif kind == "model_cost_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型费用已到上限（约 ${details.get('cost_usd')} / ${details.get('limit_usd')}）："
-                "当天不再发起新决策、反方审查和盘前研究；已有目标和止损照常执行，明天恢复。")
+                "当天不再发起新决策、反方审查、例外风控审批和盘前研究；已有目标和止损照常执行，明天恢复。")
     elif kind == "fund_cost_alert" and isinstance(details, dict):
         spent = (details.get("model_usd") or 0) + (details.get("data_usd") or 0)
         text = (f"💸 AI 和数据费用累计已占起始资金 {_percent(details.get('share'))}（${spent:.2f}，"

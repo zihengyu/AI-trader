@@ -161,6 +161,42 @@ def test_request_is_reused_within_scope_and_replaced_when_scope_grows(tmp_path):
     assert notices == 3  # One actionable alert per distinct plan scope, none for repeated polls.
 
 
+@pytest.mark.parametrize("approver", ["operator", "ai"])
+@pytest.mark.parametrize("approved", [False, True])
+def test_nav_tick_does_not_replace_sufficient_immutable_plan_authority(tmp_path, approver, approved):
+    journal, state, account, active = setup(tmp_path)
+    first = state.request(active, envelope(required_buy_turnover_usd="900"), NOW, approver=approver)
+    if approved:
+        authorize(tmp_path, first)
+    # NAV changes the theoretical hard cap by a cent, but this plan still needs
+    # much less than its original reviewed cash limit. Keep its ID and digest.
+    same = state.request(active, envelope(observed_equity="10000.01", max_buy_turnover_usd="10000.01",
+        required_buy_turnover_usd="900.01"), NOW + timedelta(seconds=30), approver=approver)
+    assert same["id"] == first["id"] and same["digest"] == first["digest"]
+    assert json.loads(same["body"])["max_buy_turnover_usd"] == "10000"
+    # Reuse cannot extend the original dollar authority by even one cent.
+    assert state.approved(active, order(), NOW, need(turnover="10000.01")) is None
+    grown = state.request(active, envelope(observed_equity="10000.02", max_buy_turnover_usd="10000.02",
+        required_buy_turnover_usd="10000.01"), NOW + timedelta(seconds=60), approver=approver)
+    assert grown["id"] != first["id"]
+
+
+@pytest.mark.parametrize("mark", ["10000.01", "9999.99"])
+def test_recomputed_quant_plan_reuses_original_cash_scope_after_small_nav_changes(tmp_path, mark):
+    from tests.test_autonomous_fund_quant import NOW as at, account, accept, default_frames, harness, quote
+    strategy = harness(tmp_path, frames=default_frames(), approval={"auto_daily_exposure_increase": "0"})
+    active = accept(strategy, [("ALFA", .09)])
+    before = strategy._candidates(active, account(), {"ALFA": quote()}, at)["request"]
+    first = strategy.execution.request(active, before, at)
+    after = strategy._candidates(active, account(cash=number(mark)), {"ALFA": quote()}, at)["request"]
+    assert number(after["required_buy_turnover_usd"]) < number(before["max_buy_turnover_usd"])
+    assert after["max_buy_turnover_usd"] != before["max_buy_turnover_usd"]
+    assert strategy.execution.request(active, after, at)["id"] == first["id"]
+    with strategy.journal.connection() as db:
+        notices = db.execute("SELECT count(*) FROM events WHERE kind='notification'").fetchone()[0]
+    assert notices == 1  # A valuation-only tick must not queue another approval alert.
+
+
 def test_restart_restores_target_but_expired_or_rejected_targets_do_not_execute(tmp_path):
     journal, state, account, active = setup(tmp_path)
     restored = ExecutionState(Journal(tmp_path, "synthetic-local-binding"))
@@ -322,8 +358,10 @@ def test_native_purchase_beyond_envelope_waits_for_plan_approval_then_rechecks_a
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     clock = Clock()
     source = YahooRealtimeData(now=clock, fetch=clock.fetch)
-    # An operator who wants every purchase reviewed sets the automatic envelope to zero.
-    config = {"model": "deepseek/deepseek-flash", "limits": {}, "approval": {"auto_daily_exposure_increase": "0"},
+    # Full automation is now the default. This regression specifically covers
+    # human approval, so select semi mode and set the automatic envelope to zero.
+    config = {"model": "deepseek/deepseek-flash", "limits": {}, "automation": {"mode": "semi"},
+              "approval": {"auto_daily_exposure_increase": "0"},
               "universe": {"ALFA": "stock", "SPY": "unlevered_etf", "QQQ": "unlevered_etf"}}
     journal = Journal(tmp_path, account_digest("local", "local-virtual-account", config))
     calls = []

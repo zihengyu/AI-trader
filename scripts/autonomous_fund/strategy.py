@@ -21,6 +21,7 @@ from .cash import policy_context
 from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
+from .risk_review import AutomationSettings, RiskApproval, RISK_APPROVAL_PROMPT
 from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnavailable, ObservedPrice,
                    OpeningValuationPending, Price, RiskError,
                    bounded_list, bounded_text, decision_levels,
@@ -31,14 +32,14 @@ from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnava
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
-                   "construction", "critic", "triage", "data_desk", "manager_run_timeout_seconds")
+                   "construction", "critic", "triage", "data_desk", "manager_run_timeout_seconds", "automation")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # Assumed per-side slippage when the broker states none (Alpaca paper), for the trade value check (V2 4.5).
 DEFAULT_SLIPPAGE = 0.0005
 # A call's purpose (V2 4.3), from its context phase, else from its role.
 CALL_PURPOSES = {"postmarket_review": "postmarket_review", "before_market_opens": "premarket_research",
                  "closed_startup": "premarket_research"}
-DEFAULT_PURPOSES = {"manager": "decision", "researcher": "research", "critic": "critique"}
+DEFAULT_PURPOSES = {"manager": "decision", "researcher": "research", "critic": "critique", "risk_reviewer": "risk_approval"}
 
 
 def targets_changed(previous, decision):
@@ -152,6 +153,14 @@ CRITIC_PROMPT = (
     "cash: the return given up against the benchmarks and the costs the fund pays regardless (fund_scoreboard). "
     "Use read-only research tools to check claims. Return concerns by symbol (\"\" for "
     "portfolio-level) with evidence, and list missing evidence. Never fabricate; say when the research holds up. "
+    "Compare retaining previous_decision with changing or exiting it over the same forward horizon, including "
+    "the incremental trading friction of the change. Challenge both alternatives; criticism does not require a "
+    "different portfolio. Identify new evidence or a newly identified error in the earlier thesis, and distinguish "
+    "those from an unchanged event calendar, hindsight about a fill, or a different argument about the same facts. "
+    "A newly recognized material mistake can justify immediate correction without new news. Model/data overhead "
+    "shared by the alternatives is not a benefit of either one; inability to cover annual overhead alone does not "
+    "determine whether exposure should rise or fall. recent_trades contains confirmed fills and recorded fees "
+    "visible at the account snapshot; paid costs are sunk and already in NAV, while future trading friction remains. "
     "Keep the summary under 3000 characters, each concern and its evidence under 800, at most 10 concerns. "
     "You do not decide or trade; the manager weighs your critique. In historical mode use only information "
     "public by as_of. Return only the requested schema fields, without placeholder fields."
@@ -172,7 +181,14 @@ MANAGER_PROMPT = (
     "or the depth of your analysis to save model costs, and never lengthen reviews for that reason; spending "
     "limits are the operator's (model_budget). "
     "Review the research, the devil's-advocate critique (when present), account and risks; independently use "
-    "read-only research tools. Address the critique's material concerns in the rationale. "
+    "read-only research tools. Address the critique's material concerns in the rationale. The critique is advisory, "
+    "not an instruction to change the portfolio; you remain responsible for the decision. When reversing a recent "
+    "target, compare continuing previous_decision with the proposed change over its stated horizon and invalidation "
+    "conditions. Explain what new evidence changed the thesis, or which earlier material error you now recognize "
+    "and why. Do not preserve an erroneous position just to appear consistent or wait for a price threshold. "
+    "Use recent_trades to distinguish already-paid fees from prospective fees, spread and slippage; never subtract "
+    "paid costs twice. Overhead shared by holding and changing must not be credited as a benefit of either choice, "
+    "and annual cost pace alone is not evidence for either adding or cutting exposure. "
     "During regular sessions research_status describes saved premarket research and its original times. "
     "It may be unavailable, invalid or from a previous session. Continue your own assessment with "
     "current read-only tools; verify material claims and disclose gaps in your rationale. "
@@ -212,8 +228,11 @@ MANAGER_PROMPT = (
     "When coverage is partial or unavailable or a refresh failed, seek current evidence as needed "
     "and identify the gap in any conclusion that depends on it. "
     "Sales execute automatically. Purchases run automatically inside a daily risk-increase "
-    "envelope; purchases beyond it, or during market stress, wait for one operator approval "
-    "of the whole plan. Choose next_review_at no earlier than min_review_minutes. "
+    "envelope; purchases beyond it, or during market stress, wait for bounded approval of the whole plan by "
+    "the independent risk AI in approval_control.mode=full, or the operator in semi mode. Purchases inside the "
+    "automatic envelope may proceed while the exception remainder waits; do not describe that as the whole "
+    "plan waiting. You cannot approve "
+    "your own request. Choose next_review_at no earlier than min_review_minutes. "
     "operator_mandate is set by the human operator: its instructions are binding and its capital is the "
     "only money you manage (the account view you receive is already that capital sleeve). "
     "Choose entry and exit points with optional per-target entry_limit, stop_loss, take_profit and "
@@ -476,7 +495,7 @@ class ModelBudget:
     skip_quiet_reviews: bool = True
     max_quiet_minutes: int = 120
     # USD per New York trading day (estimated from model_prices_per_million): beyond it no new decision,
-    # critique or pre-open research starts that day; the once-a-day post-market review still runs.
+    # critique, exception approval or pre-open research starts; the post-market review still runs.
     max_daily_cost_usd: str | None = None
     # A notice (never a trading stop) each time the fund's accrued model and data costs pass another
     # multiple of this share of its starting equity (fund_scoreboard); None turns it off.
@@ -542,8 +561,9 @@ def prompt_version(models, extra=None):
     instead of mixing them; a change is journaled as prompt_version_changed.
     """
     body = {"researcher": RESEARCHER_PROMPT, "manager": MANAGER_PROMPT, "critic": CRITIC_PROMPT,
+            "risk_reviewer": RISK_APPROVAL_PROMPT,
             "schemas": {"research": Research.model_json_schema(), "decision": Decision.model_json_schema(),
-                        "critique": Critique.model_json_schema()},
+                        "critique": Critique.model_json_schema(), "risk_approval": RiskApproval.model_json_schema()},
             "models": dict(models), **(extra or {})}
     return hashlib.sha256(json.dumps(body, sort_keys=True, default=str).encode()).hexdigest()[:12]
 
@@ -635,6 +655,7 @@ def configuration(path, environ=None):
     from .construction import ConstructionSettings
     ConstructionSettings.from_config(result.get("construction"))
     CriticSettings.from_config(result.get("critic"))
+    automation = AutomationSettings.from_config(result.get("automation"))
     from .triage import TriageSettings
     triage = TriageSettings.from_config(result.get("triage"))
     from .datadesk import DeskSettings
@@ -650,6 +671,8 @@ def configuration(path, environ=None):
             models.add(critic.model)
         if triage.mode != "off" and triage.model:
             models.add(triage.model)
+        if automation.mode == "full" and automation.model:
+            models.add(automation.model)
         prices = result.get("model_prices_per_million")
         unpriced = sorted(m for m in models if not rate_for(prices, m, len(models)))
         if unpriced:
@@ -788,10 +811,12 @@ class AutonomousFund(Strategy):
         self.quant, approval_policy, self.execution_policy, self.model_budget = risk_settings(
             config, self.universe, self.limits)
         self.mandate = Mandate.from_config(config.get("mandate"))
+        self.automation = AutomationSettings.from_config(config.get("automation"))
         self.policy_digest = hashlib.sha256(encode({
             "limits": asdict(self.limits), "quant": self.quant.digest, "approval": asdict(approval_policy),
             "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
-            "mandate": asdict(self.mandate), "universe": sorted(config["universe"].items())}).encode()).hexdigest()
+            "mandate": asdict(self.mandate), "automation": asdict(self.automation),
+            "universe": sorted(config["universe"].items())}).encode()).hexdigest()
         self._bars, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
         from .notifications import FundOutboxProvider
         self.notifications.providers.append(FundOutboxProvider(self))
@@ -917,6 +942,13 @@ class AutonomousFund(Strategy):
             self.agents.create(name="critic", model=self.agent_models["critic"], output_schema=Critique, **common,
                                run_timeout_seconds=run_timeouts["critic"], system_prompt=CRITIC_PROMPT)
             self._critic_ready = True
+        self._risk_reviewer_ready = False
+        if self.automation.mode == "full" and mode in {"local", "paper"}:
+            self.agent_models["risk_reviewer"] = self.automation.model or self.agent_models["manager"]
+            self.agents.create(name="risk_reviewer", model=self.agent_models["risk_reviewer"], output_schema=RiskApproval,
+                               **common, run_timeout_seconds=run_timeouts["critic"], system_prompt=RISK_APPROVAL_PROMPT)
+            self._risk_reviewer_ready = True
+            self._risk_review_lease_seconds = agent_worst_case_seconds("critic", run_timeout_seconds=run_timeouts["critic"]) + 60
         from .triage import TRIAGE_PROMPT, Triage, TriageSettings
         self.triage = TriageSettings.from_config(config.get("triage"))
         # Kept out of agent_models: the triage model does not shape decisions, so prompt_version is unchanged.
@@ -967,6 +999,7 @@ class AutonomousFund(Strategy):
                            "performance": {"benchmarks": self.performance.definitions(),
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
+                           "automation": asdict(self.automation),
                            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
                            "mandate": asdict(self.mandate),
                            "environment_overrides": config.get("_environment_overrides", [])})
@@ -1846,7 +1879,8 @@ class AutonomousFund(Strategy):
             from .diagnostics import structured_answer_diagnostic
             from .triage import Triage
             from .model_identity import ModelProbe
-            schema = {"researcher": Research, "manager": Decision, "critic": Critique, "triage": Triage}.get(name)
+            schema = {"researcher": Research, "manager": Decision, "critic": Critique, "triage": Triage,
+                      "risk_reviewer": RiskApproval}.get(name)
             if name.startswith("model_probe_"):
                 schema = ModelProbe
             if name == "manager" and phase == "postmarket_review":
@@ -2174,9 +2208,11 @@ class AutonomousFund(Strategy):
                    "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "leveraged_etfs": self._leveraged_context(),
                    "account": asdict(account), "previous_decision": self.last_decision,
+                   "recent_trades": self.journal.recent_trades(account.as_of),
                    "premarket_research": getattr(self, "premarket_research", None),
                    "strategy_memory": self._strategy_memory(),
                    "approval_policy": asdict(self.execution.policy),
+                   "approval_control": {"mode": getattr(getattr(self, "automation", None), "mode", "semi")},
                    "strategy_followup": self._strategy_evaluations(),
                    "risk_increase_paused": paused,
                    "risk": self._risk_context(account, now),
@@ -2231,6 +2267,7 @@ class AutonomousFund(Strategy):
                 validate_evidence(research["evidence"], now, True)
                 context["research"] = research
             context["critique"] = self._critique(context, context["research"], budget, now)
+            context["critique_source"] = getattr(self, "_current_critique_source", None)
             if self.halt_path.exists():
                 return
             context["as_of"] = self.get_datetime().isoformat()
@@ -2257,6 +2294,17 @@ class AutonomousFund(Strategy):
             **decision, "decision_id": accepted_id, "prompt_version": getattr(self, "prompt_version", None),
             "claim_checks": check_claims(decision.get("factual_claims", []), accepted_context["market_snapshot"],
                                          self.universe)})
+        try:
+            # Bind the actual accepted request, including correction/reuse, to
+            # its plan ID. Never reconstruct a critic's role from nearby calls.
+            self.journal.event(now, "decision_basis", {"decision_id": accepted_id,
+                "request_as_of": accepted_context["as_of"],
+                "previous_decision": accepted_context.get("previous_decision"),
+                "critique": accepted_context.get("critique"),
+                "critique_source": accepted_context.get("critique_source"),
+                "recent_trades": accepted_context.get("recent_trades", [])})
+        except Exception as exc:  # Diagnostic evidence must not stop an accepted plan.
+            self._disclose("decision_basis_unavailable", type(exc).__name__)
         self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
         self._record_construction_variant(decision, now)
         self._triggers = []
@@ -2474,6 +2522,7 @@ class AutonomousFund(Strategy):
         if correction_kind == "timing":
             fresh_account = self._snapshot()
             corrected["account"] = asdict(fresh_account)
+            corrected["recent_trades"] = self.journal.recent_trades(fresh_account.as_of)
             corrected["risk"] = self._risk_context(fresh_account, self.get_datetime())
             corrected["data_desk"] = self._desk_context(self.get_datetime())
             corrected["decision_timing_correction"] = diagnostic
@@ -2692,6 +2741,7 @@ class AutonomousFund(Strategy):
 
     def _critique(self, context, research, budget, now):
         """The devil's advocate's critique, or None (disabled, no budget, or failed: never blocks a decision)."""
+        self._current_critique_source = None
         settings = getattr(self, "critic", None)
         if settings is None or not settings.enabled or not getattr(self, "_critic_ready", False):
             return None
@@ -2699,9 +2749,11 @@ class AutonomousFund(Strategy):
         # any wake-up reason) are unchanged, a new call would argue the same case again: reuse it.
         key = hashlib.sha256(json.dumps(
             [trading_day(now), research, (context.get("account") or {}).get("positions"),
-             context.get("watch_triggers")], sort_keys=True, default=str).encode()).hexdigest()
+             context.get("watch_triggers"), context.get("previous_decision"), context.get("recent_trades"),
+             getattr(self, "prompt_version", None)], sort_keys=True, default=str).encode()).hexdigest()
         saved = self.journal.get_meta("critique_cache") or {}
         if saved.get("key") == key and saved.get("critique") is not None:
+            self._current_critique_source = {"at": saved.get("at"), "call_id": saved.get("call_id"), "reused": True}
             self.journal.event(now, "critic_reused", {"critique_at": saved.get("at")})
             return saved["critique"]
         if self.journal.counter("agent_runs", now) + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
@@ -2717,7 +2769,12 @@ class AutonomousFund(Strategy):
             critique = self._record_agent("critic", self._agent_call("critic",
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
                 context=critic_context), phase="critique")
-            self.journal.set_meta("critique_cache", {"key": key, "at": now.isoformat(), "critique": critique})
+            call = getattr(self, "_current_call", None) or {}
+            source = {"at": self.get_datetime().isoformat(),
+                      "call_id": call.get("call_id") if call.get("role") == "critic" else None, "reused": False}
+            self.journal.set_meta("critique_cache", {"key": key, "at": source["at"],
+                                                     "call_id": source["call_id"], "critique": critique})
+            self._current_critique_source = source
             self._call_outcome()
             return critique
         except Exception as exc:
@@ -3298,6 +3355,13 @@ class AutonomousFund(Strategy):
                 order = self.broker._pull_order(pending["broker_id"], self.name)
             if not order or self._terminal(order):
                 requested.pop(pending["id"], None)
+                continue
+            from .execution import OrderAuthorizationChanged, require_submission_authority
+            try:
+                with self.journal.connection() as db:
+                    require_submission_authority(db, pending["id"], self.get_datetime())
+            except OrderAuthorizationChanged as exc:
+                cancel(pending, order, "order_authority_canceled", {"reason": exc.reason})
                 continue
             # A protective exit outlives the allocation that preceded it: it is
             # only repriced when stale, never canceled because a target expired.
@@ -4423,11 +4487,17 @@ class AutonomousFund(Strategy):
         buys_paused = paused or session["loss_paused"]
         policy = self.execution.policy
         exposure = sum(current.values(), number(0))
+        from .local_broker import LocalPaperBroker
+        broker = getattr(self, "broker", None)
+        fee_buffer = max(self.limits.fee_buffer, broker.fee_rate if isinstance(broker, LocalPaperBroker) else number(0))
+        purchase_factor = 1 + fee_buffer
         rooms = {
             "auto_exposure": (session["start_exposure"] + number(policy.auto_daily_exposure_increase) - exposure) * equity,
             "hard_exposure": (session["start_exposure"] + number(policy.max_daily_exposure_increase) - exposure) * equity,
-            "auto_turnover": number(policy.auto_daily_buy_turnover) * equity - session["cash_spent"],
-            "hard_turnover": number(policy.max_daily_buy_turnover) * equity - session["cash_spent"],
+            # The budget counts observed cash outflow, including fees. plan()
+            # takes a notional budget, so reserve the configured fee buffer here.
+            "auto_turnover": (number(policy.auto_daily_buy_turnover) * equity - session["cash_spent"]) / purchase_factor,
+            "hard_turnover": (number(policy.max_daily_buy_turnover) * equity - session["cash_spent"]) / purchase_factor,
         }
         hard_budget = max(number(0), min(rooms["hard_exposure"], rooms["hard_turnover"]))
         auto_budget = max(number(0), min(rooms["auto_exposure"], rooms["auto_turnover"], hard_budget))
@@ -4471,7 +4541,13 @@ class AutonomousFund(Strategy):
                     buy_budget=hard_budget, blocked_buys=frozenset(blocked), **options)
         complete = not plan(weights, account, prices, self.universe, self.limits, now, False, historical, **options)
         result = {"orders": auto, "requirement": None, "complete": complete, "request": None,
-                  "weights": weights, "overlay": overlay}
+                  "weights": weights, "overlay": overlay,
+                  "authorization_context": {"account_as_of": account.as_of, "equity": str(equity),
+                      "start_exposure": str(session["start_exposure"]), "exposure_before": str(exposure),
+                      "cash_spent": str(session["cash_spent"]), "automatic_buy_budget_usd": str(auto_budget),
+                      "purchase_fee_buffer": str(fee_buffer),
+                      "hard_buy_budget_usd": str(hard_budget), "policy": asdict(policy), "stress": stress,
+                      "binding_constraints": overlay["binding"]}}
         if auto == hard or not hard or hard[0].side != "buy":
             return result
         order = hard[0]
@@ -4487,7 +4563,7 @@ class AutonomousFund(Strategy):
         requirement = {"reasons": reasons or ["automatic_envelope"],
                        "weight_after": (held + order.quantity) * order.limit / equity,
                        "exposure_after": exposure + notional / equity,
-                       "buy_turnover_after": session["cash_spent"] + notional}
+                       "buy_turnover_after": session["cash_spent"] + notional * purchase_factor}
         if self.execution.approved(active, order, now, requirement):
             return {**result, "orders": hard, "requirement": requirement}
         buys = {}
@@ -4496,11 +4572,25 @@ class AutonomousFund(Strategy):
                 limit = (number(prices[symbol].ask) * (1 + self.limits.limit_buffer)).quantize(number("0.01"))
                 buys[symbol] = {"max_weight": str(weight), "reference_limit": str(limit)}
         target_exposure = sum(weights.values(), number(0))
+        # The approval covers a plan, not just its first order. Include the
+        # automatic boundaries reachable by the bounded remaining plan, avoiding
+        # a second approval merely because a later leg crosses another boundary.
+        scope_notional = min(hard_budget, sum((max(number(0), weights[s] - current.get(s, number(0))) * equity
+                                               for s in buys), number(0)))
+        scope_reasons = list(requirement["reasons"])
+        for reason, room in (("exposure_ramp", rooms["auto_exposure"]), ("buy_turnover", rooms["auto_turnover"])):
+            if scope_notional > room and reason not in scope_reasons:
+                scope_reasons.append(reason)
         result["request"] = {
-            "reasons": requirement["reasons"], "buys": buys,
+            "reasons": scope_reasons, "buys": buys,
             "max_exposure_after": str(min(session["start_exposure"] + number(policy.max_daily_exposure_increase),
                                           max(target_exposure, exposure))),
             "max_buy_turnover_usd": str(number(policy.max_daily_buy_turnover) * equity),
+            # Actual remaining whole-share buys, including the fee reserve.
+            # Do not rotate a pending request just because NAV raised the
+            # theoretical hard cap while its original cash scope is sufficient.
+            "required_buy_turnover_usd": str(session["cash_spent"] +
+                sum((o.quantity * o.limit for o in hard if o.side == "buy"), number(0)) * purchase_factor),
             "observed_equity": str(equity), "start_exposure": str(session["start_exposure"]),
             "current_exposure": str(exposure), "cash_spent": str(session["cash_spent"]),
             "auto_envelope": {"exposure_increase": policy.auto_daily_exposure_increase,
@@ -4529,7 +4619,11 @@ class AutonomousFund(Strategy):
             self._capital_wait(now, "purchases_wait_for_redemption", {"decision_id": active["id"]})
             return
         if result["request"] and not redeeming:
-            self.execution.request(active, result["request"], now)
+            automatic = getattr(getattr(self, "automation", None), "mode", "semi") == "full"
+            request = self.execution.request(active, result["request"], now, approver="ai" if automatic else "operator")
+            if automatic and not result["orders"]:
+                self._review_purchase_request(request, account, now)
+                return  # Recompute account, quotes and hard risk after slow review I/O.
         sweep = getattr(self, "cash_sweep", None)
         if result["orders"]:
             order = result["orders"][0]
@@ -4557,6 +4651,82 @@ class AutonomousFund(Strategy):
             if sweep is not None:
                 # Only once the AI allocation is complete: idle cash above the buffer earns the bill rate.
                 self._park_idle_cash(account, now, active["id"])
+
+    def _review_purchase_request(self, request, account, now):
+        """A separate read-only agent resolves this pending exception; never sends an order."""
+        from . import risk_review
+        from .capital import require_fresh_valuation
+        from .market_data import regular_session_open
+        settings = getattr(self, "automation", None)
+        if settings is None or settings.mode != "full" or not getattr(self, "_risk_reviewer_ready", False):
+            self._disclose("ai_approval_error", {"id": request["id"], "error": "Independent risk reviewer unavailable"})
+            return
+        budget = self.model_budget
+        if (self.journal.counter("agent_runs", now) + 1 > budget.max_agent_runs_per_day - budget.reserved_review_runs
+                or self._cost_exhausted(now, "risk_approval")):
+            return  # No fallback approval; the request remains pending.
+
+        def authority():
+            checked_at = self.get_datetime()
+            if self.automation.mode != "full" or self.halt_path.exists() or not regular_session_open(checked_at):
+                raise risk_review.ReviewChanged("AI review authority is stopped or outside the regular session")
+            if getattr(self, "require_monitor", False):
+                from .monitor import require_monitor
+                require_monitor(self.run_dir, checked_at)
+            return self.get_datetime()
+
+        attempt = None
+        try:
+            require_fresh_valuation(account.as_of, self.get_datetime(), self.limits.quote_max_seconds)
+            attempt = risk_review.claim(self.journal, request, self.execution.digest, settings, authority,
+                                        getattr(self, "_risk_review_lease_seconds", 1200))
+            if attempt is None:
+                with self.journal.connection() as db:
+                    status = db.execute("SELECT attempts,state,retry_after FROM fund_ai_reviews "
+                        "WHERE approval_id=? AND digest=?", (request["id"], request["digest"])).fetchone()
+                if (status and status[0] >= settings.max_attempts and
+                        # A restarted observer must let the last in-flight
+                        # attempt finish before waking a replacement manager.
+                        (status["state"] != "running" or self.get_datetime() >= instant(status["retry_after"])) and
+                        self.journal.get_meta("risk_review_exhausted") != request["id"]):
+                    self.journal.set_meta("risk_review_exhausted", request["id"])
+                    self._request_review(self.get_datetime(), "risk_review_failed", {"approval_id": request["id"]})
+                return
+            context = {"as_of": self.get_datetime().isoformat(), "phase": "risk_approval",
+                       "approval_request": {**json.loads(request["body"]), "digest": request["digest"]},
+                       "account": asdict(account), "limits": asdict(self.limits),
+                       "operator_mandate": self._mandate_context(), "data_desk": self._desk_context(self.get_datetime())}
+            context = self._with_fund_cost_context(context, self.get_datetime())
+            authority()
+            if (self.journal.counter("agent_runs", self.get_datetime()) + 1 >
+                    budget.max_agent_runs_per_day - budget.reserved_review_runs or
+                    self._cost_exhausted(self.get_datetime(), "risk_approval")):
+                raise RiskError("AI risk-review model budget unavailable")
+            answer = self._record_agent("risk_reviewer", self._agent_call("risk_reviewer", purpose="risk_approval",
+                task_prompt="Independently approve or reject the exact pending exception request.", context=context),
+                phase="risk_approval")
+            call = getattr(self, "_current_call", None) or {}
+            try:
+                result = risk_review.resolve(self.journal, request, attempt, answer, self.execution.digest, authority,
+                    call_id=call.get("call_id") if call.get("role") == "risk_reviewer" else None,
+                    model=self.agent_models["risk_reviewer"])
+            except Exception:
+                self._call_outcome(valid=False, approval_id=request["id"], reason="approval_not_applied")
+                raise
+            self._call_outcome(approval_id=request["id"], approval_state=result["state"])
+            self._notify_fund("ai_approval_resolved", result)
+            if result["state"] == "rejected":
+                self._request_review(self.get_datetime(), "risk_approval_rejected",
+                                     {"approval_id": request["id"], "reason": result["reason"]})
+        except risk_review.ReviewChanged as exc:
+            if attempt is not None:
+                risk_review.fail(self.journal, request, attempt, self.get_datetime(), settings, type(exc).__name__)
+            self._disclose("ai_approval_stale", {"id": request["id"], "reason": str(exc)})
+        except Exception as exc:
+            if attempt is not None:
+                risk_review.fail(self.journal, request, attempt, self.get_datetime(), settings, type(exc).__name__)
+            self._disclose("ai_approval_error", {"id": request["id"], "error": type(exc).__name__,
+                                               "attempt": attempt, "retry_minutes": settings.retry_minutes})
 
     def _park_idle_cash(self, account, now, decision_id):
         """Park cash above the buffer in the sweep ETF (cash.py); optional, so a failure is recorded, never raised.
@@ -4956,10 +5126,11 @@ class AutonomousFund(Strategy):
         if not result["orders"] or intent != result["orders"][0]:
             raise RiskError("Order differs from the independently recomputed allocation")
         self._submit(intent, now, active["id"], requirement=result["requirement"], until=active["until_at"],
+                     authorization_context=result.get("authorization_context"),
                      guard=self.execution.guard(active, intent, now, result["requirement"], self.universe, self.limits))
 
     def _submit(self, intent, now, decision_id, *, requirement=None, guard=None, until=None, kind="allocation",
-                max_submissions=None, quote=None):
+                max_submissions=None, quote=None, authorization_context=None):
         """The single durable submission path: reserve, final STOP/monitor checks, send."""
         if getattr(self, "observe_only", False):
             raise RiskError("Observation-only mode cannot submit orders")
@@ -5013,6 +5184,7 @@ class AutonomousFund(Strategy):
             except Exception as exc:
                 self._disclose("execution_quote_unavailable", type(exc).__name__)
         self.execution.record_submission(key, decision_id, intent, self.get_datetime(), quote=quote)
+        authorization = None
         if self.mode in {"local", "paper"}:
             from .capital import require_order_authority
             from .market_data import regular_session_open
@@ -5031,6 +5203,8 @@ class AutonomousFund(Strategy):
                         raise RiskError("Orders require an open regular market session")
                     if until is not None and checked_at >= instant(until):
                         raise RiskError("Order authority expired before submission")
+                    authorization = self.execution.record_authority(db, key, decision_id, intent, checked_at,
+                        kind=kind, requirement=requirement, audit=authorization_context)
                 except RiskError as exc:
                     # The native send has not started. Release only this proven
                     # non-submission, retaining its attempt and quote evidence.
@@ -5059,7 +5233,8 @@ class AutonomousFund(Strategy):
         if not broker_id:
             raise RiskError("Broker acknowledgement missing; intent is locked for manual reconciliation")
         self.journal.event(now, "order_submitted", {"intent_id": key, "broker_id": str(broker_id), "kind": kind,
-                           "decision_id": decision_id, "requirement": requirement, **asdict(intent)})
+                           "decision_id": decision_id, "requirement": requirement,
+                           "authorization": authorization, **asdict(intent)})
 
     def submit_order(self, *args, **kwargs):
         raise RiskError("Direct order submission is disabled; use validated portfolio targets")

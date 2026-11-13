@@ -203,6 +203,8 @@ Telegram、外部数据与运行参数、券商”分节，所有可调项都有
 | `FUND_TELEGRAM_CHAT_ID` | 已与 Bot 建立会话的接收者或群组；先在 Telegram 中启动 Bot |
 | `FUND_TELEGRAM_APPROVER_IDS` | 可选；群组中可回复审批的用户 ID（逗号分隔）。私聊默认由聊天本人审批 |
 | `FUND_TELEGRAM_APPROVALS` | 可选；设为 `off` 时 Telegram 只通知、不接受回复审批 |
+| `FUND_AUTOMATION_MODE` | `full`（默认）：独立 AI 风控审批例外买入；`semi`：人工审批；修改后重启并在 `status` 核对加载模式 |
+| `FUND_APPROVAL_MODEL` | 独立审批模型，默认 `deepseek/deepseek-flash`；可自行更换支持的 `提供方/模型ID`，不影响经理模型；重启后生效 |
 | `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
 | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | paper 必填专用模拟账户凭证；local 选填一整对，用于日线核对及备用行情 |
 | `ALPACA_IS_PAPER=true` | 仅 paper 读取，默认 true；设为 false 会拒绝启动 |
@@ -385,6 +387,10 @@ Telegram 开盘／调仓通知与 `fund-logs.sh` 概况使用同一个“📌 �
 
 卖出和减仓始终自动执行。买入在每日自动额度内（总敞口较开盘增加不超过 25%、买入现金流不超过净值 40%）
 直接执行；只有超出额度的买入，或市场压力（SPY 大跌／高波动）下的买入，才生成一份覆盖整个调仓计划的审批请求。
+默认 `FUND_AUTOMATION_MODE=full` 由独立风控 AI 复核例外；设为 `semi` 才等待人工回复审批。
+`FUND_APPROVAL_MODEL` 单独选择审批模型，默认 `deepseek/deepseek-flash`，可自行更换；不随经理模型切换。
+自动额度内的部分仍可先执行，所以待审批不代表所有买入都停止。AI 超时、格式错误或拒绝不会变成批准，
+并继续受模型预算和持久化重试限制；批准后下一轮再独立刷新账户／报价并重算风控。
 通知包括触发原因、拟买入证券及权重上限和限价上界（±2% 领口）、批准后最高敞口、当日买入现金流上限、
 组合波动和 ES、压力详情及 AI 的理由，长理由用文本附件保留全文。一份批准覆盖该计划的多笔买入，
 有效期最长 60 分钟。新证券、更高权重、新触发原因、价格超出领口或目标变更时重新审批。

@@ -140,7 +140,48 @@ def test_process_environment_wins_over_the_env_file_and_secrets_are_redacted(tmp
 def test_role_models_from_the_environment_rank_above_ai_model(tmp_path, monkeypatch, capsys):
     shown, _ = run_show(tmp_path, monkeypatch, capsys, "FUND_RESEARCH_MODEL=openai/fixture-research\n",
                         {"AI_MODEL": "anthropic/fixture-common"})
-    assert shown["models"] == {"researcher": "openai/fixture-research", "manager": "anthropic/fixture-common"}
+    # The shipped config now explicitly pins Flash for approvals, independently
+    # of the manager/common override; research/manager precedence still applies.
+    assert shown["models"] == {"researcher": "openai/fixture-research", "manager": "anthropic/fixture-common",
+                               "risk_reviewer": "deepseek/deepseek-flash"}
+
+
+def test_approval_model_from_dotenv_is_independent_and_process_environment_can_override_it(tmp_path, monkeypatch, capsys):
+    shown, _ = run_show(tmp_path, monkeypatch, capsys,
+        "FUND_APPROVAL_MODEL=openai/synthetic-approval\n", {"FUND_APPROVAL_MODEL": "anthropic/synthetic-approval"})
+    row = next(row for row in shown["settings"] if row["variable"] == "FUND_APPROVAL_MODEL")
+    assert row["value"] == "anthropic/synthetic-approval" and "environment" in row["source"]
+    assert shown["models"]["risk_reviewer"] == "anthropic/synthetic-approval"
+    assert shown["models"]["manager"] == "deepseek/deepseek-v4-pro"
+
+
+@pytest.mark.parametrize("model", ["deepseek/synthetic-approval", "openai/synthetic-approval", "anthropic/synthetic-approval"])
+def test_approval_model_environment_accepts_supported_models_without_forking_the_account(model):
+    default = effective({})
+    selected = effective({"FUND_APPROVAL_MODEL": model})
+    assert selected["automation"]["model"] == model
+    assert selected["agent_models"] == default["agent_models"]
+    assert legacy_account_digest("paper", "synthetic-account", selected) == legacy_account_digest("paper", "synthetic-account", default)
+    assert any(row["variable"] == "FUND_APPROVAL_MODEL" for row in selected["_environment_overrides"])
+
+
+def test_blank_approval_model_uses_default_and_an_invalid_provider_fails_startup():
+    assert effective({"FUND_APPROVAL_MODEL": "  "})["automation"]["model"] == "deepseek/deepseek-flash"
+    with pytest.raises(RiskError, match="automation.model"):
+        effective({"FUND_APPROVAL_MODEL": "unsupported/synthetic-approval"})
+
+
+def test_daily_cost_cap_requires_rates_for_the_selected_approval_model():
+    override = "openai/synthetic-approval"
+    rates = {model: {"input": 1, "output": 2} for model in
+             ("deepseek/deepseek-flash", "deepseek/deepseek-v4-pro")}
+    environ = {"FUND_APPROVAL_MODEL": override, "FUND_MAX_DAILY_COST_USD": "1",
+               "FUND_MODEL_PRICES_JSON": json.dumps(rates)}
+    with pytest.raises(RiskError, match=override):
+        effective(environ)
+    rates[override] = {"input": 1, "output": 2}  # Synthetic rates, never a provider price claim.
+    environ["FUND_MODEL_PRICES_JSON"] = json.dumps(rates)
+    assert effective(environ)["automation"]["model"] == override
 
 
 def test_manager_timeout_from_dotenv_is_visible_and_preserves_legacy_account_identity(tmp_path, monkeypatch, capsys):
