@@ -192,7 +192,7 @@ ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "audit-ledger", "stop"
                               "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
                               "notify-test", "status", "decisions", "rehearse", "prefetch", "datadesk", "prune",
                               "weekly", "experiments", "settle-position", "subscribe", "redeem", "capital",
-                              "deposit", "withdraw"})
+                              "deposit", "withdraw", "economics"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
 
 

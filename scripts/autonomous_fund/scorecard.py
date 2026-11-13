@@ -111,7 +111,7 @@ RISING = {"up": True, "outperform": True, "down": False, "underperform": False}
 @lru_cache(maxsize=512)
 def _idea_session_close(day):
     """A bounded calendar cache for historical formation dates across scorecard refreshes."""
-    from .market_data import _session_close
+    from .session_calendar import _session_close
     return _session_close(day)
 
 
@@ -378,6 +378,12 @@ MIN_BETA_OBSERVATIONS = 20
 DEFAULT_COST_BPS = 10
 
 
+def beta_cutoff(at):
+    """Latest permissible daily-bar date, before any close still pending at acceptance."""
+    from .session_calendar import completed_daily_cutoff
+    return (completed_daily_cutoff(at) - timedelta(days=1)).isoformat()
+
+
 def beta(rows, benchmark_rows, through_day, lookback=BETA_LOOKBACK, *, sessions=None):
     """OLS beta of daily close-to-close returns to the benchmark, using closes through `through_day` only.
 
@@ -409,8 +415,8 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
 
     decisions: [(accepted_at_iso, decision_body)] in time order. The start is the
     first scheduled CLOSE after acceptance when an exchange calendar is supplied.
-    Each name's beta comes from closes through
-    that session only. A portfolio of high-beta names in a rising market is not
+    Each name's beta uses daily bars completed at acceptance, even when the
+    scoring start close occurs later. A portfolio of high-beta names in a rising market is not
     skill: excess_return = portfolio - portfolio_beta x benchmark. A name whose
     beta cannot be estimated is assumed to have beta 1 and is listed in
     beta_assumed. Costs: |change in target weights| versus the previous decision
@@ -442,12 +448,13 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
     for at, body in decisions:
         day = instant(at).astimezone(ZONE).date().isoformat()
         start_day, start_pending = decision_start(at, day, sessions)
+        through = beta_cutoff(at)
         weights = {t["symbol"]: float(t["weight"]) for t in body.get("targets", []) if float(t["weight"]) > 0}
         exposure = sum(weights.values())
         betas, assumed = {}, []
         for symbol in weights:
             estimate = 1.0 if symbol == benchmark else beta(closes.get(symbol), closes.get(benchmark),
-                                                           start_day or day, sessions=sessions)
+                                                           through, sessions=sessions)
             if estimate is None:
                 estimate = 1.0
                 assumed.append(symbol)
@@ -457,6 +464,7 @@ def score_decisions(decisions, closes, benchmark="SPY", cost_bps=DEFAULT_COST_BP
         cost = turnover * cost_bps / 10_000
         previous = weights
         row = {"decided_at": at, "session_date": day, "start_day": start_day,
+               "beta_through": through,
                "gross_exposure": exposure, "beta": portfolio_beta,
                **({"regime": regimes.get(start_day, "unlabeled")} if regimes else {}),
                "beta_assumed": sorted(assumed), "turnover": turnover,

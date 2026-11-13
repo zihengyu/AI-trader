@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Maintenance and logs for the AI paper fund on Ubuntu.
-# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|weekly|experiments|prune [--apply]]
+# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|weekly|experiments|prune [--apply]]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
 #   errors     last 80 warning/error records in 24 hours, including complete tracebacks
@@ -8,6 +8,7 @@
 #   approvals  purchase plans waiting for approval
 #   decisions [YYYY-MM-DD] [--event N]  read-only timeline, or one event's complete rationale
 #   weekly     this week's report so far, from the latest post-market review (printed, not sent)
+#   economics  read-only new-vs-prior target scenarios and opening-beta reference; no new inference/downloads
 #   experiments  the experiment registry: what is in effect, in the shadow, rejected or retired
 #   prune [--apply]  old headlines, model-call traces and export archives: preview, or delete with --apply
 #                    (also runs daily after the backup; the ledger, decisions and reviews are never deleted)
@@ -60,6 +61,8 @@ case "${1:-status}" in
     fund "${args[@]}" ;;
   weekly)
     fund weekly ;;
+  economics)
+    fund economics ;;
   experiments)
     fund experiments ;;
   prune)
@@ -68,5 +71,5 @@ case "${1:-status}" in
     fi
     if [[ $# -eq 2 ]]; then fund prune --apply; else fund prune; fi ;;
   *)
-    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|weekly|experiments|prune [--apply]]" >&2; exit 2 ;;
+    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|weekly|experiments|prune [--apply]]" >&2; exit 2 ;;
 esac

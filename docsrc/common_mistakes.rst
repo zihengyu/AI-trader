@@ -311,6 +311,42 @@ events carry an explicit plan ID; legacy plans are linked only by an exact
 decision match. Delivery states describe the query time. A missing fill alone
 does not establish why a plan did not trade.
 
+Use ``bash scripts/fund-logs.sh economics`` for offline economic comparisons in
+that account. It reads the journal and saved daily history without model calls,
+downloads or trading changes. New and prior targets start at the same first
+exchange close after acceptance and are measured over 1, 5 and 20 sessions.
+These are target-price scenarios, not actual fills or decision-day intraday PnL;
+they exclude dividends, cash yield, limits, stops and risk scaling. Estimated
+trading friction is 10 basis points per side of target turnover. A second value
+subtracts only exactly linked manager, correction and fresh-critique costs;
+research, triage, approval and other overhead remain outside that scope. Missing
+legacy links or usage stay unknown. Overlap counts are shown; positive scenario
+outcomes alone do not establish causal model value.
+
+The separate account reference freezes beta at each interval's opening closing
+book, using only daily bars then completed. It uses the recorded cash policy and
+benchmark prices plus recorded corporate actions. Unknown betas or missing
+receipts do not become a default beta of one. The reference is frictionless and
+does not guarantee official exchange closing prices or historical vendor data
+vintages. Beta matching does not imply equal volatility or expected shortfall.
+Only comparable adjacent closing intervals are compounded; missing account
+intervals are counted and this is not a continuous full-period return.
+Fixed benchmarks are retained. Weekly reports include this diagnostic
+at their report cutoff, over all available history. Existing decision scorecards
+also use the acceptance-time cutoff for beta, including actual early closes.
+
+Economic comparisons and manager scoreboards match benchmark evidence to the
+valuation's session and instant. Source-timed observations attached to the
+account take precedence; legacy scalar marks supply missing symbols only from
+the regular session at or before the valuation. A closing receipt recovered on
+the next day keeps its original valuation date and remains unavailable before
+its receipt time. Later postmarket prices cannot replace closing marks, and
+partial responses do not discard other symbols' valid observations. Manager
+scoreboards also exclude intervals with missing intermediate exchange sessions.
+Invalid saved daily-history rows are isolated without discarding the remaining
+valid bars; the diagnostic reports rejected rows and unreadable files and does
+not fill missing prices.
+
 Quiet checkpoints stay within the configured maximum quiet interval; they do
 not move the manager's deadline later by another review interval.
 

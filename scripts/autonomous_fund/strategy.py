@@ -996,6 +996,7 @@ class AutonomousFund(Strategy):
                            "observe_only": observe_only, "execution_revision": EXECUTION_REVISION,
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "prompt_version": self.prompt_version,
+                           "cash_management_symbol": self.cash_sweep.symbol if self.cash_sweep else None,
                            "performance": {"benchmarks": self.performance.definitions(),
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
@@ -1934,13 +1935,15 @@ class AutonomousFund(Strategy):
         except Exception:
             pass
 
-    def _agent_call(self, name, purpose=None, run_counter="agent_runs", **kwargs):
+    def _agent_call(self, name, purpose=None, run_counter="agent_runs", evaluation_calls=None, **kwargs):
         if (name != "triage" and not name.startswith("model_probe_") and getattr(self, "mode", None) == "local"
                 and hasattr(getattr(self, "broker", None), "ledger_audit")):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
             kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
         key = uuid4().hex
+        if evaluation_calls is not None:
+            evaluation_calls.append(key)  # Exact scope, including failed/corrected attempts; never infer by proximity.
         # What the call is for (V2 4.3): its agent event and, once its result is used, its outcome share the id.
         phase = (kwargs.get("context") or {}).get("phase")
         purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
@@ -2254,6 +2257,7 @@ class AutonomousFund(Strategy):
             context["ledger_audit"] = self.broker.ledger_audit()
         context = self._with_fund_cost_context(context, self.get_datetime())
         champion = self._champion()
+        evaluation_calls = []
         failure_role = "manager" if live else "researcher"
         try:
             if live:
@@ -2266,14 +2270,16 @@ class AutonomousFund(Strategy):
                     task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
                 validate_evidence(research["evidence"], now, True)
                 context["research"] = research
-            context["critique"] = self._critique(context, context["research"], budget, now)
+            context["critique"] = self._critique(context, context["research"], budget, now,
+                                                evaluation_calls=evaluation_calls)
             context["critique_source"] = getattr(self, "_current_critique_source", None)
             if self.halt_path.exists():
                 return
             context["as_of"] = self.get_datetime().isoformat()
             failure_role = "manager"
             armed = self._arm_context(context, champion)
-            decision, accepted_task, accepted_context = self._manager_decision(armed, budget)
+            decision, accepted_task, accepted_context = self._manager_decision(armed, budget,
+                                                                              evaluation_calls=evaluation_calls)
             self.journal.event(now, "decision", decision)
             # Refresh after slow model/tool work. Do not execute an expired answer.
             now = self.get_datetime()
@@ -2302,7 +2308,10 @@ class AutonomousFund(Strategy):
                 "previous_decision": accepted_context.get("previous_decision"),
                 "critique": accepted_context.get("critique"),
                 "critique_source": accepted_context.get("critique_source"),
-                "recent_trades": accepted_context.get("recent_trades", [])})
+                "recent_trades": accepted_context.get("recent_trades", []),
+                "account_equity": str(accepted_context["account"]["equity"]),
+                "evaluation_call_ids": evaluation_calls,
+                "evaluation_cost_scope": "manager_corrections_fresh_critic_v1"})
         except Exception as exc:  # Diagnostic evidence must not stop an accepted plan.
             self._disclose("decision_basis_unavailable", type(exc).__name__)
         self._call_outcome(decision_id=accepted_id, changed_targets=targets_changed(self.last_decision, decision))
@@ -2478,7 +2487,7 @@ class AutonomousFund(Strategy):
                 + "; deepseek/deepseek-flash and deepseek/deepseek-v4-pro get an enforced JSON schema", color="yellow")
         return protocols
 
-    def _manager_decision(self, context, budget):
+    def _manager_decision(self, context, budget, *, evaluation_calls=None):
         """One shared correction for format failures or a live answer's invalid timing.
 
         Return the answer with the task and strategy context that produced it.
@@ -2488,7 +2497,8 @@ class AutonomousFund(Strategy):
         """
         from .diagnostics import structured_answer_diagnostic
         context = self._with_fund_cost_context(context, self.get_datetime())
-        result = self._agent_call("manager", task_prompt=DECISION_TASK, context=context)
+        result = self._agent_call("manager", task_prompt=DECISION_TASK, context=context,
+                                  evaluation_calls=evaluation_calls)
         correction_kind = "format"
         try:
             decision = self._record_agent("manager", result)
@@ -2541,7 +2551,7 @@ class AutonomousFund(Strategy):
         self.journal.event(now, "decision_time_retry" if correction_kind == "timing" else "decision_format_retry",
                            {"diagnostic" if correction_kind == "timing" else "answer_diagnostic": diagnostic})
         retry = self._agent_call("manager", purpose="decision_correction", task_prompt=task,
-                                 context=corrected)
+                                 context=corrected, evaluation_calls=evaluation_calls)
         try:
             decision = self._record_agent("manager", retry)
             if self.mode in {"local", "paper"}:
@@ -2739,7 +2749,7 @@ class AutonomousFund(Strategy):
         self.journal.event(self.get_datetime(), "triage_scored", scored)
         return scored
 
-    def _critique(self, context, research, budget, now):
+    def _critique(self, context, research, budget, now, *, evaluation_calls=None):
         """The devil's advocate's critique, or None (disabled, no budget, or failed: never blocks a decision)."""
         self._current_critique_source = None
         settings = getattr(self, "critic", None)
@@ -2768,7 +2778,7 @@ class AutonomousFund(Strategy):
                 critic_context = self._with_fund_cost_context(critic_context, self.get_datetime())
             critique = self._record_agent("critic", self._agent_call("critic",
                 task_prompt="Argue the strongest honest case against this research and the current portfolio.",
-                context=critic_context), phase="critique")
+                context=critic_context, evaluation_calls=evaluation_calls), phase="critique")
             call = getattr(self, "_current_call", None) or {}
             source = {"at": self.get_datetime().isoformat(),
                       "call_id": call.get("call_id") if call.get("role") == "critic" else None, "reused": False}
@@ -4238,7 +4248,8 @@ class AutonomousFund(Strategy):
         return result
 
     def _compute_fund_scoreboard(self, now, cutoff):
-        from .evaluation import nav_marks
+        from datetime import date
+        from .evaluation import nav_marks, event_bodies, session_benchmarks
         from .ledger_audit import audit_connection
         from .performance import PerformanceSettings
         from .scoreboard import compute, cost_ledger
@@ -4256,24 +4267,37 @@ class AutonomousFund(Strategy):
                 day = instant(when).astimezone(zone).date()
                 if day < cutoff and equity is not None:
                     closing[day] = (sequence, when, "account", {"equity": equity})
-            # Benchmarks are marked about every 30 seconds: only each day's last mark is read.
+            packets = event_bodies(db, [row[0] for row in closing.values()])
+            marks_by_day = session_benchmarks(db, [(row[0], row[1], packets[row[0]])
+                                                  for row in closing.values()], until=moment)
+            # Preserve source-time and partial-symbol evidence; midnight recovery
+            # receipts belong to their valuation session, not their arrival date.
+            benchmarks = [(seq, at, "benchmark", marks_by_day[day.isoformat()])
+                          for day, (seq, at, _, _) in closing.items() if day.isoformat() in marks_by_day]
             rows = [(sequence, at, kind, json.loads(body)) for sequence, at, kind, body in db.execute(
-                "SELECT sequence,at,kind,body FROM events WHERE sequence IN (SELECT MAX(sequence) FROM events "
-                "WHERE kind='benchmark' AND julianday(at)<=julianday(?) GROUP BY substr(at,1,10)) "
-                "OR (kind IN ('benchmark_action','operator_reserve_adjusted','capital_flow') "
-                "AND julianday(at)<=julianday(?)) "
-                "ORDER BY sequence", (moment.isoformat(), moment.isoformat()))]
+                "SELECT sequence,at,kind,body FROM events WHERE "
+                "kind IN ('benchmark_action','operator_reserve_adjusted','capital_flow') "
+                "AND julianday(at)<=julianday(?) ORDER BY sequence", (moment.isoformat(),))
+                if instant(at) <= moment]
             calls, data_charges = cost_ledger(db, moment.isoformat())
-        events = [(at, kind, body) for _, at, kind, body in sorted([*closing.values(), *rows], key=lambda row: row[0])]
-        pairs, marks = session_pairs(events, set(closing), zone)
+        events = [(at, kind, body) for _, at, kind, body in sorted([*closing.values(), *benchmarks, *rows], key=lambda row: row[0])]
+        from .scorecard import _exchange_sessions
+        sessions = {date.fromisoformat(day) for day in _exchange_sessions(str(min(closing)), str(cutoff))} if closing else set()
+        pairs, marks = session_pairs(events, sessions, zone)
         actions = {}
         for _, kind, body in events:
             if kind == "benchmark_action":
                 actions.setdefault(body["symbol"], []).append(body)
         settings = getattr(self, "performance", None) or PerformanceSettings()
         sweep = getattr(getattr(self, "cash_sweep", None), "symbol", None)
-        return compute(pairs, calls, None, settings.definitions(), marks, actions, sweep=sweep,
-                       data_charges=data_charges)
+        result = compute(pairs, calls, None, settings.definitions(), marks, actions, sweep=sweep,
+                         data_charges=data_charges)
+        # Only adjacent sessions with both account observations are comparable.
+        window = sorted(day for day in sessions if min(closing) <= day <= max(closing)) if closing else []
+        result["missing_account_intervals"] = max(0, len(window) - 1 - len(pairs))
+        if result["missing_account_intervals"]:
+            result["meaning"] += "; missing account intervals are excluded, not bridged; not a continuous full-period return"
+        return result
 
     def _market_history(self, now):
         """Whether the latest completed session is outside the fund's history (history_bounds.py), once per cutoff.

@@ -138,15 +138,16 @@ def test_a_mature_idea_with_a_missing_symbol_endpoint_is_unavailable():
 
 
 def test_historical_calendar_work_is_reused_for_repeated_formation_dates(monkeypatch):
-    from scripts.autonomous_fund import market_data, scorecard
+    # Calendar ownership moved out of the adapter so offline reports never initialize the trading runtime.
+    from scripts.autonomous_fund import session_calendar, scorecard
     days = ["2026-11-02", "2026-11-03", "2026-11-04", "2026-11-05"]
     closes = {symbol: [(day, 100 + i) for i, day in enumerate(days)] for symbol in ("ALFA", "BENCH")}
-    calls, original = [], market_data._session_close
+    calls, original = [], session_calendar._session_close
 
     def closed(day):
         calls.append(day)
         return original(day)
-    monkeypatch.setattr(market_data, "_session_close", closed)
+    monkeypatch.setattr(session_calendar, "_session_close", closed)
     scorecard._idea_session_close.cache_clear()
     try:
         ideas = [idea(f"{day}T08:00:00-05:00") for day in days[1:3]] * 40

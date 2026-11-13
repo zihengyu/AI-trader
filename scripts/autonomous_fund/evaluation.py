@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -58,6 +59,61 @@ def event_bodies(db, sequences):
         bodies.update((sequence, event_body(kind, body)) for sequence, kind, body in db.execute(
             "SELECT sequence,kind,body FROM events WHERE sequence IN (%s)" % ",".join("?" * len(batch)), batch))
     return bodies
+
+
+def session_benchmarks(db, accounts, *, until):
+    """Benchmark evidence matched to each account valuation, keyed by its New York session.
+
+    Prefer the account's durable, source-timed observations, including closing
+    receipts obtained on a later date. Legacy scalar events may supply missing
+    symbols only at/before the valuation, during that regular session. Never
+    pair postmarket prices with closing NAV or discard other successful symbols
+    because the final response was partial.
+    """
+    zone, cutoff = ZoneInfo("America/New_York"), instant(until)
+    chosen = {instant(at).astimezone(zone).date().isoformat(): (instant(at), body)
+              for _, at, body in accounts if instant(at) <= cutoff}
+    if not chosen:
+        return {}
+    schedule = mcal.get_calendar("NYSE").schedule(start_date=min(chosen), end_date=max(chosen))
+    windows = {day.date().isoformat(): (row.market_open, min(row.market_close, chosen[day.date().isoformat()][0]))
+               for day, row in schedule.iterrows() if day.date().isoformat() in chosen}
+
+    def price(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            value = float(value)
+            return value if math.isfinite(value) and value > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    raw = {}
+    for sequence, at, body in db.execute("SELECT sequence,at,body FROM events WHERE kind='benchmark' "
+            "AND julianday(at)<=julianday(?) ORDER BY sequence", (cutoff.isoformat(),)):
+        observed = instant(at)
+        day = observed.astimezone(zone).date().isoformat()
+        window = windows.get(day)
+        if observed > cutoff or window is None or not window[0] <= observed <= window[1]:
+            continue
+        for symbol, value in json.loads(body).items():
+            value = price(value)
+            previous = raw.setdefault(day, {}).get(symbol)
+            if value is not None and (previous is None or (observed, sequence) >= previous[:2]):
+                raw[day][symbol] = (observed, sequence, value)
+    result = {day: {s: row[2] for s, row in values.items()} for day, values in raw.items()}
+    for day, (_, body) in chosen.items():
+        for symbol, observation in (body.get("benchmark_observations") or {}).items():
+            if not isinstance(observation, dict) or observation.get("as_of") is None:
+                continue
+            try:
+                observed = instant(observation["as_of"])
+            except (RiskError, TypeError, ValueError):
+                continue
+            value, window = price(observation.get("price")), windows.get(day)
+            if value is not None and window is not None and window[0] <= observed <= window[1]:
+                result.setdefault(day, {})[symbol] = value
+    return result
 
 
 def benchmark_events(db, instants, *, until=None):

@@ -1,5 +1,6 @@
 """Human-readable messages built only from the selected account's journal."""
 import json
+import sqlite3
 from collections import Counter
 from zoneinfo import ZoneInfo
 
@@ -141,6 +142,8 @@ def fund_scoreboard_line(fund):
         text += f"（另有 {fund['unpriced_calls']} 次调用未定价、未计入，实际更低）"
     if fund.get("data_costs_usd") is None:
         text += "（数据费用未知、未计入）"
+    if fund.get("missing_account_intervals"):
+        text += f"（缺 {fund['missing_account_intervals']} 个估值区间，仅复合相邻可比区间，不是连续全期收益）"
     marks = [f"{label(name, row['weights'])} {_percent(row['return'])}（净超额 {_percent(row['net_excess'])}）"
              for name, row in (fund.get("benchmarks") or {}).items()]
     if marks:
@@ -1133,6 +1136,13 @@ def weekly_document(root, sequence):
                      f"（{_percent(consistency['reversal_rate'])}，不含止损止盈触发的），"
                      f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
     lines += [f"- {line}" for line in regime_trend_lines(card) + evidence_lines(card)]
+    lines += ["", "### 经济对照（截至报告截止时间的全部可用记录）【情景估算】", ""]
+    try:
+        from .economics import assess, lines as economic_lines
+        lines += [f"- {line}" for line in economic_lines(assess(root, now=cutoff))]
+    except (RiskError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, ArithmeticError) as exc:
+        # Diagnostics are rebuildable and must not prevent delivery of recorded weekly facts.
+        lines.append(f"- 经济评估暂不可用（{type(exc).__name__}）；可运行 economics 单独诊断。")
     tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
     control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
     lines += ["", "## 五、因子实验进展【统计推断】", ""]

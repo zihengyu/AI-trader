@@ -1,5 +1,5 @@
 param(
-    [ValidateSet('start', 'mock', 'backtest', 'paper', 'local', 'check', 'report', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'factor-lab', 'acceptance', 'show-config', 'schwab-check', 'serve', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
+    [ValidateSet('start', 'mock', 'backtest', 'paper', 'local', 'check', 'report', 'economics', 'stop', 'resume', 'attach-order', 'reset-drawdown', 'adjust-reserve', 'validate-risk', 'factor-lab', 'acceptance', 'show-config', 'schwab-check', 'serve', 'approvals', 'approve', 'reject', 'monitor', 'notify-test', 'qualify')]
     # 'start' (default) runs FUND_MODE from .env: local or paper. No live mode exists.
     [string]$Mode = 'start',
     # Empty: FUND_RUN_DIR from .env, else artifacts/fund-<mode> (historical runs: artifacts/autonomous-fund).

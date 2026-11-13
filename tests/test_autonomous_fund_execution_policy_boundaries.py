@@ -335,7 +335,8 @@ def test_stop_arriving_during_context_preparation_prevents_the_manager_call(tmp_
     from .test_autonomous_fund_manager_independence import live_manager
     strategy, calls = live_manager(tmp_path)
 
-    def critique(*args):
+    # The private hook also receives the optional diagnostic call collector; STOP behavior is unchanged.
+    def critique(*args, **kwargs):
         strategy.halt_path.touch()
         return None
 

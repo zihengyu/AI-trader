@@ -5,7 +5,6 @@ import os
 from copy import deepcopy
 from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
 from types import SimpleNamespace
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -40,30 +39,7 @@ class CachedMarketHours:
 from lumibot.entities import Bars, Quote
 
 from .risk import MarketDataUnavailable, NoCompletedMinute, RiskError, instant, number
-
-
-@lru_cache(maxsize=32)
-def _session_bounds(day):
-    schedule = mcal.get_calendar("NYSE").schedule(start_date=day, end_date=day)
-    return (schedule.iloc[0].market_open, schedule.iloc[0].market_close) if not schedule.empty else (None, None)
-
-
-def _session_close(day):
-    return _session_bounds(day)[1]
-
-
-def regular_session_open(now):
-    now = instant(now)
-    opened, closed = _session_bounds(now.astimezone(ZoneInfo("America/New_York")).date())
-    return opened is not None and opened <= now < closed
-
-
-def completed_daily_cutoff(now):
-    """Exclusive New York date bound: today's bar becomes usable at its actual exchange close."""
-    now = instant(now)
-    day = now.astimezone(ZoneInfo("America/New_York")).date()
-    close = _session_close(day)
-    return day + timedelta(days=1) if close is not None and now >= close else day
+from .session_calendar import _session_bounds, _session_close, regular_session_open, completed_daily_cutoff
 
 
 class SessionClock:
