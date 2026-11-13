@@ -370,6 +370,25 @@ class Concern(BaseModel):
     concern: bounded_text(800, 1)
     evidence: bounded_text(800)
 
+    @model_validator(mode="before")
+    @classmethod
+    def fold_evidence_refs(cls, value):
+        # The critic reads research ideas that cite `evidence_refs` and copies the field
+        # (2026-11-12: `"evidence_refs": []` on every concern discarded the whole paid
+        # critique). An empty list says nothing and is dropped; cited positions are kept in
+        # the evidence text. Every other extra field stays invalid.
+        if not isinstance(value, dict) or "evidence_refs" not in value:
+            return value
+        refs = value["evidence_refs"]
+        rest = {key: item for key, item in value.items() if key != "evidence_refs"}
+        if refs in (None, []):
+            return rest
+        if not isinstance(refs, list) or not all(type(ref) is int for ref in refs) or not isinstance(
+                rest.get("evidence", ""), str):
+            return value  # Not a list of positions: invalid as before.
+        cited = "research evidence " + ", ".join(f"#{ref}" for ref in refs)
+        return {**rest, "evidence": f"{rest['evidence']} ({cited})" if rest.get("evidence") else cited}
+
 
 class Critique(BaseModel):
     """The devil's advocate: the strongest case against the research, never orders."""

@@ -13,7 +13,13 @@ from .risk import RiskError, decision_levels, instant, number
 ZONE = ZoneInfo("America/New_York")
 KINDS = ("decision_validated", "decision_accepted", "decision_backoff", "review_skipped", "notification",
          "order_submitted", "fill", "fill_reconciled", "allocation_complete", "entry_waiting",
-         "stop_breached_no_buy", "buy_chase_limit", "risk_overlay")
+         "stop_breached_no_buy", "buy_chase_limit", "risk_overlay", "review_triggered", "event_triage",
+         "triage_scored")
+# Why the manager was woken before a decision, in the operator's words.
+WAKES = {"news": "资讯", "price_move": "价格异动", "price_alert": "价格提醒", "market_stress": "市场压力",
+         "stop_loss": "止损", "take_profit": "止盈", "capital_flow": "申购/赎回", "entry": "入场价"}
+TRIAGE = {"dismissed": "快速模型判断不需要（未叫基金经理）", "audit": "快速模型判断不需要，抽查仍叫了基金经理",
+          "escalated": "快速模型判断需要", "shadow": "快速模型影子判断", "deadline": "已到必复核时间"}
 LABELS = {"initial": "首次记录", "portfolio": "调整目标组合", "levels": "调整交易价位",
           "minor": "小幅调整权重（不足 1 个百分点）", "maintain": "维持目标组合"}
 DELIVERY = {"sent": "已送达", "pending": "待发送", "retry": "等待重试", "sending": "发送中",
@@ -67,7 +73,17 @@ def activity(root, session_date=None, now=None):
 
     accepted, decisions, by_id, orders, notices = {}, [], {}, defaultdict(list), []
     complete, pending, overlays = set(), defaultdict(list), {}
+    wakes, screens, scored = [], [], {}
     for seq, at, kind, body in rows:
+        if kind == "review_triggered":
+            wakes.append(body)
+            continue
+        if kind == "event_triage":
+            screens.append(body)
+            continue
+        if kind == "triage_scored":
+            scored[body.get("id")] = body
+            continue
         if kind == "decision_accepted":
             accepted[body["id"]] = body
         elif kind == "decision_validated":
@@ -78,7 +94,9 @@ def activity(root, session_date=None, now=None):
                 raw = {k: v for k, v in body.items() if k not in {"prompt_version", "decision_id"}}
                 key = next((key for key, item in reversed(list(accepted.items())) if item["decision"] == raw), None)
             item = {"sequence": seq, "at": at, "id": key, "change": _change(previous, body),
-                    "decision": body, "notifications": [], "orders": [], "fills": []}
+                    "decision": body, "notifications": [], "orders": [], "fills": [],
+                    "wakes": wakes, "screens": screens}
+            wakes, screens = [], []
             decisions.append(item)
             if key is not None:
                 by_id[key] = item
@@ -112,6 +130,8 @@ def activity(root, session_date=None, now=None):
         item["completed"] = key in complete
         item["waits"] = pending.get(key, [])
         item["risk_binding"] = (overlays.get(key) or {}).get("binding") or []
+        for screen in item["screens"]:
+            screen["miss"] = (scored.get(screen.get("id")) or {}).get("miss")
     counts = Counter(item["change"] for item in decisions)
     return {"session_date": day.isoformat(), "cumulative_validated": total, "decisions": decisions,
             "changes": dict(counts), "validated": len(decisions),
@@ -139,6 +159,21 @@ def lines(data, timeline=False):
                          "旧日志缺少可关联计划 ID")
             result.append(f"{instant(item['at']).astimezone(ZONE):%H:%M:%S} 事件 #{item['sequence']} "
                           f"{LABELS[item['change']]}：{targets} ｜ {execution} ｜ {delivered}")
+            wakes = Counter(WAKES.get(w.get("reason"), w.get("reason")) for w in item["wakes"])
+            if wakes:
+                examples = [w.get("title") or (f"{w.get('symbol')} {w.get('reason')}" if w.get("symbol") else None)
+                            for w in item["wakes"]][-2:]
+                result.append("  触发：" + "、".join(f"{name} {count} 次" for name, count in wakes.items())
+                              + "".join(f"｜{text[:60]}" for text in examples if text))
+            for screen in item["screens"][-2:]:
+                verdict = screen.get("verdict") or {}
+                note = {True: "（抽查结果：基金经理改了组合，算漏判）", False: "（抽查结果：基金经理没改组合）"}.get(
+                    screen.get("miss"), "")
+                result.append(f"  事件判断：{TRIAGE.get(screen.get('action'), screen.get('action'))}{note}"
+                              + (f"｜{str(verdict.get('reason'))[:80]}" if verdict.get("reason") else ""))
+            rationale = " ".join(str(item["decision"].get("rationale") or "").split())
+            if rationale:
+                result.append(f"  理由：{rationale[:160]}{'…' if len(rationale) > 160 else ''}")
             for wait in item["waits"]:
                 label = {"entry_waiting": "等待入场价", "stop_breached_no_buy": "已触及止损，停止买入",
                          "buy_chase_limit": "达到追价上限"}[wait["kind"]]

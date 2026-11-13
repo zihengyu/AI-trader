@@ -110,3 +110,21 @@ def test_decisions_command_uses_the_configured_account_and_is_read_only(tmp_path
     assert result.returncode == 0, result.stdout + result.stderr
     assert "通过校验 1 次" in result.stdout and "通过校验 3 次" not in result.stdout
     assert (book / "state.sqlite3").read_bytes() == before
+
+
+def test_timeline_shows_why_the_manager_was_woken_and_what_it_said(tmp_path):
+    book = Journal(tmp_path, "synthetic-activity-account")
+    plan(book, 0)
+    wake = OPEN + timedelta(minutes=5)
+    book.event(wake, "review_triggered", {"reason": "news", "title": "Synthetic headline about ALFA guidance",
+                                          "review_at": wake.isoformat()})
+    book.event(wake, "review_triggered", {"reason": "price_move", "symbol": "ALFA", "review_at": wake.isoformat()})
+    book.event(wake, "event_triage", {"id": "t1", "action": "audit", "reasons": ["news", "price_move"],
+                                      "verdict": {"escalate": False, "importance": "low",
+                                                  "affected_symbols": [], "reason": "Routine coverage"}})
+    at, key = plan(book, 1, targets=[{"symbol": "ALFA", "weight": .02}])
+    book.event(at, "triage_scored", {"id": "t1", "miss": True, "manager_changed": True})
+    text = "\n".join(lines(activity(tmp_path, "2026-11-02", now=NOW), timeline=True))
+    assert "触发：资讯 1 次、价格异动 1 次" in text and "Synthetic headline about ALFA" in text
+    assert "快速模型判断不需要，抽查仍叫了基金经理（抽查结果：基金经理改了组合，算漏判）｜Routine coverage" in text
+    assert text.count("理由：Synthetic assessment") == 2
