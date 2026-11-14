@@ -41,6 +41,30 @@ def history_sessions(closes):
     return completed_sessions(closes, cutoff) if cutoff else ()
 
 
+def _non_overlapping(observed):
+    """First chronological observation per non-overlapping close interval.
+
+    Select by time, never by the sign or magnitude of its later return. Adjacent
+    intervals may share an endpoint; they contain no shared return interval.
+    """
+    chosen, end = [], ""
+    for row, item in observed:
+        if row["start_day"] >= end:
+            chosen.append((row, item))
+            end = item["end_day"]
+    return chosen
+
+
+def _cost_matched(observed):
+    """Before/after means on one explicitly cost-complete cohort, never mixed denominators."""
+    def mean(values):
+        return sum(values) / len(values) if values else None
+    return {"observed": len(observed),
+            "mean_before_cost": mean([p["change_benefit_after_estimated_friction"] for _, p in observed]),
+            "mean_cost_share": mean([r["review_cost_usd"] / r["account_equity"] for r, _ in observed]),
+            "mean_after_cost": mean([p["benefit_after_linked_review_cost"] for _, p in observed])}
+
+
 def decision_comparison(decisions, closes, *, bases=None, calls=None, sessions=None, cost_bps=10):
     """New vs prior AI targets at a common future close; cash earns zero in BOTH arms.
 
@@ -121,17 +145,19 @@ def decision_comparison(decisions, closes, *, bases=None, calls=None, sessions=N
     summary = {}
     for horizon in map(str, HORIZONS):
         observed = [(r, r["horizons"][horizon]) for r in rows if r["horizons"][horizon]["status"] == "observed"]
-        independent, end = [], ""
-        for row, item in observed:
-            if row["start_day"] >= end:
-                independent.append(item)
-                end = item["end_day"]
+        independent = _non_overlapping(observed)
         values = [p["change_benefit_after_estimated_friction"] for _, p in observed]
-        costed = [p["benefit_after_linked_review_cost"] for _, p in observed if p["benefit_after_linked_review_cost"] is not None]
+        costed = [(r, p) for r, p in observed if p["benefit_after_linked_review_cost"] is not None]
+        matched = _cost_matched(costed)
         summary[horizon] = {"observed": len(values), "non_overlapping": len(independent),
             "mean_change_benefit": sum(values) / len(values) if values else None,
             "positive_share": sum(v > 0 for v in values) / len(values) if values else None,
-            "with_linked_review_cost": len(costed), "mean_after_linked_review_cost": sum(costed) / len(costed) if costed else None}
+            "with_linked_review_cost": len(costed), "mean_after_linked_review_cost": matched["mean_after_cost"],
+            "cost_matched": matched,
+            # Filter missing fees first, then select chronological intervals in
+            # that cohort. An unpriced earlier observation must not hide a
+            # complete later one covering the same interval.
+            "cost_matched_non_overlapping": _cost_matched(_non_overlapping(costed))}
     return {"by_horizon": summary, "recent": rows[-20:], "decisions": len(rows), "cost_bps_per_side": cost_bps,
             "meaning": "Target-price scenarios, common first close after acceptance; no actual execution, dividends, "
                        "cash yield, stops or risk overlay. Linked review costs cover manager, corrections and fresh "
@@ -374,9 +400,20 @@ def lines(report):
         out.append(f"历史日线异常：隔离 {sum(r.get('rejected_rows', 0) for r in report['history_issues'])} 行；"
                    f"不可读文件 {sum(r['reason'] == 'unreadable_daily_history' for r in report['history_issues'])} 个。保留有效行，缺口不补。")
     for horizon, row in report["decisions"]["by_horizon"].items():
+        matched, disjoint = row.get("cost_matched"), row.get("cost_matched_non_overlapping")
         out.append(f"{horizon} 日新方案相对维持旧目标：{row['observed']} 次，非重叠 {row['non_overlapping']} 次；"
-                   f"扣估算交易摩擦后平均增益 {pct(row['mean_change_benefit'])}；"
-                   f"再扣已关联决策链费用 {pct(row['mean_after_linked_review_cost'])}（费用完整 {row['with_linked_review_cost']} 次）")
+                   f"扣估算交易摩擦后全样本平均增益 {pct(row['mean_change_benefit'])}（含重叠）；"
+                   f"费用完整 {row['with_linked_review_cost']} 次")
+        if matched is not None and disjoint is not None:
+            out.append(f"  同组扣费比较 {matched['observed']} 次：扣调用链费前 {pct(matched['mean_before_cost'])}，"
+                       f"调用链费用 {pct(matched['mean_cost_share'])}，扣调用链费后 {pct(matched['mean_after_cost'])}；"
+                       f"费用完整且非重叠 {disjoint['observed']} 次：扣调用链费前 {pct(disjoint['mean_before_cost'])}，"
+                       f"调用链费用 {pct(disjoint['mean_cost_share'])}，扣调用链费后 {pct(disjoint['mean_after_cost'])}。")
+        else:  # A stored diagnostic from before paired-cohort fields existed.
+            out.append(f"  旧格式费用完整子集的扣调用链费后均值 {pct(row['mean_after_linked_review_cost'])}；"
+                       "未记录同组扣费前均值，不能据此计算费用影响。")
+    out.append("全部方案均值与费用完整子集的均值样本可能不同，不能用两者之差解释费用影响；"
+               "同组扣费比较只覆盖已关联决策链费用。非重叠按接受时间顺序选取，不按收益挑选，也不保证样本独立。")
     ref = report["opening_reference"]
     out.append(f"期初贝塔对照：覆盖 {ref['observed']}/{ref['intervals']} 个收盘区间；"
                f"对照收益 {pct(ref['reference_return'])}，账户差额 {pct(ref['gross_difference'])}，"

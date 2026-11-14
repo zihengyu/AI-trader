@@ -736,7 +736,7 @@ def investment_markdown(result):
                      f"{pct(row.get('annual_excess_return'))} | {_number(row.get('information_ratio'))} | "
                      f"{_number(reg.get('alpha_t'))}／{_number(reg.get('alpha_t_newey_west'))} | {row.get('dividends')} |")
     from .call_value import lines as value_lines
-    value = value_lines(investment.get("call_value") or {"by_purpose": {}, "calls_saved": {}})
+    value = value_lines(investment.get("call_value") or {"by_purpose": {}, "calls_saved": {}}, include_coverage=True)
     lines += ["", "## AI 调用价值（全部记录）", ""] + (value or ["- 还没有带调用编号的记录"])
     lines += ["", f"## 分阶段资金就绪度：**{stage.get('stage')}**", ""]
     lines += [f"- {reason}" for reason in stage.get("reasons", [])] or ["- 全部条件满足"]

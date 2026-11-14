@@ -323,6 +323,15 @@ research, triage, approval and other overhead remain outside that scope. Missing
 legacy links or usage stay unknown. Overlap counts are shown; positive scenario
 outcomes alone do not establish causal model value.
 
+The all-observation mean can describe a different sample from the subset with
+complete linked costs. Do not subtract those two means to explain the effect
+of fees. ``cost_matched`` shows before-cost return, linked cost as a share of
+equity, and after-cost return on the same complete-cost observations.
+``cost_matched_non_overlapping`` first excludes incomplete costs, then selects
+non-overlapping intervals in acceptance-time order, without selecting by later
+performance. Adjacent intervals can share one closing endpoint. Non-overlap
+does not establish statistical independence; an empty cohort has unknown means.
+
 The separate account reference freezes beta at each interval's opening closing
 book, using only daily bars then completed. It uses the recorded cash policy and
 benchmark prices plus recorded corporate actions. Unknown betas or missing
@@ -548,6 +557,19 @@ Status and the weekly report distinguish absent usage, incomplete usage,
 invalid usage and missing rates. A response without usage is still an unpriced
 call, even when it has no parse error. Whole-history SQL counts and a weekly
 report's cutoff can cover different calls; neither rewrites recorded costs.
+
+Weekly and investment-acceptance reports also show attribution coverage: all
+application call records, those with IDs, legacy records without IDs, known
+costs and unpriced counts. Legacy costs remain visible without inventing their
+purpose or adoption. Per-purpose known costs are split into adopted, failed,
+explicitly not adopted and unknown adoption, with unpriced counts separate.
+Known spend stays visible beside missing prices. Cached and scripted answers
+have no provider cost. Invalid historical costs (negative, boolean, non-finite
+or unreadable) remain unknown in attribution coverage and value groups.
+These are application records and configured estimates,
+not a provider bill or its internal request count. Adoption and portfolio
+changes do not establish return contribution; skipped calls and reused reviews
+do not establish a dollar saving.
 
 The decision timeline keeps the manager's actual portfolio-change result
 separate from the event screen's miss result. A screen that escalated cannot

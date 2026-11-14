@@ -1218,7 +1218,7 @@ def weekly_document(root, sequence):
     from .call_value import from_events, lines as value_lines
     week = [(at, kind, body) for at, kind, body in events if kind in {"agent", "agent_outcome", "review_skipped",
             "critic_reused"} and monday <= instant(at).astimezone(zone).date().isoformat() <= sunday]
-    value = value_lines(from_events(week))
+    value = value_lines(from_events(week), include_coverage=True)
     if value:
         lines += ["", "AI 调用价值（被采用＝已记录结果通过校验并被使用；未记录采用结果不能证明未使用；"
                   "改变目标组合＝增删证券或权重变动至少 1 个百分点）："] + value
