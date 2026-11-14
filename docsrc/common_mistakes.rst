@@ -1017,6 +1017,17 @@ schema mismatches, ``missing_answer`` and ``invalid_json``. A rejected postmarke
 answer does not activate a new strategy memo; the last valid memo stays in use.
 ``fund-logs.sh errors`` retains the following field-location and indented detail
 lines in the same error record, including when other processes log between them.
+It also retains custom exception summaries and chained tracebacks when the
+exception name does not end in ``Error`` or ``Exception``, including exceptions
+with no message. Such summaries are recognized only inside the same process's
+active traceback, not as ordinary output or validation-detail lines.
+
+The fund's roles explicitly request a complete schema JSON object. A decision's
+entire explanation belongs in its single ``rationale`` string, not extra
+continuation fields. Unknown fields remain invalid; the existing budgeted
+manager and postmarket-research correction paths still apply. A format warning
+alone does not establish that the round failed: inspect subsequent correction,
+accepted-decision or backoff events.
 
 The autonomous fund keeps the native ``Strategy.notify`` and ``notify_user``
 contracts. Its ``fund_outbox`` provider queues AI notices durably for the selected
@@ -1028,8 +1039,16 @@ application alerts use a separate ``_notify_fund`` method.
 
 For DuckDB research, the fund's role prompts explain inspecting actual tables
 and columns, keeping CTE aliases within one statement, and separating lagged
-returns, rolling statistics and aggregates into successive CTEs. Query failures
-remain visible so the agent can correct and verify its work.
+returns, rolling statistics and aggregates into successive CTEs. Context field
+names do not establish table columns. For approximate research calculations,
+cast operands to ``DOUBLE`` before multiplication or powers; casting an already
+overflowing decimal product is too late. Exact decimal calculations need
+operand precision and scale that accommodate intermediate results, within
+DuckDB's maximum scale of 38. Widening precision alone cannot fix excess scale.
+See `DuckDB numeric types <https://duckdb.org/docs/current/sql/data_types/numeric>`_.
+Ledger values and source evidence must not be altered to hide a query error.
+Query failures remain visible so the agent can correct and verify its work;
+these instructions neither rewrite SQL nor guarantee error-free model queries.
 
 Evidence References Rejected in an Autonomous Fund Postmarket Review
 --------------------------------------------------------------------------------

@@ -2,7 +2,7 @@
 
 基于原生 LumiBot Agent、Strategy、Broker 和 BacktestingBroker 的纸面账户应用。
 
-**Last Updated:** 2026-11-13
+**Last Updated:** 2026-11-14
 
 **Status:** 公开行情、本地虚拟账户及一次真实 DeepSeek 盘前研究已验证；量化风控、例外审批、授权资金分仓、盯盘、记分卡、Telegram 回复审批、实时推送报价与资讯监控已通过替身测试；Alpaca、真实推送和开盘交易待验证
 
@@ -1160,6 +1160,10 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 输入原文仍由原生 trace 保存，规范化后的证据只保留 `estimate_reason`，无需重新调用研究员。
 反方审查兼容额外的 `missing_evidence_placeholder: null` 空占位字段；非空占位字段和其他未知字段仍拒收，
 真实的 `missing_evidence` 列表不会被占位字段替换或丢弃。
+三个角色都明确要求返回完整的 schema JSON 对象，解释文字放在对象内；经理的全部决策理由放在一个
+`rationale` 字符串中，不另加续写字段。未知字段仍拒收，不通过丢弃字段来接受一个不合规答案。
+经理格式失败及盘后研究格式失败沿用已有的一次预算内纠正；格式告警本身不代表该轮最终失败，
+需结合 `decision_format_retry`、`decision_validated`、`decision_backoff` 或 `postmarket_research_retry` 等后续事件核对。
 
 `Invalid structured agent answer` 通知现在包含失败角色、已提供的阶段、字段位置和错误代码，例如
 `researcher/postmarket_review; schema_validation: evidence[0].observed_at (string_type)`。
@@ -1168,6 +1172,8 @@ AI 只能提供搜索词，不能提供网址；资讯监控不下单。来源�
 超时等运行失败单独标为 `runtime_error: TimeoutError`，空回答为 `missing_answer`，无法提取 JSON 为 `invalid_json`。
 这些诊断在本地使用同一解析器和 schema 完成，不发起新的模型请求，也不会把失败结果激活为策略备忘。
 `fund-logs.sh errors` 同时保留校验错误下一行的字段位置、缩进详情及说明链接，其他进程的心跳不会切断它们；
+Python 自定义异常即使名称不以 `Error`／`Exception` 结尾，或没有错误消息，也保留 traceback 的最后原因行及异常链。
+这类终行只在同一进程已经开始的 traceback 内识别，不用来扩大普通日志或校验错误记录的范围。
 正常的大型研究输出仍不进入异常摘要。
 
 原生 `notify_user(title, message, severity, enabled)` 使用 LumiBot 的通知管理器，并将本账户的消息排入
@@ -1177,7 +1183,10 @@ Telegram 送达仍由独立监控确认。AI 通知固定记为 `agent_notice` �
 接收人来自该账户已有的监控配置。内部业务告警单独使用 `_notify_fund`，不再覆盖原生通知接口。
 
 三个角色的研究提示均说明 DuckDB 的实际表结构检查、CTE 只在本条语句内有效，以及用多个 CTE 分开计算
-滞后收益、滚动统计和聚合。查询错误仍返回给模型，由它修正并核对成功结果；这些提示不保证模型永不写错 SQL。
+滞后收益、滚动统计和聚合。上下文字段名不能代替实际表列名。近似研究统计里的小数乘法／幂运算，应在运算前
+把操作数转为 `DOUBLE`；只在乘积外转换类型，无法避免中间的 `DECIMAL` 溢出。需要精确小数时，先选择能容纳
+中间结果的精度和小数位数，不能只把位宽增至 38 却保留会相乘超限的小数位。不得修改底层账本或舍入来源证据来掩盖错误。
+查询错误仍返回给模型，由它修正并核对成功结果；这些提示不保证模型永不写错 SQL，也不自动改写模型的查询。
 
 **反方审查**（`critic` 段，`FUND_CRITIC`）：基金经理决策前可调用一个只读的 AI 角色（默认用研究员的模型，
 可用 `FUND_CRITIC_MODEL` 指定），专门给出研究的最强反面论证：反面证据、已被定价或拥挤的逻辑、估值、事件和流动性风险、

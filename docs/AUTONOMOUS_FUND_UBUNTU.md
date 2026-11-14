@@ -2,7 +2,7 @@
 
 本应用的显式秘密配置、无人值守进程管理、审批和日报运维说明。
 
-**Last Updated:** 2026-11-13
+**Last Updated:** 2026-11-14
 
 **Status:** 部署生成器与进程／通知回归已验证；目标 Ubuntu 安装和 Telegram 实际投递待验证
 
@@ -297,7 +297,9 @@ AI 研究超过调度间隔时，`MaxInstancesReachedError` 表示上一轮仍�
 `scheduler_logging_error` 和异常类型、隐藏原始记录，并继续调度；不增加并发迭代，不吞掉模型或交易异常。
 该提示同时保留安全的异常位置、原因链和 OS 错误码，便于定位依赖过滤器故障；不会打印原始日志内容、输入值或局部变量。
 `fund-logs.sh errors` 会将结构化回答校验的字段位置及缩进详情保留在同一条异常记录中，避免只看到
-`1 validation error` 而丢失原因。AI 调用原生 `notify_user` 使用本账户的持久化队列，队列接受不等于 Telegram 已送达。
+`1 validation error` 而丢失原因。自定义异常名不以 `Error`／`Exception` 结尾或没有消息时，也保留最后的原因行及异常链；
+仅在同一进程的 traceback 内识别这类终行，普通成功日志不因此进入异常摘要。
+AI 调用原生 `notify_user` 使用本账户的持久化队列，队列接受不等于 Telegram 已送达。
 监控收到正常停止／重启的 SIGINT 时也会正常退出，不再把 `KeyboardInterrupt` 当成崩溃堆栈输出。
 
 宏观摘要的 `macro.enabled` 只控制应用预计算的 FRED 市场摘要，

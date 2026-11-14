@@ -4,6 +4,8 @@ import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from scripts.autonomous_fund import stops
 
 
@@ -51,6 +53,61 @@ def test_error_record_limit_never_splits_a_traceback():
     assert len(result) == 2 and "older 99" in result[0]
     assert "Traceback" in result[1] and "ValueError" in result[1]
     assert result[1].count("synthetic_frame()") == 300
+
+
+@pytest.mark.parametrize("exception_name", ["ObservationPending", "QuoteNotReady",
+                                           "synthetic.feed.DataUnavailable", "lowercase_signal",
+                                           "synthetic.read.<locals>.FeedPending"])
+@pytest.mark.parametrize("message", ["", ": synthetic diagnostic"])
+def test_errors_keep_custom_exception_summaries_with_or_without_a_message(exception_name, message):
+    from scripts.autonomous_fund.log_errors import error_records
+
+    def entry(text, pid="1"):
+        return {"MESSAGE": text, "_PID": pid, "_SYSTEMD_UNIT": "synthetic.service"}
+
+    summary = exception_name + message
+    records = [entry("Traceback (most recent call last):"),
+               entry('  File "synthetic.py", line 12, in read_quote'),
+               entry("    observe()"), entry("INFO other-process heartbeat", "2"),
+               entry(summary), entry("INFO normal iteration")]
+    [trace] = error_records(records)
+    # Python exception classes need not end in Error/Exception or carry a message.
+    assert trace.splitlines()[-1] == summary
+    assert "read_quote" in trace and "heartbeat" not in trace and "normal iteration" not in trace
+
+
+def test_errors_keep_chained_custom_exceptions_in_one_record():
+    from scripts.autonomous_fund.log_errors import error_records
+
+    lines = ["Traceback (most recent call last):", '  File "synthetic.py", line 1, in read_quote',
+             "    observe()", "synthetic.feed.DataUnavailable: stale observation", "",
+             "The above exception was the direct cause of the following exception:", "",
+             "Traceback (most recent call last):", '  File "synthetic.py", line 2, in value_book',
+             "    read_quote()", "ValuationPending: waiting for source evidence", "INFO normal iteration"]
+    [trace] = error_records([{"MESSAGE": line, "_PID": "1"} for line in lines])
+    assert "DataUnavailable: stale observation" in trace
+    assert "direct cause" in trace and "ValuationPending: waiting for source evidence" in trace
+    assert trace.count("Traceback (") == 2 and "normal iteration" not in trace
+
+
+def test_custom_exception_matching_is_scoped_to_the_same_process_traceback():
+    from scripts.autonomous_fund.log_errors import error_records
+
+    records = [{"MESSAGE": "Traceback (most recent call last):", "_PID": "1"},
+               {"MESSAGE": '  File "synthetic.py", line 1, in read_quote', "_PID": "1"},
+               {"MESSAGE": "Inventory: ordinary output from another process", "_PID": "2"},
+               {"MESSAGE": "QuoteNotReady: waiting for evidence", "_PID": "1"},
+               {"MESSAGE": "Inventory: ordinary output immediately after the summary", "_PID": "1"},
+               {"MESSAGE": "INFO normal iteration", "_PID": "1"},
+               {"MESSAGE": "Inventory: ordinary output after the traceback", "_PID": "1"},
+               {"MESSAGE": "WARNING answer has 1 validation error for Research", "_PID": "3"},
+               {"MESSAGE": "summary", "_PID": "3"},
+               {"MESSAGE": "  Input should be a valid string", "_PID": "3"},
+               {"MESSAGE": "Inventory: ordinary output after validation", "_PID": "3"}]
+    traces = error_records(records)
+    assert len(traces) == 2 and "QuoteNotReady: waiting for evidence" in traces[0]
+    assert "summary\n  Input should be a valid string" in traces[1]
+    assert "Inventory:" not in "\n".join(traces)
 
 
 def test_monitor_sigint_exits_cleanly_without_clearing_the_stop(tmp_path, monkeypatch):

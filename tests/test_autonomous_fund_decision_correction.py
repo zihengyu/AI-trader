@@ -87,6 +87,27 @@ def test_a_malformed_decision_gets_one_correction_and_the_round_continues(tmp_pa
     assert strategy.journal.get_meta("decision_failures") in (0, None)
 
 
+def test_a_rationale_continuation_requires_a_complete_model_correction(tmp_path):
+    body = decision([("ALFA", .05)])
+    continuation = "Synthetic comparison with the previous plan."
+    malformed = answer(json.dumps({**body, "rationale_continue": continuation}), Decision)
+    corrected = {**body, "rationale": body["rationale"] + " " + continuation}
+    strategy, calls = fund(tmp_path, [malformed, answer(json.dumps(corrected), Decision)])
+
+    strategy._decide(account(), NOW, False)
+
+    [correction] = [call for call in calls if call["purpose"] == "decision_correction"]
+    previous = correction["context"]["structured_answer_correction"]
+    assert json.loads(previous["previous_answer"])["rationale_continue"] == continuation
+    assert previous["diagnostic"]["errors"] == [{"path": "<extra>", "type": "extra_forbidden"}]
+    agents = [event for event in events(strategy, "agent") if event["name"] == "manager"]
+    assert len(agents) == 2 and agents[0]["parse_error"] and not agents[1]["parse_error"]
+    # Only the model's complete corrected object is adopted; no text is silently discarded.
+    [accepted] = events(strategy, "decision_validated")
+    assert accepted["rationale"] == corrected["rationale"] and "rationale_continue" not in accepted
+    assert not events(strategy, "decision_backoff")
+
+
 @pytest.mark.parametrize("bound", ["minimum", "maximum"])
 def test_overflowing_claim_bound_is_corrected_before_the_decision_is_written(tmp_path, bound):
     body = {**decision([("ALFA", .05)]),

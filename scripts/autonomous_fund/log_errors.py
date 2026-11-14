@@ -19,6 +19,10 @@ TRACE = re.compile(
     r"The above exception was the direct cause|[\w.]+(?:Error|Exception)(?::|$)|"
     r"KeyboardInterrupt|SystemExit)"
 )
+# Python exception classes have no required Error/Exception suffix. Recognize
+# their summaries only inside that process's traceback, not ordinary output or
+# a Pydantic validation record. An exception with no message has no colon.
+EXCEPTION_SUMMARY = re.compile(r"^(?:(?:[^\W\d]\w*|<locals>)\.)*[^\W\d]\w*(?::|$)")
 VALIDATION = re.compile(r"validation errors? for\b|structured_output_invalid:")
 VALIDATION_FIELD = re.compile(r"^[\w]+(?:\.[\w]+)*(?:\[[\d,]+\])?$")
 
@@ -37,19 +41,26 @@ def error_records(entries, limit=80):
     Another service's output must not break a traceback. The limit applies to
     records rather than lines, so even a long traceback retains its first frame.
     """
-    records, traces, validations = deque(maxlen=limit), {}, set()
+    records, traces, validations, summaries = deque(maxlen=limit), {}, set(), set()
     for entry in entries:
         message = entry.get("MESSAGE", "")
         if not isinstance(message, str):
             continue
         key = (entry.get("_SYSTEMD_UNIT"), entry.get("_PID"))
         current = traces.get(key)
+        summary = key not in validations and EXCEPTION_SUMMARY.match(message)
         if current is not None and (not message or TRACE.match(message) or
-                                    (key in validations and VALIDATION_FIELD.fullmatch(message))):
+                                    (key in validations and VALIDATION_FIELD.fullmatch(message)) or
+                                    summary) and not (summary and key in summaries):
             current.append(message)
+            if summary:
+                summaries.add(key)
+            elif message.startswith("Traceback ("):
+                summaries.discard(key)  # The next exception in a chained traceback.
             continue
         traces.pop(key, None)
         validations.discard(key)
+        summaries.discard(key)
         is_trace = message.startswith(("Traceback (", "Exception in thread ", "--- Logging error ---"))
         if is_trace or ERROR.search(message):
             record = [_label(entry), message]

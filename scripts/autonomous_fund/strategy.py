@@ -88,7 +88,14 @@ MONITOR_AGENT_SECONDS = 900
 
 SQL_RESEARCH_PROMPT = (
     " For DuckDB research, inspect SHOW TABLES and DESCRIBE the loaded table before assuming column names; "
-    "use the actual returned schema. A CTE and its aliases exist only within that one SQL statement. "
+    "use the actual returned schema, not field names inferred from similarly named context sections. "
+    "A CTE and its aliases exist only within that one SQL statement. "
+    "Decimal literals and columns can overflow during multiplication or exhaust DuckDB's maximum decimal "
+    "scale of 38. For approximate research statistics, cast the operands to DOUBLE BEFORE multiplication "
+    "or powers; casting only the result is too late if the intermediate decimal operation overflows. "
+    "When exact decimal arithmetic is required, choose operand precision and scale that can hold the "
+    "intermediate results; a wider decimal alone cannot solve excessive scale. Never change the underlying "
+    "ledger values or round source evidence to make a research query succeed. "
     "Compute lagged returns in one CTE, rolling statistics in the next, and aggregates in a later SELECT; "
     "DuckDB does not allow nested window functions or window functions inside aggregate arguments. "
     "Project every needed column through each CTE and qualify aliases from that SELECT's actual FROM clause. "
@@ -110,7 +117,8 @@ RESEARCHER_PROMPT = (
     "leveraged, inverse or volatility ETFs the operator admitted as hedging or tactical tools. "
     "Use native market/history, technical analysis, fundamentals and news/web tools. "
     "Find opportunities autonomously, assess contradictory evidence and portfolio risk. "
-    "Return a concise summary and evidence with source, timezone-aware available_at "
+    "Return exactly one complete JSON object matching the requested Research schema, with no surrounding "
+    "prose. Put your concise summary in summary and evidence in evidence, with source, timezone-aware available_at "
     "and observed_at timestamps. Disclose missing data. Never fabricate evidence. "
     "In historical mode only use information public by as_of, completed bars and "
     "historical fundamentals/news versions. For an undated source estimate first "
@@ -151,7 +159,9 @@ CRITIC_PROMPT = (
     "theses, valuation, event and liquidity risks, correlation between ideas, and evidence that is stale, "
     "undated or unverified. When the portfolio or the plan is mostly cash, also argue the case against staying in "
     "cash: the return given up against the benchmarks and the costs the fund pays regardless (fund_scoreboard). "
-    "Use read-only research tools to check claims. Return concerns by symbol (\"\" for "
+    "Use read-only research tools to check claims. Return exactly one complete JSON object matching the "
+    "requested Critique schema, with all commentary inside its fields and no surrounding prose. "
+    "Return concerns by symbol (\"\" for "
     "portfolio-level) with evidence, and list missing evidence. Never fabricate; say when the research holds up. "
     "Compare retaining previous_decision with changing or exiting it over the same forward horizon, including "
     "the incremental trading friction of the change. Challenge both alternatives; criticism does not require a "
@@ -167,6 +177,9 @@ CRITIC_PROMPT = (
 ) + SQL_RESEARCH_PROMPT
 MANAGER_PROMPT = (
     "You are the sole investment decision maker for this long-only paper portfolio. "
+    "Return exactly one complete JSON object matching the requested output schema, with no surrounding prose "
+    "or extra keys. For a Decision, keep your entire explanation in the single rationale string; do not split "
+    "it into additional continuation fields. "
     "Your objective is long-term risk-adjusted return net of every cost, above the predefined benchmarks in "
     "fund_scoreboard.benchmarks. You have no fixed signal or obligation to trade, but no choice is free: the fund "
     "pays model and data costs whatever you decide, and cash earns only the bill rate, which those costs can "
@@ -431,7 +444,9 @@ class Decision(BaseModel):
     as_of: str
     expires_at: str
     next_review_at: str
-    rationale: str = Field(min_length=1)
+    rationale: str = Field(min_length=1, description=(
+        "The complete decision explanation in one string, including all comparisons and conclusions. "
+        "Do not split it into additional fields."))
     targets: list[Target]
     alerts: bounded_list(Alert, 20) = Field(default_factory=list)
     news_watch: bounded_list(NewsQuery, 8) = Field(default_factory=list)
