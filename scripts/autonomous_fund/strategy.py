@@ -1968,10 +1968,28 @@ class AutonomousFund(Strategy):
         model = getattr(self, "agent_models", {}).get(name) or (
             getattr(self, "triage_model", None) if name == "triage" else None) or (
             getattr(self, "probe_agents", None) or {}).get(name) or "unknown"
-        self.journal.event(self.get_datetime(), "agent_call_started", {
-            "id": key, "name": name, "model": model, "purpose": purpose})
+        from .evidence import capture_input, capture_result
         try:
-            return self.agents[name].run(**kwargs)
+            input_evidence = capture_input(self.journal, self.get_datetime(), self._current_call, self.agents[name],
+                kwargs, model=model, prompt_version=getattr(self, "prompt_version", None),
+                caller_code=AutonomousFund._agent_call.__code__)
+        except Exception as exc:
+            # Evidence collection must not become a research/trading permission
+            # gate or create an extra inference attempt. Disclose the gap.
+            input_evidence = {"status": "unavailable", "error": type(exc).__name__}
+        self.journal.event(self.get_datetime(), "agent_call_started", {
+            "id": key, "name": name, "model": model, "purpose": purpose, "input_evidence": input_evidence})
+        result_evidence = {"status": "no_result"}
+        try:
+            result = self.agents[name].run(**kwargs)
+            if input_evidence["status"] == "recorded":
+                try:
+                    result_evidence = capture_result(self.journal, key, result)
+                except Exception as exc:
+                    result_evidence = {"status": "unavailable", "error": type(exc).__name__}
+            else:
+                result_evidence = {"status": "unavailable", "error": "InputNotArchived"}
+            return result
         except BaseException as exc:
             # Interrupting a paid request must also retain unknown usage. The
             # interrupt is re-raised so Ctrl+C still stops the runner normally.
@@ -1982,7 +2000,8 @@ class AutonomousFund(Strategy):
                 "cost_unavailable_reason": "usage_missing"})
             raise
         finally:
-            self.journal.event(self.get_datetime(), "agent_call_finished", {"id": key, "name": name})
+            self.journal.event(self.get_datetime(), "agent_call_finished", {
+                "id": key, "name": name, "result_evidence": result_evidence})
 
     def _notify_fund(self, kind, details):
         """Queue application events; keep Strategy.notify's native public contract."""

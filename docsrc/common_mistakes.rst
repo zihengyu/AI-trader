@@ -801,6 +801,28 @@ archives after 12 months. The ledger, orders, fills, decisions, research,
 reviews, scorecards, factor tests, notices and NAV marks are never removed.
 Preview with ``bash scripts/fund-logs.sh prune``, and delete with ``--apply``.
 
+New optional-fund calls also retain compressed, deduplicated application inputs
+and returned answers in the account's SQLite journal, independently of trace
+retention. They include task/system prompts, context, output schema, call
+options, the existing prompt version, application source and selected package
+versions. Existing SQLite backups include these objects. This needs no new
+service, data subscription or inference. A 16 MiB uncompressed per-object bound
+limits capture; a failure records only its exception type and does not change
+model budgets, retries or trading permissions. Legacy inputs stay missing.
+
+``bash scripts/fund-logs.sh evidence`` checks hashes, event references and
+coverage without displaying private input text. ``evidence <call-id>`` displays
+one exact private request and answer from the selected account. Equivalently,
+use ``python -m scripts.autonomous_fund.run evidence --run-dir <account-directory>``
+with optional ``--call-id <call-id>``. Integrity failures exit 2; verified,
+partial and unavailable coverage exit 0 with gaps disclosed. Raw answers are
+not proof of validation or adoption. This is serialized application-boundary
+evidence, not a complete native-memory/tool-response/provider replay. Source
+files are captured from disk at first capture in the process, not certified as
+identical to every loaded module. Hashes detect corruption and reference
+mismatches, not an editor rewriting every reference. Backups on the same host
+still do not protect against loss of that host's disk.
+
 Missing legacy analytics evidence does not block valid trades. An invalid
 historical NAV projection is reported as a partial-audit warning and excluded
 from reports, notifications and review inputs; cash, shares, fills and fees

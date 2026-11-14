@@ -312,7 +312,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
                         choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position",
-                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics"])
+                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -368,7 +368,10 @@ def main(argv=None):
                         help="status: print yes when only a person can lift the STOP (scripts use it)")
     parser.add_argument("--stop-class", action="store_true",
                         help="status: print only the STOP class (operator, watchdog, service or none)")
+    parser.add_argument("--call-id", help="evidence: show one exact archived application request and returned result")
     args = parser.parse_args(argv)
+    if args.call_id is not None and (args.mode != "evidence" or not args.call_id.strip()):
+        parser.error("--call-id requires evidence and a nonempty exact call ID")
     if args.decision_event is not None and (args.mode != "decisions" or args.decision_event <= 0):
         parser.error("--event requires decisions and a positive validated event sequence")
     if args.operation_id is not None and args.mode not in {"subscribe", "redeem", "deposit", "withdraw"}:
@@ -462,6 +465,16 @@ def main(argv=None):
     if args.mode == "economics":
         from .economics import assess, lines
         print("\n".join(lines(assess(args.run_dir))))
+        return
+    if args.mode == "evidence":
+        from .evidence import audit, lines, load_call
+        if args.call_id:
+            print(json.dumps(load_call(args.run_dir, args.call_id), ensure_ascii=False, indent=2))
+        else:
+            result = audit(args.run_dir)
+            print("\n".join(lines(result)))
+            if result['status'] == 'failed':
+                raise SystemExit(2)
         return
     if args.mode == "prune":
         from .retention import lines, prune
