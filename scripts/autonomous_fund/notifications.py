@@ -198,6 +198,7 @@ def evidence_lines(card):
         lines.append(f"AI 事实核验（对照它看到的行情快照）：{claims['decisions_with_claims']}/{claims['decisions']} 次决策提交断言，"
                      f"正确 {claims['correct']}，错误 {claims['incorrect']}，"
                      f"无法核验 {claims['unavailable']}，已核验断言错误率 {_percent(claims['incorrect_rate'])}。"
+                     "仅覆盖已提交的快照数值断言，不代表未提交的决策或复盘正文全部正确。"
                      + (f"错得多的指标（错/核验）：{'、'.join(wrong[:5])}。" if wrong else ""))
     for factor in (card or {}).get("factor_crowding", [])[:3]:
         if factor.get("status") != "observed":
@@ -314,6 +315,110 @@ WATCH_KINDS = ("protective_trigger", "price_alert", "review_triggered", "entry_w
 DAILY_KINDS = TRADE_KINDS + WATCH_KINDS + ("notification",)
 
 
+def account_fact_lines(account):
+    """One recorded account's money partition, never percentages copied from AI prose.
+
+    Account.cash already includes cash equivalents. Subtract their value once
+    to display free cash; non-cash securities are the equity residual, not a
+    second addition of the cash-equivalent holding.
+    """
+    from .risk import number
+    if not account or account.get("unavailable"):
+        return ["缺少账户观测，资金构成不可计算。"]
+    valuation = account.get("valuation") or {}
+    closed = valuation.get("session_close") if valuation.get("book_existed_at_close", True) else None
+    lines = [f"账户时点：{account.get('as_of') or account.get('at') or '未知'}；"
+             + (f"会话收盘估值（会话截止 {closed}）" if closed else "普通账户观测，不等同收盘净值")]
+    try:
+        equity, cash = number(account["equity"]), number(account["cash"])
+        parked = number(account.get("cash_equivalent_value", 0))
+        receivables = number(account.get("receivables", 0))
+        if equity <= 0:
+            raise RiskError("Nonpositive equity")
+        values = {"风险证券": equity - cash - receivables, "系统现金等价物": parked,
+                  "自由现金": cash - parked, "应收": receivables}
+    except (KeyError, TypeError, ValueError):
+        return lines + ["账户资金构成不可计算：缺少有效净值、现金或现金等价物金额。"]
+    lines += [f"代码计算净值：{_usd(equity)} USD；资金构成："
+              + "；".join(f"{label} {_percent(value / equity)}" for label, value in values.items())
+              + f"；合计 {_percent(sum(values.values()) / equity)}。"]
+    if any(value < 0 for value in values.values()):
+        lines.append("资金构成出现负值，需核对账户记录；未将负值改为零。")
+    return lines
+
+
+def _saved_input_card(db, packet):
+    """Recover a legacy card only from the exact persisted research input.
+
+    This is a read-only rendering fallback, not a historical ledger backfill.
+    A same-day stage alone is insufficient to identify the review's evidence.
+    """
+    if "scorecard" in packet or not packet.get("input_as_of"):
+        return packet
+    for (body,) in db.execute(
+            "SELECT body FROM events WHERE kind='postmarket_research' AND json_valid(body) AND "
+            "json_extract(body,'$.session_date')=? AND json_extract(body,'$.context.as_of')=? "
+            "ORDER BY sequence DESC", (packet["session_date"], packet["input_as_of"])):
+        saved = json.loads(body)
+        if (instant(saved["completed_at"]) <= instant(packet["completed_at"])
+                and saved.get("model") == packet.get("models", {}).get("researcher")
+                and saved.get("research") == packet.get("research")
+                and saved["context"].get("scorecards") is not None):
+            return {**packet, "scorecard": saved["context"]["scorecards"]}
+    return packet
+
+
+def _review_scorecard(packet, related):
+    # New packets atomically retain the exact input card. Legacy reports can
+    # still use their session's projection, including one written after the
+    # review commit, but never a card explicitly dated after its cutoff.
+    card = (packet["scorecard"] if "scorecard" in packet else
+            next((body for kind, body in reversed(related) if kind == "scorecard"), None))
+    if card and card.get("as_of"):
+        try:
+            if instant(card["as_of"]) > instant(packet["completed_at"]):
+                return {"unavailable": "记分卡时间晚于所选复盘截止"}
+        except (TypeError, ValueError):
+            return {"unavailable": "记分卡输入时间不可读"}
+    return card
+
+
+def _watch_lines(events, day):
+    counts = Counter(row["kind"] for row in events)
+    news = [i for i, row in enumerate(events) if row["kind"] == "review_triggered"
+            and row["body"].get("reason") == "news"]
+    omitted = set(news[:-20])
+    shown = [row for i, row in enumerate(events) if i not in omitted]
+    lines = ["；".join(f"{kind} × {count}" for kind, count in sorted(counts.items())) or "没有盯盘触发记录。"]
+    if omitted:
+        lines += [f"新闻提前复核仅展示最近 20 条，省略 {len(omitted)} 条；保护性触发和价格提醒全部保留。"
+                  f"完整记录仍保留在账本，可用 bash scripts/fund-logs.sh decisions {day} 查看时间线。"]
+    return lines + ["", "```json", json.dumps(shown, ensure_ascii=False, indent=2), "```", ""]
+
+
+def _simulation_lines(events):
+    from .risk import number
+    assumptions = {encode(row["body"]["execution_assumptions"]): row["body"]["execution_assumptions"]
+                   for row in events if row["kind"] in {"fill", "fill_reconciled"}
+                   and isinstance(row["body"].get("execution_assumptions"), dict)
+                   and row["body"]["execution_assumptions"]}
+
+    def value(item, key, percent=False):
+        try:
+            parsed = number(item[key])
+            return _percent(parsed) if percent else format(parsed.normalize(), "f")
+        except (KeyError, TypeError, ValueError):
+            return "未知"
+
+    lines = [f"已记录模拟成交假设：手续费 {value(item, 'fee_rate', True)}；"
+             f"价差 {value(item, 'spread_bps')}bp；滑点 {value(item, 'slippage_bps')}bp。"
+             for item in assumptions.values()]
+    if lines:
+        lines.append("成交价包含模拟摩擦，可能超出原始 K 线区间；这些是模拟假设，"
+                     "现金管理成交也承担成本，需与其实际收益比较。")
+    return lines
+
+
 def daily_document(root, sequence):
     # The AI supplies neither a file path nor an upload URL. Render one exact
     # journal row in memory, so a prompt cannot turn reports into file exfiltration.
@@ -322,6 +427,7 @@ def daily_document(root, sequence):
         if not row:
             raise RiskError("Daily report has no matching completed review")
         packet = json.loads(row[0])
+        packet = _saved_input_card(db, packet)
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         # Only the kinds this document lists; the journal also holds a NAV mark
         # and a benchmark about every 30 seconds of market time.
@@ -345,30 +451,39 @@ def daily_document(root, sequence):
              f"报告截止：{packet['completed_at']}；模式：{snapshot['mode']}；Mock：{packet['mock']}",
              f"模型：{encode(packet['models'])}；策略备忘版本：{packet['version']}", "",
              "## 当日表现与账户", "",
+             f"本轮冻结输入截止：{packet.get('input_as_of') or session.get('input_as_of') or '未记录'}；"
+             "下列观测盈亏保留原输入窗口，后续估值单独列示。",
              f"观测盈亏 USD：{session['observed_pnl_usd']}；观测收益率：{session['observed_return']}",
              f"对齐观测窗口的 SPY／QQQ 价格收益：{encode(session['benchmark_observed_price_returns'])}",
              f"窗口起点：{encode(session['baseline_account'])}",
              f"窗口终点（现金、应收与持仓）：{encode(session['last_observed_account'])}", "",
+             "报告截止前最新账户观测【代码事实】：",
+             *account_fact_lines(snapshot.get("latest_account")), "",
              f"运行至报告截止的最大观测回撤：{snapshot['max_observed_drawdown']}",
              f"运行至报告截止的已确认交易费用 USD：{snapshot['observed_fees']}（null 表示不完整）",
              f"运行至报告截止的模型 usage：{encode(snapshot['model_usage_by_model'])}",
              _cost_text(snapshot.get("model_costs")),
+             "交易费用和滑点已包含在账户收益中，不重复扣除；模型费用按所列窗口统计，"
+             "数据费用及完整系统净收益见下方记分卡／经济对照，未知费用不按零计算。",
              f"没有确认结束的模型调用（用量未知）：{encode(snapshot['unfinished_model_calls'])}",
              "模型美元费用须按配置费率查看 report；本报告不把缺少费率或未知 usage 当作零费用。", "",
              "## 买卖、成交及人工审批记录", "",
              "```json", json.dumps(day_events, ensure_ascii=False, indent=2), "```", "",
+             *_simulation_lines(day_events),
              "fill_reconciled 是券商累计成交观测，不能与成交回调重复相加；未成交订单不算实际交易。", "",
              "## 授权资金与约束", "",
              f"AI 授权资金（初始/当前基数）USD：{snapshot['mandate']['capital_usd']}；账户中保留不动用的现金 USD："
              f"{snapshot['mandate']['reserved_cash']}（为空表示整个专用账户都由 AI 管理）",
              "约束遵守情况（AI 自评，需人工抽查）：" + (review.get("mandate_compliance") or "本次未填写"), "",
              "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
-             "```json", json.dumps(watch_events, ensure_ascii=False, indent=2), "```", "",
+             *_watch_lines(watch_events, day),
              "## 当日归因（代码按收盘价计算）", ""] + attribution_lines(packet.get("attribution")) + [
              "", "## AI 记分卡（只用已完成收盘价客观打分）", ""]
     # Only this session's card: an earlier one under today's heading would be stale.
-    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
-    if card:
+    card = _review_scorecard(packet, related)
+    if card and card.get("unavailable"):
+        lines += [f"本轮记分卡不可用：{card['unavailable']}；不能据此判断没有可打分样本。", ""]
+    elif card and "predictions" in card and "by_horizon" in (card.get("decisions") or {}):
         predictions, decisions = card["predictions"], card["decisions"]["by_horizon"]
         lines += [f"预测：共 {predictions['total']} 条，已打分 {predictions['scored']}，命中 {predictions['correct']}，"
                   f"命中率 {predictions['hit_rate']}，待验证 {predictions['pending']}",
@@ -394,9 +509,10 @@ def daily_document(root, sequence):
                          f"（{_percent(consistency['reversal_rate'])}，不含止损止盈），"
                          f"估算多花成本约占净值 {_percent(consistency['estimated_cost'])}")
         lines += regime_trend_lines(card) + evidence_lines(card)
-        lines += ["样本小时结论不稳定；记分差的假设应由 AI 在复盘中撤回。", ""]
+        lines += ["样本小时结论不稳定；样本数门槛不代表显著性，重叠预测不能当作独立样本。"
+                  "记分差的假设应由 AI 在复盘中撤回。", ""]
     else:
-        lines += ["本交易日没有记分卡（尚无可打分的样本，或当日数据不可用）。", ""]
+        lines += ["本交易日没有记分卡（本轮未保存完整结果；不能据此判断没有可打分样本）。", ""]
     lines += ["## 因子挖掘（AI 提出，代码客观检验）", ""]
     results = [result for kind, body in related if kind == "factor_tests" for result in body.get("results", [])]
     for result in results:
@@ -966,7 +1082,7 @@ def _weekly_facts(events, monday, sunday, zone):
     return facts
 
 
-def _weekly_events(db, cutoff, zone):
+def _weekly_events(db, cutoff, zone, *, review_sequence=None):
     """WEEKLY_KINDS events up to `cutoff`, as _weekly_facts reads them, without every NAV mark and benchmark.
 
     _weekly_facts keeps the last equity of each New York date and, per symbol,
@@ -980,7 +1096,10 @@ def _weekly_events(db, cutoff, zone):
             "CASE WHEN kind='account' AND json_valid(body) THEN json_extract(body,'$.equity') END "
             "FROM events WHERE kind IN (%s) ORDER BY sequence" % ",".join("?" * len(WEEKLY_KINDS)), WEEKLY_KINDS):
         moment = instant(at)
-        if moment > cutoff:
+        # completed_at is captured before the journal write. Include exactly the
+        # requested review, even if persistence followed by a few microseconds;
+        # this exception must never admit newer prices, costs or other reviews.
+        if moment > cutoff and not (kind == "postmarket_review" and sequence == review_sequence):
             continue
         day = moment.astimezone(zone).date()
         if kind == "account":
@@ -1026,9 +1145,10 @@ def weekly_document(root, sequence):
         if not row:
             raise RiskError("Weekly report has no matching completed review")
         packet = json.loads(row[0])
+        packet = _saved_input_card(db, packet)
         cutoff, day = instant(packet["completed_at"]), packet["session_date"]
         monday, sunday, label = week_of(day)
-        events = _weekly_events(db, cutoff, zone)
+        events = _weekly_events(db, cutoff, zone, review_sequence=sequence)
         # Written just after each review, so selected by session date like the daily report.
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
@@ -1039,7 +1159,7 @@ def weekly_document(root, sequence):
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='fund_experiment_history'").fetchone():
             for experiment, at, before, after, reason in db.execute(
                     "SELECT id,at,from_state,to_state,reason FROM fund_experiment_history ORDER BY rowid"):
-                if monday <= instant(at).astimezone(zone).date().isoformat() <= sunday:
+                if monday <= instant(at).astimezone(zone).date().isoformat() <= day:
                     changes.append((experiment, before, after, reason))
     facts = _weekly_facts(events, monday, sunday, zone)
     reviews = [b for _, k, b in events if k == "postmarket_review" and monday <= b["session_date"] <= sunday]
@@ -1063,14 +1183,22 @@ def weekly_document(root, sequence):
             text = (f"- 本周 AI 费用 ${spent:.2f}（{model['calls']} 次调用），扣除后本周收益 "
                     f"{_percent(facts['week_return'] - spent / facts['start_equity'])}")
             if model.get("unpriced"):
-                text += f"（另有 {model['unpriced']} 次调用未定价、未计入，实际更低）"
+                text += f"（另有 {model['unpriced']} 次调用未定价、未计入；该收益为上界）"
             lines.append(text)
         lines.append("- 每日：" + ("；".join(f"{d} {_percent(r)}" for d, r in facts["daily"]) or NO_DATA))
         lines.append(f"- 本周最大回撤（按每日估值）：{_percent(facts['max_drawdown'])}")
         for benchmark, value in facts["benchmarks"].items():
             excess = facts["week_return"] - value if value is not None else None
-            lines.append(f"- 基准 {benchmark}：{_percent(value)}，超额 {_percent(excess)}" if value is not None else
-                         f"- 基准 {benchmark}：{NO_DATA}（缺价格记录）")
+            text = f"- 基准 {benchmark}：{_percent(value)}，超额 {_percent(excess)}"
+            if value is not None and model.get("calls") and facts.get("start_equity"):
+                text += f"；扣已知模型费后超额 {_percent(excess - model['usd'] / facts['start_equity'])}"
+                if model.get("unpriced"):
+                    text += "（未定价调用未计入，为上界）"
+            lines.append(text if value is not None else f"- 基准 {benchmark}：{NO_DATA}（缺价格记录）")
+    lines += ["- 交易费用和滑点已包含在账户收益中，不重复扣除；模型费用按期初净值折算。"
+              "本周扣费口径仅扣已知模型费，数据费用及完整系统净收益见基金记分卡和经济对照，未知费用不按零计算。",
+              "", "### 所选复盘的冻结账户输入【事实】", "",
+              *account_fact_lines(((packet.get("session") or {}).get("last_observed_account") or {}).get("body"))]
     trades, model = facts["trades"], facts["model"]
     lines += ["", "## 二、交易成本和模型费用【事实】", "",
               f"- 成交 {trades['fills']} 笔，金额 {trades['notional']:.2f} 美元，已记录费用 {trades['fees']:.2f} 美元"
@@ -1114,9 +1242,11 @@ def weekly_document(root, sequence):
                      f"其中不完整 {sum(i['status'] == 'partial' for i in usable)} 天）")
     else:
         lines.append(NO_DATA)
-    card = next((body for kind, body in reversed(related) if kind == "scorecard"), None)
+    card = _review_scorecard(packet, related)
     lines += ["", "## 四、预测与研究想法打分【统计推断】", ""]
-    if card:
+    if card and card.get("unavailable"):
+        lines.append(f"- 记分卡不可用：{card['unavailable']}；不能据此判定没有样本。")
+    elif card and card.get("predictions") is not None:
         predictions = card.get("predictions") or {}
         lines.append(f"- 复盘预测：共 {predictions.get('total', 0)} 条，已打分 {predictions.get('scored', 0)}，"
                      f"命中率 {_percent(predictions.get('hit_rate'))}")
@@ -1129,6 +1259,8 @@ def weekly_document(root, sequence):
                              f"平均把握 {_percent(value['mean_confidence'])}")
     else:
         lines.append(NO_DATA)
+    lines.append("- 单日观察和事后复盘仍是待验证假设；最低样本数不代表统计显著，"
+                 "同一行情或重叠持有期的多条预测不能当成独立样本。")
     consistency = (card or {}).get("consistency")
     if consistency and consistency.get("moves"):
         lines.append(f"- 决策反复：最近 {consistency['decisions']} 次有效决策中，目标调整 {consistency['moves']} 次，"

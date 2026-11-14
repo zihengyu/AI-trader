@@ -1050,6 +1050,38 @@ Ledger values and source evidence must not be altered to hide a query error.
 Query failures remain visible so the agent can correct and verify its work;
 these instructions neither rewrite SQL nor guarantee error-free model queries.
 
+Autonomous Fund Reports Missing the Latest Review or Scorecard
+--------------------------------------------------------------------------
+
+A review records its completion clock before writing its journal event. Weekly
+reports include the exact selected review by sequence even when that write is
+slightly later; other future reviews, prices and costs remain excluded. New
+reviews atomically retain the scorecard actually supplied to their saved
+research stage, including after a manager retry. Legacy reports can recover a
+card from saved research with matching session, input time, model and answer
+without rewriting the ledger. Legacy session projections remain readable;
+unavailable or absent results do not imply zero samples.
+
+Daily returns retain their frozen input window. A separate account observation
+shows the latest recorded values through the report cutoff and distinguishes
+ordinary marks from closing valuations. Cash already contains system cash
+equivalents: free cash subtracts them once. Code-calculated allocations are
+separate from unverified model prose. Repetitive news details are bounded to
+the latest 20, while protective triggers and the full journal are retained.
+
+Weekly excess returns also show known model costs divided by starting equity.
+Unknown model costs make this an upper bound; data costs belong to the complete
+system-cost assessment. Trading fees and slippage already affect account NAV
+and must not be deducted twice. Simulation assumptions are shown only when
+recorded with fills, without inventing historical settings. Such friction can
+put simulated fills outside a raw minute bar's range.
+
+The bounded review context prioritizes accepted plans and execution evidence
+over routine observations and reports omitted counts. Review instructions ask
+for prospective validation periods, benchmarks, costs and invalidation rules.
+A few examples or overlapping predictions do not establish independent
+evidence of an investment edge; prompts alone cannot enforce sound inference.
+
 Evidence References Rejected in an Autonomous Fund Postmarket Review
 --------------------------------------------------------------------------------
 

@@ -297,14 +297,20 @@ def _inputs(rows, session, now):
     evidence += [r for r in rows if r["kind"] == "premarket_research" and
                  str(instant(r["body"]["session_open"]).astimezone(zone).date()) == day]
     evidence.sort(key=lambda row: row["sequence"])
-    # Keep prompts bounded; full source events stay in SQLite. Disclose omissions.
+    # Keep accepted plans and execution evidence ahead of repetitive observations
+    # in the existing prompt budget. Preserve original rows and source times;
+    # the complete ledger remains available through read-only research tools.
+    essential = {"decision_accepted", "decision_validated", "fill", "fill_reconciled", "order_submitted",
+                 "order_observed", "allocation_complete", "operator_approval", FLOW}
     selected, size = [], 0
-    for row in reversed(evidence):
+    ordered = sorted(evidence, key=lambda row: (row["kind"] in essential, row["sequence"]), reverse=True)
+    for row in ordered:
         length = len(encode(row))
         if len(selected) < 120 and size + length <= 120_000:
             selected.append(row)
             size += length
-    selected.reverse()
+    selected.sort(key=lambda row: row["sequence"])
+    selected_sequences = {row["sequence"] for row in selected}
     return {**session, "input_as_of": now.isoformat(),
             "counts": dict(Counter(r["kind"] for r in owned)),
             "baseline_account": baseline, "last_observed_account": ending,
@@ -313,6 +319,8 @@ def _inputs(rows, session, now):
             "account_observation_gaps": gaps,
             "benchmark_observed_price_returns": benchmarks,
             "events": selected, "omitted_events": len(evidence) - len(selected),
+            "omitted_event_kinds": dict(Counter(r["kind"] for r in evidence
+                                                if r["sequence"] not in selected_sequences)),
             "limitations": "Observed account marks, not guaranteed closing NAV. Source times are preserved. "
                             "Unrealized PnL is not realized profit. Cumulative broker observations are not additional fills. "
                             "Fees can be unknown; use confirmed execution costs only. Operator subscriptions and redemptions "
@@ -538,6 +546,18 @@ def review_after_close(strategy):
                     "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。")
     manager_prompt += CASH_MANAGEMENT_GUIDANCE
+    manager_prompt += (
+        "账户比例以 session 的冻结账户数值为准：cash 包含系统现金等价物，不能再把两者相加；"
+        "风险证券=equity-cash-receivables，自由现金=cash-cash_equivalent_value，"
+        "与系统现金等价物、应收合计应为净值。缺项时说明，不能编造收盘值。"
+        "检查成交事件记录的 execution_assumptions；模拟价差和滑点可能使成交价超出原始分钟高低价，"
+        "不能仅据此断言成交错误，也不能据模拟成交推断真实券商可成交。"
+        "单日涨跌只能形成观察，不能证明一种筛选规则、价位或事件过滤有效；"
+        "多个标的受同一行情影响、重叠持有期或同一信号产生的预测不等于独立样本。"
+        "新设或修改的规则保持待验证，提前写明样本外验证期限、比较基准、扣费口径和失效条件；"
+        "不能用固定几个成功案例或次日表现宣称规律已验证。"
+        "比较收益时区分账户收益、扣已知模型费后收益和包含数据费用的系统净收益，"
+        "交易费用已计入账户净值，不重复扣除；未知费用不按零计算。")
     for attempt in range(2):
         now = instant(strategy.get_datetime())
         context = {**context, "as_of": now.isoformat()}
@@ -580,6 +600,12 @@ def review_after_close(strategy):
               "evidence_catalog": catalog, "reference_correction_attempts": attempt,
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
+    # The monitor can render immediately after this commit, before projections
+    # below are written. Bind the exact research input, including on manager
+    # retries that reuse a previously completed research stage.
+    scorecards = saved["context"].get("scorecards")
+    if scorecards is not None:
+        packet["scorecard"] = scorecards
     _save_once(strategy.journal, strategy.get_datetime(), "postmarket_review", packet)
     if hasattr(strategy, "_call_outcome"):
         strategy._call_outcome(predictions=len(review.get("predictions") or []),
