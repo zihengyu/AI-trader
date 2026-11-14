@@ -833,9 +833,15 @@ def readable(kind, details, sequence=None, *, now=None):
         if details.get("missing_latest"):
             parts.append("Yahoo 缺少 Alpaca 已提供的最新交易日日线，未补写行情："
                          + "、".join(f"{s} {day}" for s, day in details["missing_latest"].items()))
+        if details.get("recovered"):
+            parts.append("重新核对后日线一致：" + "、".join(details["recovered"]))
         for item in details.get("examples") or []:
+            basis = ("参考复权 " + item["reference_adjustment"] if item.get("reference_adjustment")
+                     else "原记录未保存参考复权口径")
             parts.append(f"例：{item['symbol']} {item['date']} Yahoo {item['primary']:.2f}，"
-                         f"Alpaca {item['reference']:.2f}（差 {item['difference'] * 100:+.1f}%）")
+                         f"Alpaca {item['reference']:.2f}（差 {item['difference'] * 100:+.1f}%；{basis}）")
+        if details.get("examples"):
+            parts.append("以上为同一历史日两源价格之差，不是当日涨跌幅。")
         if details.get("unavailable"):
             parts.append(f"第二数据源（Alpaca）暂时连不上（{details['unavailable']}），部分日线未经核对就使用了。")
         actions = details.get("corporate_actions") or {}
@@ -848,8 +854,10 @@ def readable(kind, details, sequence=None, *, now=None):
         if unconfirmed_examples:
             parts.append(f"{sum(unconfirmed.values())} 条公司行动待核对。")
             for item in unconfirmed_examples:
-                kind = {"split": "拆股", "dividend": "现金分红"}.get(item["kind"], item["kind"])
-                if item.get("reason") == "one_source_only":
+                kind = {"split": "拆股", "dividend": "现金分红", "spin_off": "公司分拆"}.get(item["kind"], item["kind"])
+                if item.get("reason") == "spin_off_price_basis":
+                    reason = "Alpaca 返回分拆证据；派发比例不是价格调整系数，股数及成本分配尚未核实"
+                elif item.get("reason") == "one_source_only":
                     missing = "Yahoo" if item.get("yahoo") is None else "Alpaca"
                     reason = f"{missing} 缺少同日记录"
                 elif item.get("reason") == "currency_not_comparable":
@@ -866,7 +874,7 @@ def readable(kind, details, sequence=None, *, now=None):
         if actions.get("unavailable"):
             parts.append(f"{actions['unavailable']} 个证券的公司行动核对暂不可用。")
         text = "ℹ️ 日线数据交叉核对（Yahoo 对照 Alpaca）：\n" + "\n".join(f"- {p}" for p in parts)
-        text += "\n数据台会重新核对。持续出现时，按标的和日期查发行方公告或数据源记录。"
+        text += "\n待核对不等于已发生错账，单源缺失可能包括提供方延迟。数据台会重新核对。持续出现时，按标的和日期查发行方公告或数据源记录。"
     elif kind == "market_out_of_history" and isinstance(details, dict):
         labels = {"benchmark_vol_20d": "基准近 20 日波动率（年化）", "benchmark_return_1d": "基准单日涨跌",
                   "benchmark_drawdown": "基准从高点回撤", "stock_mean_correlation_20d": "股票之间近 20 日平均相关性"}

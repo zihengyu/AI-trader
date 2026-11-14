@@ -86,6 +86,12 @@ AGENT_RUN_TIMEOUTS = {"researcher": 420, "critic": 300, "manager": 300}
 AGENT_RUN_ATTEMPTS = 2  # The fund CLI's default for LUMIBOT_AGENT_MAX_RUN_ATTEMPTS.
 MONITOR_AGENT_SECONDS = 900
 
+SQL_FORWARD_AGGREGATE_EXAMPLE = (
+    "SELECT COUNT(*) AS rows_total, COUNT(excess_return) AS n_valid, "
+    "AVG(excess_return) AS mean_excess, AVG(CAST(excess_return > 0 AS DOUBLE)) AS hit_rate "
+    "FROM forward_returns"
+)
+
 SQL_RESEARCH_PROMPT = (
     " For DuckDB research, inspect SHOW TABLES and DESCRIBE the loaded table before assuming column names; "
     "use the actual returned schema, not field names inferred from similarly named context sections. "
@@ -103,6 +109,23 @@ SQL_RESEARCH_PROMPT = (
     "in an outer query over per-symbol results, never nest aggregate calls. Compare durations using "
     "date_diff('second', earlier_timestamp, later_timestamp), not INTERVAL against an integer. "
     "After a query error, use its feedback to correct the SQL and inspect a successful result before citing it. "
+    "For forward-return base rates, align symbol and benchmark on the same dated session grid; calculate "
+    "LEAD endpoints before filtering the signal, so horizons count trading sessions rather than later signal hits. "
+    "Require valid start and end prices for both legs at the exact horizon. Missing endpoints remain NULL, "
+    "never zero returns or losses. Show raw row count and non-NULL outcome count separately for each horizon "
+    "and condition; AVG and the win-rate denominator must use the same valid outcomes. A generic aggregate "
+    "example (adapt its table/column names after inspecting the real schema) is: "
+    + SQL_FORWARD_AGGREGATE_EXAMPLE + "; NULL excess_return is excluded from both averages and n_valid. "
+    "With only N input sessions and no later data, an h-session forward outcome has at most N-h observations, "
+    "before warm-up and other exclusions. Report overlapping windows and independent/non-overlapping counts "
+    "separately; small or repeatedly mined samples are exploratory, not proven positive or negative edge. "
+    "For yields, inversion means the shorter yield EXCEEDS the longer yield; a long-minus-short spread is "
+    "negative when inverted. Use macro.regime.yield_curve_comparisons when supplied. Compare observations "
+    "from the same source and date; never combine today's intraday proxy and an older official yield into "
+    "a supposedly simultaneous curve. Name the tenors, source, observation times and percentage-point units. "
+    "When a scheduled macro release matters, verify its own date, timezone and published result with the "
+    "official agency using research tools as needed. Separate different releases; a news-desk delay or missing "
+    "headline does not prove an official release is unpublished. Continue research and disclose unresolved facts. "
     "If ledger_audit or current_ledger_audit reports failed reconciliation, account balances and fills are "
     "disputed evidence: disclose the failure and research freely without claiming them as verified facts. "
     "Partial audits name missing historical evidence; do not invent fees, arrival quotes or slippage, "
@@ -3767,9 +3790,10 @@ class AutonomousFund(Strategy):
             self._quality_noted_day, self._quality_noted = day, {}
         noted = self._quality_noted
         store = getattr(self, "daily_store", None)
+        previous = store.get(day, f"quality/{symbol}") if store is not None else None
         paused = getattr(self, "_quality_paused_until", None)
         if paused is not None and monotonic() < paused:
-            verdict = cached_verdict(store, day, symbol, rows, cutoff)
+            verdict = cached_verdict(store, day, symbol, rows, cutoff, reference=reference, keep_previous_rejection=True)
             if verdict is None:
                 return rows, None, paused
         else:
@@ -3781,16 +3805,22 @@ class AutonomousFund(Strategy):
                     self.journal.event(now, "bar_quality_unavailable", {"error": type(exc).__name__,
                                                                         "retry_seconds": QUALITY_PAUSE_SECONDS})
                     noted[None] = True
-                return rows, None, self._quality_paused_until
+                verdict = cached_verdict(store, day, symbol, rows, cutoff, reference=reference, keep_previous_rejection=True)
+                if verdict is None:
+                    return rows, None, self._quality_paused_until
         missing_latest = verdict.get("missing_latest")
         issue = (verdict["status"], tuple(verdict.get("disputed") or ()), missing_latest)
-        if (verdict["status"] in PROBLEMS or missing_latest) and noted.get(symbol) != issue:
+        recovered = (verdict["status"] == "agree" and
+                     ((previous or {}).get("status") in PROBLEMS or
+                      (noted.get(symbol) or (None,))[0] in PROBLEMS))
+        if (verdict["status"] in PROBLEMS or missing_latest or recovered) and noted.get(symbol) != issue:
             self.journal.event(now, "bar_quality", {
                 "symbol": symbol, "status": verdict["status"], "compared": verdict.get("compared"),
                 "disputed_count": len(verdict.get("disputed") or ()), "latest": verdict.get("latest"),
                 "largest": verdict.get("largest"), "missing_count": verdict.get("missing_count"),
                 "missing_latest": missing_latest,
-                "feed": verdict.get("feed")})
+                "feed": verdict.get("feed"), "reference_adjustment": verdict.get("reference_adjustment"),
+                "comparison_version": verdict.get("comparison_version")})
             noted[symbol] = issue
         kept = apply(rows, verdict)
         return kept, ("bar_quality_unreliable" if verdict["status"] == "unreliable" else None), None
@@ -3812,6 +3842,22 @@ class AutonomousFund(Strategy):
                 latest[body.get("symbol", "*")] = {"kind": kind, **body}
         from .action_quality import KEY, blocked
         store = getattr(self, "daily_store", None)
+        if store is not None:
+            from .bar_quality import cached_verdict
+            from .market_data import completed_daily_cutoff
+            allowed_cutoff = completed_daily_cutoff(now).isoformat()
+            # The separate desk can publish a corrected verdict before this
+            # process sees it. Do not keep announcing an older failed verdict.
+            for symbol, old in list(latest.items()):
+                saved = store.get(day, f"quality/{symbol}") if symbol != "*" else None
+                cutoff = (saved or {}).get("cutoff")
+                if old.get("status") not in {"unreliable", "disputed_sessions"} or not cutoff or cutoff > allowed_cutoff:
+                    continue
+                primary = store.bars(day, symbol, 1, cutoff=cutoff)
+                current = cached_verdict(store, day, symbol, primary, cutoff,
+                                         reference=getattr(self, "history_fallback", None)) if primary else None
+                if current and current.get("status") == "agree":
+                    latest[symbol] = {"kind": "bar_quality", **current}
         actions = (store.get(day, KEY) or {}) if store is not None and self.mode == "local" else {}
         action_disputed = blocked(actions)
         action_unconfirmed = {s: len(row["unconfirmed"]) for s, row in actions.items() if row.get("unconfirmed")}
@@ -3819,20 +3865,22 @@ class AutonomousFund(Strategy):
         if not (latest or action_disputed or action_unconfirmed or action_unavailable):
             return None
         details = {"withheld": sorted(action_disputed | {s for s, b in latest.items() if b.get("status") == "unreliable"}),
+                   "recovered": sorted(s for s, b in latest.items() if b.get("status") == "agree"),
                    "disputed": {s: b["disputed_count"] for s, b in sorted(latest.items())
                                 if b.get("status") == "disputed_sessions"},
                    "missing_latest": {s: b["missing_latest"] for s, b in sorted(latest.items())
                                       if b.get("missing_latest")},
-                   "examples": [{"symbol": s, **b["largest"][0]} for s, b in sorted(latest.items())
+                   "examples": [{"symbol": s, "reference_adjustment": b.get("reference_adjustment"),
+                                 **b["largest"][0]} for s, b in sorted(latest.items())
                                 if b.get("largest")][:5],
                    "unavailable": latest.get("*", {}).get("error"),
                    "corporate_actions": {"examples": [{"symbol": s, **item} for s in sorted(action_disputed)
                                                       for item in actions[s]["discrepancies"]][:8],
                                           "unconfirmed": action_unconfirmed,
-                                          "unconfirmed_examples": [
+                                          "unconfirmed_examples": sorted([
                                               {"symbol": s, **item} for s in sorted(action_unconfirmed)
                                               for item in actions[s]["unconfirmed"]
-                                          ][:20], "unavailable": action_unavailable}}
+                                          ], key=lambda r: r["date"], reverse=True)[:20], "unavailable": action_unavailable}}
         self._notify_fund("bar_quality_issues", details)
         self.journal.set_meta("bar_quality_notified", day)
         return details
@@ -3851,6 +3899,7 @@ class AutonomousFund(Strategy):
             try:
                 rows = fallback.bars(symbol, length, cutoff)
                 self.journal.event(now, "risk_history_fallback", {"symbol": symbol, "source": "alpaca",
+                                                                  "reference_adjustment": getattr(fallback, "adjustment", None),
                                                                   "feed": fallback.feed, "yahoo_error": error})
                 return rows, None, True
             except Exception as exc:

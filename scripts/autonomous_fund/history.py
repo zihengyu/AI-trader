@@ -3,9 +3,9 @@
 Yahoo is unofficial and can rate-limit or block a server; then the risk engine
 treats a name as having no history and refuses to add to it. When Alpaca keys
 are present (free paper keys suffice), local mode fetches the same completed
-daily bars from Alpaca's historical API instead, split-adjusted like the Yahoo
-closes the fund uses (`adjustment=split`). It serves risk estimation and the
-factor lab only: the local virtual broker still matches orders and books
+daily bars from Alpaca's historical API instead, adjusted for splits and
+spin-offs, excluding cash dividends, for comparison with Yahoo Close. It serves
+risk estimation and the factor lab only: the local virtual broker still matches orders and books
 dividends and splits from its own feed. The consolidated (SIP) feed is asked
 first; an account without it falls back to IEX bars, and the source is recorded.
 """
@@ -18,6 +18,7 @@ from .risk import RiskError, instant, number
 URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
 ACTIONS_URL = "https://data.alpaca.markets/v1/corporate-actions"
 ZONE = ZoneInfo("America/New_York")
+PRICE_ADJUSTMENT = "split,spin-off"
 
 
 class NoDailyBars(RiskError):
@@ -49,7 +50,22 @@ def _cash_dividend(action):
     }}
 
 
+def _spin_off(action):
+    try:
+        old, new = number(action["source_rate"]), number(action["new_rate"])
+        child = action.get("new_symbol")
+        if old <= 0 or new <= 0 or not isinstance(child, str) or not child.strip():
+            raise RiskError("Invalid distribution")
+        return {"spin_off": {"new_symbol": child, "source_rate": str(old), "new_rate": str(new)}}
+    except (RiskError, KeyError, TypeError, ValueError):
+        # Do not discard the other symbols in this multi-symbol response. The
+        # action-quality consumer marks only this parent's observations unavailable.
+        return {"action_error": "invalid_spin_off_distribution"}
+
+
 class AlpacaDailyHistory:
+    adjustment = PRICE_ADJUSTMENT
+
     def __init__(self, key, secret, get=None):
         import requests
         if not key or not secret:
@@ -76,7 +92,7 @@ class AlpacaDailyHistory:
     def bars(self, symbol, length, today):
         """[(date, close, volume, open, high, low)] for completed sessions before `today`, oldest first."""
         today = today if isinstance(today, date) else date.fromisoformat(str(today)[:10])
-        params = {"timeframe": "1Day", "adjustment": "split", "limit": 10000, "feed": self.feed,
+        params = {"timeframe": "1Day", "adjustment": self.adjustment, "limit": 10000, "feed": self.feed,
                   "start": (today - timedelta(days=int(length * 1.5) + 10)).isoformat(),
                   # Include the whole last eligible session, rather than stopping at UTC midnight.
                   "end": datetime.combine(today, time.min, ZONE).isoformat()}
@@ -101,13 +117,14 @@ class AlpacaDailyHistory:
         return sorted(rows)[-length:]
 
     def corporate_actions(self, symbols, start, end):
-        """Split and cash-dividend observations by ex-date, including unresolved currency evidence."""
+        """Split, cash-dividend and spin-off observations; distribution ratios are not price factors."""
         symbols = sorted(set(symbols))
-        kinds = {"forward_splits": "split", "reverse_splits": "split", "cash_dividends": "dividend"}
+        kinds = {"forward_splits": "split", "reverse_splits": "split", "cash_dividends": "dividend",
+                 "spin_offs": "spin_off"}
         result = {symbol: [] for symbol in symbols}
         for offset in range(0, len(symbols), 50):
             batch = set(symbols[offset:offset + 50])
-            params = {"symbols": ",".join(sorted(batch)), "types": "forward_split,reverse_split,cash_dividend",
+            params = {"symbols": ",".join(sorted(batch)), "types": "forward_split,reverse_split,cash_dividend,spin_off",
                       "start": str(start), "end": str(end), "limit": 1000}
             seen = set()
             for _ in range(10):
@@ -119,13 +136,15 @@ class AlpacaDailyHistory:
                     raise RiskError("Invalid Alpaca corporate action response")
                 for name, kind in kinds.items():
                     for action in groups.get(name) or []:
-                        symbol = action.get("symbol")
+                        symbol = action.get("source_symbol") if kind == "spin_off" else action.get("symbol")
                         if symbol not in batch:
                             continue
                         day = date.fromisoformat(action["ex_date"])
                         if not start <= day <= end:
                             continue
-                        if kind == "split":
+                        if kind == "spin_off":
+                            values = _spin_off(action)
+                        elif kind == "split":
                             old = number(action["old_rate"])
                             if old <= 0:
                                 raise RiskError("Invalid Alpaca split ratio")

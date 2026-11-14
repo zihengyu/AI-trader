@@ -99,12 +99,26 @@ def regime(series):
         return (series.get(name) or {}).get(key)
     curve, spread, change, vix = value("T10Y2Y"), value("BAMLH0A0HYM2"), value("BAMLH0A0HYM2", "change_20_obs"), \
         value("VIXCLS")
+    comparisons = {}
+    for short, long in (("DGS3MO", "DGS2"), ("DGS2", "DGS10"), ("DGS3MO", "DGS10")):
+        a, b = series.get(short) or {}, series.get(long) or {}
+        if (a.get("latest") is None or b.get("latest") is None or not a.get("date") or a.get("date") != b.get("date")):
+            comparisons[f"{long}_minus_{short}"] = {"unavailable": "requires both yields on the same observation date"}
+        else:
+            difference = round(b["latest"] - a["latest"], 4)
+            comparisons[f"{long}_minus_{short}"] = {
+                "short_series": short, "long_series": long, "date": a["date"],
+                "short_yield_pct": a["latest"], "long_yield_pct": b["latest"],
+                "spread_percentage_points": difference, "inverted": difference < 0}
     return {
         "curve_inverted": None if curve is None else curve < 0,
         "credit_stress": None if spread is None else bool(spread >= 6 or (change is not None and change >= 1)),
         "volatility_elevated": None if vix is None else vix >= 25,
         "cash_yield_pct": value("DGS3MO"),
-        "meaning": "curve_inverted: 10y-2y < 0; credit_stress: high-yield spread >= 6 points or up >= 1 point over "
+        "yield_curve_comparisons": comparisons,
+        "meaning": "yield_curve_comparisons use same-date FRED yields, long minus short in percentage points; "
+                   "negative means inverted, mismatched dates remain unavailable. "
+                   "curve_inverted: 10y-2y < 0; credit_stress: high-yield spread >= 6 points or up >= 1 point over "
                    "20 observations; volatility_elevated: VIX >= 25. Context for the AI, not orders.",
     }
 

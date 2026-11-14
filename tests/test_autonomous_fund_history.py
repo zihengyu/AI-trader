@@ -37,7 +37,9 @@ def test_pages_are_joined_today_is_excluded_and_sip_falls_back_to_iex():
     rows = history.bars("ALFA", 10, date(2026, 11, 2))
     assert [(r[0].isoformat(), r[1]) for r in rows] == [("2026-10-29", 100.0), ("2026-10-30", 101.0)]
     assert rows[0][3:] == (99.0, 101.0, 98.0) and history.feed == "iex"
-    assert all(p["adjustment"] == "split" for p in seen)  # Same adjustment as the Yahoo closes.
+    # Contract correction: split-only prices omit spin-off restatements; cash
+    # dividends remain excluded because the book accounts for them separately.
+    assert all(p["adjustment"] == "split,spin-off" for p in seen)
 
 
 def test_no_bars_is_an_error_not_an_empty_history():

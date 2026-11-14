@@ -1094,6 +1094,26 @@ Ledger values and source evidence must not be altered to hide a query error.
 Query failures remain visible so the agent can correct and verify its work;
 these instructions neither rewrite SQL nor guarantee error-free model queries.
 
+Forward-return queries calculate aligned symbol/benchmark endpoints before
+filtering a signal. They report raw rows and non-NULL outcome counts separately
+for every horizon; averages and win rates use the same valid outcomes. Missing
+future endpoints remain NULL, never zero returns or losses. Overlapping and
+small mined samples remain exploratory. A tested aggregate example accompanies
+the role prompts. Macro comparisons use same-date FRED yields, long minus
+short in percentage points; negative means inverted. Exact release dates,
+times and results need the issuing agency, since a missing desk headline does
+not establish that the release is unpublished.
+
+The optional fund's Alpaca reference and fallback histories request
+``adjustment=split,spin-off``, excluding cash dividends. Old split-only
+comparison caches are recomputed without deleting shared caches; matching
+previous rejections survive a reference outage. Corporate-action checks span
+the requested and cached history instead of only 120 days. Spin-off parent,
+child and distribution ratios are evidence, not price factors or automatic
+share/cost-basis postings. Ambiguous share bases remain unconfirmed; unrelated
+split contradictions and genuine price mismatches keep their existing checks.
+Reported cross-source historical price differences are not daily returns.
+
 Autonomous Fund Reports Missing the Latest Review or Scorecard
 --------------------------------------------------------------------------
 

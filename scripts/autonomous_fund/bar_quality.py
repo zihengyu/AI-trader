@@ -3,7 +3,8 @@
 Yahoo is free and unofficial: a bad print, a missed split or a missing session
 would flow into risk estimates, factor tests, scorecards and the universe
 snapshot. When Alpaca keys are present (local mode), each symbol's completed
-daily closes are compared once per day with Alpaca's split-adjusted bars.
+daily closes are compared once per day with Alpaca's split/spin-off-adjusted
+bars. Cash-dividend adjustment is excluded on both sides.
 
 Neither source is assumed right when they disagree:
 
@@ -29,6 +30,7 @@ UNRELIABLE_SHARE = 0.05   # Disputed share of compared sessions that withholds t
 MIN_UNRELIABLE = 5        # ...but never fewer disputed sessions than this.
 MIN_OVERLAP = 20          # Sessions in common before a comparison means anything.
 PROBLEMS = ("disputed_sessions", "unreliable")
+COMPARISON_VERSION = 2  # Earlier verdicts used split-only reference prices.
 
 
 def _closes(rows):
@@ -82,11 +84,14 @@ def apply(rows, verdict):
     return [row for row in rows if str(row[0])[:10] not in disputed] if disputed else rows
 
 
-def cached_verdict(store, day, symbol, rows, cutoff):
+def cached_verdict(store, day, symbol, rows, cutoff, *, reference=None, keep_previous_rejection=False):
     """A verdict belongs to the exact closes and cutoff, even when the service is down."""
     saved = store.get(day, f"quality/{symbol}") if store is not None else None
     if saved and saved.get("cutoff") == str(cutoff) and saved.get("digest") == digest(rows):
-        return saved
+        current = (saved.get("comparison_version") == COMPARISON_VERSION and
+                   (reference is None or saved.get("reference_adjustment") == getattr(reference, "adjustment", None)))
+        if current or (keep_previous_rejection and saved.get("status") in PROBLEMS):
+            return saved
     return None
 
 
@@ -97,7 +102,7 @@ def check(store, day, symbol, rows, cutoff, reference):
     comparable). A network or service failure propagates, so the caller can pause.
     """
     from .history import NoDailyBars
-    saved = cached_verdict(store, day, symbol, rows, cutoff)
+    saved = cached_verdict(store, day, symbol, rows, cutoff, reference=reference)
     if saved:
         return saved
     try:
@@ -106,7 +111,8 @@ def check(store, day, symbol, rows, cutoff, reference):
     except NoDailyBars as exc:
         verdict = {"status": "no_reference", "reason": str(exc)[:120], "feed": getattr(reference, "feed", None),
                    "compared": 0, "disputed": []}
-    verdict.update(symbol=symbol, digest=digest(rows), cutoff=str(cutoff))
+    verdict.update(symbol=symbol, digest=digest(rows), cutoff=str(cutoff), comparison_version=COMPARISON_VERSION,
+                   reference_adjustment=getattr(reference, "adjustment", None))
     if store is not None:
         try:
             store.put(day, f"quality/{symbol}", verdict)

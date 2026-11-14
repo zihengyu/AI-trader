@@ -834,8 +834,9 @@ class DataDesk:
             "as_of": instant(now).isoformat(), "window_days": CALENDAR_DAYS, "releases": releases,
             "other_releases": other, "fomc_unavailable": unavailable,
             "source": "FRED release calendar (St. Louis Fed); FOMC meetings from federalreserve.gov",
-            "note": "Dates only. Most US data releases come out at 08:30 New York time and FOMC statements at "
-                    "14:00; check the agency's own calendar for the exact time."})
+            "note": "Dates only, not verified publication timestamps. Check each release separately against "
+                    "its issuing agency's calendar and published result for the exact date and time. "
+                    "A missing desk headline does not mean the official release is unpublished."})
         return {"major": len(major), "fomc": len(fomc), "other": other, "fomc_unavailable": unavailable}
 
     def _job_macro(self, now):
