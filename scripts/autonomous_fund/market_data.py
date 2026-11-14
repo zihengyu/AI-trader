@@ -542,6 +542,13 @@ class YahooRealtimeData(DataSource):
         if self.tape is not None:
             # A failed history request must not prevent a new watch from subscribing.
             self.tape.watch([self._symbol(asset)])
+            # A current-minute trade is newer than any possible completed bar.
+            # Return it before history I/O can age this or other symbols' quotes.
+            # Matching still reads its own post-submission completed bars.
+            cutoff = self.get_datetime().replace(second=0, microsecond=0)
+            live = self._live_quote(asset, cutoff, None)
+            if live is not None:
+                return self._remember_quote(asset, live)
         try:
             frame = self.execution_bars(asset)
         except MarketDataUnavailable:
@@ -631,6 +638,11 @@ class YahooRealtimeData(DataSource):
             self._quote_observations.move_to_end(asset.symbol)
             while len(self._quote_observations) > 60:
                 self._quote_observations.popitem(last=False)
+        # Keep this read's source clocks with the quote, not just in the latest
+        # global snapshot (which another consumer may replace before rejection).
+        quote.raw_data["source_clocks"] = {"stream_enabled": self.tape is not None, **{
+            key: detail[key] for key in ("stream_as_of", "stream_age_seconds", "chart_as_of", "chart_age_seconds")
+            if key in detail}}
         return quote
 
     def _chart_quote(self, asset, frame, bar_end):

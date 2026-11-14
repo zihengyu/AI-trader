@@ -713,8 +713,18 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "price_alert_unavailable" and isinstance(details, dict):
         reason = {"Stale, future or nonpositive observation": "报价过期、时间异常或价格无效",
                   "Missing source quote timestamp": "报价缺少源时间戳"}.get(details.get("error"), details.get("error"))
+        reason = {"stale": f"报价超过 {details.get('max_age_seconds', '?')} 秒有效期",
+                  "future": "报价源时间晚于当前检查时间", "nonpositive": "报价为零或负数",
+                  "invalid_price": "报价不是有效数值"}.get(details.get("reason"), reason)
+        if details.get("price_kind") == "completed_minute_close_with_spread_proxy":
+            reason += "，本次仅取得已完成分钟线的回退报价"
         text = (f"⏳ {details.get('symbol', '')} 的价位提醒等待有效报价：{reason}。"
                 "本次跳过该标的提醒检查，后续自动重试。")
+    elif kind == "price_alert_recovered" and isinstance(details, dict):
+        text = (f"✅ {details.get('symbol', '')} 的价位提醒已取得有效报价，恢复检查。"
+                f"此前记录 {details.get('failed_checks', '?')} 次失败检查；"
+                f"当前报价时间：{_when(details.get('source_as_of'))}。"
+                "这不代表期间行情连续可用，也不会补认已经错过的价位触发。")
     elif kind == "closing_valuation_pending":
         text = (f"⏳ 收盘估值等待有效行情：{details}\n后台会继续重试；盘后复盘可使用已有观测，暂不认定收盘净值。"
                 "\n诊断：bash scripts/fund-logs.sh errors")

@@ -21,6 +21,7 @@ explicit non-adoption and unknown adoption; those buckets do not establish ROI.
 from .costs import scripted
 
 PURPOSE_LABELS = {"decision": "决策复核", "shadow": "影子对照", "critique": "反方审查",
+                  "critique_correction": "反方审查格式纠正",
                   "premarket_research": "盘前研究", "research": "研究（回放）", "postmarket_review": "盘后复盘",
                   "triage": "事件判断", "risk_approval": "独立风控审批", "decision_correction": "决策格式纠正", "stability": "稳定性测试", "model_probe": "模型身份核对"}
 PURPOSES = tuple(PURPOSE_LABELS)

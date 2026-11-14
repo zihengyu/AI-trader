@@ -154,8 +154,11 @@ def observed_quote(quote, now, limits):
         # Retain whether a stale observation was a completed-bar proxy or an
         # actual last trade. Never log a full provider payload for diagnostics.
         metadata = getattr(quote, "raw_data", None) or {}
+        clocks = metadata.get("source_clocks") or {}
         exc.diagnostic = {**(exc.diagnostic or {}),
-                          **({"price_kind": metadata["price_kind"]} if metadata.get("price_kind") else {})}
+                          **({"price_kind": metadata["price_kind"]} if metadata.get("price_kind") else {}),
+                          **{key: clocks[key] for key in ("stream_enabled", "stream_as_of", "stream_age_seconds",
+                              "chart_as_of", "chart_age_seconds") if key in clocks}}
         raise
 
 

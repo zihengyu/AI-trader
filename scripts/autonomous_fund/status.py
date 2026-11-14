@@ -130,6 +130,30 @@ def _age(at, now):
         return None
 
 
+def alert_health_lines(db, now):
+    """Last failed observations for active alerts; silence never implies recovery."""
+    row = db.execute("SELECT value FROM meta WHERE key='price_alert_health'").fetchone()
+    if not row:
+        return []
+    saved = json.loads(row[0])
+    active = {row[0] for row in db.execute(
+        "SELECT DISTINCT json_extract(body,'$.symbol') FROM fund_alerts WHERE state='active'")}
+    lines = []
+    for symbol, state in sorted(saved.items()):
+        if symbol not in active:
+            continue
+        detail = state.get("diagnostic") or {}
+        reason = {"stale": "报价过期", "future": "报价源时间超前", "nonpositive": "价格非正数",
+                  "invalid_price": "价格无效", "source_backoff": "数据源冷却中"}.get(detail.get("reason"), "报价不可用")
+        elapsed = _age(state.get("last_failed_at"), now)
+        ago = f"{int(elapsed)} 秒前" if elapsed is not None and elapsed >= 0 else "时间异常"
+        age = detail.get("age_seconds")
+        age_text = f"；该次报价落后 {age:.1f} 秒" if isinstance(age, (int, float)) and age >= 0 else ""
+        lines.append(f"价位提醒 {symbol}：{reason}，已记录 {state.get('failed_checks', '?')} 次失败检查"
+                     f"（最近 {ago}{age_text}）；尚未记录有效报价恢复，不代表期间持续失败。")
+    return lines
+
+
 def _read(path):
     try:
         body = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -463,6 +487,10 @@ def summary(root, mode, now=None):
             lines.append(day_trade_line(db, now))
         except Exception as exc:
             lines.append(f"日内交易计数：暂不可用（{type(exc).__name__}）")
+        try:
+            lines += alert_health_lines(db, now)
+        except Exception as exc:
+            lines.append(f"价位提醒：状态暂不可用（{type(exc).__name__}）")
         try:
             line = triage_line(db, now)
             if line:

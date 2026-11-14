@@ -896,6 +896,24 @@ and reason alongside each deduplicated alert notice. The errors log command
 includes these INFO-level failures. A fallback cannot supply fresh evidence
 when every real source is stale; freshness checks remain enforced.
 
+A qualified current-minute stream trade is newer than every possible completed
+minute bar, so it returns before history I/O. Older-minute trades still follow
+the history comparison path. No minute volume or matching bar is manufactured;
+simulated fills still read actual post-submission completed bars independently.
+
+Active price alerts persist failed-check counts and first/latest failure times
+in account-local ``price_alert_health`` metadata, independently of notice dedupe.
+The next valid observation atomically queues ``price_alert_recovered`` and clears
+that outage, including after a restart. A valid mark need not cross the alert
+level to establish recovery. Removed alerts are pruned without claiming recovery.
+``fund-logs.sh status`` shows pending evidence for active watches; ``errors``
+includes recovery notices. These are discrete observations, not continuous
+outage/coverage measurements, and no missed price crossing is reconstructed.
+Checks made before this tracking existed are not retrospectively counted.
+Each rejected local quote also retains its own stream-enabled flag and
+stream/chart source clocks, so another consumer's later quote cannot replace
+that rejection's evidence. Raw provider payloads are not logged.
+
 A missing final completed minute is disclosed as
 ``closing_valuation_pending`` and retried by background valuation. Read-only
 review can proceed without claiming a closing NAV. Other closing account or
@@ -1073,6 +1091,14 @@ manager and postmarket-research correction paths still apply. A format warning
 alone does not establish that the round failed: inspect subsequent correction,
 accepted-decision or backoff events.
 
+In local/paper mode, a critic JSON/schema failure also permits one correction,
+within STOP, daily call/cost limits and the reserved postmarket budget, while
+leaving room for the manager's next call. Both attempts retain their exact
+call IDs, usage and explicit validity outcomes; only a valid corrected answer
+can enter the critique cache. Provider failures, missing answers and historical
+runs keep their existing single-attempt behavior. A failed optional critique
+still leaves the manager available. This does not guarantee model compliance.
+
 The autonomous fund keeps the native ``Strategy.notify`` and ``notify_user``
 contracts. Its ``fund_outbox`` provider queues AI notices durably for the selected
 account's monitor, while native disabled/backtest behavior and other configured
@@ -1093,6 +1119,18 @@ See `DuckDB numeric types <https://duckdb.org/docs/current/sql/data_types/numeri
 Ledger values and source evidence must not be altered to hide a query error.
 Query failures remain visible so the agent can correct and verify its work;
 these instructions neither rewrite SQL nor guarantee error-free model queries.
+The prompt supplies an operand-casting example for approximate notional
+research. After adapting names to the actual table schema, use:
+
+.. code-block:: sql
+
+   SELECT CAST(price AS DOUBLE) * CAST(quantity AS DOUBLE) AS notional
+   FROM holdings;
+
+Casting only ``price * quantity`` after multiplication does not prevent an
+intermediate decimal overflow. After a missing-column error, inspect the table
+or CTE's actual output instead of guessing context names. Each call needs a
+complete SQL statement, including its CTE definitions.
 
 Forward-return queries calculate aligned symbol/benchmark endpoints before
 filtering a signal. They report raw rows and non-NULL outcome counts separately

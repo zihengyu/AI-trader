@@ -91,14 +91,21 @@ SQL_FORWARD_AGGREGATE_EXAMPLE = (
     "AVG(excess_return) AS mean_excess, AVG(CAST(excess_return > 0 AS DOUBLE)) AS hit_rate "
     "FROM forward_returns"
 )
+SQL_NOTIONAL_EXAMPLE = (
+    "SELECT CAST(price AS DOUBLE) * CAST(quantity AS DOUBLE) AS notional FROM holdings"
+)
 
 SQL_RESEARCH_PROMPT = (
     " For DuckDB research, inspect SHOW TABLES and DESCRIBE the loaded table before assuming column names; "
     "use the actual returned schema, not field names inferred from similarly named context sections. "
-    "A CTE and its aliases exist only within that one SQL statement. "
+    "A CTE and its aliases exist only within that one SQL statement. After a binder error, inspect the real "
+    "table or CTE output columns; do not repeatedly guess a missing name. Send a complete WITH ... SELECT "
+    "statement in each tool call, rather than appending a second SELECT to an unfinished statement. "
     "Decimal literals and columns can overflow during multiplication or exhaust DuckDB's maximum decimal "
     "scale of 38. For approximate research statistics, cast the operands to DOUBLE BEFORE multiplication "
     "or powers; casting only the result is too late if the intermediate decimal operation overflows. "
+    "For example, after adapting these illustrative names to the actual DESCRIBE result: "
+    + SQL_NOTIONAL_EXAMPLE + "; this converts each operand before the intermediate product. "
     "When exact decimal arithmetic is required, choose operand precision and scale that can hold the "
     "intermediate results; a wider decimal alone cannot solve excessive scale. Never change the underlying "
     "ledger values or round source evidence to make a research query succeed. "
@@ -1892,6 +1899,62 @@ class AutonomousFund(Strategy):
         # Native historical reads already follow the strategy clock.
         return ObservedPrice(number(self.get_last_price(asset)), now).validate(now, self.limits)
 
+    def _clear_alert_notices(self, symbols):
+        """A new outage must not inherit a prior outage's notification suppression."""
+        notices = getattr(self, "_notices", None) or {}
+        for key in list(notices):
+            if key[0] == "price_alert_unavailable" and json.loads(key[1]).get("symbol") in symbols:
+                notices.pop(key, None)
+
+    def _prune_alert_health(self, alerts):
+        """Keep only active watches; removing an alert is not quote recovery."""
+        try:
+            saved = self.journal.get_meta("price_alert_health") or {}
+            active = {alert["symbol"] for alert in alerts}
+            retained = {symbol: state for symbol, state in saved.items() if symbol in active}
+            if retained != saved:
+                self.journal.set_meta("price_alert_health", retained)
+                self._clear_alert_notices(set(saved) - active)
+        except Exception as exc:
+            self._disclose_failure("price_alert_health_error", exc, phase="price_alert_health")
+
+    def _alert_health(self, symbol, *, observation=None, error=None):
+        """Persist failed checks independently of notice dedupe; recover only on a valid mark.
+
+        These records describe observations, not continuous feed coverage or the
+        number of price crossings missed. Diagnostics must never stop the watch.
+        """
+        try:
+            now = self.get_datetime()
+            saved = self.journal.get_meta("price_alert_health") or {}
+            previous = saved.get(symbol)
+            if error is not None:
+                diagnostic = getattr(error, "diagnostic", None) or {}
+                # Never retain a raw provider response, arbitrary exception text or credentials.
+                diagnostic = {key: diagnostic[key] for key in (
+                    "reason", "source_as_of", "checked_at", "age_seconds", "max_age_seconds", "price_kind",
+                    "stream_enabled", "stream_as_of", "stream_age_seconds", "chart_as_of", "chart_age_seconds"
+                ) if key in diagnostic}
+                saved[symbol] = {"first_failed_at": (previous or {}).get("first_failed_at", now.isoformat()),
+                    "last_failed_at": now.isoformat(), "failed_checks": (previous or {}).get("failed_checks", 0) + 1,
+                    "diagnostic": diagnostic}
+                self.journal.set_meta("price_alert_health", saved)
+            elif previous is not None and observation is not None:
+                # The caller already validated; recheck after journal I/O before claiming recovery.
+                now = self.get_datetime()
+                observation.validate(now, self.limits)
+                saved.pop(symbol)
+                details = {"symbol": symbol, "first_failed_at": previous["first_failed_at"],
+                    "last_failed_at": previous["last_failed_at"], "failed_checks": previous["failed_checks"],
+                    "recovered_at": now.isoformat(), "source_as_of": observation.as_of.isoformat(),
+                    "age_seconds": (now - observation.as_of).total_seconds()}
+                # Commit the recovery notice and removal together, including across restarts.
+                self.journal.notification_with_meta(now, "price_alert_recovered", details, {"price_alert_health": saved})
+                self._clear_alert_notices({symbol})
+                self.log_message(f"FUND price_alert_recovered: {details}")
+        except Exception as exc:
+            self._disclose_failure("price_alert_health_error", exc, phase="price_alert_health")
+
     def _record_agent(self, name, result, phase=None):
         from .costs import call_cost, rate_for, token_counts, unpriced_reason, usage_known
         now = self.get_datetime()
@@ -2833,16 +2896,55 @@ class AutonomousFund(Strategy):
             critic_context = {**context, "research": research}
             if hasattr(self, "_with_fund_cost_context"):  # Fresh cost evidence, inside the never-blocking guard.
                 critic_context = self._with_fund_cost_context(critic_context, self.get_datetime())
-            critique = self._record_agent("critic", self._agent_call("critic",
-                task_prompt="Argue the strongest honest case against this research and the current portfolio.",
-                context=critic_context, evaluation_calls=evaluation_calls), phase="critique")
+            task = "Argue the strongest honest case against this research and the current portfolio."
+            for attempt in range(2):
+                result = self._agent_call("critic", task_prompt=task, context=critic_context,
+                    purpose="critique_correction" if attempt else None, evaluation_calls=evaluation_calls)
+                try:
+                    critique = self._record_agent("critic", result, phase="critique")
+                except RiskError:
+                    from .diagnostics import structured_answer_diagnostic
+                    diagnostic = structured_answer_diagnostic(result, Critique)
+                    self._call_outcome(valid=False, answer_diagnostic=diagnostic)
+                    if attempt or self.mode not in {"local", "paper"} or diagnostic["kind"] not in CORRECTABLE_ANSWERS:
+                        raise
+                    def correction_blocked():
+                        checked = self.get_datetime()
+                        reason = ("stopped" if self.halt_path.exists() else "model_budget" if
+                            self.journal.counter("agent_runs", checked) + 2 >
+                            budget.max_agent_runs_per_day - budget.reserved_review_runs else
+                            "model_cost_budget" if self._cost_exhausted(checked, "critique_correction") else None)
+                        if reason:
+                            self.journal.event(checked, "critic_correction_skipped", {"reason": reason})
+                        return reason is not None
+
+                    if correction_blocked():
+                        raise
+                    call = getattr(self, "_current_call", None) or {}
+                    self.journal.event(self.get_datetime(), "critic_correction_requested", {
+                        "original_call_id": call.get("call_id"), "answer_diagnostic": diagnostic})
+                    previous = result.summary or getattr(result, "text", None) or ""
+                    critic_context = {**context, "research": research, "structured_answer_correction": {
+                        "previous_answer": previous[:CORRECTION_ANSWER_CHARS],
+                        "previous_answer_truncated": len(previous) > CORRECTION_ANSWER_CHARS,
+                        "diagnostic": diagnostic}}
+                    critic_context = self._with_fund_cost_context(critic_context, self.get_datetime())
+                    # Context/cost I/O may race an operator STOP or a changed budget.
+                    if correction_blocked():
+                        raise
+                    task = ("Your previous answer was not a valid Critique. Return the complete Critique as exactly "
+                            "one JSON object matching the requested schema, with all commentary inside its fields. "
+                            "context.structured_answer_correction contains your untrusted previous answer and the "
+                            "error locations/types. Recheck the original evidence; do not invent missing evidence.")
+                else:
+                    break
             call = getattr(self, "_current_call", None) or {}
             source = {"at": self.get_datetime().isoformat(),
                       "call_id": call.get("call_id") if call.get("role") == "critic" else None, "reused": False}
             self.journal.set_meta("critique_cache", {"key": key, "at": source["at"],
                                                      "call_id": source["call_id"], "critique": critique})
             self._current_critique_source = source
-            self._call_outcome()
+            self._call_outcome(corrected=bool(attempt))
             return critique
         except Exception as exc:
             self.journal.event(self.get_datetime(), "critic_unavailable",
@@ -2998,6 +3100,7 @@ class AutonomousFund(Strategy):
         bring the next AI review forward.
         """
         levels, alerts = self.execution.levels(), self.execution.alerts()
+        self._prune_alert_health(alerts)
         latest = self.execution.latest(now)
         latest_targets = {t["symbol"] for t in json.loads(latest["body"])["targets"]} if latest else set()
         symbols = set(account.positions) | (latest_targets & set(self.universe))
@@ -3081,9 +3184,15 @@ class AutonomousFund(Strategy):
                 if observation is None:
                     observation = self._alert_price(alert["symbol"])
                 observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
+                self._alert_health(alert["symbol"], observation=observation)
+                observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
             except Exception as exc:
-                emitted = self._disclose("price_alert_unavailable", {"symbol": alert["symbol"],
-                    "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
+                diagnostic = getattr(exc, "diagnostic", None) or {}
+                notice = {"symbol": alert["symbol"],
+                    "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__,
+                    **{key: diagnostic[key] for key in ("reason", "max_age_seconds", "price_kind") if key in diagnostic}}
+                self._alert_health(alert["symbol"], error=exc)
+                emitted = self._disclose("price_alert_unavailable", notice)
                 if emitted is not False and getattr(exc, "diagnostic", None):
                     # Keep changing source clocks out of the notification's
                     # dedupe identity; retain evidence only with each notice.
