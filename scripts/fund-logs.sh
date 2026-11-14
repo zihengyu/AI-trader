@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Maintenance and logs for the AI paper fund on Ubuntu.
-# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|evidence [CALL_ID]|weekly|experiments|prune [--apply]]
+# Usage: bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|evidence [CALL_ID]|quotes [SYMBOL]|weekly|experiments|prune [--apply]]
 #   status     (default) services, trading/STOP state, monitor, account, latest notices
 #   logs       follow the runner, monitor and data desk logs live (Ctrl+C to quit)
 #   errors     last 80 warning/error records in 24 hours, including complete tracebacks
@@ -10,6 +10,7 @@
 #   weekly     this week's report so far, from the latest post-market review (printed, not sent)
 #   economics  read-only new-vs-prior target scenarios and opening-beta reference; no new inference/downloads
 #   evidence [CALL_ID]  verify archived app inputs, or show one exact private request and returned result
+#   quotes [SYMBOL]  read saved quote/source clocks and pending alert failures; no new data or model calls
 #   experiments  the experiment registry: what is in effect, in the shadow, rejected or retired
 #   prune [--apply]  old headlines, model-call traces and export archives: preview, or delete with --apply
 #                    (also runs daily after the backup; the ledger, decisions and reviews are never deleted)
@@ -64,6 +65,11 @@ case "${1:-status}" in
     fund weekly ;;
   economics)
     fund economics ;;
+  quotes)
+    if [[ $# -gt 2 || ( $# -eq 2 && -z "${2:-}" ) ]]; then
+      echo "用法：bash scripts/fund-logs.sh quotes [SYMBOL]" >&2; exit 2
+    fi
+    if [[ $# -eq 2 ]]; then fund quotes --symbol="$2"; else fund quotes; fi ;;
   evidence)
     if [[ $# -gt 2 || ( $# -eq 2 && ! "${2:-}" =~ ^[A-Za-z0-9_-]+$ ) ]]; then
       echo "用法：bash scripts/fund-logs.sh evidence [CALL_ID]" >&2; exit 2
@@ -77,5 +83,5 @@ case "${1:-status}" in
     fi
     if [[ $# -eq 2 ]]; then fund prune --apply; else fund prune; fi ;;
   *)
-    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|evidence [CALL_ID]|weekly|experiments|prune [--apply]]" >&2; exit 2 ;;
+    echo "用法：bash scripts/fund-logs.sh [status|logs|errors|report|audit|approvals|decisions [YYYY-MM-DD] [--event N]|economics|evidence [CALL_ID]|quotes [SYMBOL]|weekly|experiments|prune [--apply]]" >&2; exit 2 ;;
 esac

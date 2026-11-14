@@ -312,7 +312,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
                         choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position",
-                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence"])
+                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence", "quotes"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -352,7 +352,7 @@ def main(argv=None):
     parser.add_argument("--operation-id", help="Reuse the same ID when retrying a subscribe, redeem, deposit or withdraw command")
     parser.add_argument("--targets", help="validate-risk: SYMBOL=weight pairs, e.g. SPY=0.1,TLT=0.1")
     parser.add_argument("--symbols", help="factor-lab: SYMBOL,SYMBOL files in --data-dir")
-    parser.add_argument("--symbol", help="settle-position: the local holding that was acquired or delisted")
+    parser.add_argument("--symbol", help="quotes: exact symbol to inspect; settle-position: local holding acquired or delisted")
     parser.add_argument("--cash-per-share", help="settle-position: cash actually paid per share (0 if worthless)")
     parser.add_argument("--reason", help="settle-position: what happened, e.g. 'acquired for cash at 54.20'")
     parser.add_argument("--expression", help="factor-lab: factor expression; use --expression=-vol(60) when it starts with '-'")
@@ -370,6 +370,9 @@ def main(argv=None):
                         help="status: print only the STOP class (operator, watchdog, service or none)")
     parser.add_argument("--call-id", help="evidence: show one exact archived application request and returned result")
     args = parser.parse_args(argv)
+    if args.mode == "quotes" and args.symbol is not None:
+        from .quote_diagnostics import symbol_name
+        args.symbol = symbol_name(args.symbol)
     if args.call_id is not None and (args.mode != "evidence" or not args.call_id.strip()):
         parser.error("--call-id requires evidence and a nonempty exact call ID")
     if args.decision_event is not None and (args.mode != "decisions" or args.decision_event <= 0):
@@ -465,6 +468,11 @@ def main(argv=None):
     if args.mode == "economics":
         from .economics import assess, lines
         print("\n".join(lines(assess(args.run_dir))))
+        return
+    if args.mode == "quotes":
+        from .quote_diagnostics import inspect, lines
+        print("\n".join(lines(inspect(args.run_dir, symbol=args.symbol,
+            mode=(os.environ.get("FUND_MODE") or "local").strip().lower()))))
         return
     if args.mode == "evidence":
         from .evidence import audit, lines, load_call

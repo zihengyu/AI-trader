@@ -914,6 +914,18 @@ Each rejected local quote also retains its own stream-enabled flag and
 stream/chart source clocks, so another consumer's later quote cannot replace
 that rejection's evidence. Raw provider payloads are not logged.
 
+Use ``bash scripts/fund-logs.sh quotes [SYMBOL]`` for an offline account-scoped
+diagnostic. Without a symbol it lists saved observations; an exact symbol
+selects only that symbol. It reads the configured mode/account snapshot and
+active alert failures, with source/check timestamps, ages at that check, and
+safe request-failure counts. It does not download data or invoke models.
+Missing, corrupt, old, future or mode-mismatched snapshots remain explicit;
+paper diagnostics never borrow a local snapshot. No record is not proof of
+healthy prices. A recent heartbeat does not establish quote freshness, and
+querying diagnostics does not clear an alert failure or reconstruct crossings.
+Telegram status also includes pending active-alert evidence, independently of
+whether its weekly-status convenience section succeeds.
+
 A missing final completed minute is disclosed as
 ``closing_valuation_pending`` and retried by background valuation. Read-only
 review can proceed without claiming a closing NAV. Other closing account or

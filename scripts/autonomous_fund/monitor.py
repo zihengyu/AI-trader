@@ -944,6 +944,12 @@ class Monitor:
                 lines += weekly_lines(db, now, stopped=(self.root / "STOP").exists())
         except Exception:  # The weekly line is a convenience; the account lines above still answer.
             pass
+        try:
+            from .status import alert_health_lines
+            with operator_connection(self.root) as db:
+                lines += alert_health_lines(db, now)
+        except Exception:
+            lines.append("价位提醒：状态不可读，未确认恢复。")
         return "\n".join(lines)
 
     def _answer(self, now, text, reply_to, audit):
