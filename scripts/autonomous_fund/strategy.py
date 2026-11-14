@@ -3088,6 +3088,29 @@ class AutonomousFund(Strategy):
         self.journal.event(now, "review_triggered", {"reason": reason, "review_at": earliest.isoformat(), **(detail or {})})
 
     def _watch(self, account, now, submit=True):
+        """Run the watcher and batch its sampled diagnostic evidence after each attempt."""
+        checks = [] if self.mode in {"local", "paper"} else None
+        try:
+            return self._watch_observed(account, now, submit, checks)
+        finally:
+            if checks:
+                try:
+                    from .quote_quality import record
+                    record(self.journal, checks)
+                except Exception as exc:
+                    # Diagnostics cannot suppress an exit, retry or original exception.
+                    self._disclose_failure("quote_quality_error", exc, phase="quote_quality", include_risk=True)
+
+    def _sample_quote_check(self, checks, symbol, purpose, *, observation=None, error=None):
+        if checks is None:
+            return
+        try:
+            from .quote_quality import sample
+            checks.append(sample(symbol, purpose, self.get_datetime(), observation=observation, error=error))
+        except Exception as exc:
+            self._disclose_failure("quote_quality_error", exc, phase="quote_quality", include_risk=True)
+
+    def _watch_observed(self, account, now, submit, checks):
         """Minute-level deterministic watcher; returns True when it submitted an order.
 
         With submit=False (an order is already open) triggers are still detected
@@ -3107,9 +3130,13 @@ class AutonomousFund(Strategy):
         prices = {}
         for symbol in sorted(symbols):
             try:
-                # Watching every minute must not journal every quote; triggers record their evidence.
+                # Full quote payloads stay with triggers; quality checks retain only clocks/outcomes.
                 prices[symbol] = self._price(symbol, record=False)
-            except RiskError:
+                self._sample_quote_check(checks, symbol, "portfolio_watch", observation=prices[symbol])
+            except Exception as exc:
+                self._sample_quote_check(checks, symbol, "portfolio_watch", error=exc)
+                if not isinstance(exc, RiskError):
+                    raise
                 continue  # No fresh evidence: nothing is triggered from stale data.
         equity = number(account.equity)
         for symbol in sorted(s for s, level in levels.items() if level["state"] == "triggered"
@@ -3187,6 +3214,7 @@ class AutonomousFund(Strategy):
                 self._alert_health(alert["symbol"], observation=observation)
                 observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
             except Exception as exc:
+                self._sample_quote_check(checks, alert["symbol"], "price_alert", error=exc)
                 diagnostic = getattr(exc, "diagnostic", None) or {}
                 notice = {"symbol": alert["symbol"],
                     "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__,
@@ -3198,6 +3226,7 @@ class AutonomousFund(Strategy):
                     # dedupe identity; retain evidence only with each notice.
                     self._record_price_observation_rejected({"symbol": alert["symbol"], **exc.diagnostic})
                 continue
+            self._sample_quote_check(checks, alert["symbol"], "price_alert", observation=observation)
             mark = observation.price
             crossed = ((alert.get("above") is not None and mark >= number(alert["above"])) or
                        (alert.get("below") is not None and mark <= number(alert["below"])))

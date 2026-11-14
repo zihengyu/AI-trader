@@ -926,6 +926,26 @@ querying diagnostics does not clear an alert failure or reconstruct crossings.
 Telegram status also includes pending active-alert evidence, independently of
 whether its weekly-status convenience section succeeds.
 
+Local/paper watches also append small, account-local ``fund_quote_checks`` rows
+in one transaction per watch iteration, with separate portfolio/target and price
+alert purposes. ``quotes [SYMBOL]`` includes the current New York date's recorded
+check denominator, accepted/rejected counts, rejection causes, first successes
+after a rejection and source-age buckets/mean/maximum. Negative source ages and
+missing clocks stay separate from nonnegative age statistics. A reused quote
+can serve another check; these are not independent provider requests or full
+feed availability. Trading quote/liquidity restrictions are labeled separately
+from known market-data failures. Recovery counts describe successive recorded
+checks, not continuous outages, alert-state transitions or missed crossings.
+They belong to the first-success date even when the prior rejection was earlier.
+
+Daily and weekly documents select the exact review cutoff and date range;
+later checks cannot rewrite that window. Legacy/unobserved checks remain
+unknown, and a crash or storage failure may leave gaps. Statistics failures
+emit ``quote_quality_error`` without blocking protective exits, altering watch
+validation or suppressing the original exception. Historical/Mock watches do
+not produce these records. Existing SQLite backups and retention preserve the
+rows, which contain no raw quote payloads or provider exception text.
+
 A missing final completed minute is disclosed as
 ``closing_valuation_pending`` and retried by background valuation. Read-only
 review can proceed without claiming a closing NAV. Other closing account or

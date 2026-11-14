@@ -102,7 +102,7 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
                 "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body",
-                "holding_without_market_data"}
+                "holding_without_market_data", "quote_quality_error"}
 
 
 REGIME_TEXT = {"up_calm": "上涨·平稳", "up_volatile": "上涨·波动大", "down_calm": "下跌·平稳",
@@ -532,6 +532,8 @@ def daily_document(root, sequence):
     lines += ["## 当日运行状况", "",
               ("；".join(f"{kind} × {count}" for kind, count in sorted(health.items())) if health else
                "当日没有阻断、故障、停止或自动恢复记录。"), ""]
+    from .quote_quality import inspect as quote_quality, lines as quality_lines
+    lines += quality_lines(quote_quality(root, start_day=day, until=cutoff)) + [""]
     lines += ["## 下一交易日预测（将被自动打分）", "",
               "```json", json.dumps(review.get("predictions", []), ensure_ascii=False, indent=2), "```", "",
               "## 复盘结论", "", review["summary"], ""]
@@ -732,6 +734,8 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"⚠️ 收盘账户核对或估值失败：{details}\n具体位置：bash scripts/fund-logs.sh errors"
     elif kind == "bookkeeping_error":
         text = f"⚠️ 记账步骤出错，下一轮自动重试：{details}"
+    elif kind == "quote_quality_error":
+        text = "⚠️ 盯盘检查统计未完整保存，本次统计可能缺样；盯盘继续运行。可用 errors 查看诊断。"
     elif kind == "postmarket_review_error":
         text = (f"⚠️ 盘后复盘失败：{details}\n这次的盘后日报暂不生成；原有策略备忘继续有效，交易不受影响。"
                 "下一个开盘前约 1 小时自动重试复盘。本周最后一个交易日仍没有复盘时，周报在下周第一个交易日开盘后"
@@ -1293,6 +1297,9 @@ def weekly_document(root, sequence):
     except (RiskError, OSError, sqlite3.Error, ValueError, TypeError, KeyError, ArithmeticError) as exc:
         # Diagnostics are rebuildable and must not prevent delivery of recorded weekly facts.
         lines.append(f"- 经济评估暂不可用（{type(exc).__name__}）；可运行 economics 单独诊断。")
+    from .quote_quality import inspect as quote_quality, lines as quality_lines
+    lines += ["", "### 盯盘行情检查【离散观测】", ""]
+    lines += quality_lines(quote_quality(root, start_day=monday, end_day=day, until=cutoff))
     tests = [r for kind, body in related if kind == "factor_tests" for r in body.get("results", [])]
     control = next((b for _, k, b in reversed(events) if k == "factor_negative_control"), None)
     lines += ["", "## 五、因子实验进展【统计推断】", ""]

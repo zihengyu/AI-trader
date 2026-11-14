@@ -71,10 +71,13 @@ def inspect(root, *, mode="local", symbol=None, now=None):
         for key, row in _mapping(market.get("quotes_by_symbol")).items() if isinstance(row, dict)}
     failures = market.get("source_failures") or []
     failures = [row for row in failures if isinstance(row, dict) and isinstance(row.get("symbol"), str)] if isinstance(failures, list) else []
-    names = {symbol} if symbol else set(quotes) | set(pending) | {row["symbol"] for row in failures}
+    from .quote_quality import inspect as quality
+    quality_report = quality(root, until=now, symbol=symbol)
+    names = {symbol} if symbol else set(quotes) | set(pending) | {row["symbol"] for row in failures} | {
+        row["symbol"] for row in quality_report["groups"]}
     return {"mode": mode, "queried_at": now.isoformat(), "snapshot_at": beat.get("heartbeat_at"),
             "snapshot_age_seconds": _age(beat.get("heartbeat_at"), now),
-            "runner_state": beat.get("runner_state"), "issues": issues,
+            "runner_state": beat.get("runner_state"), "issues": issues, "quality": quality_report,
             "symbols": [{"symbol": name, "observation": quotes.get(name), "pending_alert": pending.get(name),
                          # Do not expose raw provider errors, account fields or unrequested symbols.
                          "request_failures": [{key: row[key] for key in (
@@ -142,4 +145,7 @@ def lines(report):
                           f"连续请求失败次数 {failure.get('consecutive_failures', '?')}。")
     if not report["symbols"]:
         output.append("所选账户尚无可展示的逐标的记录；不会从其他账户或数据源补取。")
+    if "quality" in report:
+        from .quote_quality import lines as quality_lines
+        output += [""] + quality_lines(report["quality"])
     return output

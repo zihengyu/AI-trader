@@ -10,7 +10,7 @@
 #   weekly     this week's report so far, from the latest post-market review (printed, not sent)
 #   economics  read-only new-vs-prior target scenarios and opening-beta reference; no new inference/downloads
 #   evidence [CALL_ID]  verify archived app inputs, or show one exact private request and returned result
-#   quotes [SYMBOL]  read saved quote/source clocks and pending alert failures; no new data or model calls
+#   quotes [SYMBOL]  saved source clocks, pending alert failures and today's sampled checks; no data/model calls
 #   experiments  the experiment registry: what is in effect, in the shadow, rejected or retired
 #   prune [--apply]  old headlines, model-call traces and export archives: preview, or delete with --apply
 #                    (also runs daily after the backup; the ledger, decisions and reviews are never deleted)
