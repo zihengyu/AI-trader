@@ -159,7 +159,7 @@ def learning_harness(tmp_path, days, data):
     return strategy
 
 
-def test_learning_champion_switches_to_baseline_only_on_significant_harm_then_back(tmp_path):
+def test_learning_legacy_unbound_samples_never_switch_the_trading_champion(tmp_path):
     days = sessions(40)
     data = closes_for(days, .001, -.001)
     strategy = learning_harness(tmp_path, days, data)
@@ -172,9 +172,12 @@ def test_learning_champion_switches_to_baseline_only_on_significant_harm_then_ba
     for row in shadow_rows(days[10:30], "DOWN", "UP"):
         strategy.journal.event(row["decided_at"], "shadow_decision", row)
     second = strategy._evaluate_learning(now)
-    assert second["champion"] == "baseline" and second["memo_minus_baseline_1d_excess"]["t_stat"] <= -2
-    assert strategy.notices[-1][0] == "learning_champion_switched"
-    assert strategy._champion() == "baseline"
+    # Legacy target-only, unpriced and version-unbound samples are descriptive
+    # evidence, not authority to switch today's model. New bound-book tests
+    # cover both directions of a qualified switch.
+    assert second["champion"] == "memo" and not second["memo_minus_baseline_1d_excess"]["sufficient"]
+    assert not [n for n in strategy.notices if n[0] == "learning_champion_switched"]
+    assert strategy._champion() == "memo"
     with strategy.journal.connection() as db:
         db.execute("DELETE FROM events WHERE kind='shadow_decision'")
     for row in shadow_rows(days[:35], "UP", "DOWN", trading="baseline"):
@@ -196,7 +199,12 @@ def test_learning_starts_after_both_decisions_are_available(tmp_path):
     monday = datetime(2026, 11, 30, 21, tzinfo=timezone.utc)
     tuesday = datetime(2026, 12, 1, 21, tzinfo=timezone.utc)
     assert strategy._evaluate_learning(monday)["memo_minus_baseline_1d_excess"]["pairs"] == 0
-    assert strategy._evaluate_learning(tuesday)["memo_minus_baseline_1d_excess"]["pairs"] == 1
+    # Price-only scoring retains the receipt-time/early-close check; live
+    # promotion additionally requires bound quantitative and fee evidence.
+    assert strategy._evaluate_learning(tuesday)["memo_minus_baseline_1d_excess"]["pairs"] == 0
+    row["decided_at"] = "2026-11-27T19:00:00+00:00"
+    assert len(shadow_pairs([row], data, sessions=dates[:2])) == 0
+    assert len(shadow_pairs([row], data, sessions=dates)) == 1
 
 
 def test_shadow_runs_once_per_session_blind_and_within_budget(tmp_path):

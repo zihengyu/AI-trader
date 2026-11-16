@@ -307,6 +307,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         if closed_at is not None:
             if (self._closing_searched == closed_at and self._last_valuation is not None
                     and (self._last_valuation.get("valuation") or {}).get("session_close") == str(closed_at)):
+                from .closing_evidence import recover
+                recover(self, self._last_valuation)
                 return  # Already published or recovered for this close.
             # A closing observation is durable, including all-cash books. Reuse
             # it across polls, pre-open research and restarts until another close.
@@ -323,6 +325,8 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             if saved:
                 self._last_valuation = json.loads(saved[0])
                 self._valuation_error = None
+                from .closing_evidence import recover
+                recover(self, self._last_valuation)
                 return
         with self.journal.connection() as db:
             db.execute("BEGIN")
@@ -369,10 +373,18 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             sweep = policy["sweep"]
             account = merge(account, sweep, marks[sweep.symbol].price if sweep.symbol in marks else 0)
         benchmarks, benchmark_marks = {}, {}
-        for symbol in policy["benchmark_symbols"]:
+        # Extra shadow assets need raw closing receipts for whole-share scenarios.
+        # They never subscribe to the live tape or enlarge intraday polling.
+        try:
+            comparison = (self.journal.get_meta("comparison_symbols") or {}) if closed_at is not None else {}
+            extra = set(comparison.get("symbols", [])) & set(policy["universe"])
+        except Exception:
+            extra = set()  # Optional evidence must not withhold a valid account NAV.
+        for symbol in dict.fromkeys((*policy["benchmark_symbols"], *sorted(extra))):
             try:
                 asset = Asset(symbol, asset_type="stock")
-                mark = marks.get(symbol) or (self._closing_quote(asset, closed_at) if closed_at is not None else
+                from .closing_evidence import quote as closing_evidence
+                mark = marks.get(symbol) or (closing_evidence(self, asset, closed_at) if closed_at is not None else
                     observed_quote(self.data_source.get_quote(asset), self.data_source.get_datetime(), self.limits))
                 benchmark_marks[symbol] = mark
             except Exception:
@@ -428,6 +440,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         mark = observed_quote(quote, closed_at, self.limits)
         self._closing_sources[asset.symbol] = {key: quote.raw_data[key] for key in
             ("source", "price_kind", "bar_start", "session_close", "observed_at")}
+        self._closing_sources[asset.symbol]["corporate_actions"] = actions or []
         self._closing_sources.move_to_end(asset.symbol)
         while len(self._closing_sources) > 60:
             self._closing_sources.popitem(last=False)

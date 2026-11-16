@@ -310,6 +310,8 @@ def assess(root, now=None):
     from .scoreboard import compute, cost_ledger, _cost
     from .costs import scripted
     from .validation import session_pairs
+    from .comparison import evaluate as compare_books
+    from .execution_quality import analyze as execution_quality
     now = instant(now or datetime.now(timezone.utc))
     path = Path(root) / "state.sqlite3"
     if not path.is_file():
@@ -319,7 +321,9 @@ def assess(root, now=None):
         db.execute("BEGIN")
         events = [(seq, at, kind, json.loads(body)) for seq, at, kind, body in db.execute(
             "SELECT sequence,at,kind,body FROM events WHERE kind IN ('decision_validated','decision_basis','startup',"
-            "'benchmark_action','capital_flow','operator_reserve_adjusted') AND julianday(at)<=julianday(?) ORDER BY sequence",
+            "'benchmark_action','local_corporate_action','comparison_corporate_action','capital_flow',"
+            "'operator_reserve_adjusted','shadow_decision','comparison_risk','comparison_cohort_started') "
+            "AND julianday(at)<=julianday(?) ORDER BY sequence",
             (now.isoformat(),)) if instant(at) <= now]
         calls = {}
         for at, key, cost, mock, hit, model in db.execute("SELECT at,json_extract(body,'$.call_id'),json_extract(body,'$.cost_usd'),"
@@ -350,6 +354,7 @@ def assess(root, now=None):
         else:
             pairs, market_marks = [], {}
         paid, data = cost_ledger(db, now.isoformat())
+        execution_report = execution_quality(db, now)
         # No data-accrual receipt is not evidence that the subscription was free.
         data += [(pair["end"], None) for pair in pairs
                  if not any(pair["start"] < at <= pair["end"] for at, _ in data)]
@@ -382,11 +387,14 @@ def assess(root, now=None):
     complete_costs = not fund.get("net_is_upper_bound", True)
     reference["net_difference"] = fund["net_return"] - reference["reference_return"] if (
         complete_costs and fund.get("status") == "computed" and reference["reference_return"] is not None) else None
+    comparison_report = compare_books(events, market_marks, {d: packets[seq] for d, (seq, _) in closing.items()},
+        _exchange_sessions(min(closing), str(completed_daily_cutoff(now))) if closing else (), calls=calls)
     return {"status": "computed", "as_of": now.isoformat(), "decisions": decision_comparison(
         [(at, b) for _, at, k, b in events if k == "decision_validated"], closes,
         bases={b["decision_id"]: b for _, _, k, b in events if k == "decision_basis"}, calls=calls,
         sessions=completed_sessions(closes, str(completed_daily_cutoff(now)))),
         "opening_reference": reference, "fixed_benchmarks_and_fund": fund, "history_issues": history_issues,
+        "independent_books": comparison_report, "execution_quality": execution_report,
         "limitations": "Saved research histories can include provider restatements; historical receipt vintages "
                         "are not certified. Missing inputs stay unknown. No new model calls, trades or downloads."}
 
@@ -430,4 +438,8 @@ def lines(report):
     out.append("方案交易成本为情景估算；旧记录缺少调用链或资金证据时不推断。价格方案不含分红、现金收益及实际限价/止损/风控缩量。")
     out.append("交易摩擦假设为每侧 10bp；关联费用仅含经理、纠错和新调用的反方审查。期初贝塔用当时期初账本估计，未知贝塔不按 1 补齐。")
     out.append("研究历史可能被供应商修订；基准是账本记录价及已记录公司行动，不保证为交易所正式收盘价。缺失时显示未知。")
+    from .comparison import lines as comparison_lines
+    from .execution_quality import lines as execution_lines
+    out += comparison_lines(report.get("independent_books") or {})
+    out += execution_lines(report.get("execution_quality") or {"groups": {}})
     return out

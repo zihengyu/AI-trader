@@ -113,6 +113,23 @@ def session_benchmarks(db, accounts, *, until):
             value, window = price(observation.get("price")), windows.get(day)
             if value is not None and window is not None and window[0] <= observed <= window[1]:
                 result.setdefault(day, {})[symbol] = value
+    # Supplemental receipts can arrive after NAV was frozen, including on the
+    # next date. Bind to their original close; never use a later live tick.
+    for at, raw in db.execute("SELECT at,body FROM events WHERE kind='comparison_closing_quote' "
+                             "AND julianday(at)<=julianday(?) ORDER BY sequence", (cutoff.isoformat(),)):
+        if instant(at) > cutoff:
+            continue
+        item = json.loads(raw)
+        try:
+            close, source = instant(item["session_close"]), instant(item["as_of"])
+            day = close.astimezone(zone).date().isoformat()
+            window = windows.get(day)
+            value = price(item.get("price"))
+            if (window is not None and close == chosen[day][0] and window[0] <= source <= window[1]
+                    and value is not None):
+                result.setdefault(day, {}).setdefault(item["symbol"], value)
+        except (KeyError, RiskError, TypeError, ValueError):
+            continue
     return result
 
 

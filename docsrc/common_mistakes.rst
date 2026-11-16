@@ -323,6 +323,52 @@ research, triage, approval and other overhead remain outside that scope. Missing
 legacy links or usage stay unknown. Overlap counts are shown; positive scenario
 outcomes alone do not establish causal model value.
 
+New startup receipts also declare ``independent_books`` scenarios, displayed by
+the same command and weekly report. Existing fixed references are reduced to
+the recorded static name, exposure, overlapping-group and leveraged caps;
+unused weight stays in USD. Both shadow arms keep separate cash, whole shares
+and transaction costs using raw closing receipts after both answers arrive.
+They never receive later real-account cash flows. Identical profiles survive
+restarts; policy and prompt/model changes form separate epochs. Legacy or
+missing cost evidence is not backfilled with assumed free execution. Missing
+session prices or unresolved corporate actions withhold the affected return.
+
+These are daily-close scenarios, not proof of fully feasible live portfolios
+or causal learning: research and critique remain shared. The non-trading manager
+receives its own prior-close virtual cash, shares and previous target, while
+the trading manager continues to read the actual account. Broker tools still
+describe the real account; the shadow input states this scope explicitly.
+Static scenarios do not select the trading arm. A separate ``risk_managed``
+book reuses receipt-time frozen native risk estimates and quantitative
+construction, earnings/no-increase caps and post-rounding checks. Only the
+current contiguous policy/model/prompt/account cohort with complete risk and
+exactly linked manager/correction/half fresh-critic costs can accumulate the
+existing 20-interval, t-statistic switching sample. Old, unpriced or incomplete
+evidence never votes. Model bills accrue outside broker cash; research, triage,
+data, cash sweeps/yield, intraday fills and unrecorded actions remain excluded.
+Local mode collects additional eligible shadow closing quotes only during
+closing valuation, without additional inference, intraday polling or tape
+subscriptions. Optional evidence failure cannot withhold valid account NAV.
+The report command remains offline and read-only. Missing supplemental closing
+quotes retry separately from NAV, at most five attempts per symbol/close with
+at least 60 seconds between attempts, retaining source/receipt clocks and
+retry state across restarts. Later receipts cannot enter an earlier report.
+Native account and benchmark corporate actions are merged without double
+applying equivalent observations. Irrecoverable gaps stay in their original
+cohort; an explicitly recorded fresh cohort must earn its sample anew.
+
+``execution_quality`` separates local and paper observations. It weights
+directional shortfall against recorded bid/ask by traded notional, reports
+spread and missing arrival/fee evidence separately, replaces callbacks with
+cumulative financial totals and deduplicates explicit execution IDs. It keeps
+earlier partial-fill observation times, lists censored unfilled orders and
+rejects future quotes/fills at the report cutoff. An order limit is never an
+arrival quote. Observation latency includes polling/network delay; neither
+local simulation nor broker paper fills validate live queue position or impact.
+Numerically equivalent execution redeliveries are compared as numbers, not
+JSON formatting. Known partial fills with missing callback details are counted
+as incomplete, with unknown fees, rather than as proven zero-fill orders.
+
 The all-observation mean can describe a different sample from the subset with
 complete linked costs. Do not subtract those two means to explain the effect
 of fees. ``cost_matched`` shows before-cost return, linked cost as a share of
@@ -614,8 +660,9 @@ the record. Its best verdict is ``preliminary_edge``. Passing the operational
 report does not pass the investment report.
 
 **When what is in effect gets worse.** After each review the fund checks fixed
-thresholds. The learning and construction comparisons keep their full-record
-switch rule. They also roll back to the other arm when the last 20 paired
+thresholds. Learning uses only the current qualified costed quantitative-book
+cohort; construction retains its own full-record rule. They also roll back to
+the other arm when the last 20 eligible paired
 sessions turn against the arm that trades with ``|t| >= 2``. When the mean
 turnover of the last five sessions is above the 95th percentile of at least 40
 earlier sessions, the manager's minimum review interval doubles. Protective

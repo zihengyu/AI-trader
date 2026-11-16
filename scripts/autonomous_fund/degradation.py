@@ -3,7 +3,8 @@
 Thresholds are fixed in advance; short-term profit or loss alone never triggers anything.
 
 - Comparisons (learning memo vs baseline, construction AI weights vs risk budgets):
-  the full-record switch rule is unchanged. In addition, when the last WINDOW
+  callers supply their eligible cohort (learning requires the current profile's
+  independent, fully costed quantitative replay). When the last WINDOW
   paired sessions turned against the arm that trades, with |t| at least the
   same switch threshold, the other arm (the previous version) trades again.
 - Validated factors: the factor lab already retires a factor whose live IC

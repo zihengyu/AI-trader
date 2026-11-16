@@ -7,7 +7,7 @@ with a scripted model and a controllable synthetic market. No network.
 import json
 from datetime import datetime, timedelta, timezone
 
-from scripts.autonomous_fund.risk import Limits
+from scripts.autonomous_fund.risk import Limits, number
 
 
 def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_path, monkeypatch):
@@ -43,6 +43,9 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
         "config": config, "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account",
         "runtime": Market()})
     strategy._executor._initialize()
+    startup = next(row["body"] for row in journal.all_events() if row["kind"] == "startup")
+    assert startup["comparison_protocol"]["fee_rate"] == str(broker.fee_rate)
+    assert number(startup["comparison_protocol"]["slippage"]) == broker.slippage + source.spread / 2
 
     def step(minutes, poll=True):
         clock.value += timedelta(minutes=minutes)
@@ -99,6 +102,14 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
     assert metrics["protective_orders"] == 1 and metrics["fills"] >= 2 and metrics["review_ratio"] == 1
     assert metrics["unresolved_intents"] == 0 and metrics["mean_slippage_bps_vs_arrival"] is not None
     assert result["verdict"] == "ready", result["criteria"]
+    # Check the new offline diagnostics against actual native submission/fill
+    # receipts, rather than a parallel hand-built broker event format.
+    from scripts.autonomous_fund.economics import assess
+    diagnostics = assess(tmp_path, clock())
+    execution = diagnostics["execution_quality"]["groups"]["local"]
+    assert execution["with_fills"] >= 2 and execution["invalid_fill_orders"] == 0
+    assert execution["arrival_unknown_orders"] == 0 and execution["implementation_shortfall_bps"] is not None
+    assert diagnostics["independent_books"]["status"] == "computed"
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert report["protective_triggers"] and report["mandate"]["capital_usd"] == "10000"
     broker._close_connection()

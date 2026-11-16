@@ -1036,12 +1036,22 @@ class AutonomousFund(Strategy):
         if previous and previous != self.policy_digest:
             self.journal.event(self.get_datetime(), "risk_policy_changed", {"from": previous, "to": self.policy_digest})
         self.journal.set_meta("risk_policy_digest", self.policy_digest)
+        from .comparison import declaration
+        local_fee = getattr(self.broker, "fee_rate", None) if mode == "local" else None
+        local_slip = getattr(self.broker, "slippage", None) if mode == "local" else None
+        local_spread = getattr(getattr(self.broker, "data_source", None), "spread", None)
+        self.comparison_protocol = declaration(asdict(self.limits), asdict(self.quant),
+            {s: config["universe"][s] for s in self.universe}, self.performance.definitions(),
+            cash_symbol=self.cash_sweep.symbol if self.cash_sweep else None, fee_rate=local_fee,
+            slippage=number(local_slip) + number(local_spread) / 2
+                if local_slip is not None and local_spread is not None else None)
         self.journal.event(self.get_datetime(), "startup", {"mode": mode, "model": self.model, "models": self.agent_models,
                            "limits": asdict(self.limits), "mock_model": runtime is not None,
                            "observe_only": observe_only, "execution_revision": EXECUTION_REVISION,
                            "memory_mode": memory_mode, "risk_policy_digest": self.policy_digest,
                            "prompt_version": self.prompt_version,
                            "cash_management_symbol": self.cash_sweep.symbol if self.cash_sweep else None,
+                           "comparison_protocol": self.comparison_protocol,
                            "performance": {"benchmarks": self.performance.definitions(),
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
@@ -2041,7 +2051,11 @@ class AutonomousFund(Strategy):
                 and hasattr(getattr(self, "broker", None), "ledger_audit")):
             # A missing legacy input remains explicit; an inconsistent book is
             # rejected before it can become an agent's account evidence.
-            kwargs["context"] = {**(kwargs.get("context") or {}), "ledger_audit": self.broker.ledger_audit(strict=False)}
+            audit = self.broker.ledger_audit(strict=False)
+            context = kwargs.get("context") or {}
+            if purpose == "shadow" and context.get("comparison_account"):
+                audit = {"status": audit.get("status"), "scope": "actual_trading_account_integrity_only"}
+            kwargs["context"] = {**context, "ledger_audit": audit}
         key = uuid4().hex
         if evaluation_calls is not None:
             evaluation_calls.append(key)  # Exact scope, including failed/corrected attempts; never infer by proximity.
@@ -2453,7 +2467,7 @@ class AutonomousFund(Strategy):
             self._continue_allocation(self.execution.active(now, self.universe, self.limits))
         finally:
             # After the tradable decision is safe: the other arm decides in the shadow only.
-            self._shadow(context, champion, decision, now, budget)
+            self._shadow(context, champion, decision, now, budget, trading_call_ids=evaluation_calls)
             # The repeat waits until the iteration has checked protective levels and in-flight orders.
             self._stability_pending = (accepted_context, accepted_task, decision, accepted_id, now)
 
@@ -2884,6 +2898,8 @@ class AutonomousFund(Strategy):
         saved = self.journal.get_meta("critique_cache") or {}
         if saved.get("key") == key and saved.get("critique") is not None:
             self._current_critique_source = {"at": saved.get("at"), "call_id": saved.get("call_id"), "reused": True}
+            if "call_ids" in saved:
+                self._current_critique_source["call_ids"] = saved["call_ids"]
             self.journal.event(now, "critic_reused", {"critique_at": saved.get("at")})
             return saved["critique"]
         if self.journal.counter("agent_runs", now) + 2 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
@@ -2892,6 +2908,7 @@ class AutonomousFund(Strategy):
         if self._cost_exhausted(now, "critique"):
             self.journal.event(now, "critic_skipped", {"reason": "model_cost_budget"})
             return None
+        call_start = len(evaluation_calls) if evaluation_calls is not None else None
         try:
             critic_context = {**context, "research": research}
             if hasattr(self, "_with_fund_cost_context"):  # Fresh cost evidence, inside the never-blocking guard.
@@ -2941,12 +2958,18 @@ class AutonomousFund(Strategy):
             call = getattr(self, "_current_call", None) or {}
             source = {"at": self.get_datetime().isoformat(),
                       "call_id": call.get("call_id") if call.get("role") == "critic" else None, "reused": False}
+            if call_start is not None:
+                source["call_ids"] = evaluation_calls[call_start:]
             self.journal.set_meta("critique_cache", {"key": key, "at": source["at"],
-                                                     "call_id": source["call_id"], "critique": critique})
+                "call_id": source["call_id"], "critique": critique,
+                **({"call_ids": source["call_ids"]} if "call_ids" in source else {})})
             self._current_critique_source = source
             self._call_outcome(corrected=bool(attempt))
             return critique
         except Exception as exc:
+            if call_start is not None and evaluation_calls[call_start:]:
+                self._current_critique_source = {"at": self.get_datetime().isoformat(), "call_id": None,
+                    "call_ids": evaluation_calls[call_start:], "reused": False, "unavailable": True}
             self.journal.event(self.get_datetime(), "critic_unavailable",
                                {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
             return None
@@ -2990,7 +3013,7 @@ class AutonomousFund(Strategy):
         return {**context, "strategy_memory": None, "strategy_followup": None, "scorecards": None,
                 "learning_validation": None, "factor_lab": None}
 
-    def _shadow(self, context, champion, decision, now, budget):
+    def _shadow(self, context, champion, decision, now, budget, trading_call_ids=None):
         settings = getattr(self, "validation", None)
         if (settings is None or not settings.shadow_enabled or getattr(self, "memory_mode", "rolling") != "rolling"
                 or self.journal.counter("shadow_decisions", now) >= settings.shadows_per_session):
@@ -2998,17 +3021,55 @@ class AutonomousFund(Strategy):
         if self.journal.counter("agent_runs", now) + 1 > budget.max_agent_runs_per_day - budget.reserved_review_runs:
             return
         arm = "baseline" if champion == "memo" else "memo"
+        from .learning import independent_context, ACCOUNT_MODE, COST_SCOPE
+        shadow_context = self._arm_context(context, arm)
+        protocol = getattr(self, "comparison_protocol", None)
+        if protocol:
+            try:
+                shadow_context = independent_context(self, shadow_context, arm, self.get_datetime())
+            except Exception as exc:
+                self._disclose("comparison_account_pending", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
+                return
         self.journal.counter("shadow_decisions", now, 1)
         record = {"arm": arm, "trading_arm": champion, "decided_at": decision["as_of"], "trading_decision": decision,
-                  "memo_version": (context.get("strategy_memory") or {}).get("version")}
+                  "memo_version": (context.get("strategy_memory") or {}).get("version"),
+                  "comparison_protocol_id": (getattr(self, "comparison_protocol", None) or {}).get("id"),
+                  "comparison_prompt_version": getattr(self, "prompt_version", None),
+                  "comparison_generation": (shadow_context.get("comparison_account") or {}).get("generation"),
+                  "comparison_equity": (context.get("account") or {}).get("equity"),
+                  "comparison_origin_as_of": (context.get("account") or {}).get("as_of"),
+                  "comparison_scope": "shared_research_independent_close_price_books"}
         try:
+            prior_critique = context.get("critique_source") or {}
+            shared = (prior_critique.get("call_ids") or
+                ([prior_critique["call_id"]] if prior_critique.get("call_id") else [])) if not prior_critique.get("reused") else []
+            trading_calls = [key for key in trading_call_ids or [] if key not in shared]
+            cost_scope = COST_SCOPE if not (context.get("critique") and not prior_critique.get("call_id")
+                                            and not prior_critique.get("reused")) else None
             shadow = self._record_agent("manager", self._agent_call("manager", purpose="shadow",
                 task_prompt="Choose the complete target portfolio and when to reassess it.",
-                context=self._arm_context(context, arm)), phase="shadow")
+                context=shadow_context), phase="shadow")
             # Structural validation at its own as_of: this answer is scored, never executed.
             validate_decision(shadow, instant(shadow["as_of"]), self.universe, self.limits)
-            self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": shadow, "valid": True})
+            call = getattr(self, "_current_call", None) or {}
+            self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": shadow, "valid": True,
+                "comparison_account_mode": ACCOUNT_MODE if protocol else None,
+                "comparison_generation": (shadow_context.get("comparison_account") or {}).get("generation"),
+                "comparison_cost_scope": cost_scope,
+                "comparison_calls": {champion: {"own": trading_calls, "shared": shared},
+                    arm: {"own": [call["call_id"]] if call.get("call_id") and call.get("purpose") == "shadow" else [],
+                          "shared": shared}}})
             self._call_outcome()
+            try:
+                protocol = getattr(self, "comparison_protocol", None)
+                if protocol and self.mode == "local":
+                    saved = self.journal.get_meta("comparison_symbols") or {}
+                    symbols = set(saved.get("symbols", [])) if saved.get("protocol_id") == protocol["id"] else set()
+                    symbols |= {t["symbol"] for body in (decision, shadow) for t in body["targets"]}
+                    self.journal.set_meta("comparison_symbols", {"protocol_id": protocol["id"],
+                        "symbols": sorted(symbols & set(self.universe))})
+            except Exception as exc:
+                self._disclose("comparison_evidence_unavailable", type(exc).__name__)
         except Exception as exc:
             self.journal.event(self.get_datetime(), "shadow_decision", {**record, "decision": None, "valid": False,
                                "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
@@ -3018,19 +3079,11 @@ class AutonomousFund(Strategy):
         settings = getattr(self, "validation", None)
         if settings is None or not settings.shadow_enabled or getattr(self, "quant", None) is None:
             return None
-        from .market_data import completed_daily_cutoff
-        from .review import _events
-        from .scorecard import completed_sessions
-        from .validation import paired_test, shadow_pairs
-        # The journal timestamp is when both arms were available. The manager's
-        # as_of can precede the close even if the shadow answer arrived after it.
-        rows = [{**r["body"], "decided_at": r["at"]}
-                for r in _events(self.journal, instant(now), kinds=("shadow_decision",)) if r["body"].get("valid")]
-        symbols = {"SPY"} | {t["symbol"] for row in rows for body in (row["decision"], row["trading_decision"])
-                             for t in body["targets"]}
-        closes = {s: self._daily_closes(s, now) for s in sorted(symbols & (set(self.universe) | {"SPY"}))}
-        differences = shadow_pairs(rows, closes, sessions=completed_sessions(closes, completed_daily_cutoff(now)))
-        stats = paired_test(differences, settings.min_pairs)
+        from .learning import snapshot, evidence
+        protocol = getattr(self, "comparison_protocol", None) or {}
+        report = snapshot(self.journal, now)
+        stats, differences, qualification = evidence(report, protocol.get("id"),
+            getattr(self, "prompt_version", None), settings.min_pairs)
         champion = self._champion()
         switch, reason = None, None
         if stats["sufficient"] and stats["t_stat"] is not None:
@@ -3048,9 +3101,12 @@ class AutonomousFund(Strategy):
         evaluation = {"as_of": str(now), "champion": switch or champion, "previous_champion": champion,
                       "memo_minus_baseline_1d_excess": stats, "switch_t_stat": settings.switch_t_stat,
                       "recent": recent, "reason": reason,
-                      "interpretation": "Paired next-session excess returns of the memo-informed and baseline "
-                                        "decisions made from the same research. A switch needs at least min_pairs "
-                                        "sessions and |t| >= switch_t_stat; otherwise the current arm keeps trading."}
+                      "qualification": qualification, "protocol_id": protocol.get("id"),
+                      "prompt_version": getattr(self, "prompt_version", None),
+                      "interpretation": "Current contiguous profile only: paired independent-book daily returns "
+                          "after frozen quantitative construction, trading costs and exactly linked manager/shared critic costs. "
+                          "Shared research and the real trading arm's live account remain confounders; not causal proof. "
+                          "Incomplete/legacy/unpriced evidence cannot switch the trading arm."}
         if switch:
             self.journal.set_meta("learning_champion", switch)
             self._notify_fund("learning_champion_switched", {"from": champion, "to": switch, "t_stat": stats["t_stat"],
@@ -4623,7 +4679,7 @@ class AutonomousFund(Strategy):
             session = self._session(now, account)
             scale = drawdown_scale(session["drawdown"], self.quant, self.limits.drawdown)
             policy = self.execution.policy
-            return {
+            result = {
                 "method": "EWMA volatilities and slower, shrunk EWMA correlations of completed daily returns, "
                           "volatility-adjusted name caps, group caps, uniform scaling to the volatility target, "
                           "97.5% expected shortfall and the historical stress-window loss limit",
@@ -4667,8 +4723,34 @@ class AutonomousFund(Strategy):
                                           "earnings_max_position until the date passes; the excess is sold automatically",
                                **self._earnings_caps(now)},
             }
+            self._capture_comparison_risk(estimate, result, self.get_datetime())
+            return result
         except Exception as exc:
             return {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
+
+    def _capture_comparison_risk(self, estimate, context, now):
+        """Freeze already-computed estimates; diagnostics never fetch or gate trading."""
+        protocol = getattr(self, "comparison_protocol", None)
+        if not protocol:
+            return
+        try:
+            from .learning import pack_estimate
+            if estimate.through and estimate.through >= trading_day(now):
+                return
+            events = context.get("event_risk") or {}
+            packet = {"protocol_id": protocol["id"],
+                "estimate": pack_estimate(estimate), "stressed": bool((context.get("market_stress") or {}).get("stressed")),
+                "earnings_caps": events.get("caps", {}),
+                "earnings_unknown": sorted(set(events.get("unknown", [])) | set(events.get("deferred", []))),
+                "complete": not (getattr(self, "_scenario_deferred", None) or
+                    estimate.metrics({}).get("scenarios_unavailable"))}
+            key = [protocol["id"], trading_day(now), hashlib.sha256(encode(packet).encode()).hexdigest()]
+            if self.journal.get_meta("comparison_risk_capture") == key:
+                return
+            self.journal.event(now, "comparison_risk", packet)
+            self.journal.set_meta("comparison_risk_capture", key)
+        except Exception as exc:
+            self._disclose("comparison_risk_unavailable", type(exc).__name__)
 
     def _limit_uncovered_adds(self, active, weights, current, prices, now, overlay):
         """V2 4.5: hold at the current weight each purchase whose calibrated edge does not cover its cost."""

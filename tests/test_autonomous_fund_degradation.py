@@ -44,18 +44,18 @@ def learning(tmp_path, days):
     return strategy
 
 
-def test_the_learning_arm_rolls_back_when_its_recent_record_turns_although_the_full_record_does_not(tmp_path):
+def test_legacy_recent_learning_record_cannot_override_current_qualification(tmp_path):
     days = pd.bdate_range("2025-01-02", periods=75, tz="America/New_York")
     strategy = learning(tmp_path, days)
     now = datetime(2025, 4, 30, 21, tzinfo=timezone.utc)
     strategy.get_datetime = lambda: now
     evaluation = strategy._evaluate_learning(now)
-    assert evaluation["memo_minus_baseline_1d_excess"]["t_stat"] > -2  # The full-record rule would keep memo.
-    assert evaluation["recent"]["pairs"] == 20 and evaluation["recent"]["t_stat"] <= -2
-    assert evaluation["champion"] == "baseline" and evaluation["reason"].startswith("degradation: last 20 sessions")
-    kind, details = strategy.notices[-1]
-    assert kind == "learning_champion_switched" and details["reason"].startswith("degradation")
-    assert "退化回滚" in readable(kind, details)
+    # Rolling rollback now requires the same version/risk/cost qualification as
+    # a full-record switch. These target-only legacy rows are not eligible.
+    assert evaluation["memo_minus_baseline_1d_excess"]["t_stat"] is None
+    assert not evaluation["recent"]["sufficient"]
+    assert evaluation["champion"] == "memo" and evaluation["reason"] is None
+    assert not [n for n in strategy.notices if n[0] == "learning_champion_switched"]
 
 
 def test_a_construction_rolls_back_when_the_last_twenty_sessions_turn_against_it():
