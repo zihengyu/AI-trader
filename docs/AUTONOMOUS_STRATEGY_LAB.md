@@ -123,11 +123,14 @@ fixed-parameter walk-forward diagnostics, declared-parameter sensitivity and an
 additional observed-friction stress. A defensive mandate is assessed against
 its declared protection objective and is never labeled evidence of alpha.
 
-Final split returns and trades are excluded from agent context and the research
-tool. Candidates are frozen in a validation cohort; later variants need a fresh
-final window rather than repeatedly optimizing the same holdout. Revisions can
-still run exploratory training/validation and sensitivity tests on available
-history; these jobs omit the final test and cannot qualify. Operator
+The first eligible validation freezes the exact benchmark sessions and input
+snapshot digest for the version. The queued validation retains that snapshot.
+If it diagnoses missing data, a new attested snapshot can repair those same
+sessions. Adding later prices never moves the splits. New variants need a final
+window disjoint from already reserved windows. Exploratory training, validation
+and sensitivity tests remain available before a window can be reserved. They
+skip the final test. Source coverage or modeled-cost gaps also skip it. Agent
+context omits final results, including the individual pass flag. Operator
 diagnostics can inspect the private evidence. Public historical prices may
 already be known to the model or accessible through ordinary research tools:
 this isolation cannot certify historical hypotheses as uncontaminated. Historical
@@ -135,21 +138,29 @@ results are exploratory, and a version frozen before the forward period is
 mandatory for paper-library admission.
 
 Raw-price identity, action completeness, historical membership and publication
-coverage must be explicit. The existing daily cache does not establish those
+coverage each require an operator or adapter receipt bound to the snapshot hash.
+The existing daily cache does not establish those
 facts. The automatic cache bridge sets these coverage flags to false and records
 the session-boundary publication estimate as an estimate. It never invents
 original publication receipts, current-universe completeness or delisting
 returns. Such inputs can yield research diagnostics but cannot pass admission.
 
-Passed historical versions enter isolated forward observation. Original forward
-inputs and receipts are retained; later historical corrections cannot rewrite
-an earlier observation. Forward snapshots must attest all four coverage fields:
-raw prices, complete corporate actions, point-in-time membership and complete
-publication times. Exploratory snapshots remain usable for historical research
-and cannot replace a queued forward job or add frozen observations. Forward
-simulation is deterministic and uses no model call per bar. Fresh matching-policy
-forward evidence must satisfy both the proposal's duration and the operator
-minimum before optional library admission.
+Passed historical versions enter an independent forward book. The worker first
+evaluates the last completed close with fresh capital. Each accepted close then
+produces the next signal. The journal binds that signal to the strategy and
+policy hashes, exact input dataset, exchange open and job. The signal must be
+saved before the next exchange open and match the signal actually used in the
+simulated fill. Later historical corrections cannot rewrite a recorded input or
+signal. An imported batch can provide replay results, with each session labeled
+as prospective or replayed. Replayed sessions do not qualify. A missed signal
+remains a gap for that version. A new revalidation version earns its own
+genuinely forward sample. The benchmark uses independent capital over the same
+sessions. Neither book makes a model call per bar.
+
+Fresh matching-policy forward evidence must satisfy both minimum durations
+before optional library admission. A portfolio target must also match the signal
+on file before the next open. Previous observations remain visible after
+an execution fingerprint changes. The new contract requires revalidation.
 Predeclared drawdown or sustained relative-loss degradation pauses the version;
 already accepted strategy purchases lose authority at existing recheck points.
 Researcher receives the failure and must propose a new version rather than
@@ -274,10 +285,31 @@ python -m scripts.autonomous_fund.lab run-once --run-dir artifacts/fund-local
 
 An imported dataset contains `bars` by symbol (day, timezone-aware open/close and
 availability timestamps, positive raw OHLCV), optional dated `features`, action
-receipts (symbol, ex-date, pay-date, amount/ratio, publication time), provenance,
-and `coverage`. The importer rejects future/invalid rows and excessive resources.
-Coverage attestations are trusted operator/data-adapter input, never researcher
-claims. Do not set them true without supporting source evidence.
+receipts (symbol, ex-date, pay-date, amount/ratio, publication time), `source`, and
+`coverage`. The four coverage keys are `raw_prices`, `corporate_actions_complete`,
+`point_in_time_membership` and `publication_times_complete`. For formal validation,
+set them using reviewed evidence. The `provenance` object has two fields.
+
+- `snapshot_sha256`, computed by `strategy_validation.digest` on the exact JSON
+  object excluding `provenance`.
+- `claims`, keyed by the four coverage fields. Each entry has a `source`, a
+  retrievable `reference` to the relevant evidence and its `artifact_sha256`.
+
+Retain the original evidence separately for review. The Lab checks the snapshot
+binding, receipt shape, publication clocks and market sessions. It does not
+retrieve the referenced artifacts or independently certify a provider's claims.
+Missing manifests, changed snapshot contents or estimated timestamps support
+exploratory work only. The importer rejects future and invalid timestamps and
+excessive inputs.
+
+For automated intake, atomically replace `strategy_lab_snapshot.json` in the
+account's run directory from an authorized data adapter. The existing off-hours
+hook imports the file and starts the available jobs. To build the forward record,
+deliver each completed daily bar and its evidence before the following open.
+Daily additions can carry only that session and new available observations. The
+Lab joins them to the immutable previously accepted inputs. Check status for
+prospective and replayed session counts, the last validation, and remaining
+budget. The provider access and source evidence remain the operator's responsibility.
 
 ## Acceptance and remaining qualification
 

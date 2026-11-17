@@ -31,6 +31,8 @@ def report(root):
                 lines.append(f"  最近验证：{job['kind']} / {result.get('status')} / {job['at']}")
                 if result.get("limitations") or result.get("reason"):
                     lines.append("  缺口：" + str(result.get("limitations") or result.get("reason")))
+                if "prospective_sessions" in result:
+                    lines.append(f"  开盘前留证 {result['prospective_sessions']} 个交易日，事后回放 {result['replayed_sessions']} 个交易日")
                 for name, test in result.get("tests", {}).items():
                     lines.append(f"  {name}: passed={test.get('passed')}；净超额={test.get('net_excess')}；"
                                  f"非重叠样本={test.get('nonoverlapping_blocks')}；HAC t={test.get('hac_t')}")
@@ -79,9 +81,10 @@ def main(argv=None):
     config = json.loads(args.config.read_text(encoding="utf-8"))
     lab, now = open_lab(args.run_dir, config), datetime.now(timezone.utc)
     if args.action == "import-data":
-        if args.dataset is None or args.dataset.stat().st_size > 32_000_000:
-            parser.error("import-data requires a JSON snapshot of at most 32 MB")
-        data = json.loads(args.dataset.read_text(encoding="utf-8"))
+        from .strategy_lab import load_snapshot
+        if args.dataset is None:
+            parser.error("import-data requires --dataset")
+        data = load_snapshot(args.dataset)
         print(json.dumps({"queued": lab.schedule(data, now)}, ensure_ascii=False))
     else:
         result = lab.run_one(now)

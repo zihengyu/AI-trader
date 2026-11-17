@@ -10,6 +10,7 @@ from datetime import timedelta
 from .risk import RiskError, instant, number
 from .session_calendar import completed_daily_cutoff
 from .strategy_definition import StrategyAllocation
+from .strategy_validation import following_session
 
 
 def latest_required_session(now):
@@ -33,6 +34,17 @@ def library_entry(db, key, version, now, policy):
         raise RiskError("Strategy forward evidence is missing, stale, future or degraded")
     if not result.get("coverage_complete"):
         raise RiskError("Strategy forward data coverage is incomplete")
+    if result.get("replayed_sessions") != 0 or result.get("prospective_sessions") != len(series):
+        raise RiskError("Strategy forward history lacks timely signal receipts")
+    next_day, opened = following_session(series[-1]["day"])
+    signal = db.execute("SELECT at,body FROM fund_strategy_signals WHERE id=? AND version=? AND day=?",
+                        (key, version, next_day)).fetchone()
+    if not signal or instant(signal[0]) > instant(now) or instant(signal[0]) >= opened:
+        raise RiskError("Strategy allocation lacks a recorded next session signal")
+    bound = json.loads(signal[1])
+    if (bound["proposal_digest"] != row["digest"] or bound["policy_hash"] != policy["policy_hash"]
+            or bound["targets"] != result["next_targets"]):
+        raise RiskError("Strategy allocation does not match its recorded target")
     return {"strategy_id": key, "version": version, "digest": row["digest"],
             "next_targets": result["next_targets"], "observations": result["observations"],
             "as_of": evidence[1], "purpose": json.loads(row["proposal"])["validation"]["purpose"]}
@@ -91,6 +103,6 @@ def library(journal, now):
         for key, version in db.execute("SELECT id,version FROM fund_strategy_versions WHERE state='paper_active'"):
             try:
                 entries.append(library_entry(db, key, version, now, policy))
-            except RiskError:
+            except (sqlite3.DatabaseError, KeyError, TypeError, ValueError):
                 continue
         return entries

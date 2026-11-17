@@ -3,6 +3,7 @@ import json
 from datetime import timedelta
 
 from .risk import instant, trading_day
+from .strategy_lab import load_snapshot
 
 
 def cached_snapshot(strategy, now):
@@ -73,7 +74,21 @@ def tick(strategy):
     if previous is not None and instant(now) - instant(previous) < timedelta(seconds=30):
         return
     strategy._strategy_lab_tick_at = now
-    data = cached_snapshot(strategy, now)
-    if data is not None:
-        lab.schedule(data, now)
-    lab.kick(now)
+    try:
+        data = cached_snapshot(strategy, now)
+        if data is not None:
+            lab.schedule(data, now)
+    finally:
+        try:
+            # An account's adapter can atomically publish finished data. A
+            # newly registered candidate can use a previously delivered file.
+            inbox = lab.journal.root / "strategy_lab_snapshot.json"
+            if inbox.is_file():
+                stat = inbox.stat()
+                candidates = tuple((row["id"], row["version"]) for row in lab.rows() if row["task_state"] == "open")
+                receipt = stat.st_ino, stat.st_mtime_ns, stat.st_size, candidates
+                if receipt != getattr(strategy, "_strategy_lab_snapshot_receipt", None):
+                    lab.schedule(load_snapshot(inbox), now)
+                    strategy._strategy_lab_snapshot_receipt = receipt
+        finally:
+            lab.kick(now)

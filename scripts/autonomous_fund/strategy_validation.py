@@ -9,11 +9,12 @@ import ast
 import hashlib
 import json
 import math
+import re
 import statistics
 import sys
 from importlib.metadata import version as package_version
 from functools import lru_cache
-from datetime import date
+from datetime import date, timedelta
 from statistics import NormalDist
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -24,9 +25,39 @@ from .strategy_definition import StrategyProposal
 from .strategy_program import parameter_values, parse, targets, validate_program
 
 
+COVERAGE_FIELDS = ("raw_prices", "corporate_actions_complete", "point_in_time_membership",
+                   "publication_times_complete")
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      allow_nan=False, default=str).encode()).hexdigest()
+
+
+def snapshot_limitations(data, *, require_receipts=False):
+    coverage = data.get("coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    missing = [key for key in COVERAGE_FIELDS if coverage.get(key) is not True]
+    if not require_receipts or missing:
+        return missing
+    manifest = data.get("provenance")
+    if not isinstance(manifest, dict) or manifest.get("snapshot_sha256") != digest(
+            {key: value for key, value in data.items() if key != "provenance"}):
+        return ["snapshot_provenance_unbound"]
+    claims = manifest.get("claims")
+    if not isinstance(claims, dict):
+        return ["coverage_receipts_missing"]
+    for key in COVERAGE_FIELDS:
+        receipt = claims.get(key)
+        if (not isinstance(receipt, dict)
+                or not all(isinstance(receipt.get(field), str) and 0 < len(receipt[field].strip()) <= 512
+                           for field in ("source", "reference"))
+                or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("artifact_sha256", "")))):
+            missing.append(f"coverage_receipt_missing:{key}")
+    if any(row.get("availability_estimated") for collection in ("bars", "features")
+           for rows in data.get(collection, {}).values() for row in rows):
+        missing.append("estimated_publication_times")
+    return missing
 
 
 def implementation_hash():
@@ -35,7 +66,8 @@ def implementation_hash():
     root = Path(__file__).parent
     sources = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                for name in ("strategy_validation.py", "strategy_program.py", "strategy_worker.py", "comparison.py",
-                            "strategy_cash.py", "cash.py", "risk.py", "strategy_definition.py")}
+                            "strategy_cash.py", "cash.py", "risk.py", "strategy_definition.py",
+                            "strategy_lab.py", "strategy_admission.py")}
     return digest({"sources": sources, "python": list(sys.version_info[:3]),
                    "dependencies": {name: package_version(name) for name in ("pydantic", "pandas-market-calendars")}})
 
@@ -64,6 +96,20 @@ def forward_days(data, benchmark, after):
     if actual != expected:
         raise RiskError("Forward history has missing exchange sessions")
     return actual
+
+
+def following_session(day):
+    start = date.fromisoformat(day) + timedelta(days=1)
+    sessions = _daily_sessions(start.isoformat(), (start + timedelta(days=10)).isoformat())
+    if not sessions:
+        raise RiskError("No next exchange session in the validation calendar")
+    session, opened, _ = sessions[0]
+    return session, opened
+
+
+def planned_sessions(days, count=None):
+    expected = [day for day, _, _ in _daily_sessions(days[0], days[-1])]
+    return expected if count is None else expected[-count:]
 
 
 def check_dataset(data):
@@ -146,13 +192,14 @@ class ResearchBook(Book):
             (number(r["amount"]) for r in self.receivables), number(0))
 
 
-def replay(proposal, data, policy, days, *, initial_capital, static_weight=None):
+def replay(proposal, data, policy, days, *, initial_capital, static_weight=None, initial_signal=False):
     bars = data["bars"]
     histories = {**bars, **data.get("features", {})}
     by_day = {s: {r["day"]: r for r in rows} for s, rows in bars.items()}
     benchmark = proposal["validation"]["benchmark"]
     all_days = [row["day"] for row in bars[benchmark]]
-    if not days or list(days) != [day for day, _, _ in _daily_sessions(days[0], days[-1])]:
+    if not (initial_signal and not days) and (
+            not days or list(days) != [day for day, _, _ in _daily_sessions(days[0], days[-1])]):
         raise RiskError("Strategy replay has missing exchange sessions")
     owned_policy = copy.deepcopy(policy)
     costs = proposal["costs"]
@@ -167,13 +214,15 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None)
     cash_symbol = policy.get("cash_symbol") if proposal["implementation"]["adapter"] == "daily_cash_rules_v1" else None
     book, held_since = ResearchBook(initial_capital, owned_policy), {}
     signals, previous_close, previous_day = {}, None, None
-    first = days[0]
+    nav = number(initial_capital)
     # Warm-up only forms the initial signal. No trades, no model use and no
     # evaluation-period balance is borrowed from another split.
-    prior = [day for day in all_days if day < first]
+    prior = all_days if initial_signal else [day for day in all_days if day < days[0]]
     if prior:
         previous_day = prior[-1]
         common = [by_day[s][previous_day] for s in proposal["instruments"] if previous_day in by_day[s]]
+        if initial_signal and len(common) != len(set(proposal["instruments"])):
+            raise RiskError("Initial forward signal is missing the latest close")
         if common:
             previous_close = max(r["at"] for r in common)
             signals = ({benchmark: static_weight} if static_weight is not None else targets(
@@ -234,7 +283,8 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None)
         book.peak = max(book.peak, nav)
         book.last.update(equity=str(nav), position_prices={s: str(closed[s]) for s in book.positions},
                          receivables=copy.deepcopy(book.receivables),
-                         net_economic_equity=str(nav - book.model_cost), signal_as_of=previous_close)
+                         net_economic_equity=str(nav - book.model_cost), signal_as_of=previous_close,
+                         raw_signal=signals)
         book.series[-1] = copy.deepcopy(book.last)
         previous_close = max(by_day[s][day]["at"] for s in required)
         previous_day = day
@@ -250,6 +300,7 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None)
     # fund capital. The raw program may request 100%; it is not the tested cap.
     next_targets = {} if book.paused else project(desired, owned_policy)
     return {"series": book.series, "summary": book.summary(), "next_targets": next_targets,
+            "next_signal_as_of": previous_close,
             "raw_next_targets": signals,
             "cost_usd": str(book.model_cost), "risk_paused": book.paused,
             "implementation": "next_open_whole_share_v1"}
@@ -303,7 +354,8 @@ def test_excess(strategy, benchmark, plan, trials):
             "purpose": plan["purpose"], "meaning": "Research evidence, not proof of alpha or account authorization"}
 
 
-def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True):
+def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True, locked_sessions=None,
+             require_receipts=False):
     proposal = StrategyProposal.model_validate(proposal).model_dump()
     if proposal["validation"]["method"] != "daily_forward_v1":
         return {"status": "needs_adapter", "passed": False, "reason": "A suitable independent validation adapter is required"}
@@ -339,12 +391,20 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
     # The benchmark calendar is authoritative. Missing symbol sessions fail,
     # rather than silently shortening the tested interval to an intersection.
     days = [r["day"] for r in data["bars"][plan["benchmark"]]]
-    if days != [day for day, _, _ in _daily_sessions(days[0], days[-1])]:
+    if locked_sessions:
+        days = [day for day in days if day <= locked_sessions[-1]]
+    if days and days != planned_sessions(days):
         return {"status": "needs_data", "passed": False, "reason": "Benchmark history has missing exchange sessions"}
     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
     if len(days) < total:
         return {"status": "needs_data", "passed": False, "reason": "Insufficient predeclared split history"}
-    days = days[-total:]
+    if locked_sessions is None:
+        days = days[-total:]
+    else:
+        locked_days = [day for day in days if locked_sessions[0] <= day <= locked_sessions[-1]]
+        if locked_days != locked_sessions or len(locked_days) != total:
+            return {"status": "needs_data", "passed": False, "reason": "Snapshot does not cover the locked validation sessions"}
+        days = locked_days
     train_end = plan["train_sessions"]
     valid_end = train_end + plan["validation_sessions"]
     gap = plan["holding_sessions"]
@@ -352,9 +412,12 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
                "final": days[valid_end + gap:]}
     if any(not values for values in windows.values()):
         return {"status": "needs_data", "passed": False, "reason": "Purge exhausted a split"}
+    limitations = snapshot_limitations(data, require_receipts=require_receipts)
+    if policy.get("cash_symbol") and proposal["implementation"]["adapter"] != "daily_cash_rules_v1":
+        limitations.append("cash_sweep_execution_adapter_required")
     results, receipts = {}, {}
     for name, window in windows.items():
-        if name == "final" and not allow_final:
+        if name == "final" and (not allow_final or limitations):
             continue
         actual = replay(proposal, data, policy, window, initial_capital=initial_capital)
         reference = replay(proposal, data, policy, window, initial_capital=initial_capital,
@@ -406,18 +469,12 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
                 sensitivity.append({"parameter": key, "value": trial, "passed": bool(good)})
             except (RiskError, ArithmeticError, ValueError):
                 sensitivity.append({"parameter": key, "value": trial, "passed": False})
-    limitations = [key for key in ("raw_prices", "corporate_actions_complete", "point_in_time_membership",
-                                  "publication_times_complete") if data.get("coverage", {}).get(key) is not True]
-    if policy.get("cash_symbol") and proposal["implementation"]["adapter"] != "daily_cash_rules_v1":
-        # The diagnostic Book does not reproduce the fund's parking/funding
-        # sequence or its costs. Sweeps and their income must not be assumed free.
-        limitations.append("cash_sweep_execution_adapter_required")
     robust = agreeing / len(walk) >= plan["min_robust_fraction"] and (not sensitivity or
              sum(row["passed"] for row in sensitivity) / len(sensitivity) >= plan["min_robust_fraction"])
-    passed = allow_final and all(results[name]["passed"] for name in ("validation", "final")) and robust
-    return {"status": "awaiting_new_holdout" if not allow_final else
-            "historical_pass" if passed and not limitations else "needs_data" if limitations else "rejected",
-            "passed": passed and not limitations, "dataset_hash": identity, "protocol_hash": digest(plan),
+    passed = "final" in results and all(results[name]["passed"] for name in ("validation", "final")) and robust
+    return {"status": "needs_data" if limitations else "awaiting_new_holdout" if not allow_final else
+            "historical_pass" if passed else "rejected",
+            "passed": passed, "dataset_hash": identity, "protocol_hash": digest(plan),
             "tests": results, "receipts": receipts, "limitations": limitations,
             "walk_forward": {"folds": walk, "agreeing": agreeing, "passed": robust,
                              "meaning": "Fixed implementation; no retraining or independent-regime claim"},

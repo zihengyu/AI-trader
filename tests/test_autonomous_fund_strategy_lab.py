@@ -16,7 +16,7 @@ from scripts.autonomous_fund.risk import RiskError, instant
 from scripts.autonomous_fund.strategy_definition import StrategyLabSettings
 from scripts.autonomous_fund.strategy_lab import StrategyLab, run_worker
 from scripts.autonomous_fund.strategy_program import Evaluator, Warmup, parse
-from scripts.autonomous_fund.strategy_validation import check_dataset, replay, validate
+from scripts.autonomous_fund.strategy_validation import COVERAGE_FIELDS, check_dataset, digest, replay, validate
 
 ZONE = ZoneInfo("America/New_York")
 NOW = datetime(2026, 11, 16, 18, tzinfo=ZONE)
@@ -65,9 +65,37 @@ def dataset(count=170, *, start="2025-01-02", fail_after=None):
                                  "high": max(previous, values[symbol]) * 1.001,
                                  "low": min(previous, values[symbol]) * .999, "volume": 1000000,
                                  "event": 1.})
-    return {"bars": bars, "actions": [], "source": "synthetic acceptance fixture",
-            "coverage": dict.fromkeys(["raw_prices", "corporate_actions_complete", "point_in_time_membership",
-                                        "publication_times_complete"], True)}
+    return attest({"bars": bars, "actions": [], "source": "synthetic acceptance fixture",
+                   "coverage": dict.fromkeys(COVERAGE_FIELDS, True)})
+
+
+def attest(snapshot):
+    content = {key: value for key, value in snapshot.items() if key != "provenance"}
+    checksum = digest(content)
+    return {**content, "provenance": {"snapshot_sha256": checksum, "claims": {
+        key: {"source": "synthetic fixture", "reference": key, "artifact_sha256": checksum} for key in COVERAGE_FIELDS}}}
+
+
+def forward_one_session_at_a_time(engine, data, start, monkeypatch):
+    from scripts.autonomous_fund import strategy_lab, strategy_worker
+
+    def evaluate(payload, _timeout):
+        # Use the worker's actual evaluator and its serializable receipt shape.
+        # Separate tests cover the isolated subprocess and the real first job.
+        return json.loads(json.dumps(strategy_worker.evaluate(payload), default=str))
+
+    observed, result = None, None
+    count = len(data["bars"]["BASE"])
+    with monkeypatch.context() as worker:
+        worker.setattr(strategy_lab, "run_worker", evaluate)
+        for i in range(start, count):
+            observed = instant(data["bars"]["BASE"][i]["at"]) + timedelta(hours=1)
+            daily = attest({**data, "bars": {symbol: rows[i:i + 1] for symbol, rows in data["bars"].items()}})
+            assert len(engine.schedule(daily, observed)) == 1
+            result = engine.run_one(observed)
+            assert result["prospective_sessions"] == i - start + 1
+            assert result["replayed_sessions"] == 0
+    return observed, result
 
 
 def lab(tmp_path, **settings):
@@ -234,6 +262,7 @@ def test_unknown_execution_costs_and_unmodeled_cash_sweeps_block_admission():
 def test_worker_has_no_inherited_secrets_and_does_not_import_generated_code(tmp_path, monkeypatch):
     monkeypatch.setenv("SYNTHETIC_BROKER_SECRET", "must-not-reach-worker")
     candidate = proposal()
+    candidate["name"] = "多市场研究 Ω 🧭"
     sentinel = tmp_path / "SHOULD_NOT_EXIST"
     candidate["implementation"]["implementation_notes"] = f"open({str(sentinel)!r}, 'w').write('bad')"
     from scripts.autonomous_fund import strategy_lab
@@ -267,8 +296,10 @@ def test_no_holdout_details_in_research_context_and_new_variants_wait(tmp_path):
     engine.schedule(dataset(), NOW)
     result = engine.run_one(NOW)
     assert result is not None
-    public = engine.context(NOW)["candidates"][0]["validation"]
+    public = engine.context(NOW + timedelta(minutes=1))["candidates"][0]["validation"]
     assert "final" not in public["tests"]
+    assert "final_passed" not in public
+    assert public["tests"]["validation"]
     revision = proposal(version="v2")
     revision.update(parent_version="v1", change_type="revision")
     engine.submit(revision, NOW + timedelta(minutes=1))
@@ -281,6 +312,69 @@ def test_no_holdout_details_in_research_context_and_new_variants_wait(tmp_path):
     assert exploratory["status"] == "awaiting_new_holdout" and "final" not in exploratory["tests"]
 
 
+@pytest.mark.parametrize("gap", ["feature", "benchmark_session"])
+def test_binding_a_new_snapshot_cannot_move_or_replace_a_reserved_holdout(tmp_path, gap):
+    engine = lab(tmp_path)
+    history = dataset(170)
+    if gap == "feature":
+        history["bars"]["ALFA"][155].pop("event")
+    else:
+        del history["bars"]["BASE"][155]
+    first = attest(history)
+    corrected = dataset(171)
+    engine.submit(proposal(), NOW)
+    first_job, = engine.schedule(first, NOW)
+    # A newer snapshot can repair the same window after the verifier has
+    # diagnosed the gap. It cannot replace the reserved first validation.
+    assert engine.schedule(corrected, NOW) == []
+    report = engine.run_one(NOW)
+    assert report["status"] == "needs_data" and "final" not in report.get("tests", {})
+    with engine.journal.connection() as db:
+        receipt = db.execute("SELECT dataset,sessions FROM fund_strategy_holdouts").fetchone()
+        sessions = json.loads(receipt["sessions"])
+        assert receipt["dataset"] == digest(first)
+        assert db.execute("SELECT state FROM fund_strategy_jobs WHERE id=?", (first_job,)).fetchone()[0] == "finished"
+    again = NOW + timedelta(days=1)
+    assert len(engine.schedule(corrected, again)) == 1
+    final = engine.run_one(again)["tests"]["final"]
+    assert final["start"] == sessions[-37] and final["end"] == sessions[-1]
+    assert final["end"] != corrected["bars"]["BASE"][-1]["day"]
+
+
+def test_snapshot_provenance_at_the_automatic_ingest(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.strategy_lab_runtime import tick
+
+    engine = lab(tmp_path)
+    inbox = tmp_path / "strategy_lab_snapshot.json"
+    state = SimpleNamespace(strategy_lab=engine, mode="local", observe_only=False, halt_path=tmp_path / "STOP",
+                            get_datetime=lambda: NOW)
+    monkeypatch.setattr(engine, "kick", lambda _now: None)
+    candidate = dataset()
+    candidate["bars"]["ALFA"][-1]["event"] = 0
+    inbox.write_text(json.dumps(candidate), encoding="utf-8")
+    tick(state)
+    assert engine.run_one(NOW) is None
+    later = NOW + timedelta(minutes=1)
+    engine.submit(proposal(), later)
+    state.get_datetime = lambda: later
+    tick(state)  # The unchanged file can serve a new candidate.
+    result = engine.run_one(later)
+    assert "snapshot_provenance_unbound" in result["limitations"]
+    assert "final" not in result["tests"]
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
+    # The normal off-hours entry point accepts a replacement attested to the
+    # new contents. The previous exploratory run does not use the holdout.
+    inbox.write_text(json.dumps(attest(candidate)), encoding="utf-8")
+    state.get_datetime = lambda: later + timedelta(minutes=1)
+    tick(state)
+    assert "final" in engine.run_one(state.get_datetime())["tests"]
+    late = dataset()
+    late["bars"]["ALFA"][-1]["feature_available_at"] = {"event": (NOW + timedelta(days=1)).isoformat()}
+    with pytest.raises(RiskError, match="invalid publication time"):
+        engine.record_dataset(attest(late), NOW)
+
+
 def test_research_task_cannot_promote_a_strategy(tmp_path):
     from pydantic import ValidationError
     engine = lab(tmp_path)
@@ -291,7 +385,7 @@ def test_research_task_cannot_promote_a_strategy(tmp_path):
     assert engine.rows()[0]["state"] == "candidate"
 
 
-def test_frozen_forward_books_admission_and_degradation(tmp_path):
+def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     from scripts.autonomous_fund.strategy_admission import library, verify_allocations
     data = dataset(170)
     formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
@@ -301,11 +395,9 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path):
     assert engine.run_one(formed)["passed"]
     assert engine.rows()[0]["state"] == "shadow"
     assert library(engine.journal, formed) == []
-    later = dataset(235)
-    observed = instant(later["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
-    engine.schedule(later, observed)
-    result = engine.run_one(observed)
-    assert result["observations"] == 65
+    # Every admitted observation must have a signal on record before its open.
+    observed, result = forward_one_session_at_a_time(engine, dataset(210), 170, monkeypatch)
+    assert result["observations"] == 40
     assert result["passed"] and engine.rows()[0]["state"] == "paper_active"
     approved = library(engine.journal, observed + timedelta(seconds=10))
     assert len(approved) == 1
@@ -355,8 +447,11 @@ def test_exploratory_snapshots_cannot_claim_or_supersede_forward_evidence(tmp_pa
     exploratory["coverage"]["raw_prices"] = False
     assert engine.schedule(exploratory, resumed) == []
     result = engine.run_one(resumed)
-    assert result["passed"] and result["observations"] == 65
-    assert len(library(engine.journal, resumed + timedelta(minutes=1))) == 1
+    # The snapshot is qualified data, but bulk replay cannot recreate timely
+    # signal receipts. Its statistical result remains available for research.
+    assert result["statistical_passed"] and result["observations"] == 65
+    assert result["prospective_sessions"] == 1 and result["replayed_sessions"] == 64
+    assert not result["passed"] and library(engine.journal, resumed + timedelta(minutes=1)) == []
 
 
 def test_dividends_are_receivables_until_paid_and_never_double_counted():

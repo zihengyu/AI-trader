@@ -25,6 +25,8 @@ def compare(journal, now):
             identity = key + " / " + version
             returns[identity] = {r["day"]: value for r, value in zip(series, actual["daily_returns"])}
             entries.append({"strategy": identity, "state": state, "observations": len(series),
+                            "prospective_sessions": report.get("prospective_sessions"),
+                            "replayed_sessions": report.get("replayed_sessions"),
                             "net_return": actual["net_return"], "max_drawdown": actual["max_drawdown"],
                             "annual_volatility": actual["annual_volatility"],
                             "passive_reference_return": reference["net_return"],

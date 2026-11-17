@@ -5,7 +5,7 @@ import sys
 
 
 def main():
-    raw = sys.stdin.read(32_000_001)
+    raw = sys.stdin.buffer.read(32_000_001)
     if len(raw) > 32_000_000:
         raise ValueError("Strategy worker input exceeds its bound")
     payload = json.loads(raw)
@@ -22,17 +22,35 @@ def main():
             resource.setrlimit(resource.RLIMIT_AS, (2_000_000_000, 2_000_000_000))
     except ImportError:
         pass  # Parent still imposes wall-clock/input/output bounds on Windows.
-    from scripts.autonomous_fund.strategy_validation import check_dataset, forward_days, implementation_hash, metrics, replay, test_excess, validate
+    sys.stdout.write(json.dumps(evaluate(payload), allow_nan=False, default=str))
+
+
+def evaluate(payload):
+    from scripts.autonomous_fund.strategy_validation import (COVERAGE_FIELDS, check_dataset, forward_days,
+                                                           implementation_hash, metrics, replay, test_excess, validate)
     try:
         expected = payload["policy"].get("research_execution", {}).get("source_hash")
         if expected is not None and expected != implementation_hash():
             raise ValueError("Research execution implementation changed; a new version and validation are required")
+        proposal, data = payload["proposal"], payload["data"]
         if payload["kind"] in {"historical", "exploratory"}:
-            result = validate(payload["proposal"], payload["data"], payload["policy"],
+            if payload["kind"] == "historical" and expected is not None and not payload.get("locked_sessions"):
+                return {"status": "needs_data", "passed": False, "reason": "The historical window was not locked"}
+            result = validate(proposal, data, payload["policy"],
                               initial_capital=payload["initial_capital"], trials=payload["trials"],
-                              allow_final=payload["kind"] == "historical")
+                              allow_final=payload["kind"] == "historical", locked_sessions=payload.get("locked_sessions"),
+                              require_receipts=expected is not None)
+            if result["passed"]:
+                from scripts.autonomous_fund.strategy_definition import StrategyProposal
+                normalized = StrategyProposal.model_validate(proposal).model_dump()
+                try:
+                    initial = replay(normalized, data, payload["policy"], [],
+                                     initial_capital=payload["initial_capital"], initial_signal=True)
+                except ValueError as exc:
+                    result["forward_signal_error"] = str(exc)[:500]
+                else:
+                    result["next_signal"] = next_signal(initial)
         else:
-            proposal, data = payload["proposal"], payload["data"]
             check_dataset(data)
             plan = proposal["validation"]
             days = forward_days(data, plan["benchmark"], payload["forward_after"])
@@ -45,8 +63,7 @@ def main():
                                   static_weight=plan["benchmark_weight"], **args)
                 a, b = metrics(actual["series"], payload["initial_capital"]), metrics(baseline["series"], payload["initial_capital"])
                 test = test_excess(a, b, plan, payload["trials"])
-                complete = all(data.get("coverage", {}).get(k) is True for k in (
-                    "raw_prices", "corporate_actions_complete", "point_in_time_membership", "publication_times_complete"))
+                complete = all(data.get("coverage", {}).get(k) is True for k in COVERAGE_FIELDS)
                 window = plan["monitoring_window_sessions"]
                 relative_loss = 0
                 if len(days) >= window:
@@ -61,12 +78,17 @@ def main():
                           "degraded": actual["risk_paused"] or a["max_drawdown"] > plan["max_drawdown"]
                                       or relative_loss > plan["max_relative_loss"],
                           "coverage_complete": complete, "recent_relative_loss": relative_loss,
-                          "cost_usd": actual["cost_usd"]}
+                          "cost_usd": actual["cost_usd"], "next_signal": next_signal(actual)}
     except Exception as exc:
         # No private payload/paths/provider responses in controller diagnostics.
         result = {"status": "needs_data", "passed": False, "error": type(exc).__name__,
                   "reason": str(exc)[:500] if isinstance(exc, ValueError) else "Research input unavailable"}
-    sys.stdout.write(json.dumps(result, allow_nan=False, default=str))
+    return result
+
+
+def next_signal(simulation):
+    return {"as_of": simulation["next_signal_as_of"], "raw_targets": simulation["raw_next_targets"],
+            "targets": simulation["next_targets"]}
 
 
 if __name__ == "__main__":

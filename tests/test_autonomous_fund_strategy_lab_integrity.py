@@ -14,7 +14,8 @@ from scripts.autonomous_fund.strategy_admission import verify_allocations
 from scripts.autonomous_fund.strategy_definition import StrategyLabSettings, StrategyProposal
 from scripts.autonomous_fund.strategy_lab import StrategyLab, run_worker
 from scripts.autonomous_fund.strategy_validation import check_dataset, replay
-from tests.test_autonomous_fund_strategy_lab import NOW, cash_dataset, dataset, lab, policy, proposal
+from tests.test_autonomous_fund_strategy_lab import (NOW, attest, cash_dataset, dataset, forward_one_session_at_a_time,
+                                                   lab, policy, proposal)
 
 
 @pytest.mark.parametrize("cash_adapter", [False, True])
@@ -87,7 +88,7 @@ def test_cash_signal_uses_the_same_buffer_and_friction_as_replay():
     assert float(result["next_targets"]["ALFA"]) == pytest.approx(expected)
 
 
-def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_path):
+def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_path, monkeypatch):
     from scripts.autonomous_fund.execution import ExecutionState, OrderAuthorizationChanged, require_submission_authority
     from scripts.autonomous_fund.risk import Intent, Limits, number
     from scripts.autonomous_fund.strategy_admission import library
@@ -97,7 +98,7 @@ def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_
         # control, rather than a test of a random small sleeve beating equities.
         for row in data["bars"]["BASE"]:
             row.update(open=100., high=100., low=100., close=100.)
-        return data
+        return attest(data)
 
     configured, candidate, initial = policy(), proposal(), history(170)
     configured["limits"]["max_position"] = ".1"
@@ -108,10 +109,9 @@ def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_
     engine.submit(candidate, formed)
     engine.schedule(initial, formed)
     assert engine.run_one(formed)["passed"]
-    forward = history(235)
-    observed = instant(forward["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
-    engine.schedule(forward, observed)
-    assert engine.run_one(observed)["passed"]
+    # The same sleeve tested prospectively is the only one authorized here.
+    observed, result = forward_one_session_at_a_time(engine, history(210), 170, monkeypatch)
+    assert result["passed"]
     now = observed + timedelta(minutes=10)
     entry, = library(journal, now)
     assert float(entry["next_targets"]["ALFA"]) == pytest.approx(.1)
