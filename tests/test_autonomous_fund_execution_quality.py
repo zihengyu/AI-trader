@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from scripts.autonomous_fund.execution_quality import analyze, lines
+from scripts.autonomous_fund.execution_quality import analyze, lines, prior_cost_reference
 
 NOW = datetime(2026, 11, 2, 15, tzinfo=timezone.utc)
 
@@ -151,3 +151,72 @@ def test_terminal_partial_missing_callbacks_is_incomplete_instead_of_zero_filled
     assert row["incomplete_fill_orders"] == row["fees_unknown_orders"] == 1
     assert row["terminal_unfilled"] == row["unfilled_observations"] == 0
     assert row["implementation_shortfall_bps"] is None
+
+
+def test_all_in_cost_uses_only_jointly_observed_quote_quantity_and_fee():
+    db = database()
+    ev(db, "startup", {"mode": "paper"})
+    order(db, "complete")
+    fill(db, "complete", fee=1)
+    order(db, "price-improvement", "sell", 1, 199, 201)
+    fill(db, "price-improvement", "sell", 1, 201, 0)
+    order(db, "no-fee")
+    fill(db, "no-fee", price=105, fee=None)
+    order(db, "no-quote", bid=None)
+    fill(db, "no-quote", price=110, fee=40)
+    order(db, "still-open")
+    fill(db, "still-open", quantity=2, price=100, fee=2)
+    order(db, "terminal-partial")
+    fill(db, "terminal-partial", quantity=2, price=100, fee=1)
+    ev(db, "order_observed", {"broker_id": "terminal-partial", "status": "canceled", "filled_quantity": 2}, 3)
+    report = analyze(db, NOW + timedelta(seconds=10))
+    costs = report["groups"]["paper"]["matched_costs"]
+    arrival = 990 + 200 + 198
+    matched_execution = 1010 + 201 + 200
+    assert costs["matched_orders"] == 3 and costs["unclosed_quantity_orders"] == 1
+    assert costs["matched_arrival_notional_usd"] == arrival
+    assert costs["matched_execution_notional_usd"] == matched_execution
+    assert costs["verified_notional_coverage"] == pytest.approx(matched_execution / (matched_execution + 1050 + 1100 + 200))
+    assert costs["fee_bps"] == pytest.approx(2 / arrival * 10000)
+    assert costs["midpoint_shortfall_bps"] == pytest.approx((20 - 1 + 2) / arrival * 10000)
+    assert costs["all_in_bps"] == pytest.approx((20 - 1 + 2 + 2) / arrival * 10000)
+    assert any("覆盖已核实成交金额" in line for line in lines(report))
+
+
+def test_later_order_quantity_excludes_an_incomplete_older_cumulative_fill():
+    db = database()
+    order(db)
+    fill(db, quantity=2, seconds=1, cumulative=True)
+    ev(db, "order_observed", {"broker_id": "a", "status": "canceled", "filled_quantity": 5}, 5)
+    early = analyze(db, NOW + timedelta(seconds=2))["groups"]["unknown"]
+    assert early["matched_costs"]["unclosed_quantity_orders"] == 1
+    late = analyze(db, NOW + timedelta(seconds=10))["groups"]["unknown"]
+    assert late["incomplete_fill_orders"] == 1 and late["matched_costs"]["matched_orders"] == 0
+    assert late["matched_costs"]["all_in_bps"] is None
+
+
+def test_cost_reference_windows_modes_and_receipt_times_stay_distinct():
+    db = database()
+    ev(db, "startup", {"mode": "local"}, seconds=-100 * 86400)
+    order(db, "older", seconds=-91 * 86400)
+    fill(db, "older", price=900, seconds=-91 * 86400 + 1)
+    order(db, "local")
+    fill(db, "local", price=98, fee=0)
+    ev(db, "startup", {"mode": "paper"}, seconds=8)
+    order(db, "paper", seconds=9)
+    fill(db, "paper", seconds=10, fee=0)
+    before = prior_cost_reference(db, NOW + timedelta(seconds=10, microseconds=-1))
+    assert before["groups"]["local"]["orders_submitted"] == 1
+    assert before["groups"]["local"]["all_in_bps"] < 0
+    assert before["groups"]["paper"]["orders_without_observed_fills"] == 1
+    assert before["groups"]["paper"]["all_in_bps"] is None
+    after = prior_cost_reference(db, NOW + timedelta(seconds=10))
+    assert after["groups"]["paper"]["all_in_bps"] > 0
+    assert "broker_id" not in json.dumps(after)
+
+
+def test_unreadable_archived_execution_packet_leaves_optional_reference_unavailable():
+    db = database()
+    ev(db, "order_submitted", [])
+    reference = prior_cost_reference(db, NOW)
+    assert reference["status"] == "execution_ledger_unavailable" and reference["groups"] == {}

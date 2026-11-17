@@ -9,6 +9,7 @@ from .risk import RiskError
 
 
 def report(root):
+    from .execution_quality import reference_lines
     from .strategy_competition import compare_saved
 
     path = Path(root) / "state.sqlite3"
@@ -58,6 +59,10 @@ def report(root):
                 title += (f"，{study['evaluation_sessions']} 日净收益差 {study['incremental_net_return']:+.2%}，"
                           f"最大回撤变化 {study['change_in_max_drawdown']:+.2%}")
             lines.append(title)
+            if "execution_cost_reference" in study:
+                lines.extend(reference_lines(study["execution_cost_reference"]))
+            else:
+                lines.append("  这项声明尚未记录成交成本参考。")
             if "incremental_net_return" in study:
                 for arm, label in (("base", "基准组合"), ("combined", "加入候选")):
                     row = study[arm]

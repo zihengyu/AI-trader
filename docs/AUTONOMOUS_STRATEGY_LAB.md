@@ -246,6 +246,24 @@ shows the adjacent tested rates that bracket the threshold. It reports the
 test limit when the advantage survives every tested rate. These are extra
 transfer-cost assumptions, separate from the costs already in sleeve NAVs.
 
+New portfolio declarations freeze an account-local execution reference from the
+90 calendar days before declaration. It pairs only orders with a recorded
+arrival bid and ask, complete fees, and fills that account for the full requested
+quantity or a terminal observed filled quantity. All-in basis points are the
+directional difference from arrival midpoint plus known fees, divided by the
+matched shares' arrival midpoint notional. Price improvement can be negative.
+The amount of verified execution covered by the matched sample is calculated
+using actual fill notional for both numerator and denominator. Open or incomplete
+orders and missing quotes or fees are reported separately. The sample also
+reports the oldest arrival quote age observed within the matched orders.
+
+Local simulation and broker paper data remain separate. Forward study returns
+use the explicitly declared transfer costs. The saved reference documents what
+was known about securities execution when the study was declared. Securities
+costs and portfolio sleeve transfers represent different transactions. Later
+reconciliations appear in current economic diagnostics. Existing declarations
+retain their saved evidence, including the absence of an execution reference.
+
 The paired panel compares compounded net returns within consecutive,
 non-overlapping blocks of five trading sessions. The final partial block
 is excluded from this panel and remains part of the full-period comparison.

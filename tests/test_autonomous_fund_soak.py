@@ -109,6 +109,8 @@ def test_one_session_decides_fills_stops_out_wakes_ai_reviews_and_reports(tmp_pa
     execution = diagnostics["execution_quality"]["groups"]["local"]
     assert execution["with_fills"] >= 2 and execution["invalid_fill_orders"] == 0
     assert execution["arrival_unknown_orders"] == 0 and execution["implementation_shortfall_bps"] is not None
+    assert execution["matched_costs"]["matched_orders"] >= 2
+    assert execution["matched_costs"]["verified_notional_coverage"] == 1
     assert diagnostics["independent_books"]["status"] == "computed"
     report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
     assert report["protective_triggers"] and report["mandate"]["capital_usd"] == "10000"

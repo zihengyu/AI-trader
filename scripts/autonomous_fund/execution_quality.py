@@ -1,11 +1,18 @@
 """Cutoff-safe execution diagnostics from recorded orders, quotes and fills only."""
 import json
+import math
+import sqlite3
+from datetime import timedelta
 
 from .risk import RiskError, instant, number
 
 
-def analyze(db, until):
+REFERENCE_LOOKBACK_DAYS = 90
+
+
+def analyze(db, until, *, since=None):
     cutoff = instant(until)
+    start = instant(since) if since is not None else None
     orders, callbacks, cumulative, states, modes = {}, {}, {}, {}, []
     incomplete = set()
     conflicting = set()
@@ -67,7 +74,7 @@ def analyze(db, until):
                     quotes[key] = (bid, ask, instant(stamp), instant(submitted))
             except (RiskError, TypeError, ValueError):
                 continue
-    rows, groups = [], {}
+    rows, groups, costs = [], {}, {}
     for key, (submitted, sequence, body) in orders.items():
         # Older order events can carry iteration-start time. The immutable send
         # preparation receipt is the more precise clock, including at cutoffs.
@@ -76,6 +83,8 @@ def analyze(db, until):
             if prepared > cutoff:
                 continue
             submitted = prepared
+        if start is not None and submitted < start:
+            continue
         available_modes = [m for at, seq, m in modes if at <= submitted and seq <= sequence]
         mode = available_modes[-1] if available_modes else "unknown"
         group = groups.setdefault(mode, {"orders": 0, "with_fills": 0, "unfilled_observations": 0,
@@ -83,6 +92,9 @@ def analyze(db, until):
             "beyond_quote_usd": 0., "known_fees_usd": 0., "fees_unknown_orders": 0,
             "arrival_unknown_orders": 0, "invalid_fill_orders": 0, "first_fill_observation_seconds": []})
         group.setdefault("incomplete_fill_orders", 0)
+        evidence = costs.setdefault(mode, {"matched_orders": 0, "unclosed_quantity_orders": 0,
+            "verified_executed_notional": number(0), "matched_executed_notional": number(0),
+            "matched_arrival_notional": number(0), "fees": number(0), "shortfall": number(0), "max_quote_age_seconds": 0.})
         group["orders"] += 1
         fills = [cumulative[key]] if key in cumulative else list(callbacks.get(key, {}).values())
         state = states.get(key, {})
@@ -94,8 +106,8 @@ def analyze(db, until):
             observed_quantity, callback_quantity = None, number(0)
         except KeyError:
             observed_quantity, callback_quantity = None, number(0)
-        if key not in cumulative and (key in incomplete or observed_quantity is None or
-                observed_quantity > callback_quantity):
+        if (observed_quantity is None or observed_quantity > callback_quantity
+                or key in incomplete and key not in cumulative):
             group["incomplete_fill_orders"] += 1
             group["fees_unknown_orders"] += 1
             continue  # Known/possible partial fill is neither a proven zero-fill nor complete cost evidence.
@@ -137,6 +149,13 @@ def analyze(db, until):
         if latency >= 0:
             group["first_fill_observation_seconds"].append(latency)
         fee = sum(fees) if all(f is not None for f in fees) else None
+        executed_notional = sum(q * price for q, price in zip(quantities, prices))
+        evidence["verified_executed_notional"] += executed_notional
+        # Complete execution costs require an entire order quantity or a
+        # terminal receipt that accounts for every filled share.
+        closed_quantity = total == number(body["quantity"]) or (
+            terminal and state.get("filled_quantity") is not None and total == observed_quantity)
+        evidence["unclosed_quantity_orders"] += int(not closed_quantity)
         group["known_fees_usd"] += float(sum(f for f in fees if f is not None))
         group["fees_unknown_orders"] += int(fee is None)
         quote = quotes.get(body.get("intent_id"))
@@ -156,23 +175,46 @@ def analyze(db, until):
             shortfall = sum(q * sign * (p - mid) for q, p in zip(quantities, prices))
             beyond = sum(q * sign * (p - executable) for q, p in zip(quantities, prices))
             notional = total * mid
+            quote_age = (submitted - source_time).total_seconds()
             group["priced_notional"] += float(notional)
             group["shortfall_usd"] += float(shortfall)
             group["beyond_quote_usd"] += float(beyond)
-            row.update(arrival="recorded_bid_ask", quote_age_seconds=(submitted - source_time).total_seconds(),
+            if fee is not None and closed_quantity:
+                evidence["matched_orders"] += 1
+                evidence["matched_executed_notional"] += executed_notional
+                evidence["matched_arrival_notional"] += notional
+                evidence["fees"] += fee
+                evidence["shortfall"] += shortfall
+                evidence["max_quote_age_seconds"] = max(evidence["max_quote_age_seconds"], quote_age)
+            row.update(arrival="recorded_bid_ask", quote_age_seconds=quote_age,
                        implementation_shortfall_bps=float(shortfall / notional * 10000),
                        beyond_executable_quote_bps=float(beyond / notional * 10000))
         rows.append(row)
-    for group in groups.values():
+    for mode, group in groups.items():
         notional = group["priced_notional"]
         group["implementation_shortfall_bps"] = group["shortfall_usd"] / notional * 10000 if notional else None
         group["beyond_executable_quote_bps"] = group["beyond_quote_usd"] / notional * 10000 if notional else None
         times = sorted(group.pop("first_fill_observation_seconds"))
         group["first_fill_observation_p95_seconds"] = times[max(0, (95 * len(times) + 99) // 100 - 1)] if times else None
         group["latency_samples"] = len(times)
+        sample = costs[mode]
+        arrival = sample["matched_arrival_notional"]
+        executed = sample["verified_executed_notional"]
+        group["matched_costs"] = {
+            "matched_orders": sample["matched_orders"], "unclosed_quantity_orders": sample["unclosed_quantity_orders"],
+            "matched_arrival_notional_usd": float(arrival),
+            "matched_execution_notional_usd": float(sample["matched_executed_notional"]),
+            "verified_execution_notional_usd": float(executed),
+            "verified_notional_coverage": float(sample["matched_executed_notional"] / executed) if executed else None,
+            "max_quote_age_seconds": sample["max_quote_age_seconds"] if arrival else None,
+            "fee_bps": float(sample["fees"] / arrival * 10000) if arrival else None,
+            "midpoint_shortfall_bps": float(sample["shortfall"] / arrival * 10000) if arrival else None,
+            "all_in_bps": float((sample["fees"] + sample["shortfall"]) / arrival * 10000) if arrival else None,
+        }
     return {"groups": groups, "recent": rows[-10:],
             "meaning": "Notional-weighted implementation shortfall from recorded bid/ask, never order limits. "
                        "Cumulative fills replace callbacks; explicit execution IDs deduplicate callbacks. "
+                       "Matched costs use only orders with both complete fees and reconciled filled quantity. "
                        "Latency starts at send preparation where recorded, otherwise the legacy order-event clock; "
                        "it is time to observation, not exchange fill latency. Open/unfilled orders are censored. "
                        "Local and paper observations are separated; neither proves live impact/queue calibration."}
@@ -190,7 +232,56 @@ def lines(report):
         out.append(f"  未成交中已终结 {row['terminal_unfilled']}、仍挂单或状态未知 {row['open_or_unknown']}；"
                    f"成交明细不完整 {row.get('incomplete_fill_orders', 0)}，成交证据无效 {row['invalid_fill_orders']}，等待时间样本 {row['latency_samples']}，"
                    f"P95 {wait}。")
+        paired = row.get("matched_costs")
+        if paired:
+            coverage = paired["verified_notional_coverage"]
+            share = "未知" if coverage is None else f"{coverage:.1%}"
+            out.append(f"  报价、成交量和手续费齐备 {paired['matched_orders']} 笔，覆盖已核实成交金额 {share}，"
+                       f"中间价差额加手续费 {pct(paired['all_in_bps'])}。")
     if not report["groups"]:
         out.append("尚无可核对的已提交订单。")
     out.append("本地与券商模拟成交均非实盘校准；等待时间包含轮询/网络观察延迟，不能视为交易所撮合延迟。")
     return out
+
+
+def prior_cost_reference(db, until):
+    """Freeze aggregate account-local evidence available before a study declaration."""
+    cutoff = instant(until)
+    start = cutoff - timedelta(days=REFERENCE_LOOKBACK_DAYS)
+    window = {"from": start.isoformat(), "through": cutoff.isoformat(), "lookback_days": REFERENCE_LOOKBACK_DAYS}
+    try:
+        groups = analyze(db, cutoff, since=start)["groups"]
+    except (sqlite3.DatabaseError, ArithmeticError, AttributeError, KeyError, TypeError, ValueError):
+        return {**window, "status": "execution_ledger_unavailable", "groups": {}}
+    matched = {mode: {**row["matched_costs"], "orders_submitted": row["orders"],
+                      "orders_without_observed_fills": row["unfilled_observations"],
+                      "orders_with_incomplete_fills": row["incomplete_fill_orders"],
+                      "orders_with_invalid_fills": row["invalid_fill_orders"],
+                      "arrival_unknown_orders": row["arrival_unknown_orders"],
+                      "fees_unknown_orders": row["fees_unknown_orders"]} for mode, row in groups.items()}
+    if any(not math.isfinite(value) for row in matched.values() for value in row.values() if isinstance(value, float)):
+        return {**window, "status": "execution_ledger_unavailable", "groups": {}}
+    return {**window, "status": "matched_sample" if any(row["matched_orders"] for row in matched.values())
+            else "no_matched_sample", "groups": matched,
+            "basis": "account-local security executions versus recorded arrival midpoint plus complete fees",
+            "use": "Context for cost assumptions. Security execution is distinct from modeled sleeve transfers."}
+
+
+def reference_lines(reference):
+    if reference["status"] == "execution_ledger_unavailable":
+        return ["  声明前的成交成本账本暂不可用。"]
+    if not reference["groups"]:
+        return [f"  声明前 {reference['lookback_days']} 天暂无可核对的订单。"]
+    lines = [f"  声明前 {reference['lookback_days']} 天的证券成交参考，按账户模式分列。"]
+    for mode, row in reference["groups"].items():
+        coverage = row["verified_notional_coverage"]
+        share = "未知" if coverage is None else f"{coverage:.1%}"
+        rate = "未知" if row["all_in_bps"] is None else f"{row['all_in_bps']:+.2f} 基点"
+        lines.append(f"    {mode} 有效配对 {row['matched_orders']} 笔，覆盖已核实成交金额 {share}，"
+                     f"中间价差额加手续费 {rate}。")
+        age = row.get("max_quote_age_seconds")
+        if age is not None:
+            lines.append(f"      配对样本的到达报价最长已过 {age:.1f} 秒。")
+        lines.append(f"      缺到达报价 {row['arrival_unknown_orders']} 笔，费用未知 {row['fees_unknown_orders']} 笔，"
+                     f"成交量待核 {row['orders_with_incomplete_fills'] + row['unclosed_quantity_orders']} 笔。")
+    return lines

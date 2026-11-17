@@ -162,6 +162,39 @@ def test_combined_only_transfer_stress_brackets_a_small_edge(tmp_path, tape):
     assert any("额外加收 5 基点" in line for line in report(tmp_path))
 
 
+def test_declaration_freezes_cost_reference_without_changing_study_rates(tmp_path, tape):
+    engine = lab(tmp_path)
+    price_moves = [.013 if i % 2 else -.004 for i in range(len(tape))]
+    store(engine, "base", tape, price_moves)
+    store(engine, "candidate", tape, price_moves)
+    at = tape[25][1] + timedelta(hours=1)
+    order_at = at - timedelta(minutes=30)
+    with engine.journal.connection() as db:
+        db.executescript("CREATE TABLE fund_orders(intent_id TEXT PRIMARY KEY, submitted_at TEXT);"
+                         "CREATE TABLE fund_order_quotes(intent_id TEXT PRIMARY KEY, bid TEXT, ask TEXT,"
+                         "as_of TEXT, observed_at TEXT);")
+        stamp = order_at.isoformat()
+        db.execute("INSERT INTO fund_orders VALUES(?,?)", ("before-plan", stamp))
+        db.execute("INSERT INTO fund_order_quotes VALUES(?,?,?,?,?)", ("before-plan", "99", "101", stamp, stamp))
+    engine.journal.event(order_at - timedelta(days=1), "startup", {"mode": "paper"})
+    engine.journal.event(order_at, "order_submitted", {"broker_id": "before-plan", "intent_id": "before-plan",
+                         "symbol": "ALFA", "side": "buy", "quantity": 10})
+    fill = {"broker_id": "before-plan", "symbol": "ALFA", "side": "buy", "quantity": 10, "price": 101, "trade_cost": 2}
+    engine.journal.event(order_at + timedelta(seconds=1), "fill_reconciled", fill)
+    registered = declare(engine, spec(fees=2, slip=8), at)
+    reference = registered["execution_cost_reference"]
+    assert reference["groups"]["paper"]["all_in_bps"] == 120
+    assert reference["through"] == at.isoformat()
+
+    # A corrected fee published after declaration belongs to future economic
+    # reports, while this study retains the exact evidence it had at formation.
+    engine.journal.event(at + timedelta(minutes=1), "fill_reconciled", {**fill, "trade_cost": 20})
+    study, = studies(engine, tape[-1][1] + timedelta(hours=1))
+    assert study["execution_cost_reference"] == reference
+    assert study["plan"]["fee_bps"] == 2 and study["plan"]["slippage_bps"] == 8
+    assert any("+120.00 基点" in line for line in report(tmp_path))
+
+
 def test_paired_interval_covers_complete_five_session_blocks_only(tmp_path):
     engine = lab(tmp_path)
     tape = [(row["day"], instant(row["at"])) for row in dataset(80)["bars"]["BASE"]]

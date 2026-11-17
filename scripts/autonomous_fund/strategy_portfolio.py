@@ -6,6 +6,7 @@ from datetime import timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
 
+from .execution_quality import prior_cost_reference
 from .journal import encode
 from .risk import RiskError, instant, number
 from .scorecard import _exchange_sessions, _idea_session_close, _regime_interval
@@ -141,11 +142,13 @@ def declare_study(db, spec, now):
     target = min(vols.values())
     if target <= 0 or not all(map(math.isfinite, vols.values())):
         raise RiskError("Portfolio study requires nonzero risk in both calibration portfolios")
+    execution_reference = prior_cost_reference(db, now)
     declared_at = now + timedelta(seconds=monotonic() - started)
     local_day = declared_at.astimezone(ZoneInfo("America/New_York")).date()
     closes = _exchange_sessions(local_day.isoformat(), (local_day + timedelta(days=15)).isoformat())
     anchor = next(day for day in closes if _idea_session_close(day) > declared_at)
     saved = {"protocol": PROTOCOL, "plan": plan, "versions": versions, "declared_at": declared_at.isoformat(),
+             "execution_cost_reference": execution_reference,
              "calibration_digest": _calibration_digest(fit_days, paths), "calibration_start": fit_days[0],
              "calibration_end": fit_days[-1], "calibration_sessions": len(fit_days), "volatility_target": target,
              "calibration_volatility": vols, "scales": {arm: target / value for arm, value in vols.items()},
