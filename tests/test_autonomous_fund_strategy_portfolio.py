@@ -7,8 +7,9 @@ import pytest
 
 from scripts.autonomous_fund.journal import encode
 from scripts.autonomous_fund.lab import main, report
-from scripts.autonomous_fund.risk import RiskError, instant
+from scripts.autonomous_fund.risk import RiskError, instant, number
 from scripts.autonomous_fund.strategy_portfolio import STUDY_EVENT, declare_study
+from scripts.autonomous_fund.strategy_validation import replay
 from tests.test_autonomous_fund_strategy_comparison import nav
 from tests.test_autonomous_fund_strategy_lab import dataset, lab, proposal
 
@@ -24,9 +25,16 @@ def spec(name="example", *, fees=0, slip=0):
             "fee_bps": fees, "slippage_bps": slip}
 
 
-def store(engine, key, tape, returns, *, replayed_index=None):
+def store(engine, key, tape, returns, *, replayed_index=None, holdings=None):
     engine.submit(proposal(key), tape[0][1] - timedelta(days=1))
     series = nav([day for day, _ in tape], returns)
+    if holdings is not None:
+        for row in series:
+            row.update(holdings(row))
+    save_receipts(engine, key, tape, series, replayed_index=replayed_index)
+
+
+def save_receipts(engine, key, tape, series, *, replayed_index=None):
     with engine.journal.connection() as db:
         for index, (row, (_, close)) in enumerate(zip(series, tape, strict=True)):
             at = close + timedelta(minutes=1)
@@ -64,7 +72,115 @@ def test_frozen_risk_budget_removes_extra_market_exposure_on_new_dates(tmp_path,
     assert observed["change_in_max_drawdown"] == pytest.approx(0, abs=1e-12)
     assert observed["combined"]["mean_cash_weight"] == pytest.approx(1 - 1 / 1.2)
     assert observed["base"]["net_return"] == pytest.approx(math.prod(1 + value for value in prices[27:]) - 1)
+    exposure = observed["position_exposure"]
+    assert exposure["status"] == "unavailable" and exposure["covered_sessions"] == 0
+    assert exposure["missing_by_reason"] == {"missing_or_invalid_closing_book": observed["evaluation_sessions"]}
     assert engine.journal.pending() == []
+
+
+def closing_holdings(row, positions, *, unpaid=0):
+    equity = number(row["net_economic_equity"]) + 12  # Separate previously incurred research expense.
+    cash = equity - sum(positions.values()) * 100 - unpaid
+    receivables = [{"symbol": "ALFA", "pay_date": "2025-12-01", "amount": str(unpaid)}] if unpaid else []
+    return {"equity": str(equity), "cash": str(cash), "positions": positions,
+            "position_prices": dict.fromkeys(positions, "100"), "receivables": receivables}
+
+
+def test_closing_security_overlap_and_cash_use_end_of_interval_allocations(tmp_path, tape):
+    engine = lab(tmp_path)
+    engine.policy["universe"]["BILL"] = "cash_equivalent"
+    market = [.012 if i % 2 == 0 else -.006 for i in range(len(tape))]
+    candidate = [2 * value + (.01 if i >= 27 else 0) for i, value in enumerate(market)]
+    store(engine, "base", tape, market, holdings=lambda row: closing_holdings(row, {"ALFA": 30}))
+    store(engine, "other", tape, market, holdings=lambda row: closing_holdings(row, {"ALFA": 10, "BASE": 20}))
+    store(engine, "candidate", tape, candidate,
+          holdings=lambda row: closing_holdings(row, {"ALFA": 60, "BILL": 15}, unpaid=500))
+    plan = {**spec(), "base": [{"strategy_id": "base", "version": "v1", "weight": .6},
+                              {"strategy_id": "other", "version": "v1", "weight": .4}]}
+    declare(engine, plan, tape[25][1] + timedelta(hours=1))
+    study, = studies(engine, tape[-1][1] + timedelta(hours=1))
+    exposure = study["position_exposure"]
+    latest = exposure["latest"]
+    assert exposure["status"] == "complete"
+    assert exposure["covered_sessions"] == study["evaluation_sessions"]
+    assert latest["day"] == study["evaluation_end"] == tape[-1][0]
+
+    base_equity = 10000 * math.prod(1 + r for r in market) + 12
+    candidate_equity = 10000 * math.prod(1 + r for r in candidate) + 12
+    outside, base_close, candidate_close = 1 - 1 / 1.2, .8 / 1.2 * (1 + market[-1]), .2 / 1.2 * (1 + candidate[-1])
+    total_close = outside + base_close + candidate_close
+    base_alfa = (.6 * 3000 + .4 * 1000) / base_equity
+    candidate_alfa = candidate_close / total_close * 6000 / candidate_equity
+    combined_alfa = base_close / total_close * base_alfa + candidate_alfa
+    assert latest["base"]["max_single_security_weight"] == pytest.approx(base_alfa)
+    assert latest["base"]["shared_security_weight"] == pytest.approx(base_alfa)
+    assert latest["combined"]["max_single_security_weight"] == pytest.approx(combined_alfa)
+    assert latest["combined"]["shared_security_weight"] == pytest.approx(combined_alfa)
+    assert latest["combined"]["candidate_overlap_weight"] == pytest.approx(candidate_alfa)
+    assert latest["combined"]["outside_usd_cash_weight"] == pytest.approx(outside / total_close)
+    assert latest["combined"]["cash_equivalent_weight"] == pytest.approx(candidate_close / total_close * 1500 / candidate_equity)
+    assert latest["combined"]["receivables_weight"] == pytest.approx(candidate_close / total_close * 500 / candidate_equity)
+    assert sum(latest["combined"][key] for key in ("risk_security_weight", "outside_usd_cash_weight", "sleeve_usd_cash_weight",
+                                                    "cash_equivalent_weight", "receivables_weight")) == pytest.approx(1)
+    largest = latest["largest_risk_securities"]
+    assert [row["symbol"] for row in largest] == ["ALFA", "BASE"]
+    assert largest[0]["combined_weight"] == pytest.approx(combined_alfa)
+    assert exposure["peak_single_security_weight"]["combined"] > combined_alfa
+    lines = report(tmp_path)
+    assert any(f"候选分配至原有风险证券 {candidate_alfa:.2%}" in line for line in lines)
+    assert any(f"ALFA {base_alfa:.2%} → {combined_alfa:.2%}" in line for line in lines)
+
+
+def test_partial_exposure_keeps_matched_returns_and_never_assumes_cash(tmp_path, tape):
+    engine = lab(tmp_path)
+    market = [.012 if i % 2 == 0 else -.006 for i in range(len(tape))]
+
+    def candidate_holdings(row):
+        day = row["day"]
+        book = closing_holdings(row, {} if day == tape[-4][0] else {"ALFA": 45})
+        if day == tape[-3][0]:
+            book["position_prices"] = {}
+        elif day == tape[-2][0]:
+            book["position_prices"]["ALFA"] = "101"
+            book["cash"] = str(number(book["cash"]) - 45)
+        elif day == tape[-1][0]:
+            book["cash"] = str(number(book["cash"]) + 1)
+        return book
+
+    store(engine, "base", tape, market, holdings=lambda row: closing_holdings(row, {"ALFA": 30}))
+    store(engine, "candidate", tape, market, holdings=candidate_holdings)
+    declare(engine, spec(), tape[25][1] + timedelta(hours=1))
+    study, = studies(engine, tape[-1][1] + timedelta(hours=1))
+    exposure = study["position_exposure"]
+    assert study["evaluation_end"] == tape[-1][0]
+    assert study["incremental_net_return"] == pytest.approx(0)
+    assert exposure["status"] == "partial"
+    assert exposure["covered_sessions"] == study["evaluation_sessions"] - 3
+    assert exposure["missing_by_reason"] == {"missing_or_invalid_closing_book": 2,
+                                              "inconsistent_shared_marks_or_classification": 1}
+    assert exposure["latest"]["day"] == tape[-4][0]
+    assert exposure["latest"]["combined"]["candidate_overlap_weight"] == 0
+    assert exposure["latest"]["combined"]["sleeve_usd_cash_weight"] > exposure["latest"]["base"]["sleeve_usd_cash_weight"]
+    assert any("相同证券的估值或分类冲突 1 日" in line for line in report(tmp_path))
+
+
+def test_closing_exposure_reads_native_replay_books(tmp_path, tape):
+    engine = lab(tmp_path)
+    data = dataset(len(tape))
+    for key, weight in (("base", "0.4"), ("candidate", "0.6")):
+        body = proposal(key)
+        body["implementation"]["rules"][0]["weight"] = weight
+        engine.submit(body, tape[0][1] - timedelta(days=1))
+        result = replay(body, data, engine.policy, [day for day, _ in tape], initial_capital=10000)
+        save_receipts(engine, key, tape, result["series"])
+    declare(engine, spec(), tape[25][1] + timedelta(hours=1))
+    study, = studies(engine, tape[-1][1] + timedelta(hours=1))
+    exposure = study["position_exposure"]
+    assert exposure["status"] == "complete"
+    assert exposure["covered_sessions"] == study["evaluation_sessions"]
+    assert exposure["peak_single_security_weight"]["base"] > .35
+    assert exposure["peak_single_security_weight"]["combined"] > .35
+    assert any(row["symbol"] == "ALFA" for row in exposure["latest"]["largest_risk_securities"])
 
 
 def test_extra_transfer_cost_is_charged_and_replay_truncates_both_arms(tmp_path, tape):

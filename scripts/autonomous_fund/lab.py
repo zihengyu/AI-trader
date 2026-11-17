@@ -85,6 +85,35 @@ def report(root):
                                  f"近似 95% 区间为 {low:+.2%} 至 {high:+.2%}。")
                 else:
                     lines.append(f"  已有 {paired['non_overlapping']} 个不重叠五日区间，平均净收益差区间暂不可估计。")
+                exposure = study["position_exposure"]
+                coverage = f"{exposure['covered_sessions']}/{exposure['evaluation_sessions']} 日"
+                if exposure["status"] == "unavailable":
+                    lines.append(f"  证券持仓覆盖 {coverage}，暂无可核对的收盘持仓。")
+                else:
+                    latest = exposure["latest"]
+                    base, combined = latest["base"], latest["combined"]
+                    lines.append(f"  证券持仓覆盖 {coverage}。{latest['day']} 收盘最大单只风险证券权重"
+                                 f" {base['max_single_security_weight']:.2%} → {combined['max_single_security_weight']:.2%}，"
+                                 f"跨策略共同持有的风险证券权重"
+                                 f" {base['shared_security_weight']:.2%} → {combined['shared_security_weight']:.2%}，"
+                                 f"候选分配至原有风险证券 {combined['candidate_overlap_weight']:.2%}。")
+                    peak = exposure["peak_single_security_weight"]
+                    lines.append(f"  已覆盖收盘的最高单只权重 {peak['base']:.2%} → {peak['combined']:.2%}。"
+                                 f"加入候选后的收盘外层现金 {combined['outside_usd_cash_weight']:.2%}，"
+                                 f"策略内现金 {combined['sleeve_usd_cash_weight']:.2%}，"
+                                 f"现金等价证券 {combined['cash_equivalent_weight']:.2%}，"
+                                 f"应收款 {combined['receivables_weight']:.2%}。")
+                    largest = latest["largest_risk_securities"][:3]
+                    if largest:
+                        holdings = "，".join(f"{row['symbol']} {row['base_weight']:.2%} → {row['combined_weight']:.2%}"
+                                             for row in largest)
+                        lines.append(f"  主要风险证券收盘权重 {holdings}。")
+                if exposure["missing_by_reason"]:
+                    labels = {"missing_or_inconsistent_policy": "版本策略配置缺失或无法核验",
+                              "missing_or_invalid_closing_book": "收盘账本缺失或无法核对",
+                              "inconsistent_shared_marks_or_classification": "相同证券的估值或分类冲突"}
+                    gaps = "，".join(f"{labels[reason]} {count} 日" for reason, count in exposure["missing_by_reason"].items())
+                    lines.append(f"  持仓覆盖缺口包括{gaps}。")
         lines.append("后台任务：" + json.dumps(states, ensure_ascii=False))
         costs = db.execute("SELECT r.category,sum(coalesce(c.actual,r.reserved))/1000000.0 "
                            "FROM fund_research_reservations r LEFT JOIN fund_research_charges c ON c.id=r.id "

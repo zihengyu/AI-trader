@@ -10,6 +10,7 @@ from .execution_quality import prior_cost_reference
 from .journal import encode
 from .risk import RiskError, instant, number
 from .scorecard import _exchange_sessions, _idea_session_close, _regime_interval
+from .strategy_portfolio_exposure import position_exposure
 from .strategy_validation import _daily_sessions, digest, following_session, metrics
 
 
@@ -275,9 +276,10 @@ def evaluate_studies(db, now):
                 paired = _paired_advantage(days, arms["base"].pop("daily_returns"), arms["combined"].pop("daily_returns"))
                 stress = _cost_stress(days, paths, scaled["combined"], fee, slippage,
                                       arms["base"]["net_return"], arms["combined"]["net_return"])
+                exposure = position_exposure(db, days, paths, scaled, _identity(plan["candidate"]), now)
                 result.update(status="observed" if len(days) >= CALIBRATION_SESSIONS else "limited_sample",
                               evaluation_sessions=len(days), evaluation_end=days[-1], **arms,
-                              paired_advantage=paired, transfer_cost_stress=stress,
+                              paired_advantage=paired, transfer_cost_stress=stress, position_exposure=exposure,
                               incremental_net_return=arms["combined"]["net_return"] - arms["base"]["net_return"],
                               change_in_max_drawdown=arms["combined"]["max_drawdown"] - arms["base"]["max_drawdown"])
         elif days or now > _idea_session_close(start):

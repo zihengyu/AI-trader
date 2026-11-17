@@ -238,6 +238,26 @@ allocation. Actual fixed costs can behave differently. The study cannot estimate
 security-level order netting, funding returns, whole-share differences at the
 new sleeve sizes or actual account execution.
 
+The closing exposure comparison uses the same prospective evaluation dates. It
+calculates each sleeve's closing capital share from its declared allocation and
+that day's net NAV change. Within each sleeve, raw closing market values, USD
+cash and unpaid receivables reconcile to its marked book equity. The report
+combines weights for identical securities across sleeves. It shows the largest
+single risk security weight and the total weight of risk securities held by
+multiple sleeves. It also shows the fraction of combined capital assigned by
+the candidate to securities already held by the base.
+Frozen policy classifies cash-equivalent securities separately from risk
+securities, USD cash and receivables.
+
+Both arms use the same dates with complete closing books across all sleeves.
+Missing holdings, unreconciled books and conflicting marks or cash
+classifications reduce exposure coverage. The report dates the latest covered
+close and computes concentration peaks over the covered closes. NAV comparisons
+still use their own complete return sample. The modeled weights are at the
+security level, so an ETF appears as one security. The calculation does not
+estimate fund constituents, embedded leverage or factor exposures. The exposure
+report is research evidence for the Manager and operator.
+
 The cost sensitivity uses the same sessions and allocation scales. It keeps
 the base arm at its declared costs and adds 5, 10, 25, 50 and 100 basis points
 per dollar of combined-arm transfer. Each scenario replays the self-financing

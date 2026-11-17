@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- Portfolio contribution studies reconstruct matched closing security weights from prospective sleeve books. Manager and operator views report concentration, overlapping names, cash partitions and exposure coverage alongside the NAV comparison.
 - Execution reports pair arrival quotes, reconciled fills and complete fees on the same orders for all-in cost and verified notional coverage. New portfolio studies retain an account-local pre-declaration cost reference by execution mode while continuing to use their declared transfer assumptions.
 - Portfolio contribution studies report additional combined-arm transfer-cost stresses and the tested break-even range on the same prospective sample. Non-overlapping five-session pairs show the observed return difference and approximate uncertainty when enough blocks are available.
 - Strategy Lab supports explicitly declared, account-local portfolio contribution studies. Both arms use equal starting capital and a shared volatility target frozen from earlier prospective samples. Later paired returns report the effect of adding a candidate after modeled sleeve transfer costs, alongside drawdown, cash allocation and turnover.
