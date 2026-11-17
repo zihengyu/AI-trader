@@ -238,6 +238,23 @@ allocation. Actual fixed costs can behave differently. The study cannot estimate
 security-level order netting, funding returns, whole-share differences at the
 new sleeve sizes or actual account execution.
 
+The cost sensitivity uses the same sessions and allocation scales. It keeps
+the base arm at its declared costs and adds 5, 10, 25, 50 and 100 basis points
+per dollar of combined-arm transfer. Each scenario replays the self-financing
+transfers. When the incremental net return turns nonpositive, the report
+shows the adjacent tested rates that bracket the threshold. It reports the
+test limit when the advantage survives every tested rate. These are extra
+transfer-cost assumptions, separate from the costs already in sleeve NAVs.
+
+The paired panel compares compounded net returns within consecutive,
+non-overlapping blocks of five trading sessions. The final partial block
+is excluded from this panel and remains part of the full-period comparison.
+With at least ten complete blocks and meaningful variation, the panel shows
+an approximate 95% interval for the average five-session difference. This
+interval can understate uncertainty when the blocks remain dependent. It is
+a descriptive estimate for the declared study, separate from the portfolio's
+cumulative net return and qualification rules.
+
 ## Authority and migration
 
 Three permissions remain separate: scientific evidence, account-level strategy

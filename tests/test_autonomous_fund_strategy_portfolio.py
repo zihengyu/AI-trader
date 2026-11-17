@@ -87,6 +87,9 @@ def test_extra_transfer_cost_is_charged_and_replay_truncates_both_arms(tmp_path,
     assert result["combined"]["net_return"] == pytest.approx(
         capital_after_entry_cost * math.prod(1 + value for value in prices[27:32]) - 1)
     assert result["incremental_net_return"] == pytest.approx(0, abs=1e-12)
+    assert result["transfer_cost_stress"]["status"] == "already_nonpositive"
+    assert result["paired_advantage"]["non_overlapping"] == 1
+    assert result["paired_advantage"]["interval_95"] is None
 
 
 def test_manager_sees_later_incremental_return_and_declaration_cannot_be_altered(tmp_path, tape):
@@ -138,3 +141,52 @@ def test_declaration_requires_already_available_evidence_and_exact_owned_version
     declared = json.loads(capsys.readouterr().out)
     assert declared["plan"]["candidate"]["version"] == "v1"
     assert engine.journal.pending() == []
+
+
+def test_combined_only_transfer_stress_brackets_a_small_edge(tmp_path, tape):
+    engine = lab(tmp_path)
+    market = [.010 if i % 2 == 0 else -.005 for i in range(len(tape))]
+    candidate = [value + (.00016 if i >= 27 else 0) for i, value in enumerate(market)]
+    store(engine, "base", tape, market)
+    store(engine, "candidate", tape, candidate)
+    declare(engine, spec(fees=10, slip=5), tape[25][1] + timedelta(hours=1))
+
+    result, = studies(engine, tape[-1][1] + timedelta(hours=1))
+    assert result["base"]["net_return"] == pytest.approx(math.prod(1 + r for r in market[27:]) / 1.0015 - 1)
+    stress = result["transfer_cost_stress"]
+    assert stress["status"] == "bracketed"
+    assert stress["breakeven_bracket"] == {"positive_at_extra_bps": 5, "nonpositive_at_extra_bps": 10}
+    scenarios = {row["extra_transfer_bps"]: row["incremental_net_return"] for row in stress["scenarios"]}
+    assert scenarios[0] == pytest.approx(result["incremental_net_return"])
+    assert scenarios[0] > scenarios[5] > 0 > scenarios[10] > scenarios[100]
+    assert any("额外加收 5 基点" in line for line in report(tmp_path))
+
+
+def test_paired_interval_covers_complete_five_session_blocks_only(tmp_path):
+    engine = lab(tmp_path)
+    tape = [(row["day"], instant(row["at"])) for row in dataset(80)["bars"]["BASE"]]
+    market = [.010 if i % 2 == 0 else -.005 for i in range(len(tape))]
+    candidate = [r + ((.003 if ((i - 27) // 5) % 2 == 0 else -.003) if i >= 27 else 0)
+                 for i, r in enumerate(market)]
+    store(engine, "base", tape, market)
+    store(engine, "candidate", tape, candidate)
+    store(engine, "identical-book", tape, market)
+    store(engine, "large-edge", tape, [r + (.02 if i >= 27 else 0) for i, r in enumerate(market)])
+    at = tape[25][1] + timedelta(hours=1)
+    declare(engine, spec(), at)
+    declare(engine, {**spec("identical"), "candidate": {"strategy_id": "identical-book", "version": "v1"}}, at)
+    declare(engine, {**spec("large"), "candidate": {"strategy_id": "large-edge", "version": "v1"}}, at)
+
+    results = {item["plan"]["study_id"]: item for item in studies(engine, tape[-1][1] + timedelta(hours=1))}
+    result = results["example"]
+    paired = result["paired_advantage"]
+    assert (paired["non_overlapping"], paired["positive_blocks"], paired["trailing_sessions_excluded"]) == (10, 5, 3)
+    low, high = paired["interval_95"]
+    assert low < 0 < high  # Alternating week-level edges make this direction inconclusive.
+    assert low < paired["sample_mean"] < high
+    assert result["evaluation_sessions"] == 53 and "daily_returns" not in result["combined"]
+    zero = results["identical"]["paired_advantage"]
+    assert zero["non_overlapping"] == 10 and zero["positive_blocks"] == 0 and zero["interval_95"] is None
+    large = results["large"]["transfer_cost_stress"]
+    assert large["status"] == "above_tested_range" and large["breakeven_bracket"] is None
+    assert large["scenarios"][-1]["extra_transfer_bps"] == 100 and large["scenarios"][-1]["incremental_net_return"] > 0

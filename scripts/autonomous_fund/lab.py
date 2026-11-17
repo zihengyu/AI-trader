@@ -64,6 +64,22 @@ def report(root):
                     lines.append(f"  {label} 外层现金权重 {row['mean_cash_weight']:.2%}，"
                                  f"资金转移换手 {row['transfer_turnover_fraction']:.2%}，"
                                  f"额外费用和滑点 {row['transfer_fees_fraction'] + row['transfer_slippage_fraction']:.3%}")
+                stress = study["transfer_cost_stress"]
+                bracket = stress["breakeven_bracket"]
+                if bracket:
+                    lines.append(f"  加入候选后的组合每笔转移额外加收 {bracket['positive_at_extra_bps']} 基点时仍有优势，"
+                                 f"加收 {bracket['nonpositive_at_extra_bps']} 基点时优势消失。")
+                elif stress["status"] == "above_tested_range":
+                    lines.append(f"  额外转移成本加至 {stress['scenarios'][-1]['extra_transfer_bps']} 基点仍有优势。")
+                elif stress["status"] == "already_nonpositive":
+                    lines.append("  已声明成本下，加入候选的净收益差接近零或为负。")
+                paired = study["paired_advantage"]
+                if paired["interval_95"]:
+                    low, high = paired["interval_95"]
+                    lines.append(f"  {paired['non_overlapping']} 个不重叠五日区间，平均净收益差的"
+                                 f"近似 95% 区间为 {low:+.2%} 至 {high:+.2%}。")
+                else:
+                    lines.append(f"  已有 {paired['non_overlapping']} 个不重叠五日区间，平均净收益差区间暂不可估计。")
         lines.append("后台任务：" + json.dumps(states, ensure_ascii=False))
         costs = db.execute("SELECT r.category,sum(coalesce(c.actual,r.reserved))/1000000.0 "
                            "FROM fund_research_reservations r LEFT JOIN fund_research_charges c ON c.id=r.id "

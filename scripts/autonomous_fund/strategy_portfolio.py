@@ -8,13 +8,16 @@ from zoneinfo import ZoneInfo
 
 from .journal import encode
 from .risk import RiskError, instant, number
-from .scorecard import _exchange_sessions, _idea_session_close
+from .scorecard import _exchange_sessions, _idea_session_close, _regime_interval
 from .strategy_validation import _daily_sessions, digest, following_session, metrics
 
 
 STUDY_EVENT = "strategy_portfolio_declared"
 PROTOCOL = "daily_sleeve_volatility_match_v1"
 CALIBRATION_SESSIONS = 20
+PAIRED_BLOCK_SESSIONS = 5
+EXTRA_TRANSFER_STRESS_BPS = (5, 10, 25, 50, 100)
+RETURN_EPSILON = 1e-12
 
 
 def _identity(row):
@@ -151,7 +154,7 @@ def declare_study(db, spec, now):
     return saved
 
 
-def _simulate(days, paths, weights, fee, slippage):
+def _simulate(days, paths, weights, fee, slippage, *, keep_daily=False):
     """Transfer capital at each interval's starting close, using both legs' net sleeve NAVs."""
     cash, positions = 1.0, dict.fromkeys(weights, 0.0)
     turnover, cash_fraction, earned = 0.0, 0.0, []
@@ -161,7 +164,8 @@ def _simulate(days, paths, weights, fee, slippage):
         before = cash + math.fsum(positions.values())
         after = before
         # Solve the self-financing rebalance after transfer costs. With the
-        # bounded rates and unlevered weights this is a contraction (<= 2%).
+        # bounded rates and unlevered weights this is a contraction (<= 3%,
+        # including the largest additional transfer stress).
         for _ in range(10 if rate else 1):
             targets = {key: after * w for key, w in weights.items()}
             traded = math.fsum(abs(value - positions[key]) for key, value in targets.items())
@@ -172,9 +176,60 @@ def _simulate(days, paths, weights, fee, slippage):
         positions = {key: after * w * (1 + paths[key][day]) for key, w in weights.items()}
         earned.append({"net_economic_equity": cash + math.fsum(positions.values())})
     result = metrics(earned, 1)
-    del result["daily_returns"]
+    if not keep_daily:
+        del result["daily_returns"]
     return {**result, "mean_cash_weight": cash_fraction / len(days), "transfer_turnover_fraction": turnover,
             "transfer_fees_fraction": turnover * fee, "transfer_slippage_fraction": turnover * slippage}
+
+
+def _paired_advantage(days, base, combined):
+    width = PAIRED_BLOCK_SESSIONS
+    windows = []
+    for start in range(0, len(days) - width + 1, width):
+        end = start + width
+        left = math.prod(1 + value for value in base[start:end])
+        right = math.prod(1 + value for value in combined[start:end])
+        windows.append((days[start], days[end - 1], right - left))
+    differences = [value for _, _, value in windows]
+    interval = _regime_interval(windows, "portfolio")
+    if differences and max(differences) - min(differences) <= RETURN_EPSILON:
+        # Identical books can differ by a few float ulps after proportional
+        # transfers. That is no evidence of a tightly estimated advantage.
+        interval.update(status="unreliable", interval_95=None)
+    return {**interval, "block_sessions": width,
+            "positive_blocks": sum(value > RETURN_EPSILON for value in differences),
+            "trailing_sessions_excluded": len(days) % width}
+
+
+def _cost_stress(days, paths, weights, fee, slippage, base_return, combined_return):
+    """Hold the base at declared costs and stress transfers in the combined arm."""
+    initial = combined_return - base_return
+    scenarios = [{"extra_transfer_bps": 0, "incremental_net_return": initial}]
+    last_positive, bracket = (0 if initial > RETURN_EPSILON else None), None
+    for extra in EXTRA_TRANSFER_STRESS_BPS:
+        try:
+            stressed = _simulate(days, paths, weights, fee, slippage + extra / 10000)
+            difference = stressed["net_return"] - base_return
+        except (ArithmeticError, RiskError):
+            break
+        if not math.isfinite(difference):
+            break
+        scenarios.append({"extra_transfer_bps": extra, "incremental_net_return": difference})
+        if bracket is None and last_positive is not None:
+            if difference > RETURN_EPSILON:
+                last_positive = extra
+            else:
+                bracket = {"positive_at_extra_bps": last_positive, "nonpositive_at_extra_bps": extra}
+    if initial <= RETURN_EPSILON:
+        status = "already_nonpositive"
+    elif bracket:
+        status = "bracketed"
+    elif scenarios[-1]["extra_transfer_bps"] == EXTRA_TRANSFER_STRESS_BPS[-1]:
+        status = "above_tested_range"
+    else:
+        status = "incomplete_stress_path"
+    return {"status": status, "basis": "combined_arm_only_per_dollar_of_transfer",
+            "breakeven_bracket": bracket, "scenarios": scenarios}
 
 
 def evaluate_studies(db, now):
@@ -206,15 +261,20 @@ def evaluate_studies(db, now):
             result["status"] = "missing_or_changed_calibration_evidence"
         elif days and days[0] == start:
             fee, slippage = plan["fee_bps"] / 10000, plan["slippage_bps"] / 10000
+            scaled = {arm: {key: weight * saved["scales"][arm] for key, weight in weights.items()}
+                      for arm, weights in (("base", base), ("combined", combined))}
             try:
-                arms = {arm: _simulate(days, paths, {key: w * saved["scales"][arm] for key, w in weights.items()},
-                                       fee, slippage)
-                        for arm, weights in (("base", base), ("combined", combined))}
+                arms = {arm: _simulate(days, paths, weights, fee, slippage, keep_daily=True)
+                        for arm, weights in scaled.items()}
             except (ArithmeticError, RiskError):
                 result["status"] = "unusable_portfolio_path"
             else:
+                paired = _paired_advantage(days, arms["base"].pop("daily_returns"), arms["combined"].pop("daily_returns"))
+                stress = _cost_stress(days, paths, scaled["combined"], fee, slippage,
+                                      arms["base"]["net_return"], arms["combined"]["net_return"])
                 result.update(status="observed" if len(days) >= CALIBRATION_SESSIONS else "limited_sample",
                               evaluation_sessions=len(days), evaluation_end=days[-1], **arms,
+                              paired_advantage=paired, transfer_cost_stress=stress,
                               incremental_net_return=arms["combined"]["net_return"] - arms["base"]["net_return"],
                               change_in_max_drawdown=arms["combined"]["max_drawdown"] - arms["base"]["max_drawdown"])
         elif days or now > _idea_session_close(start):
