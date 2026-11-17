@@ -399,6 +399,10 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     observed, result = forward_one_session_at_a_time(engine, dataset(210), 170, monkeypatch)
     assert result["observations"] == 40
     assert result["passed"] and engine.rows()[0]["state"] == "paper_active"
+    comparison, = engine.context(observed + timedelta(seconds=10))["competition"]["strategies"]
+    assert comparison["return_basis"] == "prospective"
+    assert comparison["risk_matched"]["prospective_prefix_sessions"] == 40
+    assert comparison["risk_matched"]["evaluation_sessions"] == 19
     approved = library(engine.journal, observed + timedelta(seconds=10))
     assert len(approved) == 1
     allocation = {k: approved[0][k] for k in ("strategy_id", "version", "digest")}

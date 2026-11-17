@@ -9,6 +9,8 @@ from .risk import RiskError
 
 
 def report(root):
+    from .strategy_competition import compare_saved
+
     path = Path(root) / "state.sqlite3"
     if not path.exists():
         return ["Strategy Lab：尚无账户账本。"]
@@ -18,6 +20,8 @@ def report(root):
             return ["Strategy Lab：尚未初始化；原有账户与交易状态未改变。"]
         policy = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
         policy = json.loads(policy[0]) if policy else {}
+        comparison = compare_saved(db, datetime.now(timezone.utc))
+        matched = {(item["strategy_id"], item["version"]): item["risk_matched"] for item in comparison["strategies"]}
         lines = ["Strategy Lab：完整策略研究（历史结果不代表已证明 Alpha）",
                  f"准入模式：{policy.get('admission', 'research_only')}；资金分配：{policy.get('allocation_mode', 'legacy_mandate')}"]
         for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid"):
@@ -33,6 +37,17 @@ def report(root):
                     lines.append("  缺口：" + str(result.get("limitations") or result.get("reason")))
                 if "prospective_sessions" in result:
                     lines.append(f"  开盘前留证 {result['prospective_sessions']} 个交易日，事后回放 {result['replayed_sessions']} 个交易日")
+                diagnostic = matched.get((row["id"], row["version"]))
+                if diagnostic and diagnostic["status"] in {"estimated", "limited_sample"}:
+                    suffix = "（样本较少）" if diagnostic["status"] == "limited_sample" else ""
+                    lines.append(f"  固定 Beta {diagnostic['beta_to_passive_reference']:.2f}，"
+                                 f"后续 {diagnostic['evaluation_sessions']} 日的净收益差 "
+                                 f"{diagnostic['net_difference_at_frozen_beta']:+.2%}{suffix}")
+                elif diagnostic and diagnostic["status"] == "insufficient_prospective_sessions":
+                    lines.append(f"  连续前瞻记录 {diagnostic['prospective_prefix_sessions']} 日，"
+                                 "同风险比较待积累样本。")
+                elif diagnostic:
+                    lines.append(f"  同风险比较暂不可用（{diagnostic['status']}）")
                 for name, test in result.get("tests", {}).items():
                     lines.append(f"  {name}: passed={test.get('passed')}；净超额={test.get('net_excess')}；"
                                  f"非重叠样本={test.get('nonoverlapping_blocks')}；HAC t={test.get('hac_t')}")

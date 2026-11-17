@@ -157,6 +157,22 @@ remains a gap for that version. A new revalidation version earns its own
 genuinely forward sample. The benchmark uses independent capital over the same
 sessions. Neither book makes a model call per bar.
 
+The comparison read by the Manager and the operator uses exact exchange dates
+from both books. Full-span returns are labeled when they include sessions
+without timely evidence. Cross-strategy correlations use common close-to-close
+returns from each book's uninterrupted prospective prefix. A replayed session
+can change subsequent holdings, so later signals cannot restore that prefix.
+
+For the risk comparison, the first 20 complete close-to-close pairs estimate
+beta to the predeclared net passive book. The beta stays fixed for scoring the
+remaining prospective sessions, using the same dates in both legs. The report
+shows the calibration dates, evaluation dates, paired count and difference in
+compounded net return. Fewer than 20 evaluation sessions carry a limited sample
+label. Flat references and missing evidence remain unavailable. Scaling the
+passive book assumes zero return on residual cash and excludes additional
+reweighting or financing costs. This is a single-reference diagnostic. It
+leaves the strategy qualification rule and the fund's authority to trade unchanged.
+
 Fresh matching-policy forward evidence must satisfy both minimum durations
 before optional library admission. A portfolio target must also match the signal
 on file before the next open. Previous observations remain visible after
