@@ -21,6 +21,10 @@ def configure_fixture_environment(root, *, artifact_root=None):
         # Each producer's owned output holds traces and caches, never the developer's shared cache.
         from pathlib import Path
         os.environ["LUMIBOT_CACHE_FOLDER"] = str(Path(artifact_root).resolve() / "runtime_cache")
+        # FRED owns a separate cache setting. Fixture discovery may initialize
+        # that component even without a key; keep it in this producer's output
+        # rather than resolving/writing the host user's home directory.
+        os.environ["LUMIBOT_FRED_CACHE_DIR"] = str(Path(artifact_root).resolve() / "runtime_cache" / "fred")
 
 
 _INFERENCE_ENDPOINTS = {

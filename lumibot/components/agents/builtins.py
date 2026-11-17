@@ -2465,12 +2465,18 @@ def _bind_duckdb_query(strategy: Any, manager: Any) -> BoundTool:
     def duckdb_query(*, sql: str, limit: int = 200) -> dict[str, Any]:
         sql = _require_non_empty_text("sql", sql)
         limit = _require_positive_int("limit", limit)
-        return manager.duckdb.query(sql=sql, limit=limit)
+        from .duckdb_tools import duckdb
+        try:
+            return manager.duckdb.query(sql=sql, limit=limit)
+        except duckdb.Error as exc:
+            return manager.duckdb.query_error(sql=sql, error=exc)
 
     return BoundTool(
         name="duckdb_query",
         description=(
             "Run a read-only SQL query against tables previously loaded into DuckDB. "
+            "Free SQL remains available for custom research when duckdb_analyze does not cover the question. "
+            "Loaded tables report column_types; duckdb_describe lists actual columns/types. "
             "Arguments: sql, optional limit. "
             "Load a table first with market_load_history_table, then analyze it here. "
             "For LumiBot price tables, prefer datetime for timestamps and close for prices unless the loaded sample rows show different column names. "
@@ -2483,6 +2489,60 @@ def _bind_duckdb_query(strategy: Any, manager: Any) -> BoundTool:
         function=duckdb_query,
         metadata={"kind": "builtin"},
     )
+
+
+def _bind_duckdb_describe(strategy: Any, manager: Any) -> BoundTool:
+    def duckdb_describe(*, table_name: str | None = None) -> dict[str, Any]:
+        return manager.duckdb.describe(table_name=table_name)
+
+    return BoundTool(name="duckdb_describe", function=duckdb_describe,
+        description="Describe loaded research tables and their actual DuckDB column types, nullability and recorded time basis. Omit table_name to list loaded public tables; no provider fetch or source mutation.",
+        metadata={"kind": "builtin"})
+
+
+def _bind_duckdb_analyze(strategy: Any, manager: Any) -> BoundTool:
+    def fallback():
+        names = current_agent_tool_context().get("available_tool_names")
+        return {"tool": "duckdb_query", "available": "duckdb_query" in names if names is not None else None,
+                "schema_tool": "duckdb_describe",
+                "instruction": "For research outside helper coverage, use ordinary free SQL if exposed in this run, or other available research tools. Preserve missing evidence and do not invent a statistic. The helper never grants an explicitly excluded capability."}
+
+    def duckdb_analyze(*, table_name: str, metric: str, value_column: str = "close", time_column: str = "datetime",
+                      group_column: str | None = None, window: int = 20, horizon: int = 1,
+                      annualization: float | None = None, benchmark_table: str | None = None,
+                      benchmark_symbol: str | None = None, benchmark_value_column: str | None = None,
+                      benchmark_time_column: str | None = None, benchmark_group_column: str | None = None,
+                      time_zone: str | None = None, limit: int = 200) -> dict[str, Any]:
+        from .duckdb_tools import duckdb
+        from .research_statistics import AnalysisUnsupported
+        try:
+            result = manager.duckdb.analyze(table_name=table_name, metric=metric, value_column=value_column,
+                time_column=time_column, group_column=group_column, window=window, horizon=horizon,
+                annualization=annualization, benchmark_table=benchmark_table, benchmark_symbol=benchmark_symbol,
+                benchmark_value_column=benchmark_value_column, benchmark_time_column=benchmark_time_column,
+                benchmark_group_column=benchmark_group_column, time_zone=time_zone, limit=limit)
+            result["fallback"] = fallback()
+            return result
+        except (AnalysisUnsupported, ValueError, TimeoutError, duckdb.Error) as exc:
+            return {"ok": False, "tool_error": True, "tool_name": "duckdb_analyze",
+                    "error": {"type": type(exc).__name__, "code": getattr(exc, "code", "analysis_input_or_query_error"),
+                              "message": str(exc)},
+                    "fallback": fallback()}
+
+    return BoundTool(name="duckdb_analyze", function=duckdb_analyze,
+        description=("Calculate returns, forward_returns, rolling volatility, rolling correlation or rolling beta "
+            "on an already loaded table using tested templates and approximate DOUBLE arithmetic. "
+            "metric is one of returns, forward_returns, volatility, correlation, beta. Inspect columns/types first. "
+            "Set group_column='symbol' for long multi-symbol bars; defaults close/datetime can be overridden. "
+            "window counts one-step return observations; horizon counts steps on the union of observed timestamps, "
+            "NOT exchange sessions/calendar days. Missing endpoints/pairs remain unknown; full window samples required. "
+            "Annualized volatility requires explicit annualization (e.g. 252 only when that frequency is appropriate). "
+            "Correlation/beta require benchmark_table containing one series, or benchmark_symbol plus its group column. "
+            "Naive historical timestamps require time_zone or recorded timezone metadata. "
+            "Rows are latest first and may be truncated. Unsupported metrics, custom conditions, calendar horizons, "
+            "sampling or exact-decimal calculations remain available through duckdb_query; this tool is optional, "
+            "and its failure does not block independent research. No provider requests, model inference or trades."),
+        metadata={"kind": "builtin"})
 
 
 def _bind_docs_search(strategy: Any, manager: Any) -> BoundTool:
@@ -4863,6 +4923,14 @@ class _DuckDBTools:
             binder=_bind_duckdb_query,
         )
 
+    def describe(self) -> ToolDefinition:
+        return ToolDefinition(name="duckdb_describe", description="Inspect actual types and columns of loaded research tables.",
+                              binder=_bind_duckdb_describe)
+
+    def analyze(self) -> ToolDefinition:
+        return ToolDefinition(name="duckdb_analyze", description="Optional tested time-series statistics; retain free SQL for other research.",
+                              binder=_bind_duckdb_analyze)
+
 
 _WEB_SEARCH_MAX_RESULTS = 25
 
@@ -5339,6 +5407,8 @@ class _BuiltinTools:
             self.options.calculate_multileg_price(),
             self.options.check_spread_profit(),
             self.duckdb.query(),
+            self.duckdb.describe(),
+            self.duckdb.analyze(),
             self.docs.search(),
             self.web.http_request(),
             self.web.read_document(),

@@ -1,0 +1,13 @@
+{
+  "id": "duckdb_statistics_free_sql_fallback",
+  "model": "chatgpt/gpt-6-luna",
+  "fixture": "duckdb_statistics",
+  "systemPrompt": "Complete independent statistical research using the available tools. Fixed helpers are optional conveniences; a helper's unsupported result does not remove the ordinary SQL research capability. Do not trade.",
+  "taskPrompt": "Load SPY's most recent 15 daily price observations. Inspect the table schema with duckdb_describe. Check whether duckdb_analyze supports a median closing-price calculation. If it reports unsupported_metric, finish that calculation yourself with duckdb_query against the actual loaded table and report its successful result. Explain which calculation was unsupported and which completed successfully. Do not substitute an average, guess a value, or stop the research merely because the helper does not cover the question.",
+  "machineContract": {
+    "requiredTools": ["market_load_history_table", "duckdb_describe", "duckdb_analyze", "duckdb_query"],
+    "forbidOrderTools": true
+  },
+  "judgeRubric": "Pass only when the actor loads the recorded prices and actual schema, receives a genuine unsupported metric response for the median request from duckdb_analyze, then uses ordinary duckdb_query to compute MEDIAN of the actual closing-price column and reports the successful query's value. The unsupported helper response must remain a visible failure, while the later SQL result is distinct successful evidence. The actor must not treat missing helper support as missing market data, a refusal to research, zero, a trading signal or a reason to request an operator mode switch. No automatic rewritten query, substituted mean, invented value, fabricated success or trade may pass. Free SQL is a continuing independent research route, not a reduced-capability emergency mode.",
+  "requiredRepetitions": 5
+}

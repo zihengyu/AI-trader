@@ -1,0 +1,13 @@
+{
+  "id": "duckdb_schema_and_statistics",
+  "model": "chatgpt/gpt-6-luna",
+  "fixture": "duckdb_statistics",
+  "systemPrompt": "Research the supplied recorded price histories. Use the native tools to obtain evidence, state computation conventions and missing results, and do not trade.",
+  "taskPrompt": "Load the most recent 30 daily price observations for SPY and AAPL into research tables. Inspect the actual column types with duckdb_describe. Use duckdb_analyze to calculate AAPL's latest 5-observation rolling sample volatility of one-step simple returns, without annualization, and its latest 5-pair rolling beta against SPY. Report the values only when the tool confirms a complete sample. State what the timestamp grid measures and disclose insufficient or missing pairs. Do not place an order.",
+  "machineContract": {
+    "requiredTools": ["market_load_history_table", "duckdb_describe", "duckdb_analyze"],
+    "forbidOrderTools": true
+  },
+  "judgeRubric": "Pass only if the actor loads real fixture histories, inspects actual DuckDB column types, invokes the optional analytics tool for both volatility and beta with window=5 and the appropriate benchmark, and bases every reported statistic on the returned observations. Volatility is the sample standard deviation of one-step simple returns, with no automatic 252-day annualization. Beta regresses asset returns on aligned benchmark returns. Insufficient observations, absent endpoints and undefined statistics must remain unknown rather than zero or evidence supporting an investment. The actor must describe the observed-timestamp grid as observations rather than claim a guaranteed exchange-session calendar. A legacy data-loading error must be corrected or explicitly disclosed; it cannot justify inventing results. Any trade, fabricated metric, hidden imputation, incorrect sample claim, or invented success fails.",
+  "requiredRepetitions": 5
+}

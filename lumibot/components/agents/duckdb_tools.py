@@ -61,6 +61,8 @@ class DuckDBQueryLayer:
             "history_load_ms": 0.0,
             "query_calls": 0.0,
             "query_ms": 0.0,
+            "query_attempts": 0.0,
+            "query_failures": 0.0,
         }
 
     @staticmethod
@@ -169,6 +171,7 @@ class DuckDBQueryLayer:
             "columns": [str(col) for col in frame.columns],
         }
         info.update(meta)
+        info.update(self._schema(table_name))
         self._table_meta[table_name] = info
         return info
 
@@ -258,6 +261,7 @@ class DuckDBQueryLayer:
             "datetime_column": datetime_column,
             "kind": "visible_view",
         }
+        info.update(self._schema(table_name))
         self._table_meta[table_name] = info
         self.metrics["history_visible_refresh_calls"] += 1.0
         return info
@@ -452,12 +456,77 @@ class DuckDBQueryLayer:
         info["sample_rows"] = frame.head(3).astype(object).where(frame.head(3).notna(), None).to_dict(orient="records")
         return info
 
+    def _schema(self, table_name: str) -> dict[str, Any]:
+        # Ask DuckDB, not pandas: object columns may bind as DECIMAL, VARCHAR,
+        # or another type despite having the same pandas dtype.
+        quoted = self._quote_identifier(self._safe_identifier(table_name))
+        try:
+            rows = self.connection.execute(f"DESCRIBE SELECT * FROM {quoted}").fetchall()
+        except duckdb.Error as exc:
+            # Metadata is additive. An unavailable schema must not fail a
+            # document read after its table registration already succeeded.
+            return {"column_types": {}, "schema": [],
+                    "schema_error": {"type": type(exc).__name__, "message": str(exc)}}
+        schema = [{"name": str(row[0]), "type": str(row[1]),
+                   "nullable": {"YES": True, "NO": False}.get(str(row[2]))} for row in rows]
+        return {"column_types": {row["name"]: row["type"] for row in schema}, "schema": schema}
+
+    def describe(self, *, table_name: str | None = None) -> dict[str, Any]:
+        """Describe loaded public tables without fetching values or exposing backing frames."""
+        available = {name: meta for name, meta in self._table_meta.items() if meta.get("kind") != "source_frame"}
+        if table_name is None:
+            return {"tables": [self.describe(table_name=name) for name in available]}
+        name = self._safe_identifier(table_name)
+        if name not in available:
+            raise ValueError(f"Unknown loaded table {name!r}; use duckdb_describe to list available tables")
+        meta = available[name]
+        return {"table_name": name, "columns": list(meta["columns"]), **self._schema(name),
+                **{key: meta[key] for key in ("kind", "symbol", "timestep", "datetime_column", "datetime_timezone",
+                                              "loaded_at") if key in meta}}
+
+    def query_error(self, *, sql: str, error: Exception) -> dict[str, Any]:
+        """Structured feedback; preserve the submitted SQL and native failure as evidence."""
+        kind = type(error).__name__
+        hints = {
+            "BinderException": "Inspect actual columns and aliases; separate window functions and aggregates into CTEs.",
+            "CatalogException": "Inspect loaded table names with duckdb_describe; CTEs exist only in their own statement.",
+            "ParserException": "Correct SQL syntax; return a complete statement with quoted identifiers where required.",
+            "OutOfRangeException": "For approximate research cast operands to DOUBLE before arithmetic; for exact decimals choose sufficient precision and scale.",
+            "ConversionException": "Inspect column types and invalid values; do not replace unknown financial values with zero.",
+        }
+        names = [name for name, meta in self._table_meta.items() if meta.get("kind") != "source_frame"]
+        recent = names[-10:]
+        tables = []
+        for name in recent:
+            try:
+                tables.append(self.describe(table_name=name))
+            except Exception:
+                # Schema inspection is supplementary. A dropped table or an
+                # interrupted connection must not replace the original error.
+                tables.append({"table_name": name, "schema_unavailable": True})
+        return {"ok": False, "tool_error": True, "tool_name": "duckdb_query",
+                "error": {"type": kind, "code": f"duckdb_{kind}", "message": str(error),
+                          "hint": hints.get(kind, "Inspect the error and table schema, correct the query, and verify a successful result before using it.")},
+                "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+                "tables": tables,
+                "other_table_count": len(names) - len(recent), "schema_tool": "duckdb_describe"}
+
+    def analyze(self, **kwargs: Any) -> dict[str, Any]:
+        from .research_statistics import analyze
+        return analyze(self, **kwargs)
+
     def query(self, *, sql: str, limit: int = 200) -> dict[str, Any]:
         if not sql or not _READ_ONLY_SQL_RE.match(sql):
             raise ValueError("DuckDB tool only allows read-only SQL statements.")
         started = time.perf_counter()
-        result = self.connection.execute(sql)
-        frame = result.fetch_df()
+        self.metrics["query_attempts"] += 1.0
+        try:
+            result = self.connection.execute(sql)
+            column_types = {str(col[0]): str(col[1]) for col in result.description}
+            frame = result.fetch_df()
+        except Exception:
+            self.metrics["query_failures"] += 1.0
+            raise
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         self.metrics["query_calls"] += 1.0
         self.metrics["query_ms"] += float(elapsed_ms)
@@ -471,6 +540,7 @@ class DuckDBQueryLayer:
         return {
             "row_count": int(len(frame.index)),
             "columns": [str(col) for col in frame.columns],
+            "column_types": column_types,
             "rows": rows,
             "truncated": truncated,
             "query_ms": round(elapsed_ms, 3),

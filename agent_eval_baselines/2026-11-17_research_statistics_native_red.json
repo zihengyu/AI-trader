@@ -1,0 +1,31 @@
+{
+  "date": "2026-11-17",
+  "kind": "deterministic_prechange_native_contract",
+  "real_model_eval": false,
+  "actor_calls": 0,
+  "judge_calls": 0,
+  "base_commit": "f4e57d0d832d97d0a9c6a1d800bf3e82be2d115a",
+  "source": "lumibot/components/agents/duckdb_tools.py",
+  "source_sha256": "fd1acf51988030f804ffca9152d74012c8efeb53a9cba3de39c760df25febf94",
+  "results": [
+    {
+      "check": "loaded_column_types",
+      "status": "failed",
+      "exception_type": "KeyError",
+      "reason": "Required schema/tool API is absent in the unmodified source"
+    },
+    {
+      "check": "duckdb_describe",
+      "status": "failed",
+      "exception_type": "AttributeError",
+      "reason": "Required schema/tool API is absent in the unmodified source"
+    },
+    {
+      "check": "duckdb_analyze",
+      "status": "failed",
+      "exception_type": "AttributeError",
+      "reason": "Required schema/tool API is absent in the unmodified source"
+    }
+  ],
+  "qualification": "This is genuine missing-API evidence, not an actor/judge red run or semantic qualification. Subscription authentication is unavailable; real-model cases remain pending."
+}

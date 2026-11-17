@@ -151,6 +151,88 @@ Market-price tools:
   close (the VIX is ``VIXCLS``). ``get_fred_latest`` returns only what was
   published by the strategy date, so it is safe in backtests.
 
+Research Table Schemas And Statistics
+----------------------------------------
+
+Loaded price/document tables report ``columns``, actual DuckDB ``column_types``
+and ``schema`` (name, type and nullable when known). ``duckdb_describe`` lists
+loaded public research tables, or describes one ``table_name`` without fetching
+new provider data. Native backing frames are excluded from this metadata view.
+Explicit tool selection is available through ``BuiltinTools.duckdb.describe()``.
+
+``duckdb_analyze`` / ``BuiltinTools.duckdb.analyze()`` is an optional convenience
+for five common calculations on already loaded positive price/level series:
+
+- ``returns``: simple return from ``horizon`` observed timestamp-grid steps ago.
+- ``forward_returns``: simple return to that many grid steps ahead; immature or
+  missing endpoints remain unknown.
+- ``volatility``: rolling sample standard deviation of one-step simple returns.
+- ``correlation``: rolling Pearson correlation of aligned one-step returns.
+- ``beta``: rolling slope of the asset's returns on benchmark returns, without a
+  risk-free-rate adjustment.
+
+The default value/time columns are ``close`` and ``datetime``. Override them
+using the loaded schema. For long multi-symbol tables pass
+``group_column="symbol"``. Correlation/beta require ``benchmark_table`` with one
+series, or a ``benchmark_symbol`` and its group column. A second table can use
+``benchmark_value_column``, ``benchmark_time_column`` and
+``benchmark_group_column`` when its column names differ.
+
+``window`` counts return observations on the union of observed timestamps;
+``horizon`` counts steps on that same grid. This is **not an exchange calendar**.
+Missing values and absent endpoints are not filled or compressed away, and
+rolling statistics require the full window of valid observations/pairs. Entirely
+absent timestamps cannot be inferred from the table. Use free SQL or another
+research source for custom calendars, sampling, filters and event studies.
+Annualized volatility is returned only when an explicit positive
+``annualization`` factor is supplied; there is no default stock-market frequency.
+Constant benchmark returns leave correlation/beta undefined rather than zero.
+
+Calculations use approximate ``DOUBLE`` operands in fixed, staged queries;
+source tables and exact ledger amounts remain unchanged. Invalid/nonpositive
+values remain gaps. Responses include coverage, sample counts, computation
+conventions, newest-first rows and an explicit truncation flag. Duplicate
+``(group,time)`` observations require the caller to resolve its intended grouping
+or sampling. Historical calculations retain the strategy-time ceiling; naive
+intraday timestamps require recorded timezone metadata or explicit ``time_zone``.
+Date-only data uses the strategy date and cannot establish intraday availability.
+Live research has no backtest date ceiling. No market fetch, model call or trade
+is made by these tools.
+
+For example, after loading a table named ``candidate_prices``:
+
+.. code-block:: python
+
+   # Agent-facing calls; these tools are included in the default inventory.
+   duckdb_describe(table_name="candidate_prices")
+   duckdb_analyze(
+       table_name="candidate_prices",
+       metric="volatility",
+       group_column="symbol",
+       window=20,
+   )
+
+**Free SQL remains available.** These helpers do not replace or gate
+``duckdb_query``. If the research question needs another statistic, exact
+decimal arithmetic, custom conditions or different conventions, the agent can
+write its own complete query as before, without changing modes or asking for
+approval. Unsupported helper requests return an explicit failure with this
+fallback route; they are not missing market evidence, fabricated zero results
+or a reason to stop independent research.
+For explicitly restricted tool inventories, fallback hints respect whether SQL
+was actually exposed; the helper does not grant an excluded tool. Unknown
+inventory is reported as unknown availability.
+
+Failed SQL returns its native error type/message, a query hash, bounded loaded
+table schema feedback and suggested next checks. The submitted SQL is not
+rewritten or retried automatically. A successful later query is separate
+evidence, and failed calls remain failures in tool traces.
+``duckdb_metrics.query_attempts`` and ``query_failures`` complement the existing
+successful ``query_calls`` counter; local failures do not represent model API
+calls. Those counters include helpers' internal SQL; use tool traces and model
+usage to measure agent retries. Additional metadata/tool definitions consume context tokens, so actual
+model-fee savings require measurement rather than an assumption.
+
 Market And Account State
 ------------------------
 
@@ -494,7 +576,7 @@ For example, use separate result IDs and January/February bounds for independent
 monthly calculations. Source adapters retain ownership of bar completion.
 
 Recoverable research and historical news
----------------------------------------
+------------------------------------------
 
 Agent history, indicator and quote reads return a visible limitation when a
 candidate lacks data; batch quotes retain available symbols. Execution and

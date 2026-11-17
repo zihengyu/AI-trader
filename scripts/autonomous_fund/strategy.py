@@ -96,6 +96,12 @@ SQL_NOTIONAL_EXAMPLE = (
 )
 
 SQL_RESEARCH_PROMPT = (
+    " duckdb_describe supplies actual loaded column types. duckdb_analyze optionally computes standard returns, "
+    "forward returns, rolling volatility, correlation and beta. Its horizons count observed timestamp-grid steps, "
+    "not guaranteed exchange sessions. For other metrics, custom sampling/conditions, calendar horizons or exact "
+    "decimal arithmetic, continue independent research with duckdb_query or other available tools. An unsupported "
+    "helper or missing result is not a reason to stop research or invent a result; inspect its feedback and choose "
+    "the appropriate free SQL calculation. "
     " holding_math, when present, contains code-computed account amounts and estimated future trading friction. "
     "Costs in basis points apply to the traded notional: 30bp of $1,500 is $4.50, not $45. "
     "Do not add past fees or unrealized losses to a prospective cost estimate; unknown costs stay unknown. "

@@ -1917,6 +1917,9 @@ class GoogleADKRuntime:
         active_tool_context = {
             "agent_name": request.agent_name,
             "model_call_id": request.model_call_id,
+            # Descriptive evidence for optional-tool fallback hints; this does
+            # not grant, filter or automatically invoke a capability.
+            "available_tool_names": sorted(tool.name for tool in request.bound_tools),
             "tool_journal_callback": request.tool_journal_callback,
             "enforce_order_readiness": True,
             "account_snapshot": (
