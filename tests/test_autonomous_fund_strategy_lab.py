@@ -324,6 +324,41 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path):
         verify_allocations(db, {"targets": []}, observed, purchase=False)
 
 
+def test_exploratory_snapshots_cannot_claim_or_supersede_forward_evidence(tmp_path):
+    from scripts.autonomous_fund.strategy_admission import library
+    engine = lab(tmp_path, admission="paper_library", min_forward_sessions=40)
+    history = dataset(170)
+    formed = instant(history["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    engine.submit(proposal(), formed)
+    engine.schedule(history, formed)
+    assert engine.run_one(formed)["passed"]
+
+    qualifying = dataset(235)
+    observed = instant(qualifying["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    exploratory = copy.deepcopy(qualifying)
+    exploratory["coverage"]["publication_times_complete"] = False
+    # A preliminary receipt would make the deficient snapshot the frozen seed
+    # and prevent the later attested snapshot from proving complete coverage.
+    assert engine.schedule(exploratory, observed) == []
+    assert engine.run_one(observed) is None
+    # A job queued before the scheduling fix still needs the write-side check.
+    snapshot = engine.record_dataset(exploratory, observed)
+    with engine.journal.connection() as db:
+        db.execute("INSERT INTO fund_strategy_jobs VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
+                   ("legacy-forward", proposal()["strategy_id"], "v1", observed.isoformat(), "forward", snapshot, "queued"))
+    assert engine.run_one(observed)["status"] == "needs_data"
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT COUNT(*) FROM fund_strategy_forward").fetchone()[0] == 0
+
+    resumed = observed + timedelta(minutes=5)
+    assert len(engine.schedule(qualifying, resumed)) == 1
+    exploratory["coverage"]["raw_prices"] = False
+    assert engine.schedule(exploratory, resumed) == []
+    result = engine.run_one(resumed)
+    assert result["passed"] and result["observations"] == 65
+    assert len(library(engine.journal, resumed + timedelta(minutes=1))) == 1
+
+
 def test_dividends_are_receivables_until_paid_and_never_double_counted():
     data, candidate = dataset(8), proposal()
     candidate["implementation"]["rules"][0]["exit"] = "False"

@@ -176,7 +176,9 @@ using the loaded schema. For long multi-symbol tables pass
 ``group_column="symbol"``. Correlation/beta require ``benchmark_table`` with one
 series, or a ``benchmark_symbol`` and its group column. A second table can use
 ``benchmark_value_column``, ``benchmark_time_column`` and
-``benchmark_group_column`` when its column names differ.
+``benchmark_group_column`` when its column names differ. If more than one
+benchmark group is visible, choose one with ``benchmark_symbol``. Use free SQL
+to compare several benchmarks in a single query.
 
 ``window`` counts return observations on the union of observed timestamps;
 ``horizon`` counts steps on that same grid. This is **not an exchange calendar**.

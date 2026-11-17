@@ -120,6 +120,40 @@ def test_grouped_scan_uses_requested_benchmark_without_mixing_series(layer):
     assert chronological(result, "INDEX")[-1]["value"] == pytest.approx(1)
 
 
+@pytest.mark.parametrize("metric,expected", [("correlation", 1), ("beta", 2)])
+def test_paired_statistics_require_a_single_visible_benchmark_series(layer, metric, expected):
+    dates = list(pd.date_range("2026-08-01", periods=4, tz="UTC"))
+    asset, _ = loaded(layer, [100, 120, 96, 105.6], name="candidate", times=dates)
+    refs, _ = loaded(layer, [100, 110, 99, 103.95, 100, 98, 101, 105], name="references",
+                     groups=["REF_A"] * 4 + ["REF_B"] * 4, times=dates + dates)
+    tools, _ = served(layer)
+    args = dict(table_name=asset, metric=metric, benchmark_table=refs, benchmark_group_column="symbol", window=3)
+    # Joining two benchmark series by time alone duplicates the asset's rows
+    # and counts two otherwise unrelated returns for each timestamp.
+    ambiguous = tools["duckdb_analyze"](**args)
+    assert ambiguous["error"]["code"] == "ambiguous_benchmark"
+    assert ambiguous["fallback"]["available"]
+    selected = tools["duckdb_analyze"](**args, benchmark_symbol="REF_A")
+    assert selected["row_count"] == 4
+    assert chronological(selected)[-1]["samples"] == 3
+    assert chronological(selected)[-1]["value"] == pytest.approx(expected)
+    assert tools["duckdb_query"](sql=f'SELECT COUNT(*) AS n FROM "{refs}"')["rows"] == [{"n": 8}]
+
+
+def test_a_benchmark_group_with_only_future_rows_does_not_change_backtest_results(layer):
+    dates = list(pd.date_range("2026-08-01", periods=4, tz="UTC"))
+    layer.strategy.is_backtesting = True
+    layer.strategy.get_datetime = lambda: dates[-1]
+    asset, _ = loaded(layer, [100, 120, 96, 105.6], name="candidate", times=dates)
+    refs, _ = loaded(layer, [100, 110, 99, 103.95, 9999], name="references",
+                     groups=["REF_A"] * 4 + ["REF_B"], times=[*dates, dates[-1] + pd.Timedelta(days=1)])
+    result = layer.analyze(table_name=asset, metric="beta", benchmark_table=refs,
+                           benchmark_group_column="symbol", window=3)
+    assert result["benchmark_coverage"]["future_rows_withheld"] == 1
+    assert result["row_count"] == 4
+    assert chronological(result)[-1]["value"] == pytest.approx(2)
+
+
 def test_missing_timestamp_does_not_turn_a_two_step_move_into_a_one_step_return(layer):
     dates = list(pd.date_range("2026-08-01", periods=4, tz="UTC"))
     table, _ = loaded(layer, [100, 110, 121, 10, 11, 12, 13], groups=["ALFA"] * 3 + ["OTHER"] * 4,
@@ -290,9 +324,11 @@ def test_date_only_historical_cutoff_discloses_its_coarse_basis(layer):
     assert result["row_count"] == 2 and result["coverage"]["future_rows_withheld"] == 1
 
 
-def test_native_market_loading_and_default_readonly_handle_serve_the_new_tools():
+def test_native_market_loading_and_default_readonly_handle_serve_the_new_tools(tmp_path, monkeypatch):
     from scripts.agent_eval_production_fixture import ProductionFixture
     from scripts.run_agent_evals import build_fixture
+    # Binding the native tool inventory can initialize FRED's local cache.
+    monkeypatch.setenv("LUMIBOT_FRED_CACHE_DIR", str(tmp_path / "fred"))
     fixture = ProductionFixture(build_fixture("orb_breakout"))
     try:
         case = {"model": "chatgpt/gpt-6-luna", "fixture": "orb_breakout", "systemPrompt": "Synthetic research"}

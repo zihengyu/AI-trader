@@ -25,6 +25,10 @@ from .strategy_program import validate_program
 from .strategy_validation import check_dataset, digest, implementation_hash
 
 
+FORWARD_COVERAGE_FIELDS = ("raw_prices", "corporate_actions_complete", "point_in_time_membership",
+                           "publication_times_complete")
+
+
 class StrategyLab:
     def __init__(self, journal, policy, settings=None, budget_settings=None):
         self.journal, self.policy = journal, copy.deepcopy(policy)
@@ -145,6 +149,9 @@ class StrategyLab:
 
     def schedule(self, data, now):
         fingerprint = self.record_dataset(data, now)
+        coverage = data.get("coverage") or {}
+        forward_eligible = isinstance(coverage, dict) and all(coverage.get(key) is True for key in FORWARD_COVERAGE_FIELDS)
+        policy_hash = digest(self.policy)
         created = []
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -159,7 +166,7 @@ class StrategyLab:
             else:
                 members = json.loads(cohort[1])
             for row in rows:
-                if row["policy_hash"] != digest(self.policy):
+                if row["policy_hash"] != policy_hash:
                     # Historical evidence keeps its policy. It cannot authorize
                     # a strategy under a different account risk configuration.
                     continue
@@ -181,6 +188,11 @@ class StrategyLab:
                             db.execute("INSERT OR IGNORE INTO fund_strategy_cohorts VALUES(?,?,?)",
                                        (cutoff, instant(now).isoformat(), encode(members)))
                 elif row["state"] in {"shadow", "paper_active"}:
+                    # Exploratory inputs can be kept for historical research.
+                    # They must not supersede a queued forward job or become
+                    # an immutable seed for later admission checks.
+                    if not forward_eligible:
+                        continue
                     kind = "forward"
                     passed = db.execute("SELECT at FROM fund_strategy_events WHERE id=? AND version=? "
                                         "AND kind='historical_pass' ORDER BY sequence LIMIT 1",
@@ -212,7 +224,7 @@ class StrategyLab:
                                              "fund_research_reservations r ON r.id=j.reservation "
                                              "WHERE r.day=? AND j.kind IN ('historical','exploratory')", (day,)).fetchone()[0]
             prefer_historical = attempted > 0 and historical_attempts == 0
-            row = db.execute("SELECT j.* FROM fund_strategy_jobs j JOIN fund_strategy_versions v ON "
+            eligible = db.execute("SELECT j.* FROM fund_strategy_jobs j JOIN fund_strategy_versions v ON "
                              "v.id=j.strategy_id AND v.version=j.version WHERE v.policy_hash=? AND (v.task_state='open' OR "
                              "v.state IN ('shadow','paper_active')) AND "
                              "((j.kind IN ('historical','exploratory') AND v.state IN ('candidate','needs_data','awaiting_new_holdout')) OR "
@@ -223,16 +235,23 @@ class StrategyLab:
                              "(j.state='queued' OR (j.state='running' AND julianday(j.lease_until)<julianday(?))) "
                              "ORDER BY (j.kind=? OR (?='historical' AND j.kind='exploratory')) DESC,coalesce((SELECT max(r.at) FROM fund_strategy_results r "
                              "JOIN fund_strategy_jobs done ON done.id=r.job_id WHERE done.strategy_id=j.strategy_id "
-                             "AND done.version=j.version),'0000'),j.at,j.rowid LIMIT 1",
+                             "AND done.version=j.version),'0000'),j.at,j.rowid",
                              (digest(self.policy), instant(now).isoformat(), instant(now).isoformat(),
                               "historical" if prefer_historical else "forward",
-                              "historical" if prefer_historical else "forward")).fetchone()
-            if row is None:
+                              "historical" if prefer_historical else "forward"))
+            jobs = {}
+            for candidate in eligible:
+                jobs.setdefault(candidate["strategy_id"], candidate)
+            if not jobs:
                 return None
-            reservation = self.budget.reserve_in(db, now, row["strategy_id"], "validation_compute",
-                                                  self.budget.settings.validation_reservation_usd)
-            if reservation is None:
+            # A lifetime project cap cannot block unrelated work. Preserve
+            # queue priority among affordable jobs in this same transaction.
+            selected = self.budget.reserve_first_in(db, now, jobs, "validation_compute",
+                                                    self.budget.settings.validation_reservation_usd)
+            if selected is None:
                 return None
+            project, reservation = selected
+            row = jobs[project]
             lease = uuid4().hex
             until = instant(now) + timedelta(seconds=self.settings.job_timeout_seconds * 2 + 30)
             db.execute("UPDATE fund_strategy_jobs SET state='running',lease=?,lease_until=?,reservation=? WHERE id=?",
@@ -301,9 +320,14 @@ class StrategyLab:
             current = db.execute("SELECT lease,state FROM fund_strategy_jobs WHERE id=?", (job["id"],)).fetchone()
             if tuple(current) != (job["lease"], "running"):
                 return None  # An expired worker may not overwrite a newer claim.
+            if job["kind"] == "forward" and result.get("series") and result.get("coverage_complete") is not True:
+                # Recheck at the write boundary for older queued jobs or
+                # a merged seed with incomplete attestations.
+                result = {"status": "needs_data", "passed": False,
+                          "reason": "Forward data coverage is incomplete; receipts retained"}
             used = db.execute("SELECT coalesce(sum(length(body)),0) FROM fund_strategy_datasets").fetchone()[0]
             used += db.execute("SELECT coalesce(sum(length(body)),0) FROM fund_strategy_results").fetchone()[0]
-            extra_data = len(encode(data).encode()) if job["kind"] == "forward" and not db.execute(
+            extra_data = len(encode(data).encode()) if job["kind"] == "forward" and result.get("series") and not db.execute(
                 "SELECT 1 FROM fund_strategy_datasets WHERE digest=?", (digest(data),)).fetchone() else 0
             if used + extra_data + len(encode(result).encode()) > self.settings.max_artifact_bytes:
                 result = {"status": "worker_error", "passed": False, "error": "ArtifactBudgetExceeded"}
@@ -366,8 +390,11 @@ class StrategyLab:
         return True
 
     def _drain(self, now):
+        started = monotonic()
         for _ in range(self.settings.max_jobs_per_day):
-            if self.run_one(now) is None:
+            # A later job must not reuse the first claim's clock and publish
+            # an earlier receipt simply because it took less time to finish.
+            if self.run_one(now + timedelta(seconds=monotonic() - started)) is None:
                 break
 
     def context(self, now, *, detail_limit=4, strategy_id=None, version=None):

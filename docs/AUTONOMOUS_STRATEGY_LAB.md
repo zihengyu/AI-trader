@@ -143,9 +143,13 @@ returns. Such inputs can yield research diagnostics but cannot pass admission.
 
 Passed historical versions enter isolated forward observation. Original forward
 inputs and receipts are retained; later historical corrections cannot rewrite
-an earlier observation. Forward simulation is deterministic and uses no model
-call per bar. Fresh matching-policy forward evidence must satisfy both the
-proposal's duration and the operator minimum before optional library admission.
+an earlier observation. Forward snapshots must attest all four coverage fields:
+raw prices, complete corporate actions, point-in-time membership and complete
+publication times. Exploratory snapshots remain usable for historical research
+and cannot replace a queued forward job or add frozen observations. Forward
+simulation is deterministic and uses no model call per bar. Fresh matching-policy
+forward evidence must satisfy both the proposal's duration and the operator
+minimum before optional library admission.
 Predeclared drawdown or sustained relative-loss degradation pauses the version;
 already accepted strategy purchases lose authority at existing recheck points.
 Researcher receives the failure and must propose a new version rather than
@@ -222,6 +226,9 @@ exact call/project link in the started-call receipt.
 A validation job's lease, daily job slot and compute reservation are claimed in
 the same write transaction. Concurrent workers cannot start extra jobs between
 the quota check and reservation; a failed lease write rolls back its reservation.
+An exhausted project stays queued while the next affordable project can run.
+Shared daily and monthly limits still apply to every job. Consecutive jobs use
+their own start and completion times so a faster job cannot backdate its result.
 
 Reservations are configured economic estimates, not a provider-enforced invoice
 cap. Actual model overruns are recorded and restrict subsequent optional work.

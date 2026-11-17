@@ -76,22 +76,32 @@ class ResearchBudget:
 
     def reserve_in(self, db, now, project, category, amount):
         """Reserve inside the caller's write transaction, atomically with its job lease."""
+        selected = self.reserve_first_in(db, now, (project,), category, amount)
+        return selected[1] if selected is not None else None
+
+    def reserve_first_in(self, db, now, projects, category, amount):
+        """Select the first affordable project in caller-supplied priority order."""
         if not db.in_transaction:
             raise RiskError("Research reservations require a write transaction")
-        if category not in CATEGORIES or not isinstance(project, str) or not 0 < len(project) <= 120:
+        projects = tuple(projects)
+        if category not in CATEGORIES or any(not isinstance(project, str) or not 0 < len(project) <= 120
+                                             for project in projects):
             raise RiskError("Invalid research resource owner or category")
         day, value = trading_day(instant(now)), micros(amount)
         if not value:
             raise RiskError("A resource reservation must be positive")
-        key = uuid4().hex
-        checks = [("r.day=?", (day,), self.settings.daily_usd),
-                  ("r.month=?", (day[:7],), self.settings.monthly_usd),
-                  ("r.project=?", (project,), self.settings.project_usd)]
-        if any(self._spent(db, where, args) + value > micros(cap) for where, args, cap in checks):
+        month = day[:7]
+        if (not projects or self._spent(db, "r.day=?", (day,)) + value > micros(self.settings.daily_usd)
+                or self._spent(db, "r.month=?", (month,)) + value > micros(self.settings.monthly_usd)):
             return None
-        db.execute("INSERT INTO fund_research_reservations VALUES(?,?,?,?,?,?,?)",
-                   (key, instant(now).isoformat(), day, day[:7], project, category, value))
-        return key
+        project_cap = micros(self.settings.project_usd)
+        for project in projects:
+            if self._spent(db, "r.project=?", (project,)) + value <= project_cap:
+                key = uuid4().hex
+                db.execute("INSERT INTO fund_research_reservations VALUES(?,?,?,?,?,?,?)",
+                           (key, instant(now).isoformat(), day, month, project, category, value))
+                return project, key
+        return None
 
     def settle(self, key, now, actual, receipt):
         """Exactly once. None deliberately leaves unknown work reserved."""

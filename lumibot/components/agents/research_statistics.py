@@ -92,6 +92,7 @@ def _series(layer, table_name, value_column, time_column, group_column, time_zon
                (SELECT COUNT(*) FROM raw WHERE t IS NOT NULL AND NOT ({cutoff})) AS future_rows_withheld,
                COUNT(*) AS visible_rows, COUNT(*) FILTER (WHERE v IS NULL) AS invalid_value_rows,
                COUNT(*) FILTER (WHERE g IS NULL) AS missing_group_rows,
+               COUNT(DISTINCT g) AS visible_series,
                (SELECT COUNT(*) FROM duplicates) AS duplicate_keys,
                MIN(t) AS first_timestamp, MAX(t) AS last_timestamp FROM visible""", limit=1)["rows"][0]
     if not summary["visible_rows"]:
@@ -129,6 +130,10 @@ def analyze(layer, *, table_name: str, metric: str, value_column: str = "close",
         reference, reference_coverage = _series(layer, benchmark_table, benchmark_value_column or value_column,
             benchmark_time_column or time_column, benchmark_group_column or (group_column if benchmark_symbol is not None else None),
             time_zone, selector=benchmark_symbol)
+        if reference_coverage["visible_series"] > 1:
+            # The paired join is by time. A second benchmark series would
+            # duplicate asset rows and inflate the number of valid pairs.
+            raise AnalysisUnsupported("ambiguous_benchmark", "Select one benchmark with benchmark_symbol or use free SQL to compare several benchmarks")
         if coverage["time_domain"] != reference_coverage["time_domain"]:
             raise AnalysisUnsupported("incompatible_time_domains", "Series timestamps have different timezone semantics; specify time_zone or align them explicitly with free SQL")
     grid_source = "SELECT t FROM main"

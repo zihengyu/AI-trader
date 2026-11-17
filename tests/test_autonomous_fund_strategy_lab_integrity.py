@@ -8,6 +8,7 @@ from datetime import timedelta
 import pytest
 
 from scripts.autonomous_fund.journal import Journal
+from scripts.autonomous_fund.research_budget import ResearchBudgetSettings
 from scripts.autonomous_fund.risk import RiskError, instant
 from scripts.autonomous_fund.strategy_admission import verify_allocations
 from scripts.autonomous_fund.strategy_definition import StrategyLabSettings, StrategyProposal
@@ -244,3 +245,44 @@ def test_insufficient_money_does_not_lease_a_job_or_consume_a_daily_slot(tmp_pat
     assert engine._claim(NOW) is None
     with engine.journal.connection() as db:
         assert db.execute("SELECT state,lease,reservation FROM fund_strategy_jobs").fetchone()[:] == ("queued", None, None)
+
+
+def test_exhausted_project_does_not_starve_independent_queued_research(tmp_path):
+    journal = Journal(tmp_path, "synthetic-budget-owner")
+    engine = StrategyLab(journal, policy(), budget_settings=ResearchBudgetSettings(project_usd="1"))
+    engine.submit(proposal("exhausted-project"), NOW)
+    engine.submit(proposal("funded-project"), NOW + timedelta(seconds=1))
+    scheduled_at = NOW + timedelta(seconds=2)
+    assert len(engine.schedule(dataset(), scheduled_at)) == 2
+    assert engine.budget.reserve(NOW, "exhausted-project", "research_model", "1")
+    # The oldest job is queued first, but only the second project can afford
+    # a validation. No lease or daily attempt should be spent on the first.
+    claimed = engine._claim(scheduled_at)
+    assert claimed is not None and claimed["strategy_id"] == "funded-project"
+    assert engine._claim(scheduled_at) is None
+    with journal.connection() as db:
+        assert dict(db.execute("SELECT strategy_id,state FROM fund_strategy_jobs")) == {
+            "exhausted-project": "queued", "funded-project": "running"}
+        assert db.execute("SELECT count(*) FROM fund_research_reservations "
+                          "WHERE category='validation_compute'").fetchone()[0] == 1
+
+
+def test_a_faster_second_job_does_not_backdate_its_validation_receipt(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import strategy_lab
+    engine = lab(tmp_path)
+    engine.submit(proposal("first-project"), NOW)
+    engine.submit(proposal("second-project"), NOW)
+    engine.schedule(dataset(), NOW)
+    elapsed = [0]
+
+    def simulated_worker(payload, _timeout):
+        elapsed[0] += 8 if payload["proposal"]["strategy_id"] == "first-project" else 1
+        return {"status": "needs_data", "passed": False}
+
+    monkeypatch.setattr(strategy_lab, "monotonic", lambda: elapsed[0])
+    monkeypatch.setattr(strategy_lab, "run_worker", simulated_worker)
+    engine._drain(NOW)
+    with engine.journal.connection() as db:
+        completed = db.execute("SELECT j.strategy_id,r.at FROM fund_strategy_results r "
+                               "JOIN fund_strategy_jobs j ON j.id=r.job_id ORDER BY r.at").fetchall()
+    assert [row["strategy_id"] for row in completed] == ["first-project", "second-project"]

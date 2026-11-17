@@ -43,6 +43,10 @@ Horizon steps use the union of recorded timestamps, not a claimed exchange
 calendar. A missing group endpoint on that grid is not skipped. Entirely
 missing timestamps remain a limitation. Rolling statistics require full valid
 windows; a constant benchmark does not establish zero correlation/beta.
+Each paired calculation uses a single benchmark series. If several groups are
+visible after cutoff, select one with `benchmark_symbol` and its group column,
+or use free SQL to compare several benchmarks. Coverage includes the visible
+series count.
 Annualization is opt-in with a supplied frequency.
 
 Backtest-only clock clipping is applied to the loaded data. Aware timestamps
