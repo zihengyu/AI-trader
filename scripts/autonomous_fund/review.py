@@ -372,7 +372,8 @@ def _evidence_catalog(saved):
         refs.extend((ref, evidence["source"]))  # Exact original names remain valid for older callers.
         catalog.append({"ref": ref, "context_path": f"research.evidence[{index - 1}]", **evidence})
     for key in ("session", "factor_lab", "scorecards", "attribution", "strategy_memory", "strategy_followup",
-                "operator_mandate", "limits", "eligible_universe", "cash_management", "fund_scoreboard"):
+                "operator_mandate", "limits", "eligible_universe", "cash_management", "fund_scoreboard",
+                "post_close_plan"):
         if original.get(key) is not None:
             ref = f"context:{key}"
             refs.append(ref)
@@ -388,6 +389,19 @@ def _invalid_refs(review, allowed):
             if unmatched:
                 invalid.append(f"{group}[{index}].evidence_refs[{','.join(unmatched)}]")
     return invalid
+
+
+def _post_close_plan(strategy, session, now):
+    """Current accepted intent, kept separate from the completed session's trades."""
+    execution = getattr(strategy, "execution", None)
+    latest = execution.latest(now) if execution is not None else None
+    if latest is None or instant(latest["accepted_at"]) < instant(session["market_close"]):
+        return None
+    body = json.loads(latest["body"])
+    return {"as_of": now.isoformat(), "decision_id": latest["id"], "accepted_at": latest["accepted_at"],
+            "valid_until": latest["until_at"], "state": latest["state"],
+            "expired": now >= instant(latest["until_at"]), "targets": body.get("targets", []),
+            "rationale": body.get("rationale"), "is_fill_evidence": False}
 
 
 def review_after_close(strategy):
@@ -428,7 +442,8 @@ def review_after_close(strategy):
                "fund_capital": strategy._capital_context() if hasattr(strategy, "_capital_context") else None,
                # Code-computed; the review must not re-estimate where the return came from.
                "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
-               "session": _inputs(rows, session, now)}
+               "session": _inputs(rows, session, now),
+               "post_close_plan": _post_close_plan(strategy, session, now)}
     if hasattr(strategy, "_with_fund_cost_context"):
         context = strategy._with_fund_cost_context(context, strategy.get_datetime())
     if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
@@ -446,6 +461,7 @@ def review_after_close(strategy):
                         "缺失的部分如实说明。可使用只读研究工具，核对消息与价格的真实时间。"
                         "引用日志证据请使用 event:<sequence>，外部资料请给出来源和时间。"
                         "披露数据缺失、陈旧估值和费用不确定性；不要编造收盘净值或把没成交当成成交。"
+                        "post_close_plan 是收盘后才接受的目标意图，不计入盘中决策或成交；如有，单独说明其有效期和待执行状态。"
                         "结合 factor_lab 中已验证、被拒绝、冗余和退役的因子，研究可能值得检验的新因子方向（价格、成交量、"
                         "高低价区间、波动，以及 SEC 财报中的盈利、营收、毛利、经营现金流、净资产、总资产和股本等"
                         "按披露日可得的基本面），供基金经理决定是否写成 factor_proposals。"
@@ -506,14 +522,25 @@ def review_after_close(strategy):
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
                "research_completed_at": saved["completed_at"], "allowed_evidence_refs": refs,
                "evidence_catalog": catalog}
+    # Research may be reused after a restart; current intent has its own clock
+    # and must not be mistaken for the earlier research/session snapshot.
+    context["post_close_plan"] = _post_close_plan(strategy, session, now)
+    if context["post_close_plan"] is not None:
+        ref = "context:post_close_plan"
+        context["allowed_evidence_refs"] = list(dict.fromkeys([*refs, ref]))
+        allowed_refs.add(ref)
+        catalog = [item for item in catalog if item["ref"] != ref] + [
+            {"ref": ref, "context_path": "post_close_plan", "input_as_of": now.isoformat()}]
+        context["evidence_catalog"] = catalog
     if hasattr(strategy, "_with_fund_cost_context"):
         # Current costs include the completed researcher call. They are separate
         # evidence from the saved market/session snapshot, with their own cutoff.
-        context["allowed_evidence_refs"] = [*refs, "context:fund_costs"]
+        context["allowed_evidence_refs"] = [*context["allowed_evidence_refs"], "context:fund_costs"]
         allowed_refs.add("context:fund_costs")
     if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
         context["current_ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
+                    "post_close_plan 若存在，是收盘后才接受的当前目标意图；单独说明有效期与待执行状态，不能算作盘中决策、下单或成交。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
                     "自主改进选股与择时的判断方法，分别列出可检验的调整、依据、验证条件和失效条件；"
                     "evidence_refs 必须逐字复制 context.allowed_evidence_refs 中的值，保持原有大小写和标点。"
@@ -597,6 +624,7 @@ def review_after_close(strategy):
               "models": {"researcher": saved["model"], "manager": result.model},
               "attribution": saved["context"].get("attribution"),
               "fund_costs": context.get("fund_costs"),
+              "post_close_plan": context.get("post_close_plan"),
               "evidence_catalog": catalog, "reference_correction_attempts": attempt,
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}

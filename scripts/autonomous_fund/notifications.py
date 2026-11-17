@@ -675,7 +675,10 @@ def readable(kind, details, sequence=None, *, now=None):
             lines += ["", f"理由：{details['rationale']}"]
         if details.get("next_review_at"):
             lines.append(f"下次复核：{_when(details['next_review_at'])}")
-        lines.append("权重是上限：风控可能按波动、尾部风险等再缩小；买入在自动额度内直接执行，超出额度会发审批。")
+        approval = {"full": "超出自动额度由独立风控 AI 审批", "semi": "超出自动额度等待人工审批"}.get(
+            details.get("automation_mode"), "超出自动额度按运行配置进入审批")
+        lines.append("权重是上限：风控可能按波动、尾部风险等再缩小；买入在自动额度内直接执行，"
+                     + approval + "；审批不放宽硬性风控。")
         text = "\n".join(lines)
     elif kind == "execution_update" and isinstance(details, dict):
         from .status import account_lines
@@ -706,6 +709,10 @@ def readable(kind, details, sequence=None, *, now=None):
         text = f"🚨 交易进程崩溃（{details}）：服务会自动重启，监控确认安全后才恢复交易。"
     elif kind == "blocked":
         text = f"⚠️ 本轮未执行：{details}（下一轮会再检查）"
+    elif kind == "allocation_session_pending" and isinstance(details, dict):
+        text = ("⏳ 目标计划已接受，当前常规交易时段已结束或尚未开始，本轮未按此计划提交订单。\n"
+                f"下一次开盘：{_when(details['next_open'])}；计划有效至：{_when(details['valid_until'])}。\n"
+                "开盘后须重新核对计划有效期、账户、报价和风控；过期计划须重新决策，不能据此认定已买卖或成交。")
     elif kind == "local_market_data_pending":
         text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
     elif kind == "opening_valuation_pending" and isinstance(details, dict):
@@ -867,6 +874,12 @@ def readable(kind, details, sequence=None, *, now=None):
         unconfirmed_examples = actions.get("unconfirmed_examples") or []
         if unconfirmed_examples:
             parts.append(f"{sum(unconfirmed.values())} 条公司行动待核对。")
+            reasons = {"one_source_only": "单源记录", "currency_not_comparable": "币种待确认",
+                       "uncertain_share_basis": "每股口径待确认", "spin_off_price_basis": "分拆口径待确认"}
+            counts = actions.get("unconfirmed_reasons") or {}
+            if counts:
+                parts.append("待核对原因：" + "、".join(f"{reasons.get(key, key)} {count} 条"
+                                                        for key, count in sorted(counts.items())))
             for item in unconfirmed_examples:
                 kind = {"split": "拆股", "dividend": "现金分红", "spin_off": "公司分拆"}.get(item["kind"], item["kind"])
                 if item.get("reason") == "spin_off_price_basis":
@@ -881,7 +894,7 @@ def readable(kind, details, sequence=None, *, now=None):
                 parts.append(f"{item['symbol']} {item['date']} {kind} · {reason}")
             remaining = sum(unconfirmed.values()) - len(unconfirmed_examples)
             if remaining > 0:
-                parts.append(f"另有 {remaining} 条待核对。")
+                parts.append(f"另有 {remaining} 条待核对；完整明细保留在数据台当日 corporate_action_quality.json。")
         elif unconfirmed:
             parts.append("公司行动只有单一来源或计价口径未确认："
                          + "、".join(f"{s} {n} 项" for s, n in sorted(unconfirmed.items())))

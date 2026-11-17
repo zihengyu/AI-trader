@@ -6,7 +6,7 @@ retain their receipt time; missing evidence never votes for a trading-arm switch
 import copy
 import json
 
-from .risk import Limits, RiskError, instant, number, trading_day
+from .risk import Account, Limits, RiskError, instant, number, trading_day
 from .scorecard import _exchange_sessions, _idea_session_close
 
 COST_SCOPE = "paired_managers_half_fresh_critic_v1"
@@ -254,7 +254,10 @@ def independent_context(strategy, context, arm, now):
     exposures["current"] = {name: float(sum((w * number(scores[s].get(name, 0)) for s, w in weights.items()), number(0)))
                             for name in names} if set(weights) <= set(scores) else None
     risk["exposures"] = exposures
-    result = {**context, "account": account, "previous_decision": previous,
+    from .trade_value import holding_math
+    arithmetic = holding_math(Account(**{**account, "as_of": instant(account["as_of"])}))
+    arithmetic["basis"] = "independent_shadow_prior_close_not_executable_quotes"
+    result = {**context, "account": account, "holding_math": arithmetic, "previous_decision": previous,
         "recent_trades": prior.get("trades", []) if prior else [], "risk": risk,
         "risk_increase_paused": risk["purchases_paused"], "affordability": None, "day_trades": None,
         "fund_capital": None, "fund_scoreboard": None, "trade_value": None, "ledger_audit": None,

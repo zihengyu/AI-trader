@@ -111,6 +111,7 @@ def test_current_new_model_does_not_borrow_an_older_model_sample(tmp_path):
 def test_shadow_reads_own_cash_positions_and_previous_plan(tmp_path):
     strategy, p, days, _ = setup_trial(tmp_path, count=3)
     context = {"account": {"cash": "1", "equity": "20000", "positions": {"TRADING_ONLY": 99}},
+        "holding_math": {"risk_positions_usd": 19999, "positions": {"TRADING_ONLY": {"quantity": "99"}}},
         "previous_decision": {"targets": [{"symbol": "TRADING_ONLY", "weight": .1}]},
         "recent_trades": [{"symbol": "TRADING_ONLY"}], "risk": {"drawdown": ".5", "drawdown_exposure_budget": "999",
             "exposures": {"current": 99, "name_scores": {"BETA": {"beta": 1}}}},
@@ -126,6 +127,11 @@ def test_shadow_reads_own_cash_positions_and_previous_plan(tmp_path):
     assert result["risk"]["exposures"]["current"]["beta"] < 1
     assert result["risk"]["exposures"]["name_scores"] == {"BETA": {"beta": 1}}
     assert result["account"]["position_average_prices"]["BETA"] == "100.0"
+    # Derived account arithmetic must follow the shadow book too; copied
+    # trading-account helpers would contradict the independent account above.
+    assert set(result["holding_math"]["positions"]) == {"BETA"}
+    assert result["holding_math"]["equity_usd"] == float(result["account"]["equity"])
+    assert result["holding_math"]["estimated_exit_cost_usd"] is None
     assert context["account"]["positions"] == {"TRADING_ONLY": 99}  # Actual account is untouched.
 
 

@@ -19,11 +19,53 @@ Reductions, sells and protective exits are never limited. A symbol without an
 idea for today is not judged: there is nothing to estimate its edge from.
 """
 from decimal import Decimal
+import math
 
 from .risk import Limits, desired_shares, number
 
 MIN_BUCKET = 10
 RISING = {"up": True, "outperform": True, "down": False, "underperform": False}
+
+
+def holding_math(account, *, local_costs=None):
+    """Display arithmetic from an observed account, never a quote or an execution instruction.
+
+    Cash already includes the system cash-equivalent sleeve. Costs apply to
+    traded risk notional, not the entire account, and are future estimates;
+    recorded fees and unrealized losses must never be added to them again.
+    """
+    equity, cash = number(account.equity), number(account.cash)
+    receivables, parked = number(account.receivables), number(account.cash_equivalent_value)
+    risk_value = equity - cash - receivables
+    def rounded(value):
+        converted = float(value)
+        if not math.isfinite(converted):
+            raise ValueError("Account arithmetic exceeds the finite display range")
+        return round(converted, 6)
+    result = {"as_of": account.as_of.isoformat(), "basis": "account_valuation_not_executable_quotes",
+              "equity_usd": rounded(equity), "free_cash_usd": rounded(cash - parked),
+              "cash_equivalents_usd": rounded(parked), "receivables_usd": rounded(receivables),
+              "risk_positions_usd": rounded(risk_value), "positions": {},
+              "estimated_exit_cost_usd": None, "estimated_exit_cost_nav_bps": None,
+              "estimated_round_trip_cost_usd": None, "cost_assumptions": None}
+    for symbol, quantity in sorted(account.positions.items()):
+        mark = account.position_prices.get(symbol)
+        result["positions"][symbol] = {"quantity": str(quantity),
+            "valuation_price": None if mark is None else str(mark),
+            "notional_usd": None if mark is None else rounded(number(quantity) * number(mark))}
+    if local_costs is not None and risk_value >= 0:
+        fee, slip, spread = (number(local_costs[key]) for key in ("fee_rate", "slippage", "spread"))
+        if min(fee, slip, spread) < 0:
+            raise ValueError("Cost assumptions must be nonnegative")
+        friction = fee + slip + spread / 2
+        result.update({"estimated_exit_cost_usd": rounded(risk_value * friction),
+            "estimated_exit_cost_nav_bps": rounded(risk_value * friction / equity * 10000) if equity > 0 else None,
+            "estimated_round_trip_cost_usd": rounded(risk_value * friction * 2),
+            "cost_assumptions": {**{key: str(value) for key, value in zip(
+                ("fee_rate", "slippage", "spread"), (fee, slip, spread))},
+                "scope": "risk_positions_only", "estimate": True,
+                "excludes": "realized losses, past fees, model/data overhead; future prices and spreads may differ"}})
+    return result
 
 
 def model(ideas, fee_rate, slippage):

@@ -147,14 +147,18 @@ def test_real_local_quote_adapter_recovers_the_watch_without_waiting_for_lagging
     strategy._alert_price = lambda symbol: AutonomousFund._alert_price(strategy, symbol)
     accept(strategy, [], [{"symbol": "DELTA", "above": 104, "reason": "Synthetic level"}])
     strategy._watch(account(), clock())
-    assert notices(strategy, "price_alert_unavailable")[0]["price_kind"] == "completed_minute_close_with_spread_proxy"
+    # Short publication gaps remain invalid and diagnosed, but no longer create
+    # a Telegram outage/recovery pair before 90 seconds of repeated failures.
+    assert not notices(strategy, "price_alert_unavailable")
+    assert events(strategy, "price_observation_rejected")[0]["price_kind"] == "completed_minute_close_with_spread_proxy"
     assert strategy.journal.get_meta("price_alert_health")["DELTA"]["diagnostic"]["stream_as_of"] is None
     downloads = source.diagnostics()["requests"]
     stamp = clock() - timedelta(seconds=1)
     tape.handle(frame("DELTA", 105, stamp))
     strategy._watch(account(), clock())
     assert source.diagnostics()["requests"] == downloads
-    assert len(notices(strategy, "price_alert_recovered")) == 1
+    assert not notices(strategy, "price_alert_recovered")
+    assert len(events(strategy, "price_alert_recovery_observed")) == 1
     assert events(strategy, "price_alert")[0]["source_as_of"] == str(stamp)
     assert not strategy.journal.pending()
 

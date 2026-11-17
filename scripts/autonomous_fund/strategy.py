@@ -96,6 +96,9 @@ SQL_NOTIONAL_EXAMPLE = (
 )
 
 SQL_RESEARCH_PROMPT = (
+    " holding_math, when present, contains code-computed account amounts and estimated future trading friction. "
+    "Costs in basis points apply to the traded notional: 30bp of $1,500 is $4.50, not $45. "
+    "Do not add past fees or unrealized losses to a prospective cost estimate; unknown costs stay unknown. "
     " For DuckDB research, inspect SHOW TABLES and DESCRIBE the loaded table before assuming column names; "
     "use the actual returned schema, not field names inferred from similarly named context sections. "
     "A CTE and its aliases exist only within that one SQL statement. After a binder error, inspect the real "
@@ -1301,6 +1304,17 @@ class AutonomousFund(Strategy):
         self.journal.set_meta("trade_value_model", current)
         return current
 
+    def _holding_math(self, account):
+        from .local_broker import LocalPaperBroker
+        from .trade_value import holding_math
+        try:
+            broker = getattr(self, "broker", None)
+            costs = ({"fee_rate": broker.fee_rate, "slippage": broker.slippage,
+                      "spread": broker.data_source.spread} if isinstance(broker, LocalPaperBroker) else None)
+            return holding_math(account, local_costs=costs)
+        except Exception as exc:
+            return {"unavailable": type(exc).__name__}
+
     def _min_review_minutes(self, budget):
         """The manager's minimum review interval: doubled while the turnover guard (V2 4.2) is on."""
         guard = self.journal.get_meta("turnover_guard") or {}
@@ -1403,6 +1417,7 @@ class AutonomousFund(Strategy):
                 "account": asdict(account) if account is not None else None,
                 "recent_trades": self.journal.recent_trades(account.as_of) if account is not None else [],
                 "fund_costs": self._accrued_costs(now),
+                "automation_mode": getattr(getattr(self, "automation", None), "mode", None),
                 "rationale": str(decision.get("rationale") or ""), "next_review_at": decision.get("next_review_at")}
             self.journal.notification_with_meta(now, "decision_changed", details, {
                 "notified_targets": {s: str(w) for s, w in new.items()}, "notified_targets_day": day,
@@ -1945,10 +1960,43 @@ class AutonomousFund(Strategy):
                     "reason", "source_as_of", "checked_at", "age_seconds", "max_age_seconds", "price_kind",
                     "stream_enabled", "stream_as_of", "stream_age_seconds", "chart_as_of", "chart_age_seconds"
                 ) if key in diagnostic}
-                saved[symbol] = {"first_failed_at": (previous or {}).get("first_failed_at", now.isoformat()),
+                previous = previous or {}
+                state = {"first_failed_at": previous.get("first_failed_at", now.isoformat()),
                     "last_failed_at": now.isoformat(), "failed_checks": (previous or {}).get("failed_checks", 0) + 1,
-                    "diagnostic": diagnostic}
-                self.journal.set_meta("price_alert_health", saved)
+                    "diagnostic": diagnostic, "notice_version": 1,
+                    "notified_causes": previous.get("notified_causes", []),
+                    "last_notified_at": previous.get("last_notified_at"),
+                    "legacy_notified": previous.get("legacy_notified", bool(previous) and "notice_version" not in previous)}
+                notice = {"symbol": symbol,
+                    "error": str(error) if isinstance(error, RiskError) else type(error).__name__,
+                    **{key: diagnostic[key] for key in ("reason", "max_age_seconds", "price_kind") if key in diagnostic}}
+                cause = encode(notice)
+                # Publication lag is still an invalid quote. Only the Telegram
+                # outage notice waits; diagnostics and every level check keep
+                # their original clock and strict freshness validation.
+                age, ceiling = diagnostic.get("age_seconds"), diagnostic.get("max_age_seconds")
+                publication_lag = (diagnostic.get("reason") == "stale" and
+                    diagnostic.get("price_kind") == "completed_minute_close_with_spread_proxy" and
+                    isinstance(age, (int, float)) and isinstance(ceiling, (int, float)) and
+                    ceiling < age <= ceiling + 60)
+                elapsed = (now - instant(state["first_failed_at"])).total_seconds()
+                due = not publication_lag or elapsed >= 90
+                last_notice = state["last_notified_at"]
+                emit = due and (cause not in state["notified_causes"] or last_notice is None or
+                               (now - instant(last_notice)).total_seconds() >= 1800)
+                if emit:
+                    state["notified_causes"] = list(dict.fromkeys([*state["notified_causes"], cause]))
+                    state["last_notified_at"] = now.isoformat()
+                saved[symbol] = state
+                if emit:
+                    # A restart cannot turn a silent short gap into an orphan
+                    # recovery notice, or send the same initial notice twice.
+                    self.journal.notification_with_meta(now, "price_alert_unavailable", notice,
+                                                        {"price_alert_health": saved})
+                    self.log_message(f"FUND price_alert_unavailable: {notice}")
+                else:
+                    self.journal.set_meta("price_alert_health", saved)
+                return not previous or emit
             elif previous is not None and observation is not None:
                 # The caller already validated; recheck after journal I/O before claiming recovery.
                 now = self.get_datetime()
@@ -1958,12 +2006,23 @@ class AutonomousFund(Strategy):
                     "last_failed_at": previous["last_failed_at"], "failed_checks": previous["failed_checks"],
                     "recovered_at": now.isoformat(), "source_as_of": observation.as_of.isoformat(),
                     "age_seconds": (now - observation.as_of).total_seconds()}
-                # Commit the recovery notice and removal together, including across restarts.
-                self.journal.notification_with_meta(now, "price_alert_recovered", details, {"price_alert_health": saved})
+                # Old health records predate coalescing and were always notified.
+                notified = (previous.get("notice_version") != 1 or previous.get("legacy_notified") or
+                            bool(previous.get("notified_causes")))
+                if notified:
+                    self.journal.notification_with_meta(now, "price_alert_recovered", details,
+                                                        {"price_alert_health": saved})
+                else:
+                    with self.journal.connection() as db:
+                        db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)",
+                                   (now.isoformat(), "price_alert_recovery_observed", encode(details)))
+                        db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", ("price_alert_health", encode(saved)))
                 self._clear_alert_notices({symbol})
-                self.log_message(f"FUND price_alert_recovered: {details}")
+                label = "price_alert_recovered" if notified else "price_alert_recovery_observed"
+                self.log_message(f"FUND {label}: {details}")
         except Exception as exc:
             self._disclose_failure("price_alert_health_error", exc, phase="price_alert_health")
+        return False
 
     def _record_agent(self, name, result, phase=None):
         from .costs import call_cost, rate_for, token_counts, unpriced_reason, usage_known
@@ -2345,6 +2404,7 @@ class AutonomousFund(Strategy):
                    "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "leveraged_etfs": self._leveraged_context(),
                    "account": asdict(account), "previous_decision": self.last_decision,
+                   "holding_math": self._holding_math(account),
                    "recent_trades": self.journal.recent_trades(account.as_of),
                    "premarket_research": getattr(self, "premarket_research", None),
                    "strategy_memory": self._strategy_memory(),
@@ -2666,6 +2726,7 @@ class AutonomousFund(Strategy):
         if correction_kind == "timing":
             fresh_account = self._snapshot()
             corrected["account"] = asdict(fresh_account)
+            corrected["holding_math"] = self._holding_math(fresh_account)
             corrected["recent_trades"] = self.journal.recent_trades(fresh_account.as_of)
             corrected["risk"] = self._risk_context(fresh_account, self.get_datetime())
             corrected["data_desk"] = self._desk_context(self.get_datetime())
@@ -3271,15 +3332,10 @@ class AutonomousFund(Strategy):
                 observation.validate(self.get_datetime() if self.mode in {"local", "paper"} else now, self.limits)
             except Exception as exc:
                 self._sample_quote_check(checks, alert["symbol"], "price_alert", error=exc)
-                diagnostic = getattr(exc, "diagnostic", None) or {}
-                notice = {"symbol": alert["symbol"],
-                    "error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__,
-                    **{key: diagnostic[key] for key in ("reason", "max_age_seconds", "price_kind") if key in diagnostic}}
-                self._alert_health(alert["symbol"], error=exc)
-                emitted = self._disclose("price_alert_unavailable", notice)
-                if emitted is not False and getattr(exc, "diagnostic", None):
-                    # Keep changing source clocks out of the notification's
-                    # dedupe identity; retain evidence only with each notice.
+                diagnostic_due = self._alert_health(alert["symbol"], error=exc)
+                if diagnostic_due and getattr(exc, "diagnostic", None):
+                    # Retain the first rejection even during silent coalescing;
+                    # changing source clocks must not defeat notice dedupe.
                     self._record_price_observation_rejected({"symbol": alert["symbol"], **exc.diagnostic})
                 continue
             self._sample_quote_check(checks, alert["symbol"], "price_alert", observation=observation)
@@ -4055,6 +4111,10 @@ class AutonomousFund(Strategy):
         actions = (store.get(day, KEY) or {}) if store is not None and self.mode == "local" else {}
         action_disputed = blocked(actions)
         action_unconfirmed = {s: len(row["unconfirmed"]) for s, row in actions.items() if row.get("unconfirmed")}
+        unconfirmed_rows = sorted([{"symbol": s, **item} for s in sorted(action_unconfirmed)
+                                   for item in actions[s]["unconfirmed"]], key=lambda r: r["date"], reverse=True)
+        from collections import Counter
+        unconfirmed_reasons = dict(Counter(item.get("reason", "unknown") for item in unconfirmed_rows))
         action_unavailable = sum(row["status"] == "unavailable" for row in actions.values())
         if not (latest or action_disputed or action_unconfirmed or action_unavailable):
             return None
@@ -4071,10 +4131,8 @@ class AutonomousFund(Strategy):
                    "corporate_actions": {"examples": [{"symbol": s, **item} for s in sorted(action_disputed)
                                                       for item in actions[s]["discrepancies"]][:8],
                                           "unconfirmed": action_unconfirmed,
-                                          "unconfirmed_examples": sorted([
-                                              {"symbol": s, **item} for s in sorted(action_unconfirmed)
-                                              for item in actions[s]["unconfirmed"]
-                                          ], key=lambda r: r["date"], reverse=True)[:20], "unavailable": action_unavailable}}
+                                          "unconfirmed_reasons": unconfirmed_reasons,
+                                          "unconfirmed_examples": unconfirmed_rows[:5], "unavailable": action_unavailable}}
         self._notify_fund("bar_quality_issues", details)
         self.journal.set_meta("bar_quality_notified", day)
         return details
@@ -4927,14 +4985,61 @@ class AutonomousFund(Strategy):
         }
         return result
 
+    def _allocation_session_pending(self, active):
+        """An accepted plan is not permission to trade outside the regular session."""
+        if self.mode not in {"local", "paper"}:
+            return False
+        from .market_data import SessionClock
+        clock = getattr(self, "_allocation_clock", None)
+        if clock is None:
+            clock = self._allocation_clock = SessionClock(now=lambda: self.get_datetime())
+        session = clock.status()
+        if session["open"]:
+            return False
+        now = self.get_datetime()
+        details = {"decision_id": active["id"], "accepted_at": active["accepted_at"],
+                   "valid_until": active["until_at"], "next_open": session["next_open"],
+                   "valid_at_next_open": instant(session["next_open"]) < instant(active["until_at"]),
+                   "reason": "regular_session_closed"}
+        # Deduplicate across iterations and restarts. No quote, approval or
+        # order is needed to explain an exchange-calendar boundary.
+        if self.journal.get_meta("allocation_session_pending") != details:
+            self.journal.notification_with_meta(now, "allocation_session_pending", details,
+                                                {"allocation_session_pending": details})
+            self.log_message(f"FUND allocation_session_pending: {details}")
+        return True
+
     def _continue_allocation(self, active, account=None):
         if not active:
             return
+        if self._allocation_session_pending(active):
+            return
         # The iteration's own snapshot when it has one; a fresh one after slow model calls.
-        account = account if account is not None else self._snapshot()
-        prices = {symbol: self._price(symbol) for symbol in set(active["weights"]) | set(account.positions)}
+        try:
+            account = account if account is not None else self._snapshot()
+        except RiskError:
+            if self._allocation_session_pending(active):
+                return
+            raise
+        if self._allocation_session_pending(active):
+            return
+        try:
+            prices = {symbol: self._price(symbol) for symbol in set(active["weights"]) | set(account.positions)}
+        except RiskError:
+            if self._allocation_session_pending(active):
+                return
+            raise
+        if self._allocation_session_pending(active):
+            return
         now = self.get_datetime()
-        result = self._candidates(active, account, prices, now)
+        try:
+            result = self._candidates(active, account, prices, now)
+        except RiskError:
+            if self._allocation_session_pending(active):
+                return
+            raise
+        if self._allocation_session_pending(active):
+            return
         if "overlay" in result:
             summary = {"constructed": result["overlay"]["constructed"], "binding": result["overlay"]["binding"]}
             if self._overlay_logged.get(active["id"]) != summary:

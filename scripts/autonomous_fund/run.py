@@ -453,6 +453,10 @@ def main(argv=None):
     args.decision_model = args.decision_model or os.environ.get("FUND_DECISION_MODEL") or None
     # Set existing platform controls BEFORE importing its credential loader.
     os.environ["LUMIBOT_DISABLE_DOTENV"] = "true"
+    # This application constructs its selected broker explicitly. Importing a
+    # read-only desk must not also create the SDK's implicit default broker and
+    # trading websocket merely because research credentials are available.
+    os.environ["LUMIBOT_LAZY_CREDENTIALS"] = "true"
     os.environ["BACKTESTING_DATA_SOURCE"] = "none"
     os.environ["IS_BACKTESTING"] = "false" if args.mode in {"paper", "local", "check", "rehearse", "prefetch", "datadesk"} else "true"
     if args.mode == "serve":

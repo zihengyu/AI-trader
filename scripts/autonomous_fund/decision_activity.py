@@ -126,6 +126,10 @@ def activity(root, session_date=None, now=None):
             orders[body.get("decision_id")].append(body)
         elif kind == "allocation_complete":
             complete.add(body["decision_id"])
+        elif kind == "notification" and body.get("kind") == "allocation_session_pending":
+            details = body.get("details") or {}
+            if details.get("decision_id"):
+                pending[details["decision_id"]].append({"kind": "allocation_session_pending", **details})
         elif kind in {"entry_waiting", "stop_breached_no_buy", "buy_chase_limit"}:
             pending[body["decision_id"]].append({"kind": kind, **body})
         elif kind == "risk_overlay":
@@ -249,6 +253,9 @@ def lines(data, timeline=False, *, event_sequence=None):
                         if critique.get("missing_evidence"):
                             result.append("  反方指出的缺项：" + "；".join(critique["missing_evidence"]))
             for wait in item["waits"]:
+                if wait["kind"] == "allocation_session_pending":
+                    result.append("  等待常规交易时段；开盘后重新核对计划有效期、账户、报价和风控，尚不能据此认定已成交。")
+                    continue
                 label = {"entry_waiting": "等待入场价", "stop_breached_no_buy": "已触及止损，停止买入",
                          "buy_chase_limit": "达到追价上限"}[wait["kind"]]
                 result.append(f"  {wait['symbol']}：{label}")
