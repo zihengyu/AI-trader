@@ -21,6 +21,8 @@ from .cash import policy_context
 from .claims import SnapshotClaim, check_claims, score_claims
 
 from .journal import Journal, encode
+from .research_budget import ResearchBudgetExhausted
+from .strategy_definition import (RESEARCH_GUIDANCE, ResearchTaskUpdate, StrategyAllocation, StrategyLabSettings, StrategyProposal)
 from .risk_review import AutomationSettings, RiskApproval, RISK_APPROVAL_PROMPT
 from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnavailable, ObservedPrice,
                    OpeningValuationPending, Price, RiskError,
@@ -32,7 +34,8 @@ from .risk import (Account, DecisionTimingError, Intent, Limits, MarketDataUnava
 # are validated and audited at every startup, never part of the account binding.
 POLICY_SECTIONS = ("agent_models", "quant_risk", "approval", "execution", "model_budget", "mandate", "research_network",
                    "market_data", "news", "validation", "factor_lab", "service", "cash_sweep", "events", "macro",
-                   "construction", "critic", "triage", "data_desk", "manager_run_timeout_seconds", "automation")
+                   "construction", "critic", "triage", "data_desk", "manager_run_timeout_seconds", "automation",
+                   "strategy_lab", "research_budget")
 NOTICE_WINDOWS = {"stop_active": 21600}
 # Assumed per-side slippage when the broker states none (Alpaca paper), for the trade value check (V2 4.5).
 DEFAULT_SLIPPAGE = 0.0005
@@ -191,7 +194,7 @@ RESEARCHER_PROMPT = (
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
     "of time; an unfinished run returns nothing."
-) + SQL_RESEARCH_PROMPT
+) + SQL_RESEARCH_PROMPT + RESEARCH_GUIDANCE
 CRITIC_PROMPT = (
     "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
     "AGAINST the research's main ideas and the current portfolio: contrary evidence, crowded or already-priced "
@@ -211,8 +214,11 @@ CRITIC_PROMPT = (
     "determine whether exposure should rise or fall. recent_trades contains confirmed fills and recorded fees "
     "visible at the account snapshot; paid costs are sunk and already in NAV, while future trading friction remains. "
     "Keep the summary under 3000 characters, each concern and its evidence under 800, at most 10 concerns. "
-    "You do not decide or trade; the manager weighs your critique. In historical mode use only information "
-    "public by as_of. Return only the requested schema fields, without placeholder fields."
+    "You do not decide or trade; the manager weighs your critique. "
+    "If full strategy proposals are supplied, examine their economic mechanism, entry/exit consistency, "
+    "data availability, leakage, overfitting and costs. Your concerns are advisory; objective tests and "
+    "account-level strategy admission cannot be replaced by your approval or the proposer's confidence. "
+    "In historical mode use only information public by as_of. Return only the requested schema fields, without placeholder fields."
 ) + SQL_RESEARCH_PROMPT
 MANAGER_PROMPT = (
     "You are the sole investment decision maker for this long-only paper portfolio. "
@@ -313,6 +319,15 @@ MANAGER_PROMPT = (
     "trials-adjusted significance, holdout, a quintile spread that survives costs, not redundant, and the live "
     "record after validation; fields include point-in-time SEC fundamentals) with today's favored and disfavored "
     "tradable names; use them as evidence alongside research, never as orders. "
+    "strategy_lab.admitted_library lists frozen strategies with independent forward evidence, their exact "
+    "version/digest and next_targets. Candidate/needs_data/shadow entries are research only, never approved "
+    "strategies. You may allocate capital among admitted versions with strategy_allocations: strategy_id, "
+    "version, digest, capital_weight; combined capital cannot exceed 1, and portfolio targets cannot exceed "
+    "the capital-weighted strategy signals. You may reduce exposure based on market risk. With allocation_mode "
+    "legacy_mandate, your existing operator mandate still permits discretionary decisions without allocations; "
+    "do not call that historically validated. With validated_only, new purchases require admitted allocations; "
+    "holding/reducing existing positions and protective exits remain available. Research or order-approval AI "
+    "cannot authorize a candidate strategy. Empty strategy_allocations is valid; never invent library entries. "
     "risk.event_risk caps a stock reporting earnings today or on the next business day (no stop catches an "
     "overnight gap); macro gives FRED yields, the curve, credit spreads and the VIX as regime context. "
     "market_history_bounds says whether the latest session (benchmark volatility, daily move and drawdown, stock "
@@ -407,6 +422,16 @@ class Research(BaseModel):
     evidence: list[Evidence] = Field(min_length=1)
     # Empty means no opportunity with enough edge was found, which is an acceptable answer.
     ideas: bounded_list(Idea, 8) = Field(default_factory=list)
+    research_direction: str = Field(default="", max_length=2000)
+    strategy_proposals: list[StrategyProposal] = Field(default_factory=list, max_length=4)
+    research_tasks: list[ResearchTaskUpdate] = Field(default_factory=list, max_length=12)
+
+
+def research_context(value):
+    """Preserve the meaning/shape of saved pre-lab research during migration."""
+    parsed = Research.model_validate(value)
+    new_fields = {"research_direction", "strategy_proposals", "research_tasks"}
+    return parsed.model_dump(exclude=new_fields - parsed.model_fields_set)
 
 
 class Target(BaseModel):
@@ -492,6 +517,7 @@ class Decision(BaseModel):
     # Optional: the registered research ideas (idea_id) this portfolio acts on, for attribution.
     idea_refs: bounded_list(bounded_text(40, 1), 16) = Field(default_factory=list)
     factual_claims: bounded_list(SnapshotClaim, 12) = Field(default_factory=list)
+    strategy_allocations: list[StrategyAllocation] = Field(default_factory=list, max_length=20)
 
 
 @dataclass(frozen=True)
@@ -700,6 +726,9 @@ def configuration(path, environ=None):
     ValidationSettings.from_config(result.get("validation"))
     from .factors import FactorSettings
     FactorSettings.from_config(result.get("factor_lab"))
+    StrategyLabSettings.from_config(result.get("strategy_lab"))
+    from .research_budget import ResearchBudgetSettings
+    ResearchBudgetSettings.from_config(result.get("research_budget"))
     from .stops import ResumePolicy
     ResumePolicy.from_config(result.get("service"))
     from .events import EventSettings
@@ -971,7 +1000,8 @@ class AutonomousFund(Strategy):
                       reasoning_effort=config.get("reasoning_effort"), _runtime=runtime,
                       model_request_timeout_seconds=120,
                       # Live data only: a historical run must never read today's prepared data.
-                      tools=[self.desk_latest] if mode in {"paper", "local"} else None)
+                      tools=[self.desk_latest, self.strategy_research] if mode in {"paper", "local"}
+                            else [self.strategy_research])
         # Both roles are read-only by the user's explicit structured-target contract.
         # Native permissions remove every tool marked as mutating trading state.
         self.agents.create(
@@ -1054,6 +1084,15 @@ class AutonomousFund(Strategy):
             cash_symbol=self.cash_sweep.symbol if self.cash_sweep else None, fee_rate=local_fee,
             slippage=number(local_slip) + number(local_spread) / 2
                 if local_slip is not None and local_spread is not None else None)
+        from .strategy_lab import StrategyLab
+        from .research_budget import ResearchBudgetSettings
+        lab_settings = StrategyLabSettings.from_config(config.get("strategy_lab"))
+        self.strategy_lab = (StrategyLab(self.journal, {**self.comparison_protocol,
+                                                      "cash_management": policy_context(self.cash_sweep)}, lab_settings,
+                                        ResearchBudgetSettings.from_config(config.get("research_budget")))
+                             if lab_settings.enabled else None)
+        if not lab_settings.enabled:
+            self.journal.set_meta("strategy_lab_policy", {"enabled": False})
         self.journal.event(self.get_datetime(), "startup", {"mode": mode, "model": self.model, "models": self.agent_models,
                            "limits": asdict(self.limits), "mock_model": runtime is not None,
                            "observe_only": observe_only, "execution_revision": EXECUTION_REVISION,
@@ -1061,6 +1100,7 @@ class AutonomousFund(Strategy):
                            "prompt_version": self.prompt_version,
                            "cash_management_symbol": self.cash_sweep.symbol if self.cash_sweep else None,
                            "comparison_protocol": self.comparison_protocol,
+                           "strategy_lab_policy": self.strategy_lab.policy if self.strategy_lab is not None else None,
                            "performance": {"benchmarks": self.performance.definitions(),
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
@@ -1177,6 +1217,8 @@ class AutonomousFund(Strategy):
         try:
             from .review import review_after_close
             review_after_close(self)
+        except ResearchBudgetExhausted:
+            pass  # Optional AI research waits; deterministic closing reports still run.
         except Exception as exc:
             self._notify_fund("postmarket_review_error", str(exc) if isinstance(exc, RiskError) else type(exc).__name__)
         try:
@@ -1462,6 +1504,61 @@ class AutonomousFund(Strategy):
         except Exception as exc:  # An announcement must never cost the iteration.
             self.log_message(f"Session-open announcement skipped: {type(exc).__name__}", color="yellow")
 
+    def _strategy_lab_context(self, now, research=True):
+        lab = getattr(self, "strategy_lab", None)
+        if lab is None:
+            return None
+        try:
+            return lab.context(now, detail_limit=4 if research else 0)
+        except Exception as exc:
+            return {"status": "unavailable", "error": type(exc).__name__, "admitted_library": [],
+                    "authority": "No strategy permission inferred; existing mandate and execution guards still apply."}
+
+    @agent_tool(name="strategy_research", description="Read this account's saved strategy research, versions and task progress; never submits orders or reveals final holdout returns.")
+    def strategy_research(self, strategy_id: str = "", version: str = "") -> dict:
+        lab = getattr(self, "strategy_lab", None)
+        if lab is None:
+            return {"status": "disabled"}
+        return lab.context(self.get_datetime(), strategy_id=strategy_id or None, version=version or None)
+
+    def _record_strategy_research(self, research, now):
+        lab = getattr(self, "strategy_lab", None)
+        if lab is None:
+            return
+        accepted, errors = [], []
+        for proposal in research.get("strategy_proposals", []):
+            try:
+                accepted.append(lab.submit(proposal, now, proposer=(getattr(self, "agent_models", None) or {}).get(
+                    "researcher", "researcher")))
+            except Exception as exc:
+                errors.append({"strategy_id": proposal.get("strategy_id"),
+                               "error": str(exc)[:300] if isinstance(exc, ValueError) else type(exc).__name__})
+        for update in research.get("research_tasks", []):
+            try:
+                lab.update_task(update, now)
+            except Exception as exc:
+                errors.append({"strategy_id": update.get("strategy_id"),
+                               "error": str(exc)[:300] if isinstance(exc, ValueError) else type(exc).__name__})
+        if accepted or errors or research.get("research_direction"):
+            try:
+                self.journal.event(now, "strategy_research", {"research_direction": research.get("research_direction"),
+                                   "registered": accepted, "errors": errors,
+                                   "source_call_id": (getattr(self, "_current_call", None) or {}).get("call_id")})
+            except Exception:
+                self.log_message("Strategy research receipt is pending; market research is retained.", color="yellow")
+
+    def _strategy_lab_tick(self):
+        try:
+            from .strategy_lab_runtime import tick
+            tick(self)
+        except Exception as exc:
+            # A failed optional job must never skip account reconciliation,
+            # protective exits, or invalidate otherwise valid market research.
+            try:
+                self._disclose_failure("strategy_lab_pending", exc, phase="strategy_research")
+            except Exception:
+                self.log_message("Strategy lab work is pending; account supervision continues.", color="yellow")
+
     def _research_before_open(self):
         if self.mode not in {"local", "paper"} or self.observe_only or self.halt_path.exists():
             return
@@ -1503,7 +1600,8 @@ class AutonomousFund(Strategy):
                                                             or {}, now) if "unavailable" not in account else None,
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
-                       "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations()}
+                       "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations(),
+                       "strategy_lab": self._strategy_lab_context(now)}
             self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
             context = self._with_fund_cost_context(context, self.get_datetime())
             self.log_message("Researching before the regular market opens; order submission is disabled.")
@@ -1514,6 +1612,7 @@ class AutonomousFund(Strategy):
                             "Do not submit orders or treat this research as an executable portfolio decision.", context=context)
             research = self._record_agent("researcher", result)
             validate_evidence(research["evidence"], self.get_datetime(), False)
+            self._record_strategy_research(research, self.get_datetime())
             packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
                       "session_open": opens_at.isoformat(), "phase": slot, "research": research,
                       "model": result.model, "cache_hit": result.cache_hit}
@@ -1526,17 +1625,22 @@ class AutonomousFund(Strategy):
             self._call_outcome(new_ideas=len(packet["idea_ids"]))
             self.premarket_research = packet
             # The operator reads the research on Telegram before the session.
+            from .notifications import strategy_research_lines
             self._disclose("premarket_research", {
                 "session_open": opens_at.isoformat(), "phase": slot, "summary": research["summary"],
                 "evidence_count": len(research["evidence"]),
                 "ideas": [{k: idea.get(k) for k in ("symbol", "direction", "horizon_sessions", "confidence", "thesis")}
                           for idea in research.get("ideas", [])[:8]],
+                "strategy_research": strategy_research_lines(research, context.get("strategy_lab")),
                 "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
                              for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
+        except ResearchBudgetExhausted:
+            pass  # The reservation gate already recorded the budget notice.
         except Exception as exc:
             self._disclose_failure("premarket_research_error", exc, phase="premarket_research")
         finally:
+            self._strategy_lab_tick()
             from . import report as reports
             self._bookkeeping(self.journal.export,
                               lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
@@ -1569,7 +1673,7 @@ class AutonomousFund(Strategy):
         """
         from .costs import scripted
         # A runtime may hand back a plain dict: validate here so every idea carries its defaults.
-        research = Research.model_validate(research).model_dump()
+        research = research_context(research)
         ideas = research["ideas"]
         if not ideas or scripted({"model": packet.get("model")}):
             return []  # A scripted test answer is not a prediction.
@@ -2078,6 +2182,16 @@ class AutonomousFund(Strategy):
             **({"cost_unavailable_reason": missing_cost} if missing_cost else {}),
             **({"served_models": served} if served else {}),
             **({"answer_diagnostic": diagnostic} if diagnostic else {})})
+        lab = getattr(self, "strategy_lab", None)
+        if lab is not None and call.get("role") == name and call.get("research_reservation"):
+            try:
+                lab.budget.settle(call["research_reservation"], now,
+                                  0 if self.scripted or result.cache_hit else cost,
+                                  {"call_id": call["call_id"], "source": "existing_model_cost_ledger"})
+            except Exception:
+                # The original agent cost receipt is already durable. A failed
+                # optional settlement keeps its reservation; never lose the answer.
+                self.log_message("Research resource settlement is pending; reservation retained.", color="yellow")
         if served and not self.scripted and not result.cache_hit and getattr(self, "mode", None) in {"local", "paper"}:
             try:
                 from .model_identity import observe_served
@@ -2097,6 +2211,8 @@ class AutonomousFund(Strategy):
         parsed = result.parsed
         if not hasattr(parsed, "model_dump"):
             return parsed
+        if isinstance(parsed, Research):
+            return research_context(parsed)
         # Unset optional execution levels are omitted, not stored as nulls;
         # research evidence keeps its explicit (nullable) publication time.
         return parsed.model_dump(exclude_none=isinstance(parsed, Decision))
@@ -2128,6 +2244,16 @@ class AutonomousFund(Strategy):
         phase = (kwargs.get("context") or {}).get("phase")
         purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
         self._current_call = {"call_id": key, "role": name, "purpose": purpose}
+        lab = getattr(self, "strategy_lab", None)
+        if name == "researcher" and lab is not None and not self.scripted:
+            project = "shared-research:" + trading_day(self.get_datetime())[:7]
+            reservation = lab.budget.reserve(self.get_datetime(), project, "research_model",
+                                              lab.budget.settings.model_reservation_usd)
+            if reservation is None:
+                self._disclose("research_budget_exhausted", lab.budget.summary(self.get_datetime()))
+                raise ResearchBudgetExhausted("Optional research budget is exhausted")
+            self._current_call["research_reservation"] = reservation
+            self._current_call["research_project"] = project
         # Triage has its own counter: it must never use up the runs the manager's decisions need.
         self.journal.counter(run_counter, self.get_datetime(), 1)
         model = getattr(self, "agent_models", {}).get(name) or (
@@ -2143,7 +2269,9 @@ class AutonomousFund(Strategy):
             # gate or create an extra inference attempt. Disclose the gap.
             input_evidence = {"status": "unavailable", "error": type(exc).__name__}
         self.journal.event(self.get_datetime(), "agent_call_started", {
-            "id": key, "name": name, "model": model, "purpose": purpose, "input_evidence": input_evidence})
+            "id": key, "name": name, "model": model, "purpose": purpose, "input_evidence": input_evidence,
+            **({"research_reservation": reservation, "research_project": project}
+               if self._current_call.get("research_reservation") else {})})
         result_evidence = {"status": "no_result"}
         try:
             result = self.agents[name].run(**kwargs)
@@ -2228,6 +2356,7 @@ class AutonomousFund(Strategy):
                 # hooks. Review only a genuinely completed prior session at
                 # this new clock, before its memo can inform today's decision.
                 self._review_after_close()
+            self._strategy_lab_tick()
             self._reconcile()
             try:
                 account = self._snapshot()
@@ -2325,7 +2454,7 @@ class AutonomousFund(Strategy):
         if not packet:
             return absent
         try:
-            research = Research.model_validate(packet["research"]).model_dump()
+            research = research_context(packet["research"])
             validate_evidence(research["evidence"], now, False)
             made, completed, opens = (instant(packet[k]) for k in ("as_of", "completed_at", "session_open"))
             if made > completed or completed > now:
@@ -2414,6 +2543,7 @@ class AutonomousFund(Strategy):
                    "recent_trades": self.journal.recent_trades(account.as_of),
                    "premarket_research": getattr(self, "premarket_research", None),
                    "strategy_memory": self._strategy_memory(),
+                   "strategy_lab": self._strategy_lab_context(now, research=False),
                    "approval_policy": asdict(self.execution.policy),
                    "approval_control": {"mode": getattr(getattr(self, "automation", None), "mode", "semi")},
                    "strategy_followup": self._strategy_evaluations(),
@@ -2469,6 +2599,7 @@ class AutonomousFund(Strategy):
                 research = self._record_agent("researcher", self._agent_call("researcher",
                     task_prompt="Research the market and current portfolio. Identify opportunities and risks.", context=context))
                 validate_evidence(research["evidence"], now, True)
+                self._record_strategy_research(research, now)
                 context["research"] = research
             context["critique"] = self._critique(context, context["research"], budget, now,
                                                 evaluation_calls=evaluation_calls)
@@ -5705,7 +5836,8 @@ class AutonomousFund(Strategy):
             # A failed closing mark must be disclosed, not block ordinary
             # read-only review of the evidence we actually retained.
             self._bookkeeping(self._review_after_close, self.journal.export,
-                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")))
+                              lambda: reports.report(self.run_dir, self.config.get("model_prices_per_million")),
+                              self._strategy_lab_tick)
 
     def on_abrupt_closing(self):
         if getattr(self, "news", None) is not None:

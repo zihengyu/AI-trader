@@ -6,6 +6,10 @@
   },
   "reasoning_effort": null,
   "manager_run_timeout_seconds": 300,
+  "strategy_lab": {"enabled": true, "admission": "research_only", "allocation_mode": "legacy_mandate",
+                   "max_jobs_per_day": 2, "job_timeout_seconds": 120, "min_forward_sessions": 60},
+  "research_budget": {"daily_usd": "2", "monthly_usd": "30", "project_usd": "10",
+                      "model_reservation_usd": "0.50", "validation_reservation_usd": "0.05"},
   "limits": {"max_position": "0.10", "max_exposure": "0.70", "daily_orders": 20, "drawdown": "0.08"},
   "universe": {
     "AAPL": "stock", "MSFT": "stock", "AMZN": "stock", "GOOGL": "stock",

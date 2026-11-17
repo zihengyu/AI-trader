@@ -312,7 +312,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
                         choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position",
-                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence", "quotes"])
+                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence", "quotes", "strategy-lab"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -494,6 +494,10 @@ def main(argv=None):
         return
     if args.mode == "experiments":
         from .experiments import report
+        print("\n".join(report(args.run_dir)))
+        return
+    if args.mode == "strategy-lab":
+        from .lab import report
         print("\n".join(report(args.run_dir)))
         return
     if args.mode == "weekly":

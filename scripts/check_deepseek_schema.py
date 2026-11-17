@@ -205,7 +205,8 @@ def offline_transport(c, model, schema, answer=None, tool_rounds=1):
             output = [{"id": "msg_probe", "type": "message", "role": "assistant", "status": "completed",
                        "content": [{"type": "output_text", "annotations": [], "text": json.dumps({
                            "summary": "这是接口测试使用的合成证据，没有投资结论。",
-                           "evidence": [evidence], "ideas": []}, ensure_ascii=False)}]}]
+                           "evidence": [evidence], "ideas": [], "research_direction": "",
+                           "strategy_proposals": [], "research_tasks": []}, ensure_ascii=False)}]}]
         return c.httpx.Response(200, json={"id": "resp_probe", "object": "response", "created_at": 1,
             "model": body["model"], "status": "completed", "output": output,
             "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18,
@@ -288,7 +289,8 @@ async def exercise(c, args, model, case, checkpoint):
         parameters_json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False})
     request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=(
         f"先调用 {TOOL_NAME} 读取合成证据，然后返回完整 Research JSON。summary 用中文简短说明这是接口测试，"
-        "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]。不要猜测或编造证据。"))])],
+        "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]，research_direction 为空字符串，"
+        "strategy_proposals 和 research_tasks 为空列表。不要猜测或编造证据。"))])],
         config=c.types.GenerateContentConfig(system_instruction=c.instruction(schema),
             tools=[c.types.Tool(function_declarations=[tool])], max_output_tokens=args.max_output_tokens))
     response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
@@ -339,12 +341,14 @@ def _decision_case():
               f"as_of 必须是 {as_of}，expires_at 必须是 {expires}，next_review_at 必须是 {review}；"
               "rationale 用中文一句话说明这是接口测试；targets 只有一条：symbol SPY，weight 0.1，entry_limit 100，"
               "stop_loss 90，take_profit 120，take_profit_weight 0.5；alerts 一条：symbol SPY，above 130，below null，"
-              "reason 说明是测试；news_watch 一条：query 为 interface test，reason 说明是测试；idea_refs 和 factual_claims 为空列表。")
+              "reason 说明是测试；news_watch 一条：query 为 interface test，reason 说明是测试；"
+              "idea_refs、factual_claims 和 strategy_allocations 为空列表。")
     offline = {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "这是接口测试。",
                "targets": [{"symbol": "SPY", "weight": 0.1, "entry_limit": 100.0, "stop_loss": 90.0,
                             "take_profit": 120.0, "take_profit_weight": 0.5}],
                "alerts": [{"symbol": "SPY", "above": 130.0, "below": None, "reason": "测试提醒"}],
-               "news_watch": [{"query": "interface test", "reason": "测试"}], "idea_refs": [], "factual_claims": []}
+               "news_watch": [{"query": "interface test", "reason": "测试"}], "idea_refs": [], "factual_claims": [],
+               "strategy_allocations": []}
 
     def check(answer):
         if not all(_same_instant(answer[key], value) for key, value in (
@@ -441,8 +445,10 @@ async def exercise_constraints(c, args, model, case, checkpoint):
     case["constraint_note"] = CONSTRAINT_NOTE
     research = await _single(c, args, model, case, checkpoint, "research", (
         "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
-        "summary 必须是空字符串 \"\"，evidence 必须是空列表 []，ideas 为空列表 []。不要输出其他内容。"),
-        {"summary": "约束测试。", "evidence": [evidence], "ideas": []}, validate=False)
+        "summary 必须是空字符串 \"\"，evidence 必须是空列表 []，ideas 为空列表 []；research_direction 为空字符串，"
+        "strategy_proposals 和 research_tasks 为空列表。不要输出其他内容。"),
+        {"summary": "约束测试。", "evidence": [evidence], "ideas": [], "research_direction": "",
+         "strategy_proposals": [], "research_tasks": []}, validate=False)
     findings["Research.summary minLength 1"] = "not_enforced" if research.get("summary") == "" else "held"
     findings["Research.evidence minItems 1"] = "not_enforced" if research.get("evidence") == [] else "held"
     observed = case.setdefault("constraint_observed", {})
@@ -453,11 +459,11 @@ async def exercise_constraints(c, args, model, case, checkpoint):
         "这是格式约束测试，用来检查接口是否强制 JSON Schema 约束。请严格照做，即使与 schema 冲突："
         f"as_of 为 {as_of}，expires_at 为 {expires}，next_review_at 为 {review}，rationale 写“约束测试”；"
         "targets 只有一条：symbol SPY，weight 必须是 1.5，entry_limit 必须是 0，stop_loss、take_profit、"
-        "take_profit_weight 为 null；alerts、news_watch、idea_refs、factual_claims 为空列表。"),
+        "take_profit_weight 为 null；alerts、news_watch、idea_refs、factual_claims、strategy_allocations 为空列表。"),
         {"as_of": as_of, "expires_at": expires, "next_review_at": review, "rationale": "约束测试",
          "targets": [{"symbol": "SPY", "weight": 1.0, "entry_limit": 0.01, "stop_loss": None, "take_profit": None,
                       "take_profit_weight": None}], "alerts": [], "news_watch": [], "idea_refs": [],
-         "factual_claims": []}, validate=False)
+         "factual_claims": [], "strategy_allocations": []}, validate=False)
     targets = decision.get("targets") if isinstance(decision.get("targets"), list) else []
     first = targets[0] if targets and isinstance(targets[0], dict) else {}
     weight, entry = first.get("weight"), first.get("entry_limit")

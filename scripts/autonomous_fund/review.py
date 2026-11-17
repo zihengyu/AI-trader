@@ -437,6 +437,7 @@ def review_after_close(strategy):
                "operator_mandate": (None if not mandate else strategy._mandate_context()
                                     if hasattr(strategy, "_mandate_context") else mandate.context()),
                "factor_lab": strategy._factor_context(now) if hasattr(strategy, "_factor_context") else None,
+               "strategy_lab": strategy._strategy_lab_context(now) if hasattr(strategy, "_strategy_lab_context") else None,
                "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
                "fund_scoreboard": strategy._fund_scoreboard(now) if hasattr(strategy, "_fund_scoreboard") else None,
                "fund_capital": strategy._capital_context() if hasattr(strategy, "_capital_context") else None,
@@ -503,6 +504,8 @@ def review_after_close(strategy):
             else:
                 break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
+        if hasattr(strategy, "_record_strategy_research"):
+            strategy._record_strategy_research(research, strategy.get_datetime())
         # The input the saved research answered (with its refreshed costs), never the format-correction
         # diagnostic of a rejected first answer: the review manager builds on this snapshot.
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
@@ -628,6 +631,8 @@ def review_after_close(strategy):
               "evidence_catalog": catalog, "reference_correction_attempts": attempt,
               "mock": saved["mock"] or strategy.scripted,
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
+    if saved["context"].get("strategy_lab") is not None:
+        packet["strategy_lab"] = saved["context"]["strategy_lab"]
     # The monitor can render immediately after this commit, before projections
     # below are written. Bind the exact research input, including on manager
     # retries that reuse a previously completed research stage.

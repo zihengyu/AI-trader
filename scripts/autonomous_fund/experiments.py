@@ -26,7 +26,7 @@ FINAL = {"rejected", "retired"}
 STATE_LABELS = {"candidate": "候选", "historical_test": "历史检验", "rejected": "未通过", "shadow": "影子观察",
                 "paper_active": "模拟盘生效", "paused": "暂停", "retired": "退役"}
 KIND_LABELS = {"factor": "因子", "learning_ab": "学习对照", "construction_ab": "组合构建对照",
-               "prediction_stats": "预测统计"}
+               "prediction_stats": "预测统计", "strategy": "完整策略"}
 # Factor lab status -> registry state. insufficient_data is re-tested later.
 FACTOR_STATES = {"validated": "paper_active", "rejected": "rejected", "invalid": "rejected", "redundant": "rejected",
                  "insufficient_data": "historical_test", "retired": "retired"}
@@ -68,13 +68,15 @@ class Registry:
                 digest = config_hash(entry["config"])
                 version = str(entry.get("version") or digest)
                 evidence = json.dumps(entry.get("evidence"), sort_keys=True, default=str)
-                row = db.execute("SELECT state FROM fund_experiments WHERE id=? AND version=?",
+                row = db.execute("SELECT state,config_hash FROM fund_experiments WHERE id=? AND version=?",
                                  (entry["id"], version)).fetchone()
+                if row is not None and row[1] != digest:
+                    raise ValueError("An experiment version cannot change its configuration")
                 if row is None:
                     for (other, state) in db.execute(
                             "SELECT version,state FROM fund_experiments WHERE id=? AND version!=?",
                             (entry["id"], version)).fetchall():
-                        if state not in FINAL:
+                        if state not in FINAL and entry.get("supersede", True):
                             reason = f"superseded by version {version}"
                             db.execute("UPDATE fund_experiments SET state='retired',updated_at=? WHERE id=? AND version=?",
                                        (at, entry["id"], other))

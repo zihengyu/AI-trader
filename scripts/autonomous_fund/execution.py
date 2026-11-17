@@ -59,6 +59,12 @@ def require_submission_authority(db, intent_id, now):
                     decision["policy"] != json.loads(policy[0]) or
                     not instant(decision["accepted_at"]) <= instant(now) < instant(decision["until_at"])):
                 raise OrderAuthorizationChanged("legacy_allocation_changed_or_expired")
+            if decision:
+                from .strategy_admission import verify_allocations
+                try:
+                    verify_allocations(db, json.loads(decision["body"]), now, purchase=True)
+                except RiskError as exc:
+                    raise OrderAuthorizationChanged("strategy_admission_changed") from exc
         return None  # Legacy/standalone orders have no fabricated authorization evidence.
     proof = json.loads(row[0])
     if proof["source"] in {"risk_reducing", "system_cash_management", "unattributed"}:
@@ -72,6 +78,11 @@ def require_submission_authority(db, intent_id, now):
             not policy or json.loads(policy[0]) != proof["policy"] or
             not instant(decision["accepted_at"]) <= now < instant(decision["until_at"])):
         raise OrderAuthorizationChanged("allocation_changed_or_expired")
+    from .strategy_admission import verify_allocations
+    try:
+        verify_allocations(db, json.loads(decision["body"]), now, purchase=True)
+    except RiskError as exc:
+        raise OrderAuthorizationChanged("strategy_admission_changed") from exc
     if proof.get("approval_id"):
         approval = db.execute("SELECT * FROM fund_approvals WHERE id=?", (proof["approval_id"],)).fetchone()
         if not approval or approval["state"] != "approved":
@@ -240,6 +251,8 @@ class ExecutionState:
         until = min(instant(body["expires_at"]), review)
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            from .strategy_admission import verify_allocations
+            verify_allocations(db, body, now)
             db.execute("UPDATE fund_decisions SET state='superseded' WHERE state='active'")
             db.execute("UPDATE fund_approvals SET state='superseded' WHERE state IN ('pending','approved')")
             db.execute("INSERT INTO fund_decisions VALUES(?,?,?,?,?,?)",
@@ -394,6 +407,8 @@ class ExecutionState:
             source = "system_cash_management"
         elif decision is not None:
             source = "automatic"
+            from .strategy_admission import verify_allocations
+            verify_allocations(db, json.loads(decision["body"]), now, purchase=True)
             current_policy = db.execute("SELECT value FROM meta WHERE key='execution_policy_digest'").fetchone()
             if (decision["state"] != "active" or decision["policy"] != self.digest or
                     not current_policy or json.loads(current_policy[0]) != self.digest or
