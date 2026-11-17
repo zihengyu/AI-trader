@@ -182,6 +182,62 @@ already accepted strategy purchases lose authority at existing recheck points.
 Researcher receives the failure and must propose a new version rather than
 rewrite the paused implementation.
 
+## Portfolio contribution study
+
+An operator can declare a comparison between an existing research portfolio and
+the same portfolio with part of its capital assigned to one candidate version.
+Supplying the exact strategy IDs and versions keeps the comparison bound to the
+selected journal. The declaration does not require paper-library admission.
+The CLI adds an immutable research event, which appears in Manager context and
+the Strategy Lab status command when results are available.
+
+For example, save a study such as the following in `portfolio.json`. These are
+illustrative IDs and costs. Provide the versions and assumptions for your study.
+
+```json
+{
+  "study_id": "candidate-contribution-v1",
+  "base": [
+    {"strategy_id": "baseline-a", "version": "v1", "weight": 0.60},
+    {"strategy_id": "baseline-b", "version": "v3", "weight": 0.40}
+  ],
+  "candidate": {"strategy_id": "candidate-a", "version": "v2"},
+  "candidate_weight": 0.20,
+  "fee_bps": 2,
+  "slippage_bps": 8
+}
+```
+
+```bash
+python -m scripts.autonomous_fund.lab declare-portfolio --run-dir path/to/selected-run --portfolio portfolio.json
+python -m scripts.autonomous_fund.lab status --run-dir path/to/selected-run
+```
+
+The base weights sum to one. In the second arm, the candidate replaces its
+declared fraction of each base sleeve, preserving their relative allocation.
+Both arms start with equal capital. The last 20 common prospective close-to-close
+returns available at declaration estimate each arm's annualized volatility.
+Both arms use the lower estimate as their target. The higher-risk arm reduces
+its allocation and keeps the remainder in USD. The declaration freezes the
+strategy and policy fingerprints, calibration return digest and allocation scales.
+An incomplete restore leaves the comparison unavailable. Evaluation
+starts with the first complete interval whose starting exchange close follows
+the declaration. Subsequent results use the same dates in both arms. A replayed
+or missing session stops the usable prefix for that sleeve. Results with fewer
+than 20 evaluation sessions carry a limited-sample label.
+
+Each arm rebalances to its declared weights at the start of each interval. The
+saved net sleeve NAVs already include underlying modeled trading and operating
+costs. The additional fee and slippage assumptions apply once to transfers of
+capital between the sleeves and outside cash, including initial allocation.
+Turnover and transfer expenses are reported as fractions of starting capital.
+The report also shows the outside cash allocation, net return, drawdown and
+realized volatility. Outside cash earns zero, and the final balances remain
+marked at closing NAV. The study scales the underlying book costs with the
+allocation. Actual fixed costs can behave differently. The study cannot estimate
+security-level order netting, funding returns, whole-share differences at the
+new sleeve sizes or actual account execution.
+
 ## Authority and migration
 
 Three permissions remain separate: scientific evidence, account-level strategy

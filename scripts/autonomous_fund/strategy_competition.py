@@ -122,7 +122,7 @@ def compare_saved(db, now):
                         "net_excess": net_excess,
                         "benchmark": benchmark, "coverage_complete": report.get("coverage_complete", False),
                         "risk_matched": _risk_matched(series, baseline, prefix),
-                        "incremental_portfolio_value": "unestablished; requires a portfolio with and without the strategy"})
+                        "incremental_portfolio_value": "see explicitly declared portfolio studies for this version"})
     correlations = []
     names = list(returns)
     for i, left in enumerate(names):
@@ -134,7 +134,10 @@ def compare_saved(db, now):
             value = statistics.correlation(a, b) if statistics.pstdev(a) > 0 and statistics.pstdev(b) > 0 else None
             correlations.append({"left": " / ".join(left), "right": " / ".join(right), "paired_sessions": len(days),
                                  "correlation": value if value is not None and math.isfinite(value) else None})
+    from .strategy_portfolio import evaluate_studies
+
     return {"strategies": entries, "correlations": correlations, "unavailable": unavailable,
+            "portfolio_comparison": evaluate_studies(db, now),
             "meaning": "Whole series metrics can include replay. Correlation uses common close-to-close sessions "
                        "from uninterrupted prospective prefixes. The risk comparison freezes beta to the net passive "
                        "book before scoring. The scaled reference assumes zero return on residual cash and has no "

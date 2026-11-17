@@ -52,6 +52,18 @@ def report(root):
                     lines.append(f"  {name}: passed={test.get('passed')}；净超额={test.get('net_excess')}；"
                                  f"非重叠样本={test.get('nonoverlapping_blocks')}；HAC t={test.get('hac_t')}")
         states = dict(db.execute("SELECT state,count(*) FROM fund_strategy_jobs GROUP BY state"))
+        for study in comparison["portfolio_comparison"]["studies"]:
+            title = f"组合对照 {study['plan']['study_id']}（{study['status']}）"
+            if "incremental_net_return" in study:
+                title += (f"，{study['evaluation_sessions']} 日净收益差 {study['incremental_net_return']:+.2%}，"
+                          f"最大回撤变化 {study['change_in_max_drawdown']:+.2%}")
+            lines.append(title)
+            if "incremental_net_return" in study:
+                for arm, label in (("base", "基准组合"), ("combined", "加入候选")):
+                    row = study[arm]
+                    lines.append(f"  {label} 外层现金权重 {row['mean_cash_weight']:.2%}，"
+                                 f"资金转移换手 {row['transfer_turnover_fraction']:.2%}，"
+                                 f"额外费用和滑点 {row['transfer_fees_fraction'] + row['transfer_slippage_fraction']:.3%}")
         lines.append("后台任务：" + json.dumps(states, ensure_ascii=False))
         costs = db.execute("SELECT r.category,sum(coalesce(c.actual,r.reserved))/1000000.0 "
                            "FROM fund_research_reservations r LEFT JOIN fund_research_charges c ON c.id=r.id "
@@ -85,13 +97,31 @@ def open_lab(root, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["status", "import-data", "run-once"], default="status", nargs="?")
+    parser.add_argument("action", choices=["status", "import-data", "run-once", "declare-portfolio"], default="status", nargs="?")
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--dataset", type=Path, help="Operator-owned JSON snapshot with provenance and coverage receipts")
+    parser.add_argument("--portfolio", type=Path, help="Explicit base and candidate strategy versions, allocations and costs")
     args = parser.parse_args(argv)
     if args.action == "status":
         print("\n".join(report(args.run_dir)))
+        return
+    if args.action == "declare-portfolio":
+        from .strategy_lab import load_snapshot
+        from .strategy_portfolio import declare_study
+
+        if args.portfolio is None:
+            parser.error("declare-portfolio requires --portfolio")
+        spec = load_snapshot(args.portfolio)
+        path = args.run_dir / "state.sqlite3"
+        if not path.is_file():
+            raise RiskError("An existing, explicitly selected account journal is required")
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_versions'").fetchone():
+                raise RiskError("Strategy Lab is not initialized in the selected journal")
+            registered = declare_study(db, spec, datetime.now(timezone.utc))
+        print(json.dumps(registered, ensure_ascii=False))
         return
     config = json.loads(args.config.read_text(encoding="utf-8"))
     lab, now = open_lab(args.run_dir, config), datetime.now(timezone.utc)
