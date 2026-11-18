@@ -4,15 +4,23 @@ import math
 import sqlite3
 from datetime import timedelta
 
-from .risk import RiskError, instant, number
+from .risk import RiskError, instant, number, trading_day
 
 
 REFERENCE_LOOKBACK_DAYS = 90
 
 
-def analyze(db, until, *, since=None):
+def analyze(db, until, *, since=None, opening_minutes=None, opening_prices=None):
     cutoff = instant(until)
     start = instant(since) if since is not None else None
+    opening = None
+    if opening_minutes is not None:
+        from .session_calendar import _session_bounds
+
+        if type(opening_minutes) is not int or not 1 <= opening_minutes <= 390:
+            raise RiskError("Opening calibration window must be between 1 and 390 minutes")
+        opening = {"minutes": opening_minutes, "from": start.isoformat() if start else None,
+                   "through": cutoff.isoformat(), "excluded_by_mode": {}}
     orders, callbacks, cumulative, states, modes, accepted = {}, {}, {}, {}, [], {}
     incomplete = set()
     conflicting = set()
@@ -77,7 +85,7 @@ def analyze(db, until, *, since=None):
                     quotes[key] = (bid, ask, instant(stamp), instant(submitted))
             except (RiskError, TypeError, ValueError):
                 continue
-    rows, groups, costs = [], {}, {}
+    rows, groups, costs, opening_matches = [], {}, {}, {}
     for key, (acknowledged, sequence, body) in orders.items():
         submitted = acknowledged
         # Older order events can carry iteration-start time. The immutable send
@@ -98,6 +106,16 @@ def analyze(db, until, *, since=None):
             continue
         available_modes = [m for at, seq, m in modes if at <= submitted and seq <= sequence]
         mode = available_modes[-1] if available_modes else "unknown"
+        if opening is not None:
+            exclusions = opening["excluded_by_mode"].setdefault(mode, {"native_send_missing": 0, "outside_opening": 0})
+            if sent is None:
+                exclusions["native_send_missing"] += 1
+                continue
+            day = trading_day(sent)
+            opened, closed = _session_bounds(day)
+            if opened is None or not opened <= sent < min(closed, opened + timedelta(minutes=opening_minutes)):
+                exclusions["outside_opening"] += 1
+                continue
         group = groups.setdefault(mode, {"orders": 0, "with_fills": 0, "unfilled_observations": 0,
             "terminal_unfilled": 0, "open_or_unknown": 0, "priced_notional": 0., "shortfall_usd": 0.,
             "beyond_quote_usd": 0., "known_fees_usd": 0., "fees_unknown_orders": 0,
@@ -105,6 +123,8 @@ def analyze(db, until, *, since=None):
         group.setdefault("incomplete_fill_orders", 0)
         stages = group.setdefault("stage_samples", {"decision_to_send": [], "send_to_ack": [],
                                                     "send_to_first_fill": []})
+        if opening is not None:
+            stages.setdefault("open_to_send", []).append((sent - opened).total_seconds())
         if sent is not None:
             stages["send_to_ack"].append((acknowledged - sent).total_seconds())
             plan_at = accepted.get(body.get("decision_id"))
@@ -186,6 +206,22 @@ def analyze(db, until, *, since=None):
                                     "send_preparation_receipt" if prepared is not None else "legacy_order_event"),
                "filled_fraction": float(total / number(body["quantity"])),
                "first_fill_observation_seconds": latency if latency >= 0 else None}
+        if opening is not None:
+            row.update(symbol=body["symbol"], side=body["side"], session=day, send_at=sent.isoformat(),
+                       average_fill_price=float(executed_notional / total))
+        open_price = opening_prices.get((body["symbol"], day)) if opening is not None and opening_prices is not None else None
+        if open_price is not None:
+            raw_open = number(open_price)
+            open_notional = raw_open * total
+            difference = (executed_notional - open_notional) * (1 if body["side"] == "buy" else -1)
+            samples = opening_matches.setdefault(mode, {"orders": 0, "executed": number(0),
+                "reference": number(0), "difference": number(0), "paired_orders": 0, "paired_notional": number(0),
+                "open_to_mid": number(0), "mid_to_fill": number(0)})
+            samples["orders"] += 1
+            samples["executed"] += executed_notional
+            samples["reference"] += open_notional
+            samples["difference"] += difference
+            row.update(raw_open_price=float(raw_open), raw_open_shortfall_bps=float(difference / open_notional * 10000))
         if quote is None:
             group["arrival_unknown_orders"] += 1
             row["arrival"] = "unknown"
@@ -196,6 +232,14 @@ def analyze(db, until, *, since=None):
             shortfall = sum(q * sign * (p - mid) for q, p in zip(quantities, prices))
             beyond = sum(q * sign * (p - executable) for q, p in zip(quantities, prices))
             notional = total * mid
+            if open_price is not None:
+                open_to_mid = (mid - raw_open) * total * sign
+                samples["paired_orders"] += 1
+                samples["paired_notional"] += open_notional
+                samples["open_to_mid"] += open_to_mid
+                samples["mid_to_fill"] += shortfall
+                row.update(open_to_arrival_mid_bps=float(open_to_mid / open_notional * 10000),
+                           arrival_mid_to_fill_on_open_bps=float(shortfall / open_notional * 10000))
             quote_age = (submitted - source_time).total_seconds()
             group["priced_notional"] += float(notional)
             group["shortfall_usd"] += float(shortfall)
@@ -237,7 +281,20 @@ def analyze(db, until, *, since=None):
             "midpoint_shortfall_bps": float(sample["shortfall"] / arrival * 10000) if arrival else None,
             "all_in_bps": float((sample["fees"] + sample["shortfall"]) / arrival * 10000) if arrival else None,
         }
-    return {"groups": groups, "recent": rows[-10:],
+        if opening is not None and opening_prices is not None:
+            matches = opening_matches.get(mode)
+            paired = matches["paired_notional"] if matches else 0
+            group["raw_open_match"] = {
+                "matched_orders": matches["orders"] if matches else 0,
+                "reference_notional_usd": float(matches["reference"]) if matches else 0.,
+                "verified_notional_coverage": float((matches["executed"] if matches else 0) / executed) if executed else None,
+                "price_shortfall_bps": float(matches["difference"] / matches["reference"] * 10000) if matches else None,
+                "paired_with_arrival_quote": matches["paired_orders"] if matches else 0,
+                "paired_reference_notional_usd": float(paired),
+                "open_to_arrival_mid_bps": float(matches["open_to_mid"] / paired * 10000) if paired else None,
+                "arrival_mid_to_fill_on_open_bps": float(matches["mid_to_fill"] / paired * 10000) if paired else None,
+            }
+    return {**({"opening_window": opening} if opening is not None else {}), "groups": groups, "recent": rows[-10:],
             "meaning": "Notional-weighted implementation shortfall from recorded bid/ask, never order limits. "
                        "Cumulative fills replace callbacks; explicit execution IDs deduplicate callbacks. "
                        "Matched costs use only orders with both complete fees and reconciled filled quantity. "

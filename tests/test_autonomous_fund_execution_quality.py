@@ -1,4 +1,5 @@
 """Execution evidence keeps quote chronology, censored orders and fees explicit."""
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -25,10 +26,12 @@ def ev(db, kind, body, seconds=0):
                ((NOW + timedelta(seconds=seconds)).isoformat(), kind, json.dumps(body)))
 
 
-def order(db, key="a", side="buy", quantity=10, bid=98, ask=100, seconds=0):
+def order(db, key="a", side="buy", quantity=10, bid=98, ask=100, seconds=0, *, native_send=False):
     body = {"broker_id": key, "intent_id": key, "symbol": "ALFA", "side": side, "quantity": quantity}
-    ev(db, "order_submitted", body, seconds)
     stamp = (NOW + timedelta(seconds=seconds)).isoformat()
+    if native_send:
+        body["send_at"] = stamp
+    ev(db, "order_submitted", body, seconds)
     db.execute("INSERT INTO fund_orders VALUES(?,?,?)", (key, stamp, "999"))
     if bid is not None:
         db.execute("INSERT INTO fund_order_quotes VALUES(?,?,?,?,?)", (key, str(bid), str(ask), stamp, stamp))
@@ -55,6 +58,83 @@ def test_new_native_clocks_measure_each_stage_and_keep_unfilled_orders_in_ack_sa
         "send_to_ack": {"samples": 2, "p95_seconds": 2},
         "send_to_first_fill": {"samples": 1, "p95_seconds": 8},
     }
+
+
+def test_opening_calibration_uses_exchange_clock_and_separates_modes(tmp_path):
+    from scripts.autonomous_fund.lab import main
+
+    db = database()
+    ev(db, "startup", {"mode": "local"}, -1900)
+    order(db, "premarket", seconds=-1801, native_send=True)
+    order(db, "local-open", seconds=-1800, native_send=True)
+    fill(db, "local-open", seconds=-1790)
+    order(db, "legacy", seconds=-1650)
+    ev(db, "startup", {"mode": "paper"}, -1610)
+    order(db, "paper-open", seconds=-1600, native_send=True)
+    fill(db, "paper-open", fee=None, seconds=-1590)
+    order(db, "pending", seconds=-1599, native_send=True)
+    fill(db, "pending", seconds=10)
+    order(db, "window-end", seconds=-900, native_send=True)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as saved:
+        db.commit()
+        db.backup(saved)
+
+    result = analyze(db, NOW, opening_minutes=15)
+    assert result["opening_window"]["excluded_by_mode"] == {
+        "local": {"native_send_missing": 1, "outside_opening": 1},
+        "paper": {"native_send_missing": 0, "outside_opening": 1},
+    }
+    local, paper = (result["groups"][mode] for mode in ("local", "paper"))
+    assert local["orders"] == local["matched_costs"]["matched_orders"] == 1
+    assert local["stage_latency"]["open_to_send"] == {"samples": 1, "p95_seconds": 0}
+    assert paper["orders"] == 2 and paper["open_or_unknown"] == 1
+    assert paper["stage_latency"]["open_to_send"] == {"samples": 2, "p95_seconds": 201}
+    assert paper["fees_unknown_orders"] == 1 and paper["matched_costs"]["all_in_bps"] is None
+    assert [item["broker_id"] for item in result["recent"]] == ["local-open", "paper-open"]
+    before = (tmp_path / "state.sqlite3").read_bytes()
+    main(["execution-calibration", "--run-dir", str(tmp_path), "--as-of", NOW.isoformat()])
+    assert (tmp_path / "state.sqlite3").read_bytes() == before
+
+
+def test_raw_open_calibration_requires_original_bytes_and_matches_directional_prices(tmp_path):
+    from scripts.autonomous_fund.lab import execution_calibration
+    from scripts.autonomous_fund.risk import RiskError
+    from scripts.autonomous_fund.strategy_validation import COVERAGE_FIELDS, digest
+
+    cutoff = NOW + timedelta(hours=7)
+    opened, closed = NOW - timedelta(minutes=30), NOW + timedelta(hours=6)
+    raw = b"synthetic opening-price original"
+    checksum = hashlib.sha256(raw).hexdigest()
+    data = {"source": "synthetic", "bars": {"ALFA": [{"day": "2026-11-02", "open_at": opened.isoformat(),
+            "at": closed.isoformat(), "available_at": closed.isoformat(), "open": 100, "close": 105,
+            "low": 95, "high": 108, "volume": 10000}]}, "coverage": dict.fromkeys(COVERAGE_FIELDS, True)}
+    data["provenance"] = {"snapshot_sha256": digest(data), "claims": {key: {
+        "source": "synthetic", "reference": key, "artifact_sha256": checksum} for key in COVERAGE_FIELDS}}
+    db = database()
+    ev(db, "startup", {"mode": "local"}, -1900)
+    order(db, "buy", seconds=-1790, native_send=True)
+    fill(db, "buy", seconds=-1789, price=101)
+    order(db, "sell", side="sell", bid=None, seconds=-1788, native_send=True)
+    fill(db, "sell", side="sell", seconds=-1787, price=98, fee=None)
+    with sqlite3.connect(tmp_path / "state.sqlite3") as saved:
+        db.commit()
+        db.backup(saved)
+    with pytest.raises(RiskError, match="source_artifacts_unchecked"):
+        execution_calibration(tmp_path, cutoff, data=data)
+    with pytest.raises(RiskError, match="source_artifact_missing:raw_prices"):
+        execution_calibration(tmp_path, cutoff, data=data, artifacts_dir=tmp_path)
+
+    (tmp_path / checksum).write_bytes(raw)
+    report = execution_calibration(tmp_path, cutoff, data=data, artifacts_dir=tmp_path)
+    assert report["opening_price_snapshot_digest"] == digest(data)
+    assert report["opening_price_source_check"] == "checked_for_report"
+    assert report["groups"]["local"]["raw_open_match"] == {"matched_orders": 2, "reference_notional_usd": 2000,
+        "verified_notional_coverage": 1, "price_shortfall_bps": 150, "paired_with_arrival_quote": 1,
+        "paired_reference_notional_usd": 1000, "open_to_arrival_mid_bps": -100, "arrival_mid_to_fill_on_open_bps": 200}
+    assert report["groups"]["local"]["matched_costs"]["matched_orders"] == 1
+    assert [x["raw_open_shortfall_bps"] for x in report["recent"]] == [100, 200]
+    assert [(x["symbol"], x["side"], x["session"], x["average_fill_price"]) for x in report["recent"]] == [
+        ("ALFA", "buy", "2026-11-02", 101), ("ALFA", "sell", "2026-11-02", 98)]
 
 
 def test_notional_weighted_buy_sell_shortfall_and_known_fees_are_separate_from_spread():

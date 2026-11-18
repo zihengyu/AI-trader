@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- Strategy Lab can verify original artifact bytes during offline intake and require a saved check of each exact snapshot for formal historical and forward validation. Candidate preflight shares the importer's publication checks. An offline opening-window calibration report separates local and paper orders by recorded send time and reports delays, missing clocks, censored fills, matched trading costs and directional shortfall against verified raw opening prices.
 - Portfolio contribution studies reconstruct matched closing security weights from prospective sleeve books. Manager and operator views report concentration, overlapping names, cash partitions and exposure coverage alongside the NAV comparison.
 - Execution reports pair arrival quotes, reconciled fills and complete fees on the same orders for all-in cost and verified notional coverage. New portfolio studies retain an account-local pre-declaration cost reference by execution mode while continuing to use their declared transfer assumptions.
 - Portfolio contribution studies report additional combined-arm transfer-cost stresses and the tested break-even range on the same prospective sample. Non-overlapping five-session pairs show the observed return difference and approximate uncertainty when enough blocks are available.

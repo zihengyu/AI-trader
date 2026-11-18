@@ -134,6 +134,7 @@ class StrategyLabSettings:
     max_candidates: int = 100
     max_artifact_bytes: int = 64000000
     min_forward_sessions: int = 60
+    require_source_artifacts: bool = False
     # Admission grants a simulated strategy-library entry only. The current
     # manager's operator mandate and all execution guards retain their authority.
     admission: str = "research_only"
@@ -142,6 +143,8 @@ class StrategyLabSettings:
     def __post_init__(self):
         if type(self.enabled) is not bool or self.admission not in {"research_only", "paper_library"}:
             raise RiskError("Invalid strategy lab mode")
+        if type(self.require_source_artifacts) is not bool:
+            raise RiskError("Invalid strategy_lab.require_source_artifacts")
         if self.allocation_mode not in {"legacy_mandate", "validated_only"} or (
                 self.allocation_mode == "validated_only" and (not self.enabled or self.admission != "paper_library")):
             raise RiskError("Validated-only allocations require an enabled paper strategy library")

@@ -1,5 +1,6 @@
 """Open strategy research acceptance controls. Synthetic data, no paid inference or broker access."""
 import copy
+import hashlib
 import json
 import math
 import random
@@ -123,6 +124,91 @@ def test_offline_intake_preserves_the_runner_policy_and_checks_one_candidate(tmp
     assert result["receipt_gaps"] == ["snapshot_provenance_unbound"]
     with engine.journal.connection() as db:
         assert db.execute("SELECT count(*) FROM fund_strategy_jobs").fetchone()[0] == 0
+
+
+def test_strict_sources_gate_holdout_and_forward_with_exact_offline_receipts(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import lab as operator_lab
+    from scripts.autonomous_fund.lab import check_data
+
+    engine = lab(tmp_path, require_source_artifacts=True)
+    data = dataset()
+    formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    engine.journal.event(formed, "startup", {"strategy_lab_policy": engine.policy})
+    engine.submit(proposal(), formed)
+    artifacts = tmp_path / "sources"
+    artifacts.mkdir()
+    raw = b"synthetic original provider bytes"
+    checksum = hashlib.sha256(raw).hexdigest()
+    for receipt in data["provenance"]["claims"].values():
+        receipt["artifact_sha256"] = checksum
+        receipt["reference"] = "https://example.org/description-only"
+    key = proposal()["strategy_id"]
+    assert check_data(tmp_path, data, key, "v1", formed)["receipt_gaps"] == ["source_artifacts_unchecked"]
+    exploratory, = engine.schedule(data, formed)
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT kind FROM fund_strategy_jobs WHERE id=?", (exploratory,)).fetchone()[0] == "exploratory"
+        assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
+    result = engine.run_one(formed)
+    assert result["status"] == "needs_data" and "source_artifacts_unchecked" in result["limitations"]
+    assert "final" not in result["tests"]
+
+    original = artifacts / checksum
+    original.write_bytes(b"changed provider bytes")
+    with pytest.raises(RiskError, match="source_artifact_mismatch:raw_prices"):
+        engine.schedule(data, formed, artifacts_dir=artifacts)
+    original.unlink()
+    saved = tmp_path / "elsewhere"
+    saved.write_bytes(raw)
+    original.symlink_to(saved)
+    with pytest.raises(RiskError, match="source_artifact_unreadable:raw_prices"):
+        engine.schedule(data, formed, artifacts_dir=artifacts)
+    original.unlink()
+    original.write_bytes(raw)
+    checked = check_data(tmp_path, data, key, "v1", formed, artifacts_dir=artifacts)
+    assert checked["ready_for_validation_input"] and checked["source_artifacts_matched_this_check"]
+    assert not checked["source_artifacts_recorded"]
+    assert len(engine.schedule(data, formed, artifacts_dir=artifacts)) == 1
+    assert check_data(tmp_path, data, key, "v1", formed)["source_artifacts_recorded"]
+    assert engine.run_one(formed)["passed"]
+
+    later = dataset(171)
+    daily = attest({**later, "bars": {symbol: values[-1:] for symbol, values in later["bars"].items()}})
+    for receipt in daily["provenance"]["claims"].values():
+        receipt["artifact_sha256"] = checksum  # New normalized input still needs its own check.
+    observed = instant(daily["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    assert engine.schedule(daily, observed) == []
+    assert engine.run_one(observed) is None
+    snapshot = tmp_path / "daily.json"
+    snapshot.write_text(json.dumps(daily))
+    monkeypatch.setattr(operator_lab, "datetime", SimpleNamespace(now=lambda tz: observed.astimezone(tz)))
+    operator_lab.main(["import-data", "--run-dir", str(tmp_path), "--dataset", str(snapshot),
+                       "--artifacts-dir", str(artifacts)])
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_source_artifacts").fetchone()[0] == 2
+        assert db.execute("SELECT kind FROM fund_strategy_jobs WHERE state='queued'").fetchone()[0] == "forward"
+    assert check_data(tmp_path, daily, key, "v1", observed)["source_artifacts_recorded"]
+    assert not check_data(tmp_path, data, key, "v1", formed - timedelta(seconds=1))["source_artifacts_recorded"]
+    assert not engine.journal.pending()
+
+
+@pytest.mark.parametrize("field", ["feature_available_at", "actions"])
+def test_read_only_preflight_rejects_future_individual_publications(tmp_path, field):
+    from scripts.autonomous_fund.lab import check_data
+
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    data = dataset()
+    future = (NOW + timedelta(seconds=1)).isoformat()
+    if field == "actions":
+        data["actions"] = [{"symbol": "ALFA", "ex_date": "2026-11-17", "split": 2, "available_at": future}]
+    else:
+        data["bars"]["ALFA"][-1]["feature_available_at"] = {"event": future}
+    data = attest(data)
+    expected = "publication"
+    with pytest.raises(RiskError, match=expected):
+        check_data(tmp_path, data, proposal()["strategy_id"], "v1", NOW)
+    with pytest.raises(RiskError, match=expected):
+        engine.schedule(data, NOW)
 
 
 def test_nonfactor_proposal_and_no_ideas_are_accepted_without_trading(tmp_path):

@@ -22,8 +22,13 @@ from .research_budget import ResearchBudget, ResearchBudgetSettings
 from .risk import RiskError, instant, number, trading_day
 from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, StrategyProposal, daily_sample_requirements
 from .strategy_program import validate_program
-from .strategy_validation import (check_dataset, digest, following_session, implementation_hash, planned_sessions,
-                                  snapshot_limitations)
+from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, implementation_hash,
+                                  planned_sessions, snapshot_limitations, source_artifact_gaps)
+
+
+def has_source_artifact_receipt(db, fingerprint, now):
+    row = db.execute("SELECT verified_at FROM fund_strategy_source_artifacts WHERE dataset=?", (fingerprint,)).fetchone()
+    return row is not None and instant(row[0]) <= instant(now)
 
 
 class StrategyLab:
@@ -31,6 +36,7 @@ class StrategyLab:
         self.journal, self.policy = journal, copy.deepcopy(policy)
         self.settings = settings or StrategyLabSettings()
         self.policy["research_execution"] = {"initial_capital": self.settings.initial_capital_usd,
+                                            "require_source_artifacts": self.settings.require_source_artifacts,
                                             "source_hash": implementation_hash()}
         self.budget = ResearchBudget(journal, budget_settings or ResearchBudgetSettings())
         self._executor, self._future = None, None
@@ -47,6 +53,8 @@ class StrategyLab:
                 CREATE INDEX IF NOT EXISTS strategy_event_version_kind ON fund_strategy_events(id,version,kind,sequence);
                 CREATE TABLE IF NOT EXISTS fund_strategy_datasets (
                     digest TEXT PRIMARY KEY, at TEXT NOT NULL, body TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS fund_strategy_source_artifacts (
+                    dataset TEXT PRIMARY KEY REFERENCES fund_strategy_datasets(digest), verified_at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS fund_strategy_jobs (
                     id TEXT PRIMARY KEY, strategy_id TEXT NOT NULL, version TEXT NOT NULL,
                     at TEXT NOT NULL, kind TEXT NOT NULL, dataset TEXT NOT NULL,
@@ -148,19 +156,12 @@ class StrategyLab:
         with self.journal.connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid")]
 
-    def record_dataset(self, data, now):
-        if sum(len(rows) for collection in ("bars", "features") for rows in data.get(collection, {}).values()) > self.settings.max_history_rows:
-            raise RiskError("Strategy dataset exceeds the configured resource bound")
-        fingerprint = check_dataset(data)
-        if any(instant(r["at"]) > instant(now) or instant(r["available_at"]) > instant(now)
-               for name in ("bars", "features") for rows in data.get(name, {}).values() for r in rows):
-            raise RiskError("A research snapshot contains observations from the future")
-        if any(not instant(r["at"]) <= instant(stamp) <= instant(now)
-               for name in ("bars", "features") for rows in data.get(name, {}).values() for r in rows
-               for stamp in (r.get("feature_available_at") or {}).values()):
-            raise RiskError("An individual feature has an invalid publication time")
-        if any(instant(r["available_at"]) > instant(now) for r in data.get("actions", [])):
-            raise RiskError("A corporate-action publication receipt is from the future")
+    def record_dataset(self, data, now, *, artifacts_dir=None):
+        fingerprint = check_snapshot_as_of(data, now, self.settings.max_history_rows)
+        if artifacts_dir is not None:
+            gaps = source_artifact_gaps(data, artifacts_dir)
+            if gaps:
+                raise RiskError("Source artifact verification failed: " + ", ".join(gaps))
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT 1 FROM fund_strategy_datasets WHERE digest=?", (fingerprint,)).fetchone():
@@ -170,15 +171,22 @@ class StrategyLab:
                     raise RiskError("Strategy research artifact allowance is exhausted; audit data retained")
             db.execute("INSERT OR IGNORE INTO fund_strategy_datasets VALUES(?,?,?)",
                        (fingerprint, instant(now).isoformat(), encode(data)))
+            if artifacts_dir is not None:
+                db.execute("INSERT OR IGNORE INTO fund_strategy_source_artifacts VALUES(?,?)",
+                           (fingerprint, instant(now).isoformat()))
         return fingerprint
 
-    def schedule(self, data, now):
-        fingerprint = self.record_dataset(data, now)
-        complete = not snapshot_limitations(data, require_receipts=True)
+    def _qualified_input(self, db, data, fingerprint, now):
+        return not snapshot_limitations(data, require_receipts=True) and (
+            not self.settings.require_source_artifacts or has_source_artifact_receipt(db, fingerprint, now))
+
+    def schedule(self, data, now, *, artifacts_dir=None):
+        fingerprint = self.record_dataset(data, now, artifacts_dir=artifacts_dir)
         policy_hash = digest(self.policy)
         created = []
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
+            complete = self._qualified_input(db, data, fingerprint, now)
             rows = [dict(r) for r in db.execute("SELECT * FROM fund_strategy_versions WHERE task_state='open' "
                                                "OR state IN ('shadow','paper_active')")]
             previous_cutoff = db.execute("SELECT max(cutoff) FROM fund_strategy_cohorts").fetchone()[0]
@@ -406,7 +414,7 @@ class StrategyLab:
             row = dict(db.execute("SELECT * FROM fund_strategy_versions WHERE id=? AND version=?",
                                   (job["strategy_id"], job["version"])).fetchone())
             data = json.loads(db.execute("SELECT body FROM fund_strategy_datasets WHERE digest=?", (job["dataset"],)).fetchone()[0])
-            qualified_input = not snapshot_limitations(data, require_receipts=True)
+            qualified_input = digest(data) == job["dataset"] and self._qualified_input(db, data, job["dataset"], now)
             trials = sum(instant(created) <= now for (created,) in db.execute("SELECT created_at FROM fund_strategy_versions"))
             holdout = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                  (row["id"], row["version"])).fetchone()
@@ -428,11 +436,16 @@ class StrategyLab:
                    "locked_sessions": json.loads(holdout[0]) if job["kind"] == "historical" and holdout else None,
                    "timeout_seconds": self.settings.job_timeout_seconds}
         try:
-            if job["kind"] == "forward" and (input_issue or not qualified_input):
+            if job["kind"] in {"historical", "forward"} and (input_issue or not qualified_input):
                 result = {"status": "needs_data", "passed": False,
-                          "reason": input_issue or "Forward snapshot lacks bound source receipts"}
+                          "reason": input_issue or "Snapshot lacks eligible bound source evidence"}
             else:
                 result = run_worker(payload, self.settings.job_timeout_seconds)
+                if (job["kind"] == "exploratory" and self.settings.require_source_artifacts
+                        and not qualified_input and result.get("status") != "worker_error"):
+                    result.setdefault("limitations", []).append("source_artifacts_unchecked")
+                    if result["status"] == "awaiting_new_holdout":
+                        result["status"] = "needs_data"
         except Exception as exc:
             result = {"status": "worker_error", "passed": False, "error": type(exc).__name__}
         with self.journal.connection() as db:

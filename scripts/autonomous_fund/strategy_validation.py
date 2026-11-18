@@ -9,7 +9,9 @@ import ast
 import hashlib
 import json
 import math
+import os
 import re
+import stat
 import statistics
 import sys
 from importlib.metadata import version as package_version
@@ -52,12 +54,45 @@ def snapshot_limitations(data, *, require_receipts=False):
         if (not isinstance(receipt, dict)
                 or not all(isinstance(receipt.get(field), str) and 0 < len(receipt[field].strip()) <= 512
                            for field in ("source", "reference"))
-                or not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("artifact_sha256", "")))):
+                or not isinstance(receipt.get("artifact_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", receipt["artifact_sha256"])):
             missing.append(f"coverage_receipt_missing:{key}")
     if any(row.get("availability_estimated") for collection in ("bars", "features")
            for rows in data.get(collection, {}).values() for row in rows):
         missing.append("estimated_publication_times")
     return missing
+
+
+def source_artifact_gaps(data, directory):
+    """Match original bytes against bound receipts without following receipt references."""
+    gaps = snapshot_limitations(data, require_receipts=True)
+    if gaps:
+        return gaps
+    directory = Path(directory)
+    checks = {}
+    for key in COVERAGE_FIELDS:
+        expected = data["provenance"]["claims"][key]["artifact_sha256"]
+        if expected not in checks:
+            try:
+                fd = os.open(directory / expected, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                try:
+                    if not stat.S_ISREG(os.fstat(fd).st_mode):
+                        checks[expected] = "unreadable"
+                    else:
+                        checksum = hashlib.sha256()
+                        with os.fdopen(fd, "rb", closefd=False) as stream:
+                            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                                checksum.update(chunk)
+                        checks[expected] = "matched" if checksum.hexdigest() == expected else "mismatch"
+                finally:
+                    os.close(fd)
+            except FileNotFoundError:
+                checks[expected] = "missing"
+            except OSError:
+                checks[expected] = "unreadable"
+        if checks[expected] != "matched":
+            gaps.append(f"source_artifact_{checks[expected]}:{key}")
+    return gaps
 
 
 def implementation_hash():
@@ -180,6 +215,25 @@ def check_dataset(data):
             if not values or any(type(v) not in {int, float} or not math.isfinite(v) for v in values):
                 raise RiskError("External strategy features must be finite numeric observations")
     return digest(data)
+
+
+def check_snapshot_as_of(data, now, max_rows=None):
+    if max_rows is not None and sum(len(rows) for collection in ("bars", "features")
+                                    for rows in data.get(collection, {}).values()) > max_rows:
+        raise RiskError("Strategy dataset exceeds the configured resource bound")
+    fingerprint = check_dataset(data)
+    now = instant(now)
+    for collection in ("bars", "features"):
+        for rows in data.get(collection, {}).values():
+            for row in rows:
+                at = instant(row["at"])
+                if at > now or instant(row["available_at"]) > now:
+                    raise RiskError("A research snapshot contains observations from the future")
+                if any(not at <= instant(stamp) <= now for stamp in (row.get("feature_available_at") or {}).values()):
+                    raise RiskError("An individual feature has an invalid publication time")
+    if any(instant(row["available_at"]) > now for row in data.get("actions", [])):
+        raise RiskError("A corporate-action publication receipt is from the future")
+    return fingerprint
 
 
 class ResearchBook(Book):

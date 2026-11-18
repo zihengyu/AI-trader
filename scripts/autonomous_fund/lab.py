@@ -2,7 +2,7 @@
 import argparse
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .risk import RiskError, instant, trading_day
@@ -42,33 +42,74 @@ def forward_readiness(db, now, policy):
             "daily_slots_left": max(0, policy.get("max_jobs_per_day", 0) - attempted)}
 
 
-def check_data(root, data, key, version, now):
-    from .strategy_validation import check_dataset, snapshot_limitations
+def check_data(root, data, key, version, now, *, artifacts_dir=None):
+    from .strategy_lab import has_source_artifact_receipt
+    from .strategy_validation import check_snapshot_as_of, snapshot_limitations, source_artifact_gaps
 
-    fingerprint = check_dataset(data)
     path = Path(root) / "state.sqlite3"
     if not path.is_file():
         raise RiskError("An existing, explicitly selected account journal is required")
     with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
         row = db.execute("SELECT proposal,policy,state FROM fund_strategy_versions WHERE id=? AND version=?",
                          (key, version)).fetchone()
-    if row is None:
-        raise RiskError("Unknown strategy version in the selected account")
-    if any(instant(item["available_at"]) > instant(now) for collection in ("bars", "features")
-           for series in data.get(collection, {}).values() for item in series):
-        raise RiskError("A research snapshot contains observations from the future")
+        if row is None:
+            raise RiskError("Unknown strategy version in the selected account")
+        current = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
+        settings = json.loads(current[0]) if current else {}
+        fingerprint = check_snapshot_as_of(data, now, settings.get("max_history_rows"))
+        recorded = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_source_artifacts'").fetchone()
+                        and has_source_artifact_receipt(db, fingerprint, now))
     proposal, policy = json.loads(row[0]), json.loads(row[1])
     required = set(proposal["instruments"]) | {proposal["validation"]["benchmark"]}
     if policy.get("cash_symbol"):
         required.add(policy["cash_symbol"])
     features = set(proposal.get("data_symbols", ()))
-    gaps = snapshot_limitations(data, require_receipts=True)
+    gaps = (snapshot_limitations(data, require_receipts=True) if artifacts_dir is None
+            else source_artifact_gaps(data, artifacts_dir))
+    required_artifacts = policy.get("research_execution", {}).get("require_source_artifacts", False)
+    matched = artifacts_dir is not None and not gaps
+    if required_artifacts and not recorded and artifacts_dir is None:
+        gaps.append("source_artifacts_unchecked")
     missing = sorted((required - data["bars"].keys()) |
                      (features - data["bars"].keys() - data.get("features", {}).keys()))
     return {"strategy_id": key, "version": version, "state": row[2], "snapshot_digest": fingerprint,
             "receipt_gaps": gaps, "symbols_missing_from_this_snapshot": missing,
+            "source_artifacts_required": required_artifacts, "source_artifacts_recorded": recorded,
+            "source_artifacts_matched_this_check": matched,
             "benchmark_sessions_in_snapshot": len(data["bars"].get(proposal["validation"]["benchmark"], ())),
             "ready_for_validation_input": not gaps and not missing}
+
+
+def execution_calibration(root, now, *, opening_minutes=15, data=None, artifacts_dir=None):
+    from .execution_quality import REFERENCE_LOOKBACK_DAYS, analyze
+
+    path = Path(root) / "state.sqlite3"
+    if not path.is_file():
+        raise RiskError("An existing, explicitly selected account journal is required")
+    now = instant(now)
+    with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
+        prices, fingerprint = None, None
+        if data is not None:
+            from .strategy_lab import has_source_artifact_receipt
+            from .strategy_validation import check_snapshot_as_of, snapshot_limitations, source_artifact_gaps
+
+            fingerprint = check_snapshot_as_of(data, now)
+            if artifacts_dir is not None:
+                gaps = source_artifact_gaps(data, artifacts_dir)
+            else:
+                gaps = snapshot_limitations(data, require_receipts=True)
+                if not (db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_source_artifacts'").fetchone()
+                        and has_source_artifact_receipt(db, fingerprint, now)):
+                    gaps.append("source_artifacts_unchecked")
+            if gaps:
+                raise RiskError("Raw opening-price evidence is incomplete: " + ", ".join(gaps))
+            prices = {(symbol, row["day"]): row["open"] for symbol, rows in data["bars"].items() for row in rows}
+        result = analyze(db, now, since=now - timedelta(days=REFERENCE_LOOKBACK_DAYS), opening_minutes=opening_minutes,
+                         opening_prices=prices)
+        if prices is not None:
+            result["opening_price_snapshot_digest"] = fingerprint
+            result["opening_price_source_check"] = "checked_for_report" if artifacts_dir is not None else "saved_before_cutoff"
+        return result
 
 
 def report(root):
@@ -89,6 +130,8 @@ def report(root):
         matched = {(item["strategy_id"], item["version"]): item["risk_matched"] for item in comparison["strategies"]}
         lines = ["Strategy Lab：完整策略研究（历史结果不代表已证明 Alpha）",
                  f"准入模式：{policy.get('admission', 'research_only')}；资金分配：{policy.get('allocation_mode', 'legacy_mandate')}"]
+        if policy.get("require_source_artifacts"):
+            lines.append("正式验证要求原始数据凭证通过字节核验；用 check-data 检查候选快照。")
         for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid"):
             proposal = json.loads(row["proposal"])
             lines.append(f"- {row['id']} / {row['version']} [{row['state']}] 研究任务：{row['task_state']}｜{proposal['name']}")
@@ -246,7 +289,8 @@ def open_lab(root, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["status", "check-data", "import-data", "run-once", "declare-portfolio"],
+    parser.add_argument("action", choices=["status", "check-data", "import-data", "run-once", "declare-portfolio",
+                                           "execution-calibration"],
                         default="status", nargs="?")
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
@@ -254,6 +298,9 @@ def main(argv=None):
     parser.add_argument("--strategy-id", help="Existing candidate for read-only check-data")
     parser.add_argument("--version", help="Exact version for read-only check-data")
     parser.add_argument("--portfolio", type=Path, help="Explicit base and candidate strategy versions, allocations and costs")
+    parser.add_argument("--artifacts-dir", type=Path, help="Original source artifacts named by their SHA-256 digests")
+    parser.add_argument("--opening-minutes", type=int, default=15, help="Execution calibration window after session open")
+    parser.add_argument("--as-of", help="Timezone-aware cutoff for execution calibration")
     args = parser.parse_args(argv)
     if args.action == "status":
         print("\n".join(report(args.run_dir)))
@@ -263,7 +310,18 @@ def main(argv=None):
         if args.dataset is None or not args.strategy_id or not args.version:
             parser.error("check-data requires --dataset, --strategy-id and --version")
         result = check_data(args.run_dir, load_snapshot(args.dataset), args.strategy_id, args.version,
-                            datetime.now(timezone.utc))
+                            datetime.now(timezone.utc), artifacts_dir=args.artifacts_dir)
+        print(json.dumps(result, ensure_ascii=False))
+        return
+    if args.action == "execution-calibration":
+        from .strategy_lab import load_snapshot
+
+        if args.artifacts_dir is not None and args.dataset is None:
+            parser.error("execution-calibration uses --artifacts-dir with --dataset")
+        result = execution_calibration(args.run_dir, args.as_of or datetime.now(timezone.utc),
+                                       opening_minutes=args.opening_minutes,
+                                       data=load_snapshot(args.dataset) if args.dataset is not None else None,
+                                       artifacts_dir=args.artifacts_dir)
         print(json.dumps(result, ensure_ascii=False))
         return
     if args.action == "declare-portfolio":
@@ -290,7 +348,8 @@ def main(argv=None):
         if args.dataset is None:
             parser.error("import-data requires --dataset")
         data = load_snapshot(args.dataset)
-        print(json.dumps({"queued": lab.schedule(data, now)}, ensure_ascii=False))
+        queued = lab.schedule(data, now, artifacts_dir=args.artifacts_dir)
+        print(json.dumps({"queued": queued, "source_artifacts_checked": args.artifacts_dir is not None}, ensure_ascii=False))
     else:
         result = lab.run_one(now)
         print(json.dumps({"status": (result or {}).get("status", "no_ready_job")}, ensure_ascii=False))

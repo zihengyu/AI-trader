@@ -356,7 +356,8 @@ Defaults in `config.json`:
     "allocation_mode": "legacy_mandate",
     "max_jobs_per_day": 2,
     "job_timeout_seconds": 120,
-    "min_forward_sessions": 60
+    "min_forward_sessions": 60,
+    "require_source_artifacts": false
   },
   "research_budget": {
     "daily_usd": "2",
@@ -483,12 +484,28 @@ set them using reviewed evidence. The `provenance` object has two fields.
 - `claims`, keyed by the four coverage fields. Each entry has a `source`, a
   retrievable `reference` to the relevant evidence and its `artifact_sha256`.
 
-Retain the original evidence separately for review. The Lab checks the snapshot
-binding, receipt shape, publication clocks and market sessions. It does not
-retrieve the referenced artifacts or independently certify a provider's claims.
-Missing manifests, changed snapshot contents or estimated timestamps support
-exploratory work only. The importer rejects future and invalid timestamps and
-excessive inputs.
+Retain the original evidence for review. Put each original artifact in a local
+directory under its lowercase SHA-256 digest as the filename. The following
+commands verify those bytes against the four coverage receipts. The first
+command is read-only. The second records a successful check against the exact
+snapshot and schedules eligible work. A supplied directory with missing or
+mismatched artifacts fails before scheduling.
+
+```bash
+python -m scripts.autonomous_fund.lab check-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json --strategy-id candidate-id --version v1 --artifacts-dir path/to/originals
+python -m scripts.autonomous_fund.lab import-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json --artifacts-dir path/to/originals
+```
+
+For a new data qualification pilot, set `strategy_lab.require_source_artifacts`
+to `true` in the account's approved runner configuration before registering the
+candidate. The lab requires a saved check for each exact snapshot before
+reserving a historical holdout or running a forward update. Changing the
+setting changes the frozen validation policy. The default remains `false` for
+existing research workflows. Hash verification checks byte identity. Review
+the provider artifacts for completeness, authenticity, membership dates,
+delistings, action terms, publication times and normalization separately.
+The Lab rejects future and invalid timestamps and excessive inputs, and treats
+missing manifests, altered snapshots or estimated timestamps as exploratory.
 
 For automated intake, atomically replace `strategy_lab_snapshot.json` in the
 account's run directory from an authorized data adapter. The existing off-hours
@@ -497,7 +514,44 @@ deliver each completed daily bar and its evidence before the following open.
 Daily additions can carry only that session and new available observations. The
 Lab joins them to the immutable previously accepted inputs. Check status for
 prospective and replayed session counts, the last validation, and remaining
-budget. The provider access and source evidence remain the operator's responsibility.
+budget. With strict source evidence enabled, verify and import each snapshot
+offline before its validation deadline. The regular runner can reuse the saved
+check without reading the original files. Provider access and evidence
+collection remain the operator's responsibility.
+
+Use the selected account's observation journal to inspect the opening execution
+window. The default is the last 90 days and the first 15 minutes of each NYSE
+session. A timezone-aware cutoff makes the report reproducible from retained
+receipts.
+
+```bash
+python -m scripts.autonomous_fund.lab execution-calibration --run-dir artifacts/fund-local --opening-minutes 15
+```
+
+The report classifies orders by their recorded send start and separates local
+simulation from broker paper evidence. It reports excluded legacy clocks,
+open-to-send and fill-observation delays, censored orders, arrival quote age and
+costs on matched fills with known fees. Fills are observed through `--as-of`,
+including later fills on orders sent in the opening window.
+
+For a comparison with the Lab's assumed opening fill, supply a snapshot that
+contains the raw opening prices. The report pairs by exact symbol and exchange
+session, reports the matched fill notional coverage and measures directional
+price shortfall in basis points. Fee coverage is reported separately. The daily
+bars must have been published by the cutoff. Use a saved source check or supply
+the original artifacts for read-only verification.
+On orders with both a raw open and a saved quote, the report splits price
+shortfall into the change from open to arrival midpoint and the difference
+from arrival midpoint to fill. Both use the same opening notional so they add
+up on the matched subset.
+
+```bash
+python -m scripts.autonomous_fund.lab execution-calibration --run-dir artifacts/fund-local --dataset path/to/snapshot.json --artifacts-dir path/to/originals
+```
+
+Opening-price differences include market moves before the order was sent and
+the fill process. They are descriptive execution evidence. The opening print
+does not establish available liquidity, executable size or live trading impact.
 
 ## Acceptance and remaining qualification
 
@@ -507,7 +561,11 @@ capability-escaping expressions; future and unpublished observations; next-open
 fills; in-sample winners rejected out of sample; missing membership evidence;
 atomic concurrent/monthly budgets; isolated worker operation; holdout reuse;
 forward-only admission; revocation; distribution receivables; and read-only
-diagnostics. Regression runs cover the existing fund lifecycle, risk, approvals,
+diagnostics. Intake tests also verify original-byte binding, offline receipt
+reuse and consistent publication checks. Opening calibration tests exercise
+session boundaries, separate modes, missing send clocks, censored fills and the
+buy/sell comparison against verified raw opening prices.
+Regression runs cover the existing fund lifecycle, risk, approvals,
 execution and reporting. Synthetic passes establish software behavior, never
 investment returns or real-model strategy creativity.
 
