@@ -123,28 +123,40 @@ class ResearchBudget:
                        (key, instant(now).isoformat(), value, body))
 
     def summary(self, now):
-        day = trading_day(instant(now))
+        now = instant(now)
+        day = trading_day(now)
+        daily = monthly = pending = 0
+        categories, projects, confirmed = {}, {}, {}
         with self.journal.connection() as db:
-            used = {label: self._spent(db, where, args) / 1e6 for label, where, args in (
-                ("daily_committed_usd", "r.day=?", (day,)),
-                ("monthly_committed_usd", "r.month=?", (day[:7],)))}
-            categories = {row[0]: row[1] / 1e6 for row in db.execute(
-                "SELECT r.category,sum(coalesce(c.actual,r.reserved)) FROM fund_research_reservations r "
-                "LEFT JOIN fund_research_charges c ON r.id=c.id WHERE r.month=? GROUP BY r.category", (day[:7],))}
-            pending = db.execute("SELECT count(*) FROM fund_research_reservations r LEFT JOIN "
-                                 "fund_research_charges c ON r.id=c.id WHERE c.id IS NULL").fetchone()[0]
-            projects = {r[0]: r[1] / 1e6 for r in db.execute(
-                "SELECT r.project,sum(coalesce(c.actual,r.reserved)) FROM fund_research_reservations r "
-                "LEFT JOIN fund_research_charges c ON r.id=c.id GROUP BY r.project")}
+            rows = db.execute("SELECT r.at,r.day,r.month,r.category,r.project,r.reserved,c.at,c.actual "
+                              "FROM fund_research_reservations r LEFT JOIN fund_research_charges c ON r.id=c.id "
+                              "WHERE julianday(r.at)<=julianday(?)", (now.isoformat(),))
+            for at, reserved_day, month, category, project, reservation, settled_at, actual in rows:
+                if instant(at) > now:
+                    continue
+                settled = settled_at is not None and instant(settled_at) <= now
+                amount = actual if settled else reservation
+                daily += amount if reserved_day == day else 0
+                if month == day[:7]:
+                    monthly += amount
+                    categories[category] = categories.get(category, 0) + amount
+                projects[project] = projects.get(project, 0) + amount
+                if settled:
+                    confirmed[project] = confirmed.get(project, 0) + actual
+                else:
+                    pending += 1
             operational = db.execute("SELECT coalesce(sum(json_extract(body,'$.cost_usd')),0), "
                                      "sum(CASE WHEN json_extract(body,'$.cost_usd') IS NULL AND "
                                      "coalesce(json_extract(body,'$.cache_hit'),0)=0 AND "
                                      "coalesce(json_extract(body,'$.mock'),0)=0 THEN 1 ELSE 0 END) FROM events "
-                                     "WHERE kind='agent' AND json_extract(body,'$.name')!='researcher'").fetchone()
-        return {**used, "daily_limit_usd": self.settings.daily_usd,
-                "monthly_limit_usd": self.settings.monthly_usd, "monthly_by_category": categories,
+                                     "WHERE kind='agent' AND json_extract(body,'$.name')!='researcher' "
+                                     "AND julianday(at)<=julianday(?)", (now.isoformat(),)).fetchone()
+        return {"daily_committed_usd": daily / 1e6, "monthly_committed_usd": monthly / 1e6,
+                "daily_limit_usd": self.settings.daily_usd, "monthly_limit_usd": self.settings.monthly_usd,
+                "monthly_by_category": {key: value / 1e6 for key, value in categories.items()},
                 "unknown_or_running_reservations": pending,
-                "lifetime_by_project_usd": projects,
+                "lifetime_by_project_usd": {key: value / 1e6 for key, value in projects.items()},
+                "known_lifetime_by_project_usd": {key: value / 1e6 for key, value in confirmed.items()},
                 "operational_models": {"known_cost_usd": operational[0], "unpriced_calls": operational[1] or 0,
                                        "budget_owner": "existing model_budget; outside research resource envelope"},
                 "meaning": "Estimated resource commitments; unknown usage stays reserved. Not a provider bill."}

@@ -32,6 +32,8 @@ def library_entry(db, key, version, now, policy):
     if (not result.get("passed") or result.get("degraded") or not series or
             instant(evidence[1]) > instant(now) or series[-1]["day"] != latest_required_session(now)):
         raise RiskError("Strategy forward evidence is missing, stale, future or degraded")
+    if (result.get("qualification") or {}).get("status") != "passed":
+        raise RiskError("Strategy has no successful frozen forward qualification")
     if not result.get("coverage_complete"):
         raise RiskError("Strategy forward data coverage is incomplete")
     if result.get("replayed_sessions") != 0 or result.get("prospective_sessions") != len(series):

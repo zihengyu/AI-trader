@@ -110,6 +110,10 @@ def compare_saved(db, now):
                             "AND kind IN ('registered','validation','historical_pass') AND julianday(at)<=julianday(?) "
                             "ORDER BY julianday(at) DESC,sequence DESC", (key, version, cutoff))
         state = next((value for at, value in states if instant(at) <= now), None)
+        execution = report.get("strategy_summary") or {}
+        charges = {k: execution[k] for k in ("fees", "friction", "turnover", "orders") if k in execution}
+        qualification = {k: v for k, v in (report.get("qualification") or {}).items()
+                         if k in {"status", "start", "end", "required_sessions", "trials"}}
         entries.append({"strategy": identity, "strategy_id": key, "version": version,
                         "state": state, "observations": len(series),
                         "start_day": days[0], "end_day": days[-1],
@@ -121,6 +125,10 @@ def compare_saved(db, now):
                         "passive_reference_return": reference["net_return"],
                         "net_excess": net_excess,
                         "benchmark": benchmark, "coverage_complete": report.get("coverage_complete", False),
+                        "qualification": qualification, "execution_costs": charges,
+                        "modeled_operating_cost_usd": report.get("cost_usd"),
+                        "regimes": report.get("regimes"),
+                        "volume_participation": report.get("volume_participation"),
                         "risk_matched": _risk_matched(series, baseline, prefix),
                         "incremental_portfolio_value": "see explicitly declared portfolio studies for this version"})
     correlations = []

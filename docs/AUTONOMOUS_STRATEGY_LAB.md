@@ -2,8 +2,8 @@
 
 Open strategy proposals, reproducible research, independent simulation and bounded paper-library admission for the optional autonomous fund.
 
-Last Updated: 2026-11-17
-Status: Initial implementation; research-only defaults; no live-trading authorization
+Last Updated: 2026-11-18
+Status: Daily strategy research and paper qualification; research-only defaults
 Audience: Fund operators, researchers and contributors
 
 ## Overview
@@ -56,6 +56,13 @@ versions require a known parent and identify revision, retraining or
 revalidation. Earlier results and failures are retained. A new candidate does
 not automatically retire an older usable version.
 
+Registration links the originating Researcher call when one was recorded.
+Each daily validation and final window must cover its purge plus the declared
+number of complete holding-horizon blocks. An infeasible sample design stays
+open for formalization with the required window sizes shown to the researcher.
+An unsupported verification method stays open for adapter review. These
+proposals do not consume a formal holdout.
+
 Research task updates can continue, request data, pause or retire *research work*.
 They cannot promote a strategy, rewrite an implementation, alter production
 permissions or disable an existing investment mandate. Task progress is available
@@ -103,9 +110,11 @@ receivables and payment dates. Strategy and reference use the same cash conventi
 Actual asynchronous orders, quote queues and approval delays are not reproduced.
 The plain daily-rule adapter adds a blocking limitation when automatic sweeping
 is configured; it cannot assume sweep income or execution is free.
-Shared data costs apply to the passive reference too; its
-model cost is zero. Model/data overhead reduces economic NAV without inventing
-a broker cash withdrawal.
+The passive reference uses frozen account fees, friction and shared data cost.
+The candidate uses those account costs as a floor for its own estimates and
+also pays its declared model cost. Changing proposal costs never changes
+the passive book. Unknown account data costs leave qualification incomplete.
+Model and data overhead reduce economic NAV as accounting charges.
 
 ## Historical and forward validation
 
@@ -157,6 +166,24 @@ remains a gap for that version. A new revalidation version earns its own
 genuinely forward sample. The benchmark uses independent capital over the same
 sessions. Neither book makes a model call per bar.
 
+Historical pass freezes one forward qualification checkpoint. Its size is the
+largest of the declared forward window, the account minimum and the length
+needed for the declared complete holding-horizon blocks. The trial adjustment
+uses the registered version count observed by that historical job, including
+failed versions. Unregistered exploratory searches remain an evidence gap.
+The qualification ledger records one outcome for the first contiguous prefix. A failed test is
+retained as rejected. Missing timely signals in that prefix are recorded as
+incomplete and require a new revalidation version. Later observations update
+monitoring and risk diagnostics while preserving the original checkpoint.
+When projected forward jobs fill the remaining daily slots, they run before
+optional historical jobs. Daily and project budgets still apply.
+
+This separation follows the investment research concern that strategy selection
+can overfit repeated evaluations and the model governance practice of keeping
+independent validation and outcome monitoring distinct.
+[Probability of Backtest Overfitting](https://escholarship.org/uc/item/4w1110bb)
+· [Federal Reserve revised model risk guidance](https://www.federalreserve.gov/supervisionreg/srletters/SR2602.htm)
+
 The comparison read by the Manager and the operator uses exact exchange dates
 from both books. Full-span returns are labeled when they include sessions
 without timely evidence. Cross-strategy correlations use common close-to-close
@@ -181,6 +208,16 @@ Predeclared drawdown or sustained relative-loss degradation pauses the version;
 already accepted strategy purchases lose authority at existing recheck points.
 Researcher receives the failure and must propose a new version rather than
 rewrite the paused implementation.
+
+The forward report includes modeled fees, friction, trading notional, operating
+cost and traded shares as a fraction of eventual same-session volume.
+Full-day volume is an ex-post liquidity diagnostic. Opening fill capacity
+requires separate execution evidence, consistent with the use of actual order
+and execution data in [AQR's trading-cost research](https://www.aqr.com/insights/research/working-paper/trading-costs).
+Regime outcomes group paired net returns
+using the existing benchmark trend and volatility labels available before
+the evaluated open. Unknown labels stay in the sample. Regime summaries are
+descriptive and separate from the fixed qualification test.
 
 ## Portfolio contribution study
 
@@ -474,9 +511,20 @@ diagnostics. Regression runs cover the existing fund lifecycle, risk, approvals,
 execution and reporting. Synthetic passes establish software behavior, never
 investment returns or real-model strategy creativity.
 
-Further qualification requires real provider provenance, usable historical
-membership/actions, forward observations, and evidence that incremental returns
-cover research/operation costs. Advanced execution/ML adapters, independent
-strategy-generation A/B experiments and full production sleeve attribution are
-not established by this initial adapter. Existing A/B controls remain available,
-and no extra paid agents are enabled to imitate missing statistical evidence.
+## Next qualification increments
+
+1. **Data and realistic execution.** Prove one authorized feed through repeatable
+   point-in-time membership, delistings, corporate actions and opening-price
+   receipts. Run a small, versioned paper cohort with signal and fill
+   reconciliation before adding intraday or ML adapters.
+2. **Independent research comparison.** Predeclare Researcher treatment and
+   control profiles with matched information, cost envelopes and research
+   opportunities. Capture days with no proposals and count failed trials. Score
+   the downstream net economic contribution against an independent non-AI
+   reference on fresh observations. The existing Manager memory experiment
+   measures Manager behavior. It provides infrastructure for pairing and
+   attribution, while Researcher generation needs its own cohort.
+3. **Realized economics.** Compare simulated and paper execution at matched
+   orders, account for shared research costs separately from sleeve operating
+   costs, and reconcile realized attribution across sleeves before considering
+   wider account permissions.

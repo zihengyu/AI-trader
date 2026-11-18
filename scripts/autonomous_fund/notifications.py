@@ -431,7 +431,7 @@ def strategy_research_lines(research, lab=None):
     labels = {"candidate": "候选", "needs_formalization": "待形式化", "needs_adapter": "待适配",
               "needs_data": "待补数据", "awaiting_new_holdout": "等待新的独立测试数据",
               "shadow": "独立影子观察", "paper_active": "模拟策略库准入", "rejected": "验证未通过",
-              "paused": "暂停", "retired": "退役"}
+              "paused": "暂停", "retired": "退役", "forward_incomplete": "前瞻留证不足，须重验"}
     lines = ["策略研发：", "研究方向：" + (research.get("research_direction") or "本轮未另行记录")]
     for proposal in proposals[:4]:
         kind = "策略改进" if proposal.get("parent_version") else "新策略提案"
@@ -449,6 +449,31 @@ def strategy_research_lines(research, lab=None):
         lines.append(f"研究资源本月占用 ${budget.get('monthly_committed_usd', 0):.2f} / "
                      f"${budget['monthly_limit_usd']}（含未知费用预留，非提供方账单）。")
     lines.append("提案和影子结果不等于策略准入，也不代表已证明收益优势。")
+    return lines
+
+
+def _strategy_day_activity(db, day, cutoff):
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_events'").fetchone():
+        return []
+    from datetime import date, datetime, time, timedelta
+    zone = ZoneInfo("America/New_York")
+    start = datetime.combine(date.fromisoformat(day), time(), zone)
+    end = start + timedelta(days=1)
+    titles = {"registered": "登记", "validation": "验证", "historical_pass": "历史验证完成",
+              "forward_qualification": "前瞻准入检验完成", "worker_failure": "计算待重试"}
+    events = [(at, key, version, kind, json.loads(body)) for at, key, version, kind, body in db.execute(
+        "SELECT at,id,version,kind,body FROM fund_strategy_events WHERE kind IN (%s) "
+        "AND julianday(at)>=julianday(?) AND julianday(at)<=julianday(?) ORDER BY sequence"
+        % ",".join("?" * len(titles)), (*titles, start.isoformat(), min(end, cutoff).isoformat()))
+        if start <= instant(at) <= cutoff and instant(at) < end]
+    if not events:
+        return []
+    counts = Counter(kind for _, _, _, kind, _ in events)
+    lines = ["## 当日策略实验记录", "", "；".join(f"{titles[kind]} {count} 项" for kind, count in counts.items())]
+    for at, key, version, kind, body in events[-12:]:
+        state = body.get("state") or body.get("status")
+        lines.append(f"- {instant(at).astimezone(zone):%H:%M:%S} {key} / {version} · {titles[kind]}"
+                     + (f" · {state}" if state else ""))
     return lines
 
 
@@ -477,6 +502,7 @@ def daily_report(root, sequence):
         related = [(kind, json.loads(body)) for kind, body in db.execute(
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
             "json_extract(body,'$.session_date')=? ORDER BY sequence", (day,))]
+        lab_activity = _strategy_day_activity(db, day, cutoff)
     from .report import report
     snapshot = report(root, write_files=False, as_of=cutoff)
     review, session = packet["review"], packet["session"]
@@ -589,6 +615,8 @@ def daily_report(root, sequence):
     strategy_lines = strategy_research_lines(packet["research"], packet.get("strategy_lab"))
     if strategy_lines:
         lines.extend(["## 策略研发与验证", "", *strategy_lines, ""])
+    if lab_activity:
+        lines.extend([*lab_activity, ""])
     lines.extend(["## 下一交易日策略备忘", "", review["strategy_memo"], "",
                   f"置信度：{review['confidence']}。调整仍是待验证假设；未实现盈亏不等于已实现利润。",
                   session["limitations"], "", "## 原始研究", "", packet["research"]["summary"], "",

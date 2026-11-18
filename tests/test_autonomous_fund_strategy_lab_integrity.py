@@ -223,6 +223,25 @@ def test_missing_result_table_is_an_order_denial_instead_of_a_database_error(tmp
                 NOW, purchase=True)
 
 
+def test_forward_jobs_take_the_remaining_slots_before_optional_history(tmp_path):
+    engine = lab(tmp_path, max_jobs_per_day=3)
+    for key in ("alpha-research", "beta-research", "gamma-research"):
+        engine.submit(proposal(key), NOW)
+    engine.submit({**proposal("beta-research", "v2"), "parent_version": "v1", "change_type": "revision"}, NOW)
+    engine.schedule(dataset(), NOW)
+    with engine.journal.connection() as db:
+        db.execute("UPDATE fund_strategy_versions SET state='shadow' WHERE id IN (?,?)",
+                   ("alpha-research", "beta-research"))
+        db.execute("UPDATE fund_strategy_jobs SET kind='forward' WHERE strategy_id IN (?,?)",
+                   ("alpha-research", "beta-research"))
+    # Independent versions still need their own daily validation even when
+    # the research budget groups their compute spend into one project.
+    claimed = [engine._claim(NOW) for _ in range(3)]
+    assert {(row["strategy_id"], row["version"]) for row in claimed} == {
+        ("alpha-research", "v1"), ("beta-research", "v1"), ("beta-research", "v2")}
+    assert engine._claim(NOW) is None
+
+
 def test_failed_lease_write_rolls_back_its_budget_reservation(tmp_path):
     engine = lab(tmp_path)
     engine.submit(proposal(), NOW)

@@ -65,6 +65,14 @@ class ValidationPlan(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
 
 
+def daily_sample_requirements(plan):
+    """The daily verifier needs one complete holding-horizon block per observation."""
+    evaluation = plan["holding_sessions"] * plan["min_independent_observations"]
+    purged = evaluation + plan["holding_sessions"]
+    return {"validation_sessions": purged, "final_sessions": purged,
+            "forward_sessions": max(plan["forward_sessions"], evaluation)}
+
+
 class CostAssumptions(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     fee_rate: float = Field(ge=0, le=0.01, allow_inf_nan=False)
@@ -163,6 +171,9 @@ RESEARCH_GUIDANCE = (
     "Validation method daily_forward_v1 supports the documented daily evidence protocol; propose any other "
     "method when its assumptions do not fit, with an explanation in validation.rationale. It remains a "
     "feasibility task until a suitable independent verifier exists. Never force all mechanisms into one test. "
+    "For daily_forward_v1, allow holding_sessions for the purge plus holding_sessions times "
+    "min_independent_observations in both validation and final windows. Base revisions on identified evidence gaps "
+    "and declare a fresh evaluation before drawing a new conclusion. "
     "For executable daily_rules_v1 use rules with symbol, entry/exit Boolean expressions and weight expression. "
     "Expressions support field(symbol,column,lag), mean(symbol,column,window), ret(symbol,window), "
     "stdev(symbol,column,window), min/max/abs, arithmetic, comparisons, and/or/not, and the names "

@@ -20,7 +20,7 @@ from .experiments import Registry
 from .journal import encode
 from .research_budget import ResearchBudget, ResearchBudgetSettings
 from .risk import RiskError, instant, number, trading_day
-from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, StrategyProposal
+from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, StrategyProposal, daily_sample_requirements
 from .strategy_program import validate_program
 from .strategy_validation import (check_dataset, digest, following_session, implementation_hash, planned_sessions,
                                   snapshot_limitations)
@@ -44,6 +44,7 @@ class StrategyLab:
                 CREATE TABLE IF NOT EXISTS fund_strategy_events (
                     sequence INTEGER PRIMARY KEY, id TEXT NOT NULL, version TEXT NOT NULL,
                     at TEXT NOT NULL, kind TEXT NOT NULL, body TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS strategy_event_version_kind ON fund_strategy_events(id,version,kind,sequence);
                 CREATE TABLE IF NOT EXISTS fund_strategy_datasets (
                     digest TEXT PRIMARY KEY, at TEXT NOT NULL, body TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS fund_strategy_jobs (
@@ -78,7 +79,7 @@ class StrategyLab:
         db.execute("INSERT INTO fund_strategy_events(id,version,at,kind,body) VALUES(?,?,?,?,?)",
                    (key, version, instant(now).isoformat(), kind, encode(body)))
 
-    def submit(self, proposal, now, proposer="researcher"):
+    def submit(self, proposal, now, proposer="researcher", *, source_call_id=None):
         body = StrategyProposal.model_validate(proposal).model_dump()
         key, version = body["strategy_id"], body["version"]
         fingerprint, policy_hash = digest(body), digest(self.policy)
@@ -91,7 +92,17 @@ class StrategyLab:
             # cannot yet be compiled; a syntax error is not worthless research.
             state, feasibility_error = "needs_formalization", str(exc)[:500]
         if state == "ready":
-            state = "candidate"
+            plan = body["validation"]
+            required = daily_sample_requirements(plan)
+            short = {key: required[key] for key in ("validation_sessions", "final_sessions")
+                     if plan[key] < required[key]}
+            if plan["method"] != "daily_forward_v1":
+                state, feasibility_error = "needs_adapter", "An independent verifier for this method is needed"
+            elif short:
+                state = "needs_formalization"
+                feasibility_error = "After purging, minimum split sizes are " + encode(short)
+            else:
+                state = "candidate"
         with self.journal.connection() as db:
             db.execute("BEGIN IMMEDIATE")
             old = db.execute("SELECT digest,policy_hash FROM fund_strategy_versions WHERE id=? AND version=?",
@@ -100,7 +111,8 @@ class StrategyLab:
                 if old[0] != fingerprint or old[1] != policy_hash:
                     raise RiskError("A strategy version or its execution policy cannot be rewritten")
                 return key, version
-            if db.execute("SELECT count(*) FROM fund_strategy_versions WHERE state NOT IN ('rejected','retired','paused') "
+            if db.execute("SELECT count(*) FROM fund_strategy_versions WHERE "
+                          "state NOT IN ('rejected','retired','paused','forward_incomplete') "
                           "AND task_state!='retired'").fetchone()[0] >= self.settings.max_candidates:
                 raise RiskError("Strategy research capacity reached; existing evidence is retained")
             parent = body.get("parent_version")
@@ -113,7 +125,8 @@ class StrategyLab:
                        (key, version, instant(now).isoformat(), proposer, encode(body), fingerprint,
                         encode(self.policy), policy_hash, state, "open"))
             self._event(db, key, version, now, "registered", {"state": state, "digest": fingerprint,
-                                                            "feasibility_error": feasibility_error})
+                                                            "feasibility_error": feasibility_error,
+                                                            "source_call_id": source_call_id})
         self.sync_registry(now)
         return key, version
 
@@ -205,6 +218,9 @@ class StrategyLab:
                         if previous_cutoff and sessions[-plan["final_sessions"]] <= previous_cutoff:
                             db.execute("UPDATE fund_strategy_versions SET state='awaiting_new_holdout' WHERE id=? AND version=?",
                                        (row["id"], row["version"]))
+                            if row["state"] != "awaiting_new_holdout":
+                                self._event(db, row["id"], row["version"], now, "validation",
+                                            {"state": "awaiting_new_holdout", "status": "awaiting_new_holdout"})
                         else:
                             kind = "historical"
                             db.execute("INSERT INTO fund_strategy_holdouts VALUES(?,?,?,?,?)",
@@ -253,7 +269,6 @@ class StrategyLab:
             historical_attempts = db.execute("SELECT count(*) FROM fund_strategy_jobs j JOIN "
                                              "fund_research_reservations r ON r.id=j.reservation "
                                              "WHERE r.day=? AND j.kind IN ('historical','exploratory')", (day,)).fetchone()[0]
-            prefer_historical = attempted > 0 and historical_attempts == 0
             eligible = db.execute("SELECT j.* FROM fund_strategy_jobs j JOIN fund_strategy_versions v ON "
                              "v.id=j.strategy_id AND v.version=j.version WHERE v.policy_hash=? AND (v.task_state='open' OR "
                              "v.state IN ('shadow','paper_active')) AND julianday(j.at)<=julianday(?) AND "
@@ -263,12 +278,17 @@ class StrategyLab:
                              "AND other.version=j.version AND other.id!=j.id AND other.state='running' AND "
                              "julianday(other.lease_until)>=julianday(?)) AND "
                              "(j.state='queued' OR (j.state='running' AND julianday(j.lease_until)<julianday(?))) "
-                             "ORDER BY (j.kind=? OR (?='historical' AND j.kind='exploratory')) DESC,coalesce((SELECT max(r.at) FROM fund_strategy_results r "
+                             "ORDER BY coalesce((SELECT max(r.at) FROM fund_strategy_results r "
                              "JOIN fund_strategy_jobs done ON done.id=r.job_id WHERE done.strategy_id=j.strategy_id "
                              "AND done.version=j.version),'0000'),j.at,j.rowid",
-                             (digest(self.policy), instant(now).isoformat(), instant(now).isoformat(), instant(now).isoformat(),
-                              "historical" if prefer_historical else "forward",
-                              "historical" if prefer_historical else "forward"))
+                             (digest(self.policy), instant(now).isoformat(), instant(now).isoformat(),
+                              instant(now).isoformat())).fetchall()
+            forward_versions = {(job["strategy_id"], job["version"]) for job in eligible if job["kind"] == "forward"}
+            # A missed forward deadline leaves a permanent gap. Historical work
+            # gets the usual rotation when enough daily slots are still available.
+            prefer_historical = (attempted > 0 and historical_attempts == 0
+                                 and len(forward_versions) < self.settings.max_jobs_per_day - attempted)
+            eligible.sort(key=lambda job: (job["kind"] == "forward") == prefer_historical)
             jobs = {}
             for candidate in eligible:
                 jobs.setdefault(candidate["strategy_id"], candidate)
@@ -322,7 +342,7 @@ class StrategyLab:
         # The constituent snapshots retain their own receipts in the journal.
         # The merged replay data is derived and has a separate digest.
         seed.pop("provenance", None)
-        return seed, passed[0], [json.loads(r[0])["receipt"] for r in records]
+        return seed, passed[0], [json.loads(r[0])["receipt"] for r in records], json.loads(passed[1])["forward_plan"]
 
     @staticmethod
     def _save_next_signal(db, row, job, result, last_bar, finished, dataset):
@@ -357,6 +377,22 @@ class StrategyLab:
                 prospective.add(day)
         return prospective
 
+    def _forward_qualification(self, db, row, job, result, prospective, finished):
+        qualification = result["qualification"]
+        prior = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? "
+                           "AND kind='forward_qualification' ORDER BY sequence LIMIT 1",
+                           (row["id"], row["version"])).fetchone()
+        if prior:
+            return json.loads(prior[0])
+        if qualification["status"] == "collecting":
+            return qualification
+        prefix = result["series"][:qualification["required_sessions"]]
+        if any(item["day"] not in prospective for item in prefix):
+            qualification = {**qualification, "status": "incomplete"}
+        qualification = {**qualification, "job_id": job["id"]}
+        self._event(db, row["id"], row["version"], finished, "forward_qualification", qualification)
+        return qualification
+
     def run_one(self, now):
         now = instant(now)
         if (self.journal.root / "STOP").exists():
@@ -371,21 +407,24 @@ class StrategyLab:
                                   (job["strategy_id"], job["version"])).fetchone())
             data = json.loads(db.execute("SELECT body FROM fund_strategy_datasets WHERE digest=?", (job["dataset"],)).fetchone()[0])
             qualified_input = not snapshot_limitations(data, require_receipts=True)
-            trials = db.execute("SELECT count(*) FROM fund_strategy_versions").fetchone()[0]
+            trials = sum(instant(created) <= now for (created,) in db.execute("SELECT created_at FROM fund_strategy_versions"))
             holdout = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                  (row["id"], row["version"])).fetchone()
-            forward_at, prior, input_issue = None, [], None
+            forward_at, prior, forward_plan, input_issue = None, [], None, None
             if job["kind"] == "forward" and qualified_input:
                 try:
-                    data, forward_at, prior = self._forward_input(db, row, data)
+                    data, forward_at, prior, forward_plan = self._forward_input(db, row, data)
                 except RiskError as exc:
                     input_issue = str(exc)
+                except (KeyError, TypeError, ValueError):
+                    input_issue = "Frozen forward qualification plan is unavailable; revalidation is required"
         frozen_policy = json.loads(row["policy"])
         proposal = json.loads(row["proposal"])
         benchmark_bars = data["bars"][proposal["validation"]["benchmark"]]
         payload = {"proposal": proposal, "data": data, "policy": frozen_policy,
                    "initial_capital": frozen_policy["research_execution"]["initial_capital"], "trials": trials,
                    "kind": job["kind"], "forward_after": forward_at,
+                   "forward_plan": forward_plan,
                    "locked_sessions": json.loads(holdout[0]) if job["kind"] == "historical" and holdout else None,
                    "timeout_seconds": self.settings.job_timeout_seconds}
         try:
@@ -423,7 +462,10 @@ class StrategyLab:
                     result["statistical_passed"] = result["passed"]
                     result["prospective_sessions"] = len(prospective)
                     result["replayed_sessions"] = len(series) - len(prospective)
-                    result["passed"] = result["passed"] and not result["replayed_sessions"]
+                    qualification = self._forward_qualification(db, row, job, result, prospective, finished)
+                    result["qualification"] = qualification
+                    result["passed"] = (result["passed"] and qualification["status"] == "passed"
+                                        and not result["replayed_sessions"] and not result["degraded"])
                     db.execute("INSERT OR IGNORE INTO fund_strategy_datasets VALUES(?,?,?)",
                                (frozen, finished.isoformat(), encode(data)))
                     for receipt in series[len(prior):]:
@@ -452,6 +494,10 @@ class StrategyLab:
                 state = "shadow" if result.get("passed") else result.get("status", "rejected")
             elif result.get("degraded"):
                 state = "paused"
+            elif job["kind"] == "forward" and (result.get("qualification") or {}).get("status") == "failed":
+                state = "rejected"
+            elif job["kind"] == "forward" and (result.get("qualification") or {}).get("status") == "incomplete":
+                state = "forward_incomplete"
             elif job["kind"] == "forward" and result.get("passed") and self.settings.admission == "paper_library" and (
                     result.get("observations", 0) >= self.settings.min_forward_sessions):
                 current = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
@@ -459,9 +505,14 @@ class StrategyLab:
                     state = "paper_active"
             db.execute("UPDATE fund_strategy_versions SET state=? WHERE id=? AND version=?",
                        (state, row["id"], row["version"]))
+            event = {"job_id": job["id"], "state": state, "status": result.get("status")}
+            historical_pass = job["kind"] == "historical" and result.get("passed")
+            if historical_pass:
+                required = daily_sample_requirements(proposal["validation"])["forward_sessions"]
+                event["forward_plan"] = {"required_sessions": max(required, self.settings.min_forward_sessions),
+                                         "trials": trials, "trial_scope": "registered_versions_at_freeze"}
             self._event(db, row["id"], row["version"], finished,
-                        "historical_pass" if job["kind"] == "historical" and result.get("passed") else "validation",
-                        {"job_id": job["id"], "state": state, "status": result.get("status")})
+                        "historical_pass" if historical_pass else "validation", event)
         # This is a configured compute allowance, not a measured cloud bill.
         self.budget.settle(reservation, finished, self.budget.settings.validation_reservation_usd,
                            {"job_id": job["id"], "wall_seconds": round(monotonic() - started, 6),
@@ -494,28 +545,44 @@ class StrategyLab:
 
     def context(self, now, *, detail_limit=4, strategy_id=None, version=None):
         candidates = []
-        rows = [row for row in self.rows() if instant(row["created_at"]) <= instant(now)
+        now = instant(now)
+        rows = [row for row in self.rows() if instant(row["created_at"]) <= now
                 and (strategy_id is None or row["id"] == strategy_id) and (version is None or row["version"] == version)]
         with self.journal.connection() as db:
             for index, row in enumerate(reversed(rows[-20:])):
-                result_row = db.execute("SELECT r.body FROM fund_strategy_results r JOIN fund_strategy_jobs j ON "
+                results = db.execute("SELECT r.at,r.body FROM fund_strategy_results r JOIN fund_strategy_jobs j ON "
                                         "r.job_id=j.id WHERE j.strategy_id=? AND j.version=? AND julianday(r.at)<=julianday(?) "
-                                        "ORDER BY r.at DESC LIMIT 1", (row["id"], row["version"], instant(now).isoformat())).fetchone()
-                result = json.loads(result_row[0]) if result_row else {}
-                task = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? AND kind='research_task' "
-                                  "ORDER BY sequence DESC LIMIT 1", (row["id"], row["version"])).fetchone()
+                                        "ORDER BY julianday(r.at) DESC,r.rowid DESC", (row["id"], row["version"], now.isoformat()))
+                result = next((json.loads(body) for at, body in results if instant(at) <= now), {})
+                history = db.execute("SELECT at,kind,body FROM fund_strategy_events WHERE id=? AND version=? "
+                                     "AND kind IN ('registered','historical_pass','validation','research_task') "
+                                     "AND julianday(at)<=julianday(?) ORDER BY julianday(at) DESC,sequence DESC",
+                                     (row["id"], row["version"], now.isoformat()))
+                events = {}
+                for at, kind, body in history:
+                    if instant(at) <= now:
+                        category = "validation" if kind == "historical_pass" else kind
+                        if category not in events:
+                            events[category] = json.loads(body)
+                registration, task = events.get("registered", {}), events.get("research_task")
+                state = events.get("validation", registration).get("state", "unavailable")
+                task_state = {"pause": "paused", "retire": "retired"}.get(task["action"] if task else None, "open")
                 # Final holdout trades, returns and parameter-level diagnostics
                 # are operator-only; ordinary SQL/research capability is intact.
                 public_tests = {k: v for k, v in result.get("tests", {}).items() if k != "final"}
                 proposal = json.loads(row["proposal"])
                 candidates.append({"id": row["id"], "version": row["version"], "digest": row["digest"],
-                                   "state": row["state"], "task_state": row["task_state"],
+                                   "state": state, "task_state": task_state,
                                    "policy_current": row["policy_hash"] == digest(self.policy),
                                    **({"proposal": proposal} if index < detail_limit or strategy_id else
                                       {"name": proposal["name"], "hypothesis": proposal["hypothesis"][:500]}),
-                                   "last_task": json.loads(task[0]) if task else None,
+                                   "last_task": task, "source_call_id": registration.get("source_call_id"),
+                                   "feasibility_error": registration.get("feasibility_error"),
                                    "validation": {"status": result.get("status"), "tests": public_tests,
                                                   "limitations": result.get("limitations"),
+                                                  "qualification": {k: v for k, v in (result.get("qualification") or {}).items()
+                                                                    if k in {"status", "required_sessions", "start", "end", "trials"}},
+                                                  "regimes": result.get("regimes"),
                                                   "prospective_sessions": result.get("prospective_sessions"),
                                                   "replayed_sessions": result.get("replayed_sessions"),
                                                   "reason": result.get("reason")}})
@@ -532,6 +599,7 @@ class StrategyLab:
 
     def sync_registry(self, now):
         mapping = {"shadow": "shadow", "paper_active": "paper_active", "paused": "paused", "rejected": "rejected",
+                   "forward_incomplete": "paused",
                    "retired": "retired"}
         return Registry(self.journal).observe(now, [{
             "id": "strategy:" + row["id"], "version": row["version"], "kind": "strategy",

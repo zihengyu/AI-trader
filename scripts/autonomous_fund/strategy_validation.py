@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .comparison import Book, project
 from .risk import RiskError, instant, number
-from .strategy_definition import StrategyProposal
+from .strategy_definition import StrategyProposal, daily_sample_requirements
 from .strategy_program import parameter_values, parse, targets, validate_program
 
 
@@ -203,8 +203,14 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         raise RiskError("Strategy replay has missing exchange sessions")
     owned_policy = copy.deepcopy(policy)
     costs = proposal["costs"]
-    owned_policy["fee_rate"] = str(max(float(policy["fee_rate"]), costs["fee_rate"]))
-    owned_policy["slippage"] = str(max(float(policy["slippage"]), costs["slippage"]))
+    shared_data = policy.get("shared_data_cost_usd_per_session", "0")
+    if shared_data is None:
+        raise RiskError("The account's shared data cost is unknown")
+    daily_overhead = number(shared_data)
+    if static_weight is None:
+        owned_policy["fee_rate"] = str(max(number(policy["fee_rate"]), number(costs["fee_rate"])))
+        owned_policy["slippage"] = str(max(number(policy["slippage"]), number(costs["slippage"])))
+        daily_overhead = max(daily_overhead, number(costs["daily_data_usd"])) + number(costs["daily_model_usd"])
     if static_weight is not None:
         # A separately financed passive reference, not a trading permission.
         owned_policy["universe"] = {benchmark: "unlevered_etf"}
@@ -277,7 +283,7 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         for symbol in set(book.positions) - before:
             held_since[symbol] = all_days.index(day)
         held_since = {s: value for s, value in held_since.items() if s in book.positions}
-        book.charge(costs["daily_data_usd"] + (costs["daily_model_usd"] if static_weight is None else 0))
+        book.charge(daily_overhead)
         # Execution occurred at the open, valuation at the completed close.
         nav = book.value(closed)
         book.peak = max(book.peak, nav)
@@ -354,6 +360,45 @@ def test_excess(strategy, benchmark, plan, trials):
             "purpose": plan["purpose"], "meaning": "Research evidence, not proof of alpha or account authorization"}
 
 
+def regime_outcomes(days, strategy, reference, benchmark_bars):
+    from .scorecard import market_regimes
+
+    sessions = _daily_sessions(benchmark_bars[0]["day"], days[-1])
+    before = {following[0]: previous[0] for previous, following in zip(sessions, sessions[1:])}
+    opens = {previous[0]: following[1] for previous, following in zip(sessions, sessions[1:])}
+    available = [(row["day"], row["close"]) for row in benchmark_bars
+                 if row["day"] in opens
+                 and max(instant(row["available_at"]),
+                         instant((row.get("feature_available_at") or {}).get("close", row["available_at"])))
+                 < opens[row["day"]]]
+    labels = market_regimes(available, sessions=tuple(day for day, _, _ in sessions))
+    grouped = {}
+    for day, own, passive in zip(days, strategy["daily_returns"], reference["daily_returns"], strict=True):
+        label = labels.get(before.get(day), "unclassified")
+        result = grouped.setdefault(label, {"sessions": 0, "strategy_nav": 1.0, "reference_nav": 1.0})
+        result["sessions"] += 1
+        result["strategy_nav"] *= 1 + own
+        result["reference_nav"] *= 1 + passive
+    return {label: {"sessions": group["sessions"], "strategy_net_return": group["strategy_nav"] - 1,
+                    "reference_net_return": group["reference_nav"] - 1,
+                    "net_difference": group["strategy_nav"] - group["reference_nav"]}
+            for label, group in grouped.items()}
+
+
+def volume_participation(series, bars):
+    """Compare modeled traded shares with the same session's eventual total volume."""
+    volume = {(symbol, row["day"]): row["volume"] for symbol, rows in bars.items() for row in rows}
+    quantities = {}
+    for day in series:
+        for trade in day["trades"]:
+            key = (trade["symbol"], day["day"])
+            quantities[key] = quantities.get(key, 0) + trade["quantity"]
+    ratios = [quantity / volume[key] for key, quantity in quantities.items() if key in volume and volume[key] > 0]
+    return {"symbol_sessions_with_trades": len(quantities), "covered_symbol_sessions": len(ratios),
+            "max_fraction_of_daily_volume": max(ratios, default=None),
+            "median_fraction_of_daily_volume": statistics.median(ratios) if ratios else None}
+
+
 def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True, locked_sessions=None,
              require_receipts=False):
     proposal = StrategyProposal.model_validate(proposal).model_dump()
@@ -363,8 +408,15 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
         return {"status": "needs_adapter", "passed": False}
     if policy.get("fee_rate") is None or policy.get("slippage") is None:
         return {"status": "needs_data", "passed": False, "reason": "Verified execution costs are unavailable"}
+    if policy.get("shared_data_cost_usd_per_session", "0") is None:
+        return {"status": "needs_data", "passed": False, "reason": "The account's shared data cost is unknown"}
     identity = check_dataset(data)
     plan = proposal["validation"]
+    required = daily_sample_requirements(plan)
+    short = {key: required[key] for key in ("validation_sessions", "final_sessions") if plan[key] < required[key]}
+    if short:
+        return {"status": "needs_formalization", "passed": False, "minimum_sessions": short,
+                "reason": "Declared split cannot supply the required nonoverlapping blocks after purging"}
     symbols = set(proposal["instruments"]) | {plan["benchmark"]}
     if proposal["implementation"]["adapter"] == "daily_cash_rules_v1":
         if not policy.get("cash_symbol") or not (policy.get("cash_management") or {}).get("enabled"):
@@ -431,6 +483,7 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
         result["passed"] &= result["stress_net_return"] > 0 and not actual["risk_paused"]
         results[name] = {**result, "strategy": {k: v for k, v in a.items() if k != "daily_returns"},
                          "reference": {k: v for k, v in b.items() if k != "daily_returns"},
+                         "regimes": regime_outcomes(window, a, b, data["bars"][plan["benchmark"]]),
                          "start": window[0], "end": window[-1]}
         receipts[name] = {"strategy": actual, "reference": reference}
     # Fixed-version expanding-history evaluations: each subsequent fold may use

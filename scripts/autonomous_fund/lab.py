@@ -102,6 +102,20 @@ def report(root):
                     lines.append("  缺口：" + str(result.get("limitations") or result.get("reason")))
                 if "prospective_sessions" in result:
                     lines.append(f"  开盘前留证 {result['prospective_sessions']} 个交易日，事后回放 {result['replayed_sessions']} 个交易日")
+                if qualification := result.get("qualification"):
+                    lines.append(f"  前瞻准入 {qualification['status']}，固定样本 {qualification['required_sessions']} 日，"
+                                 f"窗口 {qualification.get('start', '待定')} → {qualification.get('end', '待定')}")
+                if costs := result.get("strategy_summary"):
+                    lines.append(f"  模拟手续费 ${costs['fees']}，摩擦 ${costs['friction']}，"
+                                 f"成交额 ${costs['turnover']}，模型及数据成本 ${result['cost_usd']}。")
+                if regimes := result.get("regimes"):
+                    lines.append("  按开盘前可知市场状态观察 " + "，".join(
+                        f"{label} {values['sessions']} 日，净收益差 {values['net_difference']:+.2%}"
+                        for label, values in sorted(regimes.items())))
+                participation = result.get("volume_participation") or {}
+                if participation.get("max_fraction_of_daily_volume") is not None:
+                    lines.append(f"  模拟成交量最高占当日总量 {participation['max_fraction_of_daily_volume']:.3%}，"
+                                 f"覆盖 {participation['covered_symbol_sessions']}/{participation['symbol_sessions_with_trades']} 个标的日。")
                 diagnostic = matched.get((row["id"], row["version"]))
                 if diagnostic and diagnostic["status"] in {"estimated", "limited_sample"}:
                     suffix = "（样本较少）" if diagnostic["status"] == "limited_sample" else ""

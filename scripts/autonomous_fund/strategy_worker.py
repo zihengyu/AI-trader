@@ -27,7 +27,9 @@ def main():
 
 def evaluate(payload):
     from scripts.autonomous_fund.strategy_validation import (COVERAGE_FIELDS, check_dataset, forward_days,
-                                                           implementation_hash, metrics, replay, test_excess, validate)
+                                                           implementation_hash, metrics, regime_outcomes, replay,
+                                                           test_excess, validate, volume_participation)
+    from scripts.autonomous_fund.strategy_definition import daily_sample_requirements
     try:
         expected = payload["policy"].get("research_execution", {}).get("source_hash")
         if expected is not None and expected != implementation_hash():
@@ -63,6 +65,18 @@ def evaluate(payload):
                                   static_weight=plan["benchmark_weight"], **args)
                 a, b = metrics(actual["series"], payload["initial_capital"]), metrics(baseline["series"], payload["initial_capital"])
                 test = test_excess(a, b, plan, payload["trials"])
+                frozen = payload.get("forward_plan") or {
+                    "required_sessions": daily_sample_requirements(plan)["forward_sessions"],
+                    "trials": payload["trials"],
+                }
+                required = frozen["required_sessions"]
+                qualification = {**frozen, "status": "collecting"}
+                if len(days) >= required:
+                    prefix = test_excess(metrics(actual["series"][:required], payload["initial_capital"]),
+                                         metrics(baseline["series"][:required], payload["initial_capital"]),
+                                         plan, frozen["trials"])
+                    qualification.update(status="passed" if prefix["passed"] else "failed",
+                                         start=days[0], end=days[required - 1], test=prefix)
                 complete = all(data.get("coverage", {}).get(k) is True for k in COVERAGE_FIELDS)
                 window = plan["monitoring_window_sessions"]
                 relative_loss = 0
@@ -72,8 +86,12 @@ def evaluate(payload):
                     recent_b = metrics(baseline["series"][-window:], baseline["series"][-window - 1]["net_economic_equity"]
                                        if len(days) > window else payload["initial_capital"])
                     relative_loss = recent_b["net_return"] - recent_a["net_return"]
-                result = {"status": "forward", "passed": complete and test["passed"] and len(days) >= plan["forward_sessions"],
+                result = {"status": "forward", "passed": complete and test["passed"] and qualification["status"] == "passed",
                           "series": actual["series"], "reference_series": baseline["series"], "tests": {"forward": test},
+                          "qualification": qualification,
+                          "regimes": regime_outcomes(days, a, b, data["bars"][plan["benchmark"]]),
+                          "volume_participation": volume_participation(actual["series"], data["bars"]),
+                          "strategy_summary": {k: actual["summary"][k] for k in ("fees", "friction", "turnover", "orders")},
                           "next_targets": actual["next_targets"], "observations": len(days),
                           "degraded": actual["risk_paused"] or a["max_drawdown"] > plan["max_drawdown"]
                                       or relative_loss > plan["max_relative_loss"],

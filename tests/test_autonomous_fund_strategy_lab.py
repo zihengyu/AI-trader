@@ -13,7 +13,7 @@ import pytest
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.research_budget import ResearchBudget, ResearchBudgetSettings
 from scripts.autonomous_fund.risk import RiskError, instant
-from scripts.autonomous_fund.strategy_definition import StrategyLabSettings
+from scripts.autonomous_fund.strategy_definition import StrategyLabSettings, StrategyProposal
 from scripts.autonomous_fund.strategy_lab import StrategyLab, run_worker
 from scripts.autonomous_fund.strategy_program import Evaluator, Warmup, parse
 from scripts.autonomous_fund.strategy_validation import COVERAGE_FIELDS, check_dataset, digest, replay, validate
@@ -164,6 +164,22 @@ def test_a_novel_validation_method_is_not_forced_into_daily_significance_tests()
     assert result["status"] == "needs_adapter" and "tests" not in result
 
 
+def test_impossible_purged_windows_remain_researchable_without_spending_the_holdout(tmp_path):
+    engine = lab(tmp_path)
+    candidate = proposal()
+    candidate["validation"]["holding_sessions"] = 5  # 10 complete blocks plus a five-session purge needs 55 days.
+    engine.submit(candidate, NOW, source_call_id="synthetic-research-call")
+    saved = engine.context(NOW)["candidates"][0]
+    assert saved["state"] == "needs_formalization"
+    assert saved["source_call_id"] == "synthetic-research-call"
+    assert "55" in saved["feasibility_error"]
+    assert engine.schedule(dataset(), NOW) == []
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
+    assert validate(candidate, dataset(), policy())["minimum_sessions"] == {
+        "validation_sessions": 55, "final_sessions": 55}
+
+
 def test_versions_are_immutable_and_failures_survive_revisions(tmp_path):
     engine, candidate = lab(tmp_path), proposal()
     engine.submit(candidate, NOW)
@@ -254,6 +270,34 @@ def test_resource_budget_is_atomic_monthly_and_unknown_usage_is_retained(tmp_pat
     with pytest.raises(RiskError, match="cannot be rewritten"):
         budget.settle(key, NOW, ".1", {})
     assert journal.pending() == []  # Financial supervision is a separate owner.
+
+
+def test_research_budget_and_tasks_are_reported_as_known_at_the_cutoff(tmp_path):
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    reserved = engine.budget.reserve(NOW, "synthetic-research", "validation_compute", "0.05")
+    later = NOW + timedelta(minutes=1)
+    engine.budget.settle(reserved, later, "0.02", {})
+    engine.update_task({"strategy_id": "synthetic-research", "version": "v1", "action": "pause",
+                        "findings": "Synthetic new risk", "next_step": "Check inputs"}, later)
+    early = engine.context(NOW)
+    updated = engine.context(later)
+    assert early["candidates"][0]["task_state"] == "open" and early["candidates"][0]["last_task"] is None
+    assert updated["candidates"][0]["task_state"] == "paused"
+    assert early["budget"]["daily_committed_usd"] == .05
+    assert early["budget"]["known_lifetime_by_project_usd"] == {}
+    assert updated["budget"]["known_lifetime_by_project_usd"] == {"synthetic-research": .02}
+
+
+def test_daily_activity_omits_validation_receipts_after_the_report_cutoff(tmp_path):
+    from scripts.autonomous_fund.notifications import _strategy_day_activity
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    engine.submit(proposal("next-study"), NOW + timedelta(seconds=10))
+    with engine.journal.connection() as db:
+        lines = "\n".join(_strategy_day_activity(db, NOW.date().isoformat(), NOW))
+    assert "登记 1 项" in lines and "synthetic-research / v1" in lines
+    assert "next-study" not in lines
 
 
 def test_shared_daily_research_does_not_exhaust_a_lifetime_project_forever(tmp_path):
@@ -422,6 +466,10 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     observed, result = forward_one_session_at_a_time(engine, dataset(210), 170, monkeypatch)
     assert result["observations"] == 40
     assert result["passed"] and engine.rows()[0]["state"] == "paper_active"
+    assert result["qualification"]["status"] == "passed"
+    assert result["qualification"]["end"] == result["series"][-1]["day"]
+    assert sum(item["sessions"] for item in result["regimes"].values()) == 40
+    assert 0 < result["volume_participation"]["max_fraction_of_daily_volume"] < 1
     with engine.journal.connection() as db:
         readiness = forward_readiness(db, observed + timedelta(seconds=10), engine.admission_policy)
         assert readiness["ready"] == ["synthetic-research / v1"] and not readiness["waiting"]
@@ -484,7 +532,29 @@ def test_exploratory_snapshots_cannot_claim_or_supersede_forward_evidence(tmp_pa
     # signal receipts. Its statistical result remains available for research.
     assert result["statistical_passed"] and result["observations"] == 65
     assert result["prospective_sessions"] == 1 and result["replayed_sessions"] == 64
+    assert result["qualification"]["status"] == "incomplete"
+    assert engine.rows()[0]["state"] == "forward_incomplete"
     assert not result["passed"] and library(engine.journal, resumed + timedelta(minutes=1)) == []
+
+
+def test_strong_later_returns_cannot_reopen_the_first_forward_checkpoint():
+    from scripts.autonomous_fund.strategy_worker import evaluate
+
+    data = dataset(260)
+    start = 170
+    value = data["bars"]["ALFA"][start - 1]["close"]
+    for i, bar in enumerate(data["bars"]["ALFA"][start:], start):
+        opened = value
+        value *= 1 + (-.0003 if i < 210 else .035 + .001 * (i % 3))
+        bar.update(open=opened, close=value, high=max(opened, value), low=min(opened, value))
+    payload = {"kind": "forward", "proposal": StrategyProposal.model_validate(proposal()).model_dump(),
+        "data": data, "policy": policy(), "initial_capital": "10000", "trials": 1,
+        "forward_after": (instant(data["bars"]["BASE"][start - 1]["at"]) + timedelta(hours=1)).isoformat(),
+        "forward_plan": {"required_sessions": 40, "trials": 1}}
+    result = evaluate(payload)
+    assert result["tests"]["forward"]["passed"]
+    assert result["qualification"]["end"] == data["bars"]["BASE"][209]["day"]
+    assert result["qualification"]["status"] == "failed" and not result["passed"]
 
 
 def test_dividends_are_receivables_until_paid_and_never_double_counted():
@@ -498,6 +568,37 @@ def test_dividends_are_receivables_until_paid_and_never_double_counted():
     paid = next(r for r in result["series"] if r["day"] == days[5])
     assert ex["receivables"] and not paid["receivables"]
     assert float(paid["cash"]) > float(ex["cash"])
+
+
+def test_regime_outcomes_use_only_the_benchmark_visible_before_the_open():
+    from scripts.autonomous_fund.strategy_validation import regime_outcomes
+    bars = dataset(211)["bars"]["BASE"]
+    day = bars[-1]["day"]
+    own, reference = {"daily_returns": [.022]}, {"daily_returns": [.01]}
+    original = regime_outcomes([day], own, reference, bars)
+    assert set(original) - {"unclassified"}
+    later = copy.deepcopy(bars)
+    later[-1]["close"] *= .3
+    assert regime_outcomes([day], own, reference, later) == original
+    later[-2]["available_at"] = (instant(later[-1]["open_at"]) + timedelta(seconds=1)).isoformat()
+    assert regime_outcomes([day], own, reference, later)["unclassified"]["sessions"] == 1
+
+
+def test_reference_costs_are_frozen_independently_of_proposer_assumptions():
+    data = dataset(8)
+    configured = {**policy(), "shared_data_cost_usd_per_session": "0.50"}
+    version = proposal()
+    days = [row["day"] for row in data["bars"]["BASE"]][1:]
+    baseline = replay(version, data, configured, days, initial_capital="10000", static_weight=1)
+    original = replay(version, data, configured, days, initial_capital="10000")
+    version["costs"].update(slippage=.012, daily_data_usd=4, daily_model_usd=2)
+    candidate = replay(version, data, configured, days, initial_capital="10000")
+    assert replay(version, data, configured, days, initial_capital="10000", static_weight=1) == baseline
+    assert float(baseline["cost_usd"]) == 3.5
+    assert float(candidate["cost_usd"]) == 42
+    assert float(candidate["summary"]["friction"]) > float(original["summary"]["friction"])
+    missing = validate(version, data, {**configured, "shared_data_cost_usd_per_session": None})
+    assert missing["status"] == "needs_data" and "shared data cost" in missing["reason"]
 
 
 def cash_dataset(count=12):

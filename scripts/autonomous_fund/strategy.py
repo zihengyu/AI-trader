@@ -209,6 +209,8 @@ CRITIC_PROMPT = (
     "the incremental trading friction of the change. Challenge both alternatives; criticism does not require a "
     "different portfolio. Identify new evidence or a newly identified error in the earlier thesis, and distinguish "
     "those from an unchanged event calendar, hindsight about a fill, or a different argument about the same facts. "
+    "For strategy proposals, challenge historical availability, the independent sample, regime dependence, "
+    "and fee and liquidity assumptions. Qualification remains the independent evaluator's responsibility. "
     "A newly recognized material mistake can justify immediate correction without new news. Model/data overhead "
     "shared by the alternatives is not a benefit of either one; inability to cover annual overhead alone does not "
     "determine whether exposure should rise or fall. recent_trades contains confirmed fills and recorded fees "
@@ -1088,9 +1090,13 @@ class AutonomousFund(Strategy):
                 if local_slip is not None and local_spread is not None else None)
         from .strategy_lab import StrategyLab
         from .research_budget import ResearchBudgetSettings
+        from .performance import SESSIONS_PER_MONTH
         lab_settings = StrategyLabSettings.from_config(config.get("strategy_lab"))
+        monthly_data = self.performance.data_costs_usd_per_month
+        daily_data = str(number(monthly_data) / number(SESSIONS_PER_MONTH)) if monthly_data is not None else None
         self.strategy_lab = (StrategyLab(self.journal, {**self.comparison_protocol,
-                                                      "cash_management": policy_context(self.cash_sweep)}, lab_settings,
+                                                      "cash_management": policy_context(self.cash_sweep),
+                                                      "shared_data_cost_usd_per_session": daily_data}, lab_settings,
                                         ResearchBudgetSettings.from_config(config.get("research_budget")))
                              if lab_settings.enabled else None)
         if not lab_settings.enabled:
@@ -1528,11 +1534,13 @@ class AutonomousFund(Strategy):
         lab = getattr(self, "strategy_lab", None)
         if lab is None:
             return
+        source_call = getattr(self, "_current_call", None) or {}
+        source_call_id = source_call.get("call_id") if source_call.get("role") == "researcher" else None
         accepted, errors = [], []
         for proposal in research.get("strategy_proposals", []):
             try:
                 accepted.append(lab.submit(proposal, now, proposer=(getattr(self, "agent_models", None) or {}).get(
-                    "researcher", "researcher")))
+                    "researcher", "researcher"), source_call_id=source_call_id))
             except Exception as exc:
                 errors.append({"strategy_id": proposal.get("strategy_id"),
                                "error": str(exc)[:300] if isinstance(exc, ValueError) else type(exc).__name__})
@@ -1546,7 +1554,7 @@ class AutonomousFund(Strategy):
             try:
                 self.journal.event(now, "strategy_research", {"research_direction": research.get("research_direction"),
                                    "registered": accepted, "errors": errors,
-                                   "source_call_id": (getattr(self, "_current_call", None) or {}).get("call_id")})
+                                   "source_call_id": source_call_id})
             except Exception:
                 self.log_message("Strategy research receipt is pending; market research is retained.", color="yellow")
 
