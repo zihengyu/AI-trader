@@ -530,6 +530,27 @@ the data cache and inbox, including candidate state, policy and source proof.
 An unchanged input can be skipped after a rewrite or restart. Provider access and evidence
 collection remain the operator's responsibility.
 
+Review a frozen candidate's first forward window using the selected account's
+read-only journal. The audit shows the planned NYSE window, opened sessions
+and the next pending session. Each visible date links the recorded signal, its
+job and source snapshot to the paired observation. Missing signals, replay,
+pending observations and inconsistent receipts have distinct states. Under a
+strict pilot, the audit also checks that the original-byte receipt was recorded
+by the evidence timestamp.
+
+```bash
+python -m scripts.autonomous_fund.lab forward-audit --run-dir artifacts/fund-local --strategy-id candidate-id --version v1
+```
+
+Use `--as-of` with an explicit timezone to reproduce what the journal could
+show at a prior cutoff. The economic comparison uses the uninterrupted
+prospective prefix and the predeclared static benchmark. After qualification
+it reads the exact checkpoint job. Fees and operating costs are modeled for
+both arms. When the proposal links its Researcher call, the audit displays the
+saved call cost or pricing gap separately. Multiple proposals can share that
+call, so its full cost is displayed as evidence and is not charged again to
+each strategy's simulated book. The report does not modify qualifications.
+
 Use the selected account's observation journal to inspect the opening execution
 window. The default is the last 90 days and the first 15 minutes of each NYSE
 session. A timezone-aware cutoff makes the report reproducible from retained

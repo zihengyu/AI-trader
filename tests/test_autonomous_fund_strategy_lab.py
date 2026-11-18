@@ -173,6 +173,13 @@ def test_strict_sources_gate_holdout_and_forward_with_exact_offline_receipts(tmp
     assert engine.run_one(formed)["passed"]
 
     later = dataset(171)
+    from scripts.autonomous_fund.lab import forward_audit
+
+    opened = instant(later["bars"]["BASE"][-1]["open_at"])
+    audit = forward_audit(tmp_path, key, "v1", opened - timedelta(minutes=1))
+    upcoming, = audit["sessions"]
+    assert audit["source_artifacts_required"] and upcoming["status"] == "ready_for_open"
+    assert upcoming["signal_source_status"] == "artifact_bytes_matched"
     daily = attest({**later, "bars": {symbol: values[-1:] for symbol, values in later["bars"].items()}})
     for receipt in daily["provenance"]["claims"].values():
         receipt["artifact_sha256"] = checksum  # New normalized input still needs its own check.
@@ -647,7 +654,7 @@ def test_research_task_cannot_promote_a_strategy(tmp_path):
 
 
 def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
-    from scripts.autonomous_fund.lab import forward_readiness
+    from scripts.autonomous_fund.lab import forward_audit, forward_readiness
     from scripts.autonomous_fund.strategy_admission import library, verify_allocations
     data = dataset(170)
     formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
@@ -663,6 +670,9 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     assert result["passed"] and engine.rows()[0]["state"] == "paper_active"
     assert result["qualification"]["status"] == "passed"
     assert result["qualification"]["end"] == result["series"][-1]["day"]
+    audit = forward_audit(tmp_path, proposal()["strategy_id"], "v1", observed + timedelta(seconds=10))
+    assert audit["window_evidence_complete"] and audit["checkpoint"]["status"] == "passed"
+    assert audit["counts"] == {"prospective": 40} and audit["economic_comparison"]["sessions"] == 40
     assert sum(item["sessions"] for item in result["regimes"].values()) == 40
     assert 0 < result["volume_participation"]["max_fraction_of_daily_volume"] < 1
     with engine.journal.connection() as db:
@@ -690,6 +700,46 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
         with pytest.raises(RiskError, match="not admitted"):
             verify_allocations(db, decision, observed + timedelta(seconds=10), purchase=True)
         verify_allocations(db, {"targets": []}, observed, purchase=False)
+
+
+def test_forward_audit_preserves_cutoffs_and_stops_economics_at_first_replayed_session(tmp_path, monkeypatch, capsys):
+    from scripts.autonomous_fund import strategy_lab, strategy_worker
+    from scripts.autonomous_fund.lab import forward_audit, main
+
+    data = dataset(174)
+    bars = data["bars"]["BASE"]
+    freeze = instant(bars[169]["at"]) + timedelta(hours=1)
+    engine = lab(tmp_path)
+    engine.journal.event(freeze - timedelta(minutes=1), "agent", {"name": "researcher", "call_id": "pilot-call",
+                                                                  "cost_usd": 0.24})
+    key, version = engine.submit(proposal(), freeze, source_call_id="pilot-call")
+    assert forward_audit(tmp_path, key, version, freeze)["status"] == "awaiting_historical_pass"
+    monkeypatch.setattr(strategy_lab, "run_worker", lambda payload, _timeout: json.loads(
+        json.dumps(strategy_worker.evaluate(payload), default=str)))
+    for day_index in (169, 170, 172, 173):
+        now = instant(bars[day_index]["at"]) + timedelta(hours=1)
+        part = attest({**data, "bars": {symbol: values[:day_index + 1] for symbol, values in data["bars"].items()}})
+        assert engine.schedule(part, now)
+        assert engine.run_one(now)["status"] == ("historical_pass" if day_index == 169 else "forward")
+
+    before_replay = instant(bars[172]["open_at"]) + timedelta(minutes=1)
+    main(["forward-audit", "--run-dir", str(tmp_path), "--strategy-id", key, "--version", version,
+          "--as-of", before_replay.isoformat()])
+    audit = json.loads(capsys.readouterr().out)
+    assert audit["first_evidence_gap"]["session"] == bars[172]["day"]
+    assert audit["first_evidence_gap"]["status"] == "missed_signal"
+    assert audit["counts"] == {"prospective": 1, "awaiting_observation": 1, "missed_signal": 1, "awaiting_signal": 1}
+    assert audit["economic_comparison"]["sessions"] == 1
+
+    after_replay = forward_audit(tmp_path, key, version, now + timedelta(seconds=10))
+    assert after_replay["counts"] == {"prospective": 3, "replayed": 1, "ready_for_open": 1}
+    assert after_replay["first_evidence_gap"]["status"] == "replayed"
+    comparison = after_replay["economic_comparison"]
+    assert comparison["sessions"] == 2 and comparison["through"] == bars[171]["day"]
+    assert comparison["passive_reference"]["net_return"] is not None
+    assert after_replay["originating_research_call"]["reported_call_cost_usd"] == 0.24
+    assert after_replay["passive_reference"]["kind"] == "static_no_ai"
+    assert not after_replay["window_evidence_complete"]
 
 
 def test_exploratory_snapshots_cannot_claim_or_supersede_forward_evidence(tmp_path):

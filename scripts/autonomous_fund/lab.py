@@ -192,6 +192,20 @@ def execution_calibration(root, now, *, opening_minutes=15, data=None, artifacts
         return result
 
 
+def forward_audit(root, key, version, now):
+    from contextlib import closing
+    from .strategy_forward_audit import audit_forward
+
+    path = Path(root) / "state.sqlite3"
+    if not path.is_file():
+        raise RiskError("An existing, explicitly selected account journal is required")
+    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        db.execute("BEGIN")  # One consistent view while the runner posts new receipts.
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_versions'").fetchone():
+            raise RiskError("Strategy Lab is not initialized in the selected journal")
+        return audit_forward(db, key, version, now)
+
+
 def report(root):
     from .execution_quality import reference_lines
     from .strategy_competition import compare_saved
@@ -378,20 +392,26 @@ def open_lab(root, config):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=["status", "check-data", "import-data", "run-once", "declare-portfolio",
-                                           "execution-calibration"],
+                                           "execution-calibration", "forward-audit"],
                         default="status", nargs="?")
     parser.add_argument("--run-dir", required=True, type=Path)
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--dataset", type=Path, help="Operator-owned JSON snapshot with provenance and coverage receipts")
-    parser.add_argument("--strategy-id", help="Existing candidate for read-only check-data")
-    parser.add_argument("--version", help="Exact version for read-only check-data")
+    parser.add_argument("--strategy-id", help="Existing candidate for check-data or forward-audit")
+    parser.add_argument("--version", help="Exact version for check-data or forward-audit")
     parser.add_argument("--portfolio", type=Path, help="Explicit base and candidate strategy versions, allocations and costs")
     parser.add_argument("--artifacts-dir", type=Path, help="Original source artifacts named by their SHA-256 digests")
     parser.add_argument("--opening-minutes", type=int, default=15, help="Execution calibration window after session open")
-    parser.add_argument("--as-of", help="Timezone-aware cutoff for execution calibration")
+    parser.add_argument("--as-of", help="Timezone-aware cutoff for execution-calibration or forward-audit")
     args = parser.parse_args(argv)
     if args.action == "status":
         print("\n".join(report(args.run_dir)))
+        return
+    if args.action == "forward-audit":
+        if not args.strategy_id or not args.version:
+            parser.error("forward-audit requires --strategy-id and --version")
+        result = forward_audit(args.run_dir, args.strategy_id, args.version, args.as_of or datetime.now(timezone.utc))
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return
     if args.action == "check-data":
         from .strategy_lab import load_snapshot
