@@ -124,11 +124,11 @@ def test_trade_prices_keep_partial_fills_and_replace_callbacks_with_reconciliati
         ("buy", "5", "93.20"), ("sell", "1", "98"), ("sell", "1", "99")]
     assert report(tmp_path, write_files=False)["recent_trades"] == trades
     [text] = delivered(tmp_path / "telegram", "decision_changed", details).messages
-    assert "买入 ALFA：5 股 ｜ 累计成交均价 $93.20" in text
-    assert "卖出 ALFA：1 股 ｜ 成交价 $98.00" in text
-    assert "卖出 ALFA：1 股 ｜ 成交价 $99.00" in text
-    assert "BETA" not in text
-    assert "成交价 $98.00" in summary(tmp_path, "local", now=NOW)
+    # Both operator views put the most recently observed fill first.
+    for output in (text, summary(tmp_path, "local", now=NOW)):
+        assert output.index("卖出 ALFA：1 股 ｜ 成交价 $99.00") < output.index(
+            "卖出 ALFA：1 股 ｜ 成交价 $98.00") < output.index("买入 ALFA：5 股 ｜ 累计成交均价 $93.20")
+        assert "BETA" not in output
 
 
 def test_the_entire_rationale_is_preserved_when_the_notice_needs_an_attachment(tmp_path):

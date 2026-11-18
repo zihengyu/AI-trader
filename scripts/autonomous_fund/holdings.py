@@ -43,7 +43,7 @@ def average_prices(positions, holdings):
 
 
 def recent_trades(events, as_of, limit=6):
-    """Confirmed fills visible at the account snapshot, without double-counting reconciliation."""
+    """Return the latest confirmed fills in chronological order, deduplicating reconciliation."""
     cutoff = instant(as_of)
     callbacks, reconciled = [], {}
     for index, (at, kind, body) in enumerate(events):

@@ -379,7 +379,7 @@ def account_lines(account, recent_trades=None, *, now=None, costs=None):
                   for symbol, quantity in sorted(swept.items())]
     if recent_trades:
         lines.append("🧾 最近成交（最近 6 笔，时间为成交观测时间）：")
-        for trade in recent_trades:
+        for trade in reversed(recent_trades):  # The shared history is chronological.
             side = {"buy": "买入", "sell": "卖出"}.get(trade.get("side"), trade.get("side"))
             label = "累计成交均价" if trade.get("evidence_kind") == "broker_cumulative_observation" else "成交价"
             lines.append(f"• {side} {trade['symbol']}：{shares(trade['quantity'])} 股 ｜ {label} {money(trade.get('price'))}"
