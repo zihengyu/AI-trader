@@ -130,7 +130,8 @@ class DocumentTelegram(FakeTelegram):
 
 def test_the_monitor_sends_one_weekly_report_after_the_weeks_last_session(tmp_path, monkeypatch):
     import scripts.autonomous_fund.notifications as notifications
-    monkeypatch.setattr(notifications, "daily_document", lambda root, sequence: ("daily.md", "daily"))
+    # Stub the combined daily caption and document at the monitor boundary.
+    monkeypatch.setattr(notifications, "daily_report", lambda root, sequence: ("daily", "daily.md", "daily"))
     journal, _ = ledger(tmp_path)
     transport = DocumentTelegram()
     monitor = Monitor(tmp_path, transport)

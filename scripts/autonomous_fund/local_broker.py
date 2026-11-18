@@ -522,11 +522,17 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         return order
 
     def cancel_order(self, order):
+        self._cancel_local_order(order)
+
+    def _cancel_local_order(self, order, *, reason=None):
         with self._order_state_lock:
             with self.journal.connection() as db:
                 changed = db.execute("UPDATE local_orders SET status='canceled' WHERE id=? AND status IN ('new','partial_fill')", (str(order.identifier),)).rowcount
                 if changed:
-                    self._event(db, "local_order_canceled", {"broker_id": str(order.identifier)})
+                    evidence = {"broker_id": str(order.identifier)}
+                    if reason is not None:
+                        evidence["reason"] = reason
+                    self._event(db, "local_order_canceled", evidence)
             if changed:
                 self._process_trade_event(order, self.CANCELED_ORDER)
 
@@ -551,8 +557,9 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 with self._order_state_lock:
                     order = self.get_tracked_order(row["id"]) or self._parse_broker_order(row, row["strategy"])
                 now = self.data_source.get_datetime()
-                if (self.journal.root / "STOP").exists() or now >= instant(row["expires_at"]):
-                    self.cancel_order(order)
+                stopped = (self.journal.root / "STOP").exists()
+                if stopped or now >= instant(row["expires_at"]):
+                    self._cancel_local_order(order, reason="stop_active" if stopped else "order_expired")
                     continue
                 from .capital import OrderAuthorityChanged, require_order_authority
                 from .execution import OrderAuthorizationChanged, require_submission_authority

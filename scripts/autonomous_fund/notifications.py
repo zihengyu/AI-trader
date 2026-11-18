@@ -261,12 +261,14 @@ def attribution_lines(result):
     if costs and costs.get("share") is not None:
         from .scoreboard import known_cost_total
         text = (f"- AI 和数据费用（账户本身不付，基金承担）：{_percent(costs['share'])}"
-                f"（${known_cost_total(costs):.2f}）；扣费后当日收益 {_percent(result.get('net_return'))}")
+                f"（${known_cost_total(costs):.2f}）；扣已知费用后 {_percent(result.get('net_return'))}")
         if costs.get("unpriced_calls"):
             text += f"（另有 {costs['unpriced_calls']} 次调用未定价、未计入，实际更低）"
         if costs.get("data_usd") is None:
             text += "（另有未知数据费用未计入，净收益仅为上限）"
         lines.append(text)
+        if window := result.get("cost_window"):
+            lines.append(f"- 费用窗口：{window['start_at']} → {window['end_at']}；期末账户估值之后的调用另计。")
     groups = result.get("selection_by_group") or {}
     if groups:
         lines.append("- 选股按组：" + "；".join(f"{name} {_percent(value)}" for name, value in groups.items()))
@@ -306,8 +308,8 @@ def _usd(value):
     return _decimal(value, 2)
 
 
-def _percent(value):
-    return "暂无" if value is None else f"{value * 100:.2f}%"
+def _percent(value, places=2):
+    return "暂无" if value is None else f"{value:.{places}%}"
 
 
 TRADE_KINDS = ("order_submitted", "fill", "fill_reconciled", "fill_details_unavailable", "operator_approval", "ai_approval")
@@ -451,6 +453,11 @@ def strategy_research_lines(research, lab=None):
 
 
 def daily_document(root, sequence):
+    _, filename, document = daily_report(root, sequence)
+    return filename, document
+
+
+def daily_report(root, sequence):
     # The AI supplies neither a file path nor an upload URL. Render one exact
     # journal row in memory, so a prompt cannot turn reports into file exfiltration.
     with operator_connection(root) as db:
@@ -567,7 +574,7 @@ def daily_document(root, sequence):
     lines += quality_lines(quote_quality(root, start_day=day, until=cutoff)) + [""]
     lines += ["## 下一交易日预测（将被自动打分）", "",
               "```json", json.dumps(review.get("predictions", []), ensure_ascii=False, indent=2), "```", "",
-              "## 复盘结论", "", review["summary"], ""]
+              "## AI 复盘意见", "", review["summary"], ""]
     for title, key in (("选股调整", "selection_adjustments"), ("择时调整", "timing_adjustments")):
         lines.extend([f"## {title}", ""])
         for change in review[key]:
@@ -586,7 +593,24 @@ def daily_document(root, sequence):
                   f"置信度：{review['confidence']}。调整仍是待验证假设；未实现盈亏不等于已实现利润。",
                   session["limitations"], "", "## 原始研究", "", packet["research"]["summary"], "",
                   encode(packet["research"]["evidence"])])
-    return f"daily-{day}.md", "\n".join(lines)
+    caption = f"LumiBot 模拟账户 · {day} 盘后日报"
+    attribution = packet.get("attribution") or {}
+    if attribution.get("status") in {"complete", "partial"}:
+        observed = attribution["observed_return"]
+        benchmark = attribution.get("benchmark_return")
+        net = attribution.get("net_return")
+        caption += f"\n日度归因｜账户 {_percent(observed, 3)}｜{attribution['benchmark']} {_percent(benchmark, 3)}"
+        if net is not None:
+            caption += f"\n扣已知费用后 {_percent(net, 3)}"
+            if benchmark is not None:
+                caption += f"｜相对基准 {(net - benchmark) * 100:+.3f} 个百分点"
+            if attribution.get("net_is_upper_bound"):
+                caption += "（收益上限，费用有缺项）"
+            if window := attribution.get("cost_window"):
+                caption += f"\n费用计至 {_when(window['end_at'])} 的账户估值，之后的调用另计。"
+    else:
+        caption += "\n日度归因暂无可用数据，账户观测见附件。"
+    return caption, f"daily-{day}.md", "\n".join(lines)
 
 
 # ----- Readable operator notices ---------------------------------------------------------------
@@ -682,15 +706,15 @@ def readable(kind, details, sequence=None, *, now=None):
         header = ("🧭 今日首次复核：维持目标组合" if details.get("first_today") else "🧭 AI 调整目标组合")
         if details.get("level_changes") and details.get("weight_changed") is False:
             header = "🧭 AI 更新交易价位"
-        lines = [f"{header}（{_when(details.get('at'))}）", "这是目标计划，实际买卖以成交更新为准。"]
-        for label, rows in (("买入／加仓", [r for r in changes if float(r["to"]) > float(r["from"])]),
-                            ("卖出／减仓", [r for r in changes if float(r["to"]) < float(r["from"])]),
+        lines = [f"{header}（{_when(details.get('at'))}）", "以下权重与上次通知的目标相比。实际交易以成交更新为准。"]
+        for label, rows in (("目标上调", [r for r in changes if float(r["to"]) > float(r["from"])]),
+                            ("目标下调", [r for r in changes if float(r["to"]) < float(r["from"])]),
                             ("不变", [r for r in changes if float(r["to"]) == float(r["from"])])):
             for row in rows:
                 if label == "不变":
                     lines.append(f"不变：{row['symbol']} {percent(row['to'])}{levels(row)}")
                 else:
-                    lines.append(f"计划{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
+                    lines.append(f"{label}：{row['symbol']} {percent(row['from'])}→{percent(row['to'])}{levels(row)}")
         for change in details.get("level_changes") or []:
             before, after = change["before"], change["after"]
             parts = []
@@ -703,7 +727,7 @@ def readable(kind, details, sequence=None, *, now=None):
                 right = show(after[key]) if key in after else "已撤销"
                 parts.append(f"{label} {left}→{right}")
             lines.append(f"价位调整：{change['symbol']}（{'，'.join(parts)}）")
-        lines.append(f"目标现金约 {percent(details.get('cash_weight') or 0)}")
+        lines.append(f"目标现金及现金等价物约 {percent(details.get('cash_weight') or 0)}")
         from .status import account_lines
         lines += ["", *account_lines(details.get("account"), details.get("recent_trades"), now=now,
                                      costs=details.get("fund_costs"))]

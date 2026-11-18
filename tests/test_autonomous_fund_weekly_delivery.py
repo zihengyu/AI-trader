@@ -40,7 +40,8 @@ def polls(monitor, root, start, minutes):
 
 def daily_only(monkeypatch):
     import scripts.autonomous_fund.notifications as notifications
-    monkeypatch.setattr(notifications, "daily_document", lambda root, sequence: ("daily.md", "daily"))
+    # Stub the combined daily caption and document at the monitor boundary.
+    monkeypatch.setattr(notifications, "daily_report", lambda root, sequence: ("daily", "daily.md", "daily"))
     return notifications
 
 

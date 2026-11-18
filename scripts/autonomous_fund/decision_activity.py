@@ -11,10 +11,21 @@ from .holdings import recent_trades
 from .risk import RiskError, decision_levels, instant, number
 
 ZONE = ZoneInfo("America/New_York")
+ORDER_UPDATES = {
+    "local_order_canceled": "模拟券商确认撤单",
+    "local_risk_canceled": "模拟券商按风控撤单",
+    "order_reprice_cancel": "申请撤单重报",
+    "order_authority_canceled": "因授权变化申请撤单",
+    "protective_priority_cancel": "为保护性退出申请撤单",
+    "buy_canceled_for_redemption": "为赎回申请撤单",
+    "redemption_request_closed": "赎回请求已结束，申请撤单",
+    "cash_parking_superseded": "现金管理计划被取代，申请撤单",
+    "buy_canceled_stop_breached": "触及止损，申请撤买单",
+}
 KINDS = ("decision_validated", "decision_accepted", "decision_backoff", "review_skipped", "notification",
          "order_submitted", "fill", "fill_reconciled", "allocation_complete", "entry_waiting",
          "stop_breached_no_buy", "buy_chase_limit", "risk_overlay", "review_triggered", "event_triage",
-         "triage_scored", "decision_basis")
+         "triage_scored", "decision_basis", *ORDER_UPDATES)
 # Why the manager was woken before a decision, in the operator's words.
 WAKES = {"news": "资讯", "price_move": "价格异动", "price_alert": "价格提醒", "market_stress": "市场压力",
          "stop_loss": "止损", "take_profit": "止盈", "capital_flow": "申购/赎回", "entry": "入场价"}
@@ -80,6 +91,7 @@ def activity(root, session_date=None, now=None):
     accepted, decisions, by_id, orders, notices = {}, [], {}, defaultdict(list), []
     complete, pending, overlays = set(), defaultdict(list), {}
     wakes, screens, scored, bases = [], [], {}, {}
+    updates = defaultdict(list)
     for seq, at, kind, body in rows:
         if kind == "decision_basis":
             bases[body.get("decision_id")] = body
@@ -94,7 +106,7 @@ def activity(root, session_date=None, now=None):
             scored[body.get("id")] = body
             continue
         if kind == "decision_accepted":
-            accepted[body["id"]] = body
+            accepted[body["id"]] = {**body, "at": at}
         elif kind == "decision_validated":
             key = body.get("decision_id")
             if key is None:
@@ -123,7 +135,9 @@ def activity(root, session_date=None, now=None):
             if item is not None:
                 item["notifications"].append(notice)
         elif kind == "order_submitted":
-            orders[body.get("decision_id")].append(body)
+            orders[body.get("decision_id")].append({**body, "at": at})
+        elif kind in ORDER_UPDATES and body.get("broker_id") is not None:
+            updates[str(body["broker_id"])].append({"at": at, "kind": kind, **body})
         elif kind == "allocation_complete":
             complete.add(body["decision_id"])
         elif kind == "notification" and body.get("kind") == "allocation_session_pending":
@@ -135,11 +149,20 @@ def activity(root, session_date=None, now=None):
         elif kind == "risk_overlay":
             overlays[body["decision_id"]] = body
     fills = recent_trades([(at, kind, body) for _, at, kind, body in rows], cutoff, limit=max(1, len(rows)))
+    fills_by_order = defaultdict(list)
+    for fill in fills:
+        fills_by_order[str(fill["broker_id"])].append(fill)
     for item in decisions:
         key = item["id"]
         item["orders"] = orders.get(key, []) if key is not None else []
-        ids = {str(order["broker_id"]) for order in item["orders"]}
-        item["fills"] = [fill for fill in fills if str(fill["broker_id"]) in ids]
+        item["accepted"] = accepted.get(key)
+        for order in item["orders"]:
+            broker_id = str(order["broker_id"])
+            order["updates"] = updates[broker_id]
+            order["fills"] = fills_by_order[broker_id]
+        ids = dict.fromkeys(str(order["broker_id"]) for order in item["orders"])
+        item["fills"] = sorted((fill for broker_id in ids for fill in fills_by_order[broker_id]),
+                               key=lambda fill: instant(fill["at"]))
         item["completed"] = key in complete
         item["waits"] = pending.get(key, [])
         item["risk_binding"] = (overlays.get(key) or {}).get("binding") or []
@@ -165,12 +188,17 @@ def activity(root, session_date=None, now=None):
             "notifications": len(notices), "deliveries": dict(Counter(item["state"] for item in notices))}
 
 
+def _clock(value):
+    return f"{instant(value).astimezone(ZONE):%m-%d %H:%M:%S}"
+
+
 def lines(data, timeline=False, *, event_sequence=None):
     decisions = data["decisions"]
     if event_sequence is not None:
-        decisions = [item for item in decisions if item["sequence"] == event_sequence]
+        decisions = [item for item in decisions if item["sequence"] == event_sequence or
+                     any(notice["sequence"] == event_sequence for notice in item["notifications"])]
         if not decisions:
-            raise RiskError("No validated decision with that event sequence in the selected account/date")
+            raise RiskError("No validated decision or linked target notification with that event sequence in the selected account/date")
     counts = data["changes"]
     result = [f"AI 复核（纽约日期 {data['session_date']}）：通过校验 {data['validated']} 次，"
               f"失败尝试 {data['failures']} 次，静默跳过 {data['quiet_skips']} 次",
@@ -190,6 +218,26 @@ def lines(data, timeline=False, *, event_sequence=None):
                          "旧日志缺少可关联计划 ID")
             result.append(f"{instant(item['at']).astimezone(ZONE):%H:%M:%S} 事件 #{item['sequence']} "
                           f"{LABELS[item['change']]}：{targets} ｜ {execution} ｜ {delivered}")
+            accepted = item.get("accepted")
+            if accepted and accepted.get("until_at"):
+                result.append(f"  计划接纳 {_clock(accepted['at'])} ｜ 有效至 {_clock(accepted['until_at'])}")
+            for order in item["orders"]:
+                side = {"buy": "买", "sell": "卖"}.get(order.get("side"), "方向未知")
+                execution_time = (f"送单 {_clock(order['send_at'])}，回执 {_clock(order['at'])}"
+                                  if order.get("send_at") else f"下单日志 {_clock(order['at'])}（旧记录）")
+                limit = f"${order['limit']}" if order.get("limit") is not None else "未记录"
+                result.append(f"  {order.get('symbol')} {side} {order.get('quantity', '?')} 股"
+                              f" ｜ 限价 {limit} ｜ {execution_time}")
+                lifecycle = []
+                for fill in order["fills"]:
+                    action = ("累计成交观测" if fill["evidence_kind"] == "broker_cumulative_observation"
+                              else "成交观测")
+                    lifecycle.append((fill["at"], f"{action} {fill['quantity']} 股 @ ${fill['price']}"))
+                for update in order["updates"]:
+                    reason = f"（{update['reason']}）" if update.get("reason") else ""
+                    lifecycle.append((update["at"], ORDER_UPDATES[update["kind"]] + reason))
+                for at, label in sorted(lifecycle, key=lambda row: instant(row[0])):
+                    result.append(f"    {_clock(at)} {label}")
             wakes = Counter(WAKES.get(w.get("reason"), w.get("reason")) for w in item["wakes"])
             if wakes:
                 examples = [w.get("title") or (f"{w.get('symbol')} {w.get('reason')}" if w.get("symbol") else None)
@@ -254,7 +302,14 @@ def lines(data, timeline=False, *, event_sequence=None):
                             result.append("  反方指出的缺项：" + "；".join(critique["missing_evidence"]))
             for wait in item["waits"]:
                 if wait["kind"] == "allocation_session_pending":
-                    result.append("  等待常规交易时段；开盘后重新核对计划有效期、账户、报价和风控，尚不能据此认定已成交。")
+                    message = "  等待常规交易时段"
+                    if wait.get("next_open"):
+                        message += f" ｜ 下次开盘 {_clock(wait['next_open'])}"
+                    if wait.get("valid_at_next_open") is False:
+                        message += " ｜ 计划届时已过期"
+                    elif wait.get("valid_at_next_open") is True:
+                        message += " ｜ 届时仍须复核计划和风控"
+                    result.append(message)
                     continue
                 label = {"entry_waiting": "等待入场价", "stop_breached_no_buy": "已触及止损，停止买入",
                          "buy_chase_limit": "达到追价上限"}[wait["kind"]]

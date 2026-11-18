@@ -10,7 +10,7 @@ from scripts.autonomous_fund.cash import CashSweep
 from scripts.autonomous_fund.journal import Journal
 from scripts.autonomous_fund.local_broker import LocalPaperBroker
 from scripts.autonomous_fund.market_data import YahooRealtimeData
-from scripts.autonomous_fund.risk import Intent, Limits, Price, RiskError, number
+from scripts.autonomous_fund.risk import Intent, Limits, Price, RiskError, instant, number
 from scripts.autonomous_fund.run import ScriptedRuntime
 from scripts.autonomous_fund.strategy import AutonomousFund, account_digest
 from .test_autonomous_fund_autonomy import decision_body
@@ -219,6 +219,25 @@ def test_stale_cash_parking_order_does_not_block_reviews_until_the_old_decision_
     clock.value += timedelta(seconds=strategy.execution_policy.reprice_after_seconds + 1)
     strategy._manage_open_orders(clock())
     assert canceled == [order.identifier]
+
+
+def test_native_allocation_records_distinct_send_and_acknowledgement_times(native_fund, monkeypatch):
+    strategy, clock, _, journal, _ = native_fund()
+    active, key = accept_targets(strategy, clock, [("ALFA", .05)])
+    submitted_at = clock()
+    original = strategy._submit_order_impl
+
+    def submit_then_wait(order, **kwargs):
+        result = original(order, **kwargs)
+        clock.value += timedelta(seconds=7)
+        return result
+
+    monkeypatch.setattr(strategy, "_submit_order_impl", submit_then_wait)
+    strategy._continue_allocation(active, strategy._snapshot())
+    [submission] = [row for row in journal.all_events() if row["kind"] == "order_submitted"]
+    assert submission["body"]["decision_id"] == key
+    assert instant(submission["body"]["send_at"]) == submitted_at
+    assert instant(submission["at"]) == submitted_at + timedelta(seconds=7)
 
 
 @pytest.mark.parametrize("future", [False, True])

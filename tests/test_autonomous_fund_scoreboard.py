@@ -173,7 +173,8 @@ def test_the_daily_attribution_and_the_weekly_report_show_returns_after_ai_costs
     assert result["fund_costs"]["model_usd"] == 2.5 and result["fund_costs"]["data_usd"] == pytest.approx(2.0)
     assert result["net_return"] == pytest.approx(0.001 - 4.5 / 10_000)
     [line] = [text for text in attribution_lines(result) if "AI 和数据费用" in text]
-    assert "-0.04%" in line and "扣费后当日收益 0.06%" in line and "另有 1 次调用未定价" in line
+    # The 0.06% shown can only account for costs with known amounts.
+    assert "-0.04%" in line and "扣已知费用后 0.06%" in line and "另有 1 次调用未定价" in line
     _, sequence = ledger(tmp_path / "weekly")
     _, text = weekly_document(tmp_path / "weekly", sequence)
     assert "本周 AI 费用 $0.25（2 次调用），扣除后本周收益" in text and "另有 1 次调用未定价、未计入" in text

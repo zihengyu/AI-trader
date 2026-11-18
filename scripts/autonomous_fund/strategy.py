@@ -3710,6 +3710,7 @@ class AutonomousFund(Strategy):
                                 "known_data_usd": round(data, 4), "unpriced_data_sessions": unknown_data,
                                 "unpriced_calls": sum(cost is None for cost in model_costs),
                                 "share": -(model + data) / equity if equity else None}
+        result["cost_window"] = {"start_at": start.isoformat(), "end_at": instant(end_at).isoformat()}
         result["net_is_upper_bound"] = bool(unknown_data or result["fund_costs"]["unpriced_calls"])
         result["net_return"] = (result["observed_return"] + result["fund_costs"]["share"]
                                 if result["fund_costs"]["share"] is not None else None)
@@ -5796,13 +5797,15 @@ class AutonomousFund(Strategy):
                   "Configured cash-equivalent sweep" if kind == "cash_sweep" else
                   "Operator redemption: raising its cash" if kind == "redemption" else
                   "Validated structured portfolio target")
+        send_at = self.get_datetime()
         Strategy.submit_order(self, order, reason=reason, evidence={"intent_id": key})
+        acknowledged_at = self.get_datetime()
         broker_id = getattr(getattr(order, "_raw", None), "id", None) if self.mode == "paper" else order.identifier
-        self.journal.update(key, broker_id, False, now)
+        self.journal.update(key, broker_id, False, acknowledged_at)
         if not broker_id:
             raise RiskError("Broker acknowledgement missing; intent is locked for manual reconciliation")
-        self.journal.event(now, "order_submitted", {"intent_id": key, "broker_id": str(broker_id), "kind": kind,
-                           "decision_id": decision_id, "requirement": requirement,
+        self.journal.event(acknowledged_at, "order_submitted", {"intent_id": key, "broker_id": str(broker_id), "kind": kind,
+                           "decision_id": decision_id, "send_at": send_at, "requirement": requirement,
                            "authorization": authorization, **asdict(intent)})
 
     def submit_order(self, *args, **kwargs):

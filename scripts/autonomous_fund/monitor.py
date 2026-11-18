@@ -361,7 +361,7 @@ class Monitor:
                     continue
                 db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (review["at"], "notification", encode({
                     "kind": "postmarket_report", "details": {"review_sequence": review["sequence"],
-                    "session_date": packet["session_date"], "summary": packet["review"]["summary"]}})))
+                    "session_date": packet["session_date"]}})))
             self._queue_weekly(db, reviews, now)
             self._queue_fill_updates(db, now)
             # Drop stale first-start alerts; retain recent requests and failures.
@@ -795,11 +795,9 @@ class Monitor:
 
     def _outgoing(self, body, sequence, text, now):
         """("text", message) or ("document", caption, filename, document) for one notice."""
-        from .notifications import approval_message, daily_document
+        from .notifications import approval_message, daily_report
         if body.get("kind") == "postmarket_report":
-            filename, document = daily_document(self.root, body["details"]["review_sequence"])
-            return ("document", f"LumiBot 模拟账户 · {body['details']['session_date']} 盘后日报\n" + body["details"]["summary"],
-                    filename, document)
+            return ("document", *daily_report(self.root, body["details"]["review_sequence"]))
         if body.get("kind") == "weekly_report":
             from .notifications import weekly_document
             filename, document = weekly_document(self.root, body["details"]["review_sequence"])

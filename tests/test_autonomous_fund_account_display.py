@@ -51,7 +51,9 @@ def test_target_notice_has_observed_shares_and_cost_before_the_rationale(tmp_pat
     [details] = notices(strategy.journal, "decision_changed")
     assert details["account"]["positions"] == {"BETA": "4.0"}
     [text] = delivered(tmp_path / "telegram", "decision_changed", details).messages
-    assert "买入／加仓：BETA 0%→8%" in text and "目标现金约 92%" in text
+    # This is a target delta even though the account already holds BETA.
+    assert "目标上调：BETA 0%→8%" in text and "目标现金及现金等价物约 92%" in text
+    assert "计划买入" not in text
     assert "BETA：4 股 ｜ 买入均价 $91.25" in text
     # Relative freshness measures the actual snapshot's age at delivery,
     # including delays; it must not restart at the notification's creation.
@@ -95,7 +97,8 @@ def test_cash_equivalents_survive_report_rebuild_and_remain_separate(tmp_path):
     strategy.journal.event(NOW, "account", asdict(account))
     saved = report(tmp_path, write_files=False)["latest_account"]
     text = "\n".join(account_lines(saved))
-    assert "现金 $9,000.00" in text and "现金中含短债 ETF $8,000.00" in text
+    # The stored aggregate includes the ETF. Only the residual is free cash.
+    assert "自由现金 $1,000.00" in text and "系统现金等价物 $8,000.00" in text
     assert "BILLS：80 股 ｜ 买入均价 $99.80" in text
     assert saved["positions"] == {"ALFA": 10}
 

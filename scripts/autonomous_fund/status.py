@@ -333,9 +333,18 @@ def account_lines(account, recent_trades=None, *, now=None, costs=None):
     from .market_data import regular_session_open
     if not regular_session_open(now):
         updated = "休市"
+    swept = account.get("cash_equivalents") or {}
+    cash = account.get("cash")
+    cash_label = "现金"
+    if swept:
+        cash_label = "自由现金"
+        try:
+            cash = number(cash) - number(account.get("cash_equivalent_value"))
+        except (TypeError, ValueError):
+            cash = None
     lines = [f"📌 当前实际持仓（快照：{when(at)}）",
              f"账户：净值 {money(account.get('equity'))}（{updated}）"
-             f" ｜ 现金 {money(account.get('cash'))}"]
+             f" ｜ {cash_label} {money(cash)}"]
     value = fund_value_line(account, costs) if available else None
     if value:
         lines.append(value)
@@ -355,9 +364,8 @@ def account_lines(account, recent_trades=None, *, now=None, costs=None):
         lines.append(f"• {symbol}：{shares(quantity)} 股 ｜ 买入均价 {money(prices.get(symbol))}")
     if available and not any(number(quantity) != 0 for quantity in positions.values()):
         lines.append("• 暂无证券持仓")
-    swept = account.get("cash_equivalents") or {}
     if swept:
-        lines.append(f"现金中含短债 ETF {money(account.get('cash_equivalent_value'))}：")
+        lines.append(f"系统现金等价物 {money(account.get('cash_equivalent_value'))}：")
         lines += [f"• {symbol}：{shares(quantity)} 股 ｜ 买入均价 {money(prices.get(symbol))}"
                   for symbol, quantity in sorted(swept.items())]
     if recent_trades:

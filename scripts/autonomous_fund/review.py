@@ -577,6 +577,9 @@ def review_after_close(strategy):
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。")
     manager_prompt += CASH_MANAGEMENT_GUIDANCE
     manager_prompt += (
+        "复盘摘要重点写判断、证据局限和待验证的调整。引用账户、基准、扣费后收益或超额时，"
+        "使用同一 context.attribution 窗口；新闻里的行情涨跌若窗口或价格来源不同，明确标注。"
+        "费用归因止于期末账户估值。目标反转次数衡量决策变化，实际换手和成交成本以成交记录为准。"
         "账户比例以 session 的冻结账户数值为准：cash 包含系统现金等价物，不能再把两者相加；"
         "风险证券=equity-cash-receivables，自由现金=cash-cash_equivalent_value，"
         "与系统现金等价物、应收合计应为净值。缺项时说明，不能编造收盘值。"

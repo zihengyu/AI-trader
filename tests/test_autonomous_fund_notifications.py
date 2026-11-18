@@ -112,6 +112,31 @@ def test_report_retry_uses_exact_review_and_excludes_future_accounts_and_file_co
         daily_document(tmp_path, 999999)
 
 
+def test_daily_caption_uses_frozen_attribution_instead_of_ai_figures(tmp_path):
+    strategy, _ = completed(tmp_path)
+    with strategy.journal.connection() as db:
+        sequence, raw = db.execute("SELECT sequence,body FROM events WHERE kind='postmarket_review'").fetchone()
+        packet = json.loads(raw)
+        packet["review"]["summary"] = "新闻涨跌 −9.999%。"
+        packet["attribution"] = {
+            "status": "complete", "session_date": "2026-11-02", "previous_session": "2026-10-30",
+            "benchmark": "SPY", "benchmark_return": -.01081, "observed_return": -.00179,
+            "net_return": -.00225, "net_is_upper_bound": True, "components": {}, "unexplained": -.00179,
+            "fund_costs": {"model_usd": 4.57, "data_usd": 0, "share": -.00046, "unpriced_calls": 1},
+            "cost_window": {"start_at": (CLOSE - timedelta(days=3)).isoformat(), "end_at": CLOSE.isoformat()},
+        }
+        db.execute("UPDATE events SET body=? WHERE sequence=?", (json.dumps(packet), sequence))
+
+    transport = Attachments()
+    Monitor(tmp_path, transport).poll(CLOSE)
+    [(caption, _, document)] = transport.documents
+    assert "账户 -0.179%｜SPY -1.081%" in caption
+    assert "扣已知费用后 -0.225%｜相对基准 +0.856 个百分点（收益上限，费用有缺项）" in caption
+    assert "之后的调用另计" in caption
+    assert "−9.999%" not in caption and "## AI 复盘意见\n\n新闻涨跌 −9.999%。" in document
+    assert "费用窗口：" in document
+
+
 def test_telegram_upload_is_in_memory_and_redacts_token_on_http_failure():
     calls = []
     def post(url, **kwargs):

@@ -128,3 +128,31 @@ def test_timeline_shows_why_the_manager_was_woken_and_what_it_said(tmp_path):
     assert "触发：资讯 1 次、价格异动 1 次" in text and "Synthetic headline about ALFA" in text
     assert "快速模型判断不需要，抽查仍叫了基金经理（抽查结果：基金经理改了组合，算漏判）｜Routine coverage" in text
     assert text.count("理由：Synthetic assessment") == 2
+
+
+def test_notification_id_opens_only_its_linked_order_timeline(tmp_path):
+    book = Journal(tmp_path, "synthetic-timeline-account")
+    at, key = plan(book, 0)
+    book.event(at, "notification", {"kind": "decision_changed", "details": {"decision_id": key}})
+    book.event(at + timedelta(seconds=50), "order_submitted", {
+        "decision_id": key, "broker_id": "order-a", "symbol": "ALFA", "side": "sell",
+        "quantity": "3", "limit": "90.12", "send_at": (at + timedelta(seconds=43)).isoformat()})
+    book.event(at + timedelta(minutes=2), "fill", {
+        "broker_id": "order-a", "symbol": "ALFA", "side": "sell", "quantity": "1", "price": "90.31"})
+    book.event(at + timedelta(minutes=3), "order_reprice_cancel", {"broker_id": "order-a"})
+    book.event(at + timedelta(minutes=4), "local_order_canceled", {
+        "broker_id": "order-a", "reason": "order_expired"})
+    book.event(at + timedelta(minutes=5), "local_order_canceled", {"broker_id": "other-order"})
+    plan(book, 1)
+
+    data = activity(tmp_path, "2026-11-02", now=NOW)
+    item = data["decisions"][0]
+    notice = item["notifications"][0]["sequence"]
+    text = "\n".join(lines(data, timeline=True, event_sequence=notice))
+    assert f"事件 #{item['sequence']}" in text
+    assert "计划接纳 11-02 09:30:00 ｜ 有效至 11-02 09:40:00" in text
+    assert "限价 $90.12 ｜ 送单 11-02 09:30:43，回执 11-02 09:30:50" in text
+    assert "09:32:00 成交观测 1 股 @ $90.31" in text
+    assert "09:33:00 申请撤单重报" in text
+    assert "09:34:00 模拟券商确认撤单（order_expired）" in text
+    assert "09:35:00" not in text and "09:40:00 事件" not in text

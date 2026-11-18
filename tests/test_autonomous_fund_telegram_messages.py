@@ -226,7 +226,7 @@ def test_an_unavailable_logger_cannot_break_a_durably_queued_announcement(tmp_pa
     assert len(notices(strategy.journal, "decision_changed")) == 1
 
 
-def test_a_portfolio_change_reads_as_buys_sales_and_reasons(tmp_path):
+def test_a_portfolio_change_reports_target_deltas_and_reasons(tmp_path):
     bot = delivered(tmp_path, "decision_changed", {
         "at": "2026-11-02T15:15:00+00:00", "first_today": False, "cash_weight": "0.85",
         "changes": [{"symbol": "NVDA", "from": "0", "to": "0.05", "entry_limit": "120", "stop_loss": "110"},
@@ -234,8 +234,9 @@ def test_a_portfolio_change_reads_as_buys_sales_and_reasons(tmp_path):
         "rationale": "NVDA 财报超预期；能源股动能转弱。", "next_review_at": "2026-11-02T16:00:00+00:00"})
     [text] = bot.messages
     assert text.startswith("🧭 AI 调整目标组合")
-    assert "买入／加仓：NVDA 0%→5%（入场 ≤ 120，止损 110）" in text and "卖出／减仓：XLE 6%→0%" in text
-    assert "不变：SPY 10%" in text and "现金约 85%" in text and "NVDA 财报超预期" in text
+    # The previous target does not describe the holdings or an order to buy or sell.
+    assert "目标上调：NVDA 0%→5%（入场 ≤ 120，止损 110）" in text and "目标下调：XLE 6%→0%" in text
+    assert "不变：SPY 10%" in text and "目标现金及现金等价物约 85%" in text and "NVDA 财报超预期" in text
     first = delivered(tmp_path / "first", "decision_changed", {
         "at": "2026-11-02T15:00:00+00:00", "first_today": True, "cash_weight": "0.9",
         "changes": [{"symbol": "SPY", "from": "0.1", "to": "0.1"}], "rationale": "维持。", "next_review_at": None})
