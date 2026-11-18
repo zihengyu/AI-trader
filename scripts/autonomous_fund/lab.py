@@ -8,20 +8,50 @@ from pathlib import Path
 from .risk import RiskError, instant, trading_day
 
 
-def forward_readiness(db, now, policy):
-    from .market_data import SessionClock
-    from .strategy_validation import following_session
+FORWARD_REASON_TEXT = {
+    "awaiting_snapshot": "待当日快照或校验", "source_evidence_incomplete": "最近快照的来源凭证不足",
+    "daily_slots_exhausted": "当日验证名额已用完", "research_budget_exhausted": "验证资源预算不足",
+    "queued": "任务排队", "running": "计算中", "result_needs_data": "验证结果要求补数据",
+    "missed": "未在开盘前留存有效信号",
+}
+
+
+def forward_readiness(db, now, policy, *, opened=None, budget=None):
+    from .research_budget import ResearchBudget, micros
 
     now = instant(now)
-    session = SessionClock(now=lambda: now).status()
-    opened = instant(session["next_open"])
-    if opened <= now:
-        _, opened = following_session(trading_day(now))
+    if opened is None:
+        from .market_data import SessionClock
+        from .strategy_validation import following_session
+
+        opened = instant(SessionClock(now=lambda: now).status()["next_open"])
+        if opened <= now:
+            _, opened = following_session(trading_day(now))
+    opened = instant(opened)
     day = trading_day(opened)
     rows = db.execute("SELECT v.id,v.version,v.digest,v.policy_hash,s.at,s.body FROM fund_strategy_versions v "
                       "LEFT JOIN fund_strategy_signals s ON s.id=v.id AND s.version=v.version AND s.day=? "
                       "WHERE v.state IN ('shadow','paper_active') ORDER BY v.id,v.version", (day,)).fetchall()
-    ready, waiting, previous_policy = [], [], []
+    ready, waiting, previous_policy, reasons, missed = [], [], [], {}, {}
+    now_day = trading_day(now)
+    attempted = db.execute("SELECT count(*) FROM fund_research_reservations "
+                           "WHERE day=? AND category='validation_compute'", (now_day,)).fetchone()[0]
+    slots = max(0, policy.get("max_jobs_per_day", 0) - attempted)
+    receipt = db.execute("SELECT value FROM meta WHERE key='strategy_lab_last_intake'").fetchone()
+    intake = json.loads(receipt[0]) if receipt else {}
+    if intake and instant(intake["at"]) > now:
+        intake = {}
+    if budget is None:
+        from .research_budget import ResearchBudgetSettings
+
+        startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+        if startup:
+            settings = json.loads(startup[0]).get("research_budget")
+            budget = ResearchBudgetSettings.from_config(settings) if settings is not None else None
+    if budget:
+        cost = micros(budget.validation_reservation_usd)
+        shared_cap = (ResearchBudget._spent(db, "r.day=?", (now_day,)) + cost > micros(budget.daily_usd) or
+                      ResearchBudget._spent(db, "r.month=?", (now_day[:7],)) + cost > micros(budget.monthly_usd))
     for key, version, digest, fingerprint, at, body in rows:
         identity = f"{key} / {version}"
         if fingerprint != policy.get("policy_hash"):
@@ -34,12 +64,62 @@ def forward_readiness(db, now, policy):
         except (KeyError, TypeError, ValueError):
             bound = False
         (ready if bound else waiting).append(identity)
-    attempted = db.execute("SELECT count(*) FROM fund_research_reservations "
-                           "WHERE day=? AND category='validation_compute'", (trading_day(now),)).fetchone()[0]
+        if bound:
+            continue
+        if opened <= now:
+            passed = db.execute("SELECT at FROM fund_strategy_events WHERE id=? AND version=? AND kind='historical_pass' "
+                                "ORDER BY sequence LIMIT 1", (key, version)).fetchone()
+            if passed and instant(passed[0]) < opened:
+                missed[identity] = "missed"
+            continue
+        job = db.execute("SELECT j.state,j.lease_until,r.body FROM fund_strategy_jobs j "
+                         "LEFT JOIN fund_strategy_results r ON r.job_id=j.id WHERE j.strategy_id=? AND j.version=? "
+                         "AND j.kind='forward' AND julianday(j.at)<=julianday(?) ORDER BY j.rowid DESC LIMIT 1",
+                         (key, version, now.isoformat())).fetchone()
+        if job and job[0] == "running" and job[1] and instant(job[1]) >= now:
+            reason = "running"
+        elif not slots:
+            reason = "daily_slots_exhausted"
+        elif budget and (shared_cap or ResearchBudget._spent(db, "r.project=?", (key,)) + cost > micros(budget.project_usd)):
+            reason = "research_budget_exhausted"
+        elif job and job[0] in {"queued", "running"}:
+            reason = "queued"
+        elif intake.get("coverage_gaps"):
+            reason = "source_evidence_incomplete"
+        elif job and job[2] and json.loads(job[2]).get("status") == "needs_data":
+            reason = "result_needs_data"
+        else:
+            reason = "awaiting_snapshot"
+        reasons[identity] = reason
     queued = db.execute("SELECT count(*) FROM fund_strategy_jobs WHERE kind='forward' AND state='queued'").fetchone()[0]
     return {"next_open": opened.isoformat(), "ready": ready, "waiting": waiting, "previous_policy": previous_policy,
-            "queued_forward_jobs": queued,
-            "daily_slots_left": max(0, policy.get("max_jobs_per_day", 0) - attempted)}
+            "queued_forward_jobs": queued, "daily_slots_left": slots, "waiting_reasons": reasons, "missed": missed}
+
+
+def queue_forward_notice(db, now, opened):
+    from .journal import encode
+
+    row = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
+    policy = json.loads(row[0]) if row else {}
+    if not policy.get("enabled"):
+        return
+    startup = db.execute("SELECT body FROM events WHERE kind='startup' ORDER BY sequence DESC LIMIT 1").fetchone()
+    if not startup or json.loads(startup[0]).get("observe_only"):
+        return
+    readiness = forward_readiness(db, now, policy, opened=opened)
+    past = opened <= now
+    versions = readiness["missed"] if past else readiness["waiting_reasons"]
+    if not versions:
+        return
+    kind = "strategy_lab_open_missed" if past else "strategy_lab_open_pending"
+    payload = encode({"kind": kind, "details": {"open_at": opened.isoformat(), "versions": versions}})
+    key = f"strategy_lab_notice:{kind}"
+    previous = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    if previous and previous[0] == payload:
+        return
+    # The independent monitor commits deduplication with the outbox event.
+    db.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (key, payload))
+    db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", payload))
 
 
 def check_data(root, data, key, version, now, *, artifacts_dir=None):
@@ -252,7 +332,15 @@ def report(root):
         lines.append(f"前瞻截止 {forward['next_open']}，已留证 {len(forward['ready'])}，待留证 {len(forward['waiting'])}，"
                      f"前瞻排队 {forward['queued_forward_jobs']}，今日剩余任务名额 {forward['daily_slots_left']}。")
         if forward["waiting"]:
-            lines.append("  待留证版本 " + "、".join(forward["waiting"]))
+            lines.append("  待留证版本 " + "、".join(f"{key}（{FORWARD_REASON_TEXT[reason]}）"
+                                                     for key, reason in forward["waiting_reasons"].items()))
+        from .session_calendar import _session_bounds
+
+        opened, _ = _session_bounds(trading_day(now))
+        if opened is not None and opened <= now:
+            missed = forward_readiness(db, now, policy, opened=opened)["missed"]
+            if missed:
+                lines.append("  今日开盘未留证 " + "、".join(missed))
         if forward["previous_policy"]:
             lines.append("  旧配置版本，须重验 " + "、".join(forward["previous_policy"]))
         costs = db.execute("SELECT r.category,sum(coalesce(c.actual,r.reserved))/1000000.0 "

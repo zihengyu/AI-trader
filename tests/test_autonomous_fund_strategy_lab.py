@@ -5,6 +5,7 @@ import json
 import math
 import random
 from concurrent.futures import ThreadPoolExecutor
+from threading import Event, get_ident
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -500,7 +501,8 @@ def test_snapshot_provenance_at_the_automatic_ingest(tmp_path, monkeypatch):
     inbox = tmp_path / "strategy_lab_snapshot.json"
     state = SimpleNamespace(strategy_lab=engine, mode="local", observe_only=False, halt_path=tmp_path / "STOP",
                             get_datetime=lambda: NOW)
-    monkeypatch.setattr(engine, "kick", lambda _now: None)
+    # Run preparation synchronously to inspect its exact cutoff in this intake test.
+    monkeypatch.setattr(engine, "kick", lambda now, *, prepare: prepare(now))
     candidate = dataset()
     candidate["bars"]["ALFA"][-1]["event"] = 0
     inbox.write_text(json.dumps(candidate), encoding="utf-8")
@@ -525,6 +527,113 @@ def test_snapshot_provenance_at_the_automatic_ingest(tmp_path, monkeypatch):
     late["bars"]["ALFA"][-1]["feature_available_at"] = {"event": (NOW + timedelta(days=1)).isoformat()}
     with pytest.raises(RiskError, match="invalid publication time"):
         engine.record_dataset(attest(late), NOW)
+
+
+def test_repeated_cache_revision_schedules_once_on_the_existing_worker(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.datastore import DailyStore
+    from scripts.autonomous_fund.risk import trading_day
+    from scripts.autonomous_fund.strategy_lab_runtime import tick
+
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    store = DailyStore(tmp_path / "daily")
+    row = ["2026-11-13", 101., 10000., 100., 102., 99.]
+    for symbol in ("ALFA", "BASE"):
+        store.put(trading_day(NOW), "bars/" + symbol, {"rows": [row]})
+    strategy = SimpleNamespace(strategy_lab=engine, daily_store=store, universe={"ALFA", "BASE"},
+                               mode="local", observe_only=False, halt_path=tmp_path / "STOP", get_datetime=lambda: NOW)
+    original, threads = engine.schedule, []
+
+    def schedule(data, now):
+        threads.append(get_ident())
+        return original(data, now)
+
+    monkeypatch.setattr(engine, "schedule", schedule)
+    monkeypatch.setattr(engine, "run_one", lambda _now: None)
+    try:
+        tick(strategy)
+        engine._future.result(timeout=10)
+        store.put(trading_day(NOW), "bars/ALFA", {"rows": [row]})
+        strategy.get_datetime = lambda: NOW + timedelta(seconds=30)
+        tick(strategy)
+        engine._future.result(timeout=10)
+        strategy.get_datetime = lambda: NOW + timedelta(seconds=60)
+        tick(strategy)
+        engine._future.result(timeout=10)
+        assert len(threads) == 1 and threads[0] != get_ident()
+        strategy = SimpleNamespace(strategy_lab=engine, daily_store=store, universe={"ALFA", "BASE"},
+                                   mode="local", observe_only=False, halt_path=tmp_path / "STOP",
+                                   get_datetime=lambda: NOW + timedelta(seconds=80))
+        tick(strategy)
+        engine._future.result(timeout=10)
+        assert len(threads) == 1
+        store.put(trading_day(NOW), "bars/ALFA", {"rows": [[*row[:-1], 98.]]})
+        strategy.get_datetime = lambda: NOW + timedelta(seconds=110)
+        tick(strategy)
+        engine._future.result(timeout=10)
+        assert len(threads) == 2
+    finally:
+        if engine._executor is not None:
+            engine._executor.shutdown()
+
+
+def test_live_lab_poll_does_not_depend_on_a_trading_iteration():
+    from scripts.autonomous_fund.strategy_lab_runtime import poll_live_inputs
+
+    called = Event()
+    moments = []
+
+    def tick(*, now):
+        moments.append(now)
+        called.set()
+
+    strategy = SimpleNamespace(_strategy_lab_tick=tick)
+    with poll_live_inputs(strategy, enabled=False, interval=.01):
+        assert not moments
+    with poll_live_inputs(strategy, enabled=True, interval=.01):
+        assert called.wait(2)
+    assert moments and all(now.tzinfo is not None for now in moments)
+
+
+def test_old_policy_queue_does_not_keep_waking_worker(tmp_path):
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    assert engine.schedule(dataset(5), NOW)
+    with engine.journal.connection() as db:
+        db.execute("UPDATE fund_strategy_versions SET policy_hash='previous-policy'")
+    assert not engine.kick(NOW)
+
+
+def test_opening_deadline_surfaces_source_gaps_and_deduplicates_across_runner_restarts(tmp_path):
+    from scripts.autonomous_fund.execution import EXECUTION_REVISION
+    from scripts.autonomous_fund.lab import forward_readiness
+    from scripts.autonomous_fund.monitor import Monitor
+    from scripts.autonomous_fund.strategy_validation import following_session
+    from tests.test_autonomous_fund_monitor import FakeTelegram, heartbeat
+
+    engine = lab(tmp_path)
+    engine.submit(proposal(), NOW)
+    key = proposal()["strategy_id"]
+    _, opened = following_session("2026-11-16")
+    pending = opened - timedelta(minutes=3)
+    engine.journal.event(NOW, "startup", {"mode": "local", "execution_revision": EXECUTION_REVISION})
+    engine.journal.set_meta("strategy_lab_last_intake", {"at": NOW.isoformat(), "coverage_gaps": ["source_artifacts_unchecked"]})
+    with engine.journal.connection() as db:
+        db.execute("UPDATE fund_strategy_versions SET state='shadow'")
+        engine._event(db, key, "v1", NOW, "historical_pass", {})
+        readiness = forward_readiness(db, pending, engine.admission_policy, opened=opened, budget=engine.budget.settings)
+    assert readiness["waiting_reasons"] == {f"{key} / v1": "source_evidence_incomplete"}
+    transport = FakeTelegram()
+    heartbeat(tmp_path, pending)
+    Monitor(tmp_path, transport).poll(pending)
+    Monitor(tmp_path, transport).poll(pending + timedelta(seconds=30))
+    heartbeat(tmp_path, opened)
+    Monitor(tmp_path, transport).poll(opened)
+    notices = [row["body"] for row in engine.journal.events(["notification"])]
+    assert [notice["kind"] for notice in notices] == ["strategy_lab_open_pending", "strategy_lab_open_missed"]
+    assert notices[-1]["details"]["versions"] == {f"{key} / v1": "missed"}
+    assert any("开盘前仍待留证" in message for message in transport.messages)
+    assert any("已错过开盘留证" in message for message in transport.messages)
 
 
 def test_research_task_cannot_promote_a_strategy(tmp_path):

@@ -12,11 +12,12 @@ in the journal (`agent` events: `tokens`, `cost_usd`), so status, reports and th
 daily document need no price table. A call with unknown usage or an unpriced
 model is counted as unpriced, never as free.
 """
+import json
 import math
 from datetime import timedelta
 from zoneinfo import ZoneInfo
 
-from .risk import instant
+from .risk import instant, trading_day
 
 TRADING_DAYS = 252
 # The usage spellings LumiBot's runtime and the providers use (LiteLLM, OpenAI, Anthropic, Gemini, DeepSeek).
@@ -28,6 +29,56 @@ CACHED_KEYS = ("cached_content_token_count", "cached_input_tokens", "cache_read_
 MISS_KEYS = ("prompt_cache_miss_tokens", "prompt_tokens_details.uncached_tokens")
 UNPRICED_LABELS = {"usage_missing": "用量缺失", "usage_incomplete": "用量不全",
                    "usage_invalid": "用量格式异常", "rate_missing": "缺少费率"}
+
+
+def optional_model_commitments(db, now, *, for_admission=False):
+    """Keep unmatched and unpriced call reservations visible without double-counting priced calls."""
+    now = instant(now)
+    cutoff = None if for_admission else now.isoformat()
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_optional_model_reservations'").fetchone():
+        return {"reserved_microusd": 0, "running": 0, "unpriced": 0}
+    rows = db.execute("""
+        SELECT r.id,r.reserved,r.at,e.at,e.body FROM fund_optional_model_reservations r
+        LEFT JOIN events e ON e.kind='agent' AND json_valid(e.body) AND json_extract(e.body,'$.call_id')=r.id
+            AND (? IS NULL OR julianday(e.at)<=julianday(?))
+        WHERE r.day=? AND (? IS NULL OR julianday(r.at)<=julianday(?)) ORDER BY r.id,e.sequence
+    """, (cutoff, cutoff, trading_day(now), cutoff, cutoff))
+    calls = {}
+    for key, amount, reserved_at, observed_at, body in rows:
+        if not for_admission and instant(reserved_at) > now:
+            continue
+        calls.setdefault(key, (amount, None))
+        if body and (for_admission or instant(observed_at) <= now):
+            calls[key] = amount, json.loads(body)
+    pending = [(amount, body) for amount, body in calls.values()
+               if body is None or (body.get("cost_usd") is None and not body.get("cache_hit") and not scripted(body))]
+    return {"reserved_microusd": sum(amount for amount, _ in pending),
+            "running": sum(body is None for _, body in pending), "unpriced": sum(body is not None for _, body in pending)}
+
+
+def reserve_optional_model_call(journal, now, call_id, purpose, maximum, estimate):
+    from .research_budget import micros
+
+    day = trading_day(now)
+    with journal.connection() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("""CREATE TABLE IF NOT EXISTS fund_optional_model_reservations (
+            id TEXT PRIMARY KEY, at TEXT NOT NULL, day TEXT NOT NULL, purpose TEXT NOT NULL, reserved INTEGER NOT NULL)""")
+        db.execute("CREATE INDEX IF NOT EXISTS optional_model_reservation_day ON fund_optional_model_reservations(day)")
+        row = db.execute("SELECT value FROM meta WHERE key='counter:model_cost_microusd'").fetchone()
+        counter = json.loads(row[0]) if row else {}
+        spent = counter.get("count", 0) if counter.get("day") == day else 0
+        # An overlapping caller may have captured its timestamp before the
+        # caller that acquired the write lock first. Both reserve the same day.
+        pending = optional_model_commitments(db, now, for_admission=True)
+        amount = micros(estimate)
+        detail = {"day": day, "purpose": purpose, "limit_usd": maximum, "known_usd": spent / 1e6,
+                  "requested_usd": amount / 1e6, **pending}
+        if spent + pending["reserved_microusd"] + amount > micros(maximum):
+            return detail
+        db.execute("INSERT INTO fund_optional_model_reservations VALUES(?,?,?,?,?)",
+                   (call_id, instant(now).isoformat(), day, purpose, amount))
+        return None
 
 
 def _usage_value(raw, keys):

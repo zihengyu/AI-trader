@@ -471,6 +471,12 @@ Daily incremental snapshots can omit data that was already frozen in the book.
 Lab status shows the next opening deadline, current versions awaiting timestamped
 signals, queued forward jobs and the remaining daily job slots. Versions that
 carry an older execution fingerprint remain visible with a revalidation label.
+Waiting versions show the last observed input or job issue, including missing
+source evidence, queued/running work, and exhausted validation slots or budget.
+The independent monitor records an outbox notice in the last ten minutes before today's open
+and checks again for missed signals in the first two minutes after the open.
+Identical notices are suppressed across restarts. Status can still show a miss
+later the same trading day if the runner missed the notification window.
 
 An imported dataset contains `bars` by symbol (day, timezone-aware open/close and
 availability timestamps, positive raw OHLCV), optional dated `features`, action
@@ -516,7 +522,12 @@ Lab joins them to the immutable previously accepted inputs. Check status for
 prospective and replayed session counts, the last validation, and remaining
 budget. With strict source evidence enabled, verify and import each snapshot
 offline before its validation deadline. The regular runner can reuse the saved
-check without reading the original files. Provider access and evidence
+check without reading the original files. The existing background worker reads
+and verifies the snapshot. Local and broker paper services poll the inbox even
+while the market is closed and the strategy is waiting for its next iteration.
+The runner retains the last scheduled identities for
+the data cache and inbox, including candidate state, policy and source proof.
+An unchanged input can be skipped after a rewrite or restart. Provider access and evidence
 collection remain the operator's responsibility.
 
 Use the selected account's observation journal to inspect the opening execution

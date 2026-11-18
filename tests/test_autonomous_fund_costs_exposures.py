@@ -87,6 +87,68 @@ def test_a_cost_cap_without_prices_is_refused_at_startup(tmp_path):
     assert configuration(path, environ={"FUND_MAX_DAILY_COST_USD": "2", "FUND_MODEL_PRICES_JSON": prices})
 
 
+def test_unset_optional_reservation_preserves_legacy_approval_policy_digest_input():
+    from scripts.autonomous_fund.strategy import ModelBudget
+
+    budget = ModelBudget(max_daily_cost_usd="1")
+    assert list(budget.policy_dict()) == ["max_agent_runs_per_day", "reserved_review_runs", "min_review_minutes",
+        "failure_backoff_minutes", "skip_quiet_reviews", "max_quiet_minutes", "max_daily_cost_usd", "cost_alert_share"]
+    with pytest.raises(RiskError, match="daily cost cap"):
+        ModelBudget(optional_call_reservation_usd="0.2")
+    assert ModelBudget(max_daily_cost_usd="1", optional_call_reservation_usd="0.2").policy_dict()[
+        "optional_call_reservation_usd"] == "0.2"
+
+
+def test_optional_model_reserves_before_request_and_retains_unknown_usage_across_restart(tmp_path):
+    from scripts.autonomous_fund.costs import optional_model_commitments
+    from scripts.autonomous_fund.research_budget import ResearchBudgetExhausted
+    from scripts.autonomous_fund.strategy import AutonomousFund, ModelBudget
+
+    strategy = harness(tmp_path, mode="local")
+    strategy.scripted = False
+    strategy.model_budget = ModelBudget(max_daily_cost_usd="1", optional_call_reservation_usd="0.6")
+    strategy.config = {"model_prices_per_million": PRICES}
+    strategy.agent_models = {"manager": "m/decide"}
+    calls = []
+
+    def run(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 2:
+            raise TimeoutError("simulated provider timeout")
+        return SimpleNamespace(model="m/decide", cache_hit=False, summary="", parse_error=None, parsed={"ok": 1},
+                               usage={"prompt_tokens": 100_000, "completion_tokens": 0})
+
+    strategy.agents = {"manager": SimpleNamespace(run=run)}
+    call = lambda purpose: AutonomousFund._agent_call(strategy, "manager", purpose=purpose)
+    strategy._record_agent("manager", call("shadow"))
+    with strategy.journal.connection() as db:
+        assert optional_model_commitments(db, NOW)["reserved_microusd"] == 0
+    with pytest.raises(TimeoutError):
+        call("stability")
+    from scripts.autonomous_fund.journal import Journal
+
+    with strategy.journal.connection() as db:
+        binding = db.execute("SELECT value FROM meta WHERE key='binding'").fetchone()[0]
+    journal = Journal(tmp_path, binding)
+    with journal.connection() as db:
+        assert optional_model_commitments(db, NOW) == {"reserved_microusd": 600_000, "running": 0, "unpriced": 1}
+    with pytest.raises(ResearchBudgetExhausted, match="before inference"):
+        call("shadow")
+    assert len(calls) == 2
+    assert call("decision").parsed == {"ok": 1}  # Primary decision uses the existing realized-cost guard.
+
+
+def test_model_budget_competing_call_with_earlier_clock_cannot_borrow_reserved_amount(tmp_path):
+    from scripts.autonomous_fund.costs import optional_model_commitments, reserve_optional_model_call
+
+    journal = harness(tmp_path, mode="local").journal
+    assert reserve_optional_model_call(journal, NOW + timedelta(seconds=1), "one", "shadow", "1", "0.6") is None
+    with journal.connection() as db:
+        assert optional_model_commitments(db, NOW)["running"] == 0  # The historical report has an exact cutoff.
+    denied = reserve_optional_model_call(journal, NOW, "two", "stability", "1", "0.6")
+    assert denied["running"] == 1 and denied["reserved_microusd"] == 600_000
+
+
 def test_the_status_line_states_the_break_even_in_plain_words():
     from scripts.autonomous_fund.status import cost_line
     line = cost_line({"calls": 3, "window_days": 30, "days_with_calls": 2, "today_usd": 1.0, "window_usd": 4.0,

@@ -1,37 +1,42 @@
 """Thin fund-owned bridge to the lab; cached reads only, no research order path."""
 import json
-from datetime import timedelta
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from threading import Event, Lock, Thread
 
 from .risk import instant, trading_day
-from .strategy_lab import load_snapshot
+from .session_calendar import completed_daily_cutoff, regular_session_open
+from .strategy_lab import has_source_artifact_receipt, load_snapshot
+from .strategy_validation import digest, snapshot_limitations
 
 
-def cached_snapshot(strategy, now):
-    """Reuse the existing data desk; never refetch history on the trading thread.
-
-    This cache has no original publication receipts, delisting completeness or
-    unadjusted-price guarantee. It is useful exploratory data, not admission proof.
-    """
-    lab, store = getattr(strategy, "strategy_lab", None), getattr(strategy, "daily_store", None)
-    if lab is None or store is None:
-        return None
+def _cache_symbols(strategy, rows):
+    cash = strategy.strategy_lab.policy.get("cash_symbol")
     requested = set()
-    for row in lab.rows():
+    for row in rows:
         if row["task_state"] != "open":
             continue
         proposal = json.loads(row["proposal"])
         requested.update(proposal["instruments"])
         requested.update(proposal.get("data_symbols", []))
         requested.add(proposal["validation"]["benchmark"])
-    if requested and lab.policy.get("cash_symbol"):
-        requested.add(lab.policy["cash_symbol"])
+    if requested and cash:
+        requested.add(cash)
+    # A model-supplied feature name is never a path to arbitrary local data.
+    return tuple(sorted(symbol for symbol in requested if (symbol in strategy.universe or symbol == cash)
+                        and not any(char in symbol for char in ("/", "\\", "\x00"))))
+
+
+def cached_snapshot(strategy, now, *, symbols=None):
+    """The existing daily cache is exploratory and carries no original provider receipts."""
+    lab, store = getattr(strategy, "strategy_lab", None), getattr(strategy, "daily_store", None)
+    if lab is None or store is None:
+        return None
+    symbols = _cache_symbols(strategy, lab.rows()) if symbols is None else symbols
     raw_bars = {}
-    for symbol in sorted(requested):
-        # Only operator-selected cache names, never a path from a model answer.
-        if (symbol not in strategy.universe and symbol != lab.policy.get("cash_symbol")) or any(
-                c in symbol for c in ("/", "\\", "\x00")):
-            continue
-        cached = store.get(trading_day(now), "bars/" + symbol)
+    day = trading_day(now)
+    for symbol in symbols:
+        cached = store.get(day, "bars/" + symbol)
         if cached and cached.get("rows"):
             raw_bars[symbol] = cached["rows"]
     if not raw_bars:
@@ -62,33 +67,94 @@ def cached_snapshot(strategy, now):
             "availability_estimate_reason": "Completed-session boundaries; original provider publication times are unavailable."}
 
 
-def tick(strategy):
+def prepare_inputs(strategy, now):
+    lab = strategy.strategy_lab
+    if strategy.halt_path.exists() or regular_session_open(now):
+        return
+    rows = lab.rows()
+    candidates = tuple((row["id"], row["version"], row["task_state"], row["state"] in {"shadow", "paper_active"})
+                       for row in rows if row["task_state"] == "open" or row["state"] in {"shadow", "paper_active"})
+    policy = lab.admission_policy["policy_hash"]
+    inbox = lab.journal.root / "strategy_lab_snapshot.json"
+    try:
+        stat = inbox.stat()
+    except FileNotFoundError:
+        stat = None
+    if stat is not None:
+        revision = (stat.st_ino, stat.st_mtime_ns, stat.st_size)
+        loaded = getattr(strategy, "_strategy_lab_inbox", None)
+        if loaded is None or loaded[0] != revision:
+            data = load_snapshot(inbox)
+            loaded = strategy._strategy_lab_inbox = revision, data, digest(data)
+        _, data, fingerprint = loaded
+        with lab.journal.connection() as db:
+            verified = lab.settings.require_source_artifacts and has_source_artifact_receipt(db, fingerprint, now)
+        receipt = revision, candidates, verified
+        if receipt != getattr(strategy, "_strategy_lab_inbox_receipt", None):
+            key = digest([fingerprint, candidates, verified, policy])
+            previous = lab.journal.get_meta("strategy_lab_last_intake", {})
+            if previous.get("schedule_key") != key:
+                lab.schedule(data, now)
+                gaps = snapshot_limitations(data, require_receipts=True)
+                if lab.settings.require_source_artifacts and not verified and not gaps:
+                    gaps = ["source_artifacts_unchecked"]
+                lab.journal.set_meta("strategy_lab_last_intake", {
+                    "at": instant(now).isoformat(), "coverage_gaps": gaps, "schedule_key": key})
+            strategy._strategy_lab_inbox_receipt = receipt
+
+    store = getattr(strategy, "daily_store", None)
+    if store is None:
+        return
+    symbols = _cache_symbols(strategy, rows)
+    day = trading_day(now)
+    cache = tuple((symbol, store.version(day, "bars/" + symbol)) for symbol in symbols)
+    receipt = day, completed_daily_cutoff(now), candidates, cache
+    if receipt != getattr(strategy, "_strategy_lab_cache_receipt", None):
+        data = cached_snapshot(strategy, now, symbols=symbols)
+        if data is not None:
+            content = digest([digest(data), candidates, policy])
+            if content != lab.journal.get_meta("strategy_lab_cache_content"):
+                lab.schedule(data, now)
+                lab.journal.set_meta("strategy_lab_cache_content", content)
+        strategy._strategy_lab_cache_receipt = receipt
+
+
+def tick(strategy, *, now=None):
     lab = getattr(strategy, "strategy_lab", None)
     if lab is None or strategy.observe_only or strategy.halt_path.exists() or strategy.mode not in {"local", "paper"}:
         return
-    now = strategy.get_datetime()
-    from .session_calendar import regular_session_open
-    if regular_session_open(now):
+    lock = strategy.__dict__.setdefault("_strategy_lab_tick_lock", Lock())
+    if not lock.acquire(blocking=False):
         return
-    previous = getattr(strategy, "_strategy_lab_tick_at", None)
-    if previous is not None and instant(now) - instant(previous) < timedelta(seconds=30):
-        return
-    strategy._strategy_lab_tick_at = now
     try:
-        data = cached_snapshot(strategy, now)
-        if data is not None:
-            lab.schedule(data, now)
+        now = instant(now if now is not None else strategy.get_datetime())
+        if regular_session_open(now):
+            return
+        previous = getattr(strategy, "_strategy_lab_tick_at", None)
+        if previous is not None and now - previous < timedelta(seconds=30):
+            return
+        if lab.kick(now, prepare=lambda checked: prepare_inputs(strategy, checked)):
+            strategy._strategy_lab_tick_at = now
     finally:
-        try:
-            # An account's adapter can atomically publish finished data. A
-            # newly registered candidate can use a previously delivered file.
-            inbox = lab.journal.root / "strategy_lab_snapshot.json"
-            if inbox.is_file():
-                stat = inbox.stat()
-                candidates = tuple((row["id"], row["version"]) for row in lab.rows() if row["task_state"] == "open")
-                receipt = stat.st_ino, stat.st_mtime_ns, stat.st_size, candidates
-                if receipt != getattr(strategy, "_strategy_lab_snapshot_receipt", None):
-                    lab.schedule(load_snapshot(inbox), now)
-                    strategy._strategy_lab_snapshot_receipt = receipt
-        finally:
-            lab.kick(now)
+        lock.release()
+
+
+@contextmanager
+def poll_live_inputs(strategy, *, enabled, interval=30):
+    """Wake the existing lab worker even while the broker waits for its next session."""
+    if not enabled:
+        yield
+        return
+    stopped = Event()
+
+    def poll():
+        while not stopped.wait(interval):
+            strategy._strategy_lab_tick(now=datetime.now(timezone.utc))
+
+    thread = Thread(target=poll, name="strategy-lab-input-poll", daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=2)

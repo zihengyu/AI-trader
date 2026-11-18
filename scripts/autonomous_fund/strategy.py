@@ -43,6 +43,9 @@ DEFAULT_SLIPPAGE = 0.0005
 CALL_PURPOSES = {"postmarket_review": "postmarket_review", "before_market_opens": "premarket_research",
                  "closed_startup": "premarket_research"}
 DEFAULT_PURPOSES = {"manager": "decision", "researcher": "research", "critic": "critique", "risk_reviewer": "risk_approval"}
+OPTIONAL_MODEL_PURPOSES = {"premarket_research", "research", "critique", "critique_correction", "triage", "stability", "shadow",
+                           "model_probe", "decision_correction", "postmarket_research_correction",
+                           "postmarket_reference_correction"}
 
 
 def targets_changed(previous, decision):
@@ -584,6 +587,8 @@ class ModelBudget:
     # A notice (never a trading stop) each time the fund's accrued model and data costs pass another
     # multiple of this share of its starting equity (fund_scoreboard); None turns it off.
     cost_alert_share: str | None = "0.02"
+    # Operator estimate for pre-call budget reservations on optional inference.
+    optional_call_reservation_usd: str | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "failure_backoff_minutes", tuple(self.failure_backoff_minutes))
@@ -607,6 +612,11 @@ class ModelBudget:
             object.__setattr__(self, "max_daily_cost_usd", str(self.max_daily_cost_usd))
             if not number("0") < number(self.max_daily_cost_usd) <= number("10000"):
                 raise RiskError("max_daily_cost_usd must be a positive amount up to 10000")
+        if self.optional_call_reservation_usd is not None:
+            amount = number(self.optional_call_reservation_usd)
+            if self.max_daily_cost_usd is None or not 0 < amount <= number(self.max_daily_cost_usd):
+                raise RiskError("optional_call_reservation_usd requires a daily cost cap and a positive amount within it")
+            object.__setattr__(self, "optional_call_reservation_usd", str(amount))
 
     @classmethod
     def from_config(cls, section):
@@ -615,6 +625,13 @@ class ModelBudget:
         if unknown:
             raise RiskError("Unknown model_budget settings: " + ", ".join(sorted(unknown)))
         return cls(**section)
+
+    def policy_dict(self):
+        settings = asdict(self)
+        # The new opt-in setting must not invalidate existing order approvals by default.
+        if self.optional_call_reservation_usd is None:
+            settings.pop("optional_call_reservation_usd")
+        return settings
 
 
 def _manager_run_timeout_seconds(config):
@@ -901,7 +918,7 @@ class AutonomousFund(Strategy):
         self.automation = AutomationSettings.from_config(config.get("automation"))
         self.policy_digest = hashlib.sha256(encode({
             "limits": asdict(self.limits), "quant": self.quant.digest, "approval": asdict(approval_policy),
-            "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
+            "execution": asdict(self.execution_policy), "model_budget": self.model_budget.policy_dict(),
             "mandate": asdict(self.mandate), "automation": asdict(self.automation),
             "universe": sorted(config["universe"].items())}).encode()).hexdigest()
         self._bars, self._estimates, self._notices, self._stress_cache = {}, {}, {}, {}
@@ -1114,7 +1131,7 @@ class AutonomousFund(Strategy):
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),
                            "automation": asdict(self.automation),
-                           "execution": asdict(self.execution_policy), "model_budget": asdict(self.model_budget),
+                           "execution": asdict(self.execution_policy), "model_budget": self.model_budget.policy_dict(),
                            "mandate": asdict(self.mandate),
                            "environment_overrides": config.get("_environment_overrides", [])})
         if mode == "local":
@@ -1558,10 +1575,10 @@ class AutonomousFund(Strategy):
             except Exception:
                 self.log_message("Strategy research receipt is pending; market research is retained.", color="yellow")
 
-    def _strategy_lab_tick(self):
+    def _strategy_lab_tick(self, *, now=None):
         try:
             from .strategy_lab_runtime import tick
-            tick(self)
+            tick(self, now=now)
         except Exception as exc:
             # A failed optional job must never skip account reconciliation,
             # protective exits, or invalidate otherwise valid market research.
@@ -2249,8 +2266,6 @@ class AutonomousFund(Strategy):
                 audit = {"status": audit.get("status"), "scope": "actual_trading_account_integrity_only"}
             kwargs["context"] = {**context, "ledger_audit": audit}
         key = uuid4().hex
-        if evaluation_calls is not None:
-            evaluation_calls.append(key)  # Exact scope, including failed/corrected attempts; never infer by proximity.
         # What the call is for (V2 4.3): its agent event and, once its result is used, its outcome share the id.
         phase = (kwargs.get("context") or {}).get("phase")
         purpose = purpose or CALL_PURPOSES.get(phase) or DEFAULT_PURPOSES.get(name, name)
@@ -2265,6 +2280,22 @@ class AutonomousFund(Strategy):
                 raise ResearchBudgetExhausted("Optional research budget is exhausted")
             self._current_call["research_reservation"] = reservation
             self._current_call["research_project"] = project
+        budget = getattr(self, "model_budget", None)
+        if (not self.scripted and getattr(self, "mode", None) in {"local", "paper"} and budget is not None
+                and budget.optional_call_reservation_usd is not None and purpose in OPTIONAL_MODEL_PURPOSES):
+            from .costs import reserve_optional_model_call
+
+            now = self.get_datetime()
+            denied = reserve_optional_model_call(self.journal, now, key, purpose, budget.max_daily_cost_usd,
+                                                  budget.optional_call_reservation_usd)
+            if denied is not None:
+                if self._current_call.get("research_reservation"):
+                    lab.budget.settle(reservation, now, 0, {"call_id": key, "source": "model_budget_preflight_skip"})
+                self._current_call = None
+                self._disclose("optional_model_budget_exhausted", denied)
+                raise ResearchBudgetExhausted("Optional model cost budget is exhausted before inference")
+        if evaluation_calls is not None:
+            evaluation_calls.append(key)  # Exact scope, including failed/corrected attempts.
         # Triage has its own counter: it must never use up the runs the manager's decisions need.
         self.journal.counter(run_counter, self.get_datetime(), 1)
         model = getattr(self, "agent_models", {}).get(name) or (

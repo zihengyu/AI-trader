@@ -533,28 +533,38 @@ class StrategyLab:
         self.sync_registry(finished)
         return result
 
-    def kick(self, now):
+    def _has_pending_jobs(self):
+        with self.journal.connection() as db:
+            return bool(db.execute("SELECT 1 FROM fund_strategy_jobs j JOIN fund_strategy_versions v "
+                "ON v.id=j.strategy_id AND v.version=j.version WHERE j.state IN ('queued','running') "
+                "AND v.policy_hash=? AND (v.task_state='open' OR v.state IN ('shadow','paper_active')) LIMIT 1",
+                (self.admission_policy["policy_hash"],)).fetchone())
+
+    def kick(self, now, *, prepare=None):
         if self._future is not None and not self._future.done():
             return False
         if self._future is not None:
             # Surface errors instead of silently abandoning a background task.
             previous, self._future = self._future, None
             previous.result()
-        with self.journal.connection() as db:
-            if not db.execute("SELECT 1 FROM fund_strategy_jobs WHERE state IN ('queued','running') LIMIT 1").fetchone():
-                return False
+        if prepare is None and not self._has_pending_jobs():
+            return False
         if self._executor is None:
             self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="strategy-lab")
-        self._future = self._executor.submit(self._drain, instant(now), monotonic())
+        self._future = self._executor.submit(self._drain, instant(now), monotonic(), prepare=prepare)
         return True
 
-    def _drain(self, now, started=None):
+    def _drain(self, now, started=None, *, prepare=None):
         started = monotonic() if started is None else started
-        for _ in range(self.settings.max_jobs_per_day):
-            # A later job must not reuse the first claim's clock and publish
-            # an earlier receipt simply because it took less time to finish.
-            if self.run_one(now + timedelta(seconds=monotonic() - started)) is None:
-                break
+        try:
+            if prepare is not None:
+                prepare(now + timedelta(seconds=monotonic() - started))
+        finally:
+            if prepare is None or self._has_pending_jobs():
+                for _ in range(self.settings.max_jobs_per_day):
+                    # Each claim uses its actual elapsed time within the batch.
+                    if self.run_one(now + timedelta(seconds=monotonic() - started)) is None:
+                        break
 
     def context(self, now, *, detail_limit=4, strategy_id=None, version=None):
         candidates = []

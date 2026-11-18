@@ -481,6 +481,12 @@ def summary(root, mode, now=None):
     if line:
         lines.append(line)
     with closing(sqlite3.connect(book.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+        from .costs import optional_model_commitments
+
+        commitments = optional_model_commitments(db, now)
+        if commitments["reserved_microusd"]:
+            lines.append(f"可选模型费用预留：${commitments['reserved_microusd'] / 1e6:.2f}"
+                         f"（{commitments['running']} 次未回执，{commitments['unpriced']} 次费用未知）")
         failure = db.execute("SELECT at,body FROM events WHERE kind='operation_error' ORDER BY sequence DESC LIMIT 1").fetchone()
         age = _age(failure[0], now) if failure else None
         if age is not None and age > 86400:

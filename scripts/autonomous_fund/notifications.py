@@ -102,7 +102,8 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
                 "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body",
-                "holding_without_market_data", "quote_quality_error"}
+                "holding_without_market_data", "quote_quality_error", "strategy_lab_open_pending", "strategy_lab_open_missed",
+                "optional_model_budget_exhausted"}
 
 
 REGIME_TEXT = {"up_calm": "上涨·平稳", "up_volatile": "上涨·波动大", "down_calm": "下跌·平稳",
@@ -895,6 +896,19 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "model_cost_budget_exhausted" and isinstance(details, dict):
         text = (f"ℹ️ 今日模型费用已到上限（约 ${details.get('cost_usd')} / ${details.get('limit_usd')}）："
                 "当天不再发起新决策、反方审查、例外风控审批和盘前研究；已有目标和止损照常执行，明天恢复。")
+    elif kind == "optional_model_budget_exhausted" and isinstance(details, dict):
+        reserved = (details.get("reserved_microusd") or 0) / 1e6
+        text = (f"💸 可选模型调用已跳过（{details.get('purpose')}）。今日已计费 ${details.get('known_usd')}，"
+                f"待结算预留 ${reserved:.2f}（{details.get('unpriced')} 次费用未知），"
+                f"本次预留 ${details.get('requested_usd')}，日上限 ${details.get('limit_usd')}。")
+    elif kind in {"strategy_lab_open_pending", "strategy_lab_open_missed"} and isinstance(details, dict):
+        from .lab import FORWARD_REASON_TEXT
+
+        title = "开盘前仍待留证" if kind == "strategy_lab_open_pending" else "已错过开盘留证"
+        versions = details.get("versions") or {}
+        summary = "\n".join(f"• {key}：{FORWARD_REASON_TEXT.get(reason, reason)}"
+                            for key, reason in list(versions.items())[:10])
+        text = f"⚠️ 策略实验室{title}（{_when(details['open_at'])}，{len(versions)} 个版本）\n{summary}"
     elif kind == "fund_cost_alert" and isinstance(details, dict):
         spent = (details.get("model_usd") or 0) + (details.get("data_usd") or 0)
         text = (f"💸 AI 和数据费用累计已占起始资金 {_percent(details.get('share'))}（${spent:.2f}，"

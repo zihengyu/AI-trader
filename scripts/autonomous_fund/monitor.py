@@ -13,7 +13,7 @@ import requests
 
 from .execution import EXECUTION_REVISION, approval_code, operator_connection, resolve_approval
 from .journal import NOTIFICATION_KIND, encode, notification_body
-from .risk import RiskError, instant
+from .risk import RiskError, instant, trading_day
 
 
 DECISION_GRACE_MINUTES = 90  # After the open, the first valid decision is expected within this.
@@ -364,6 +364,8 @@ class Monitor:
                     "session_date": packet["session_date"]}})))
             self._queue_weekly(db, reviews, now)
             self._queue_fill_updates(db, now)
+            if state == "healthy":
+                self._queue_lab_deadline(db, now)
             # Drop stale first-start alerts; retain recent requests and failures.
             # Persist future notices as deferred outbox work, so their event
             # position cannot block a later, already-due watchdog alert.
@@ -445,6 +447,23 @@ class Monitor:
     def _week_ends(self, day):
         """True when `day` is the last NYSE session of its ISO week (cached; holidays and early weeks included)."""
         return self._week_calendar(day)[0]
+
+    def _queue_lab_deadline(self, db, now):
+        from .session_calendar import _session_bounds
+
+        opened, _ = _session_bounds(trading_day(now))
+        if opened is None or not timedelta(minutes=-10) <= now - opened < timedelta(minutes=2):
+            return
+        from .lab import queue_forward_notice
+
+        db.execute("SAVEPOINT lab_deadline")
+        try:
+            queue_forward_notice(db, now, opened)
+        except Exception:
+            db.execute("ROLLBACK TO lab_deadline")
+            _disclose_build_failure("strategy_lab_deadline", "poll")
+        finally:
+            db.execute("RELEASE lab_deadline")
 
     def _queue_fill_updates(self, db, now):
         """Recover confirmed-fill notices once a coherent post-fill account exists."""

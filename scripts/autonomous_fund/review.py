@@ -344,9 +344,9 @@ def _save_once(journal, now, kind, packet):
     return packet
 
 
-def _run_stage(strategy, name, **kwargs):
+def _run_stage(strategy, name, *, purpose=None, **kwargs):
     if hasattr(strategy, "_agent_call"):
-        return strategy._agent_call(name, **kwargs)
+        return strategy._agent_call(name, **({"purpose": purpose} if purpose else {}), **kwargs)
     try:
         return strategy.agents[name].run(**kwargs)
     except Exception as exc:
@@ -479,7 +479,8 @@ def review_after_close(strategy):
         for attempt in range(2):
             if attempt and hasattr(strategy, "_with_fund_cost_context"):
                 research_context = strategy._with_fund_cost_context(research_context, strategy.get_datetime())
-            result = _run_stage(strategy, "researcher", task_prompt=research_prompt,
+            result = _run_stage(strategy, "researcher", purpose="postmarket_research_correction" if attempt else None,
+                                task_prompt=research_prompt,
                                 context=research_context, output_schema=Research)
             try:
                 research = strategy._record_agent("researcher", result, phase="postmarket_review")
@@ -600,7 +601,8 @@ def review_after_close(strategy):
                 "ref": "context:fund_costs", "context_path": "fund_costs",
                 "input_as_of": context["fund_costs"]["as_of"]}]
             context["evidence_catalog"] = catalog
-        result = _run_stage(strategy, "manager", task_prompt=manager_prompt, context=context,
+        result = _run_stage(strategy, "manager", purpose="postmarket_reference_correction" if attempt else None,
+                            task_prompt=manager_prompt, context=context,
                             output_schema=PostmarketReview)
         review = PostmarketReview.model_validate(
             strategy._record_agent("manager", result, phase="postmarket_review")).model_dump()

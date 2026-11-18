@@ -194,7 +194,8 @@ def run_paper(args, config):
     trader.add_strategy(strategy)
     try:
         from .monitor import RunnerHeartbeat
-        with RunnerHeartbeat(args.run_dir):
+        from .strategy_lab_runtime import poll_live_inputs
+        with RunnerHeartbeat(args.run_dir), poll_live_inputs(strategy, enabled=(config.get("strategy_lab") or {}).get("enabled", True)):
             trader.run_all()
     finally:
         strategy.journal.export()
@@ -297,7 +298,10 @@ def run_local(args, config):
     trader = Trader()
     trader.add_strategy(strategy)
     try:
-        trader.run_all(run_once=args.once)
+        from .strategy_lab_runtime import poll_live_inputs
+        poll_lab = not (args.once or args.observe_only) and (config.get("strategy_lab") or {}).get("enabled", True)
+        with poll_live_inputs(strategy, enabled=poll_lab):
+            trader.run_all(run_once=args.once)
     finally:
         if tape is not None:
             tape.close()
