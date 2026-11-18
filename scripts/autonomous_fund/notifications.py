@@ -628,6 +628,31 @@ def _when(value):
             f" · 本地 {moment.astimezone():%m-%d %H:%M}")
 
 
+def _plan_status(execution):
+    if execution["orders"]:
+        count, filled = execution["orders"], execution["filled"]
+        phase = f"已送单 {count} 笔"
+        if filled == count:
+            phase += "，已提交订单均已成交"
+        elif execution["orders_with_fill"]:
+            phase += f"，部分成交（{filled} 笔全部成交）"
+        if execution["terminal"]:
+            phase += f"，{execution['terminal']} 笔撤单或终结"
+        if execution["complete"]:
+            phase += "，目标处理完毕"
+    elif execution["complete"]:
+        phase = "目标处理完毕，无需下单"
+    else:
+        phase = "尚未记录送单"
+    if not execution["complete"] and execution["expired"]:
+        phase += "，计划已过期"
+    lines = [f"执行状态（{_when(execution['at'])}）{phase}。"]
+    if not execution["complete"] and not execution["session_open"] and execution.get("next_open"):
+        opening = "仍在有效期内，须重新核对" if execution["valid_at_next_open"] else "届时已过期，须重新决策"
+        lines.append(f"当前休市。下一次开盘 {_when(execution['next_open'])}，计划{opening}。")
+    return lines
+
+
 def _stop_text(stop):
     from . import stops
     from .status import CLASSES, REASONS
@@ -707,6 +732,8 @@ def readable(kind, details, sequence=None, *, now=None):
         if details.get("level_changes") and details.get("weight_changed") is False:
             header = "🧭 AI 更新交易价位"
         lines = [f"{header}（{_when(details.get('at'))}）", "以下权重与上次通知的目标相比。实际交易以成交更新为准。"]
+        if execution := details.get("execution_status"):
+            lines.extend(_plan_status(execution))
         for label, rows in (("目标上调", [r for r in changes if float(r["to"]) > float(r["from"])]),
                             ("目标下调", [r for r in changes if float(r["to"]) < float(r["from"])]),
                             ("不变", [r for r in changes if float(r["to"]) == float(r["from"])])):

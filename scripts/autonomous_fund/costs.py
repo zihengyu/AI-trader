@@ -126,6 +126,8 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
     calls = [row for row in calls if start is None or start <= instant(row["at"]) <= now]
     models = {r["body"].get("model") for r in calls}
     by_day, by_role, unpriced, reasons, tokens = {}, {}, 0, {}, {"input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0}
+    today = now.astimezone(zone).date().isoformat() if now is not None else None
+    today_purposes, missing_details = {}, {}
     for row in calls:
         at = instant(row["at"])
         body = row["body"]
@@ -135,16 +137,24 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
         cost = body.get("cost_usd")
         if cost is None and usage_known(body.get("usage")):
             cost = call_cost(counts, rate_for(prices, body.get("model"), len(models)))
+        day = at.astimezone(zone).date().isoformat()
+        role = body.get("name") or "unknown"
+        purpose = body.get("purpose") or body.get("phase") or role
+        if day == today:
+            item = today_purposes.setdefault(purpose, {"calls": 0, "known_usd": 0.0, "unpriced_calls": 0})
+            item["calls"] += 1
+            item["unpriced_calls"] += int(cost is None)
+            if cost is not None:
+                item["known_usd"] += cost
         if cost is None:
             unpriced += 1
             reason = unpriced_reason(body)
             reasons[reason] = reasons.get(reason, 0) + 1
+            key = (body.get("model") or "unknown", purpose, reason)
+            missing_details[key] = missing_details.get(key, 0) + 1
             continue
-        day = at.astimezone(zone).date().isoformat()
         by_day[day] = by_day.get(day, 0.0) + cost
-        role = body.get("name") or "unknown"
         by_role[role] = by_role.get(role, 0.0) + cost
-    today = now.astimezone(zone).date().isoformat() if now is not None else None
     per_day = sum(by_day.values()) / len(by_day) if by_day else None
     annual = per_day * TRADING_DAYS if per_day is not None else None
     equity = float(equity) if equity else None
@@ -154,6 +164,10 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
         "window_usd": round(sum(by_day.values()), 4), "days_with_calls": len(by_day),
         "by_day_usd": {d: round(v, 4) for d, v in sorted(by_day.items())},
         "by_role_usd": {r: round(v, 4) for r, v in sorted(by_role.items())},
+        "today_by_purpose": {key: {**item, "known_usd": round(item["known_usd"], 4)}
+                             for key, item in sorted(today_purposes.items())},
+        "unpriced_details": [{"model": model, "purpose": purpose, "reason": reason, "calls": count}
+                             for (model, purpose, reason), count in sorted(missing_details.items())],
         "average_per_day_usd": round(per_day, 4) if per_day is not None else None,
         "annual_pace_usd": round(annual, 2) if annual is not None else None,
         "break_even_excess_return": round(annual / equity, 5) if annual is not None and equity else None,

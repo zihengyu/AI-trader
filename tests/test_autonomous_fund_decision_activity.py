@@ -156,3 +156,30 @@ def test_notification_id_opens_only_its_linked_order_timeline(tmp_path):
     assert "09:33:00 申请撤单重报" in text
     assert "09:34:00 模拟券商确认撤单（order_expired）" in text
     assert "09:35:00" not in text and "09:40:00 事件" not in text
+
+
+def test_target_notice_reports_only_visible_orders_and_fills_from_its_plan(tmp_path):
+    from scripts.autonomous_fund.execution import ExecutionState
+    from scripts.autonomous_fund.monitor import Monitor
+    from .test_autonomous_fund_monitor import FakeTelegram
+
+    book = Journal(tmp_path, "synthetic-notice-account")
+    ExecutionState(book)
+    expiry = OPEN + timedelta(minutes=10)
+    at, key = plan(book, 0)
+    with book.connection() as db:
+        db.execute("INSERT INTO fund_decisions VALUES(?,?,?,?,?,?)",
+                   (key, at.isoformat(), expiry.isoformat(), "{}", "test", "active"))
+    for seconds, kind, item in (
+        (10, "order_submitted", {"decision_id": "unrelated", "broker_id": "other", "kind": "allocation", "quantity": "3"}),
+        (20, "order_submitted", {"decision_id": key, "broker_id": "mine", "kind": "allocation", "quantity": "3"}),
+        (40, "fill", {"broker_id": "mine", "symbol": "ALFA", "side": "sell", "quantity": "1", "price": "10"}),
+        (50, "fill_reconciled", {"broker_id": "mine", "symbol": "ALFA", "side": "sell", "quantity": "3", "price": "10"}),
+    ):
+        book.event(at + timedelta(seconds=seconds), kind, item)
+    monitor = Monitor(tmp_path, FakeTelegram())
+    notice = {"kind": "decision_changed", "details": {"at": at.isoformat(), "decision_id": key}}
+    for seconds, expected in ((15, "尚未记录送单"), (25, "已送单 1 笔"), (45, "部分成交"),
+                              (55, "已提交订单均已成交"), (601, "计划已过期")):
+        outgoing = monitor._outgoing(notice, 1, "", at + timedelta(seconds=seconds))
+        assert outgoing[0] == "text" and expected in outgoing[1]

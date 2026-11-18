@@ -271,6 +271,15 @@ def cost_line(costs):
     if costs.get("unpriced_calls"):
         text += f"（另有 {costs['unpriced_calls']} 次调用没有单价或完整用量，未计入"
         text += f"：{detail}）" if detail else "）"
+    purposes = costs.get("today_by_purpose") or {}
+    if purposes:
+        today = sorted(purposes, key=lambda key: (-purposes[key]["known_usd"], key))
+        entries = [f"{key} ${purposes[key]['known_usd']:.2f}"
+                   + (f"（{purposes[key]['unpriced_calls']} 次未定价）" if purposes[key]["unpriced_calls"] else "")
+                   for key in today[:5]]
+        text += "。今日费用按用途 " + "、".join(entries)
+        if len(today) > 5:
+            text += f"，另 {len(today) - 5} 项见 report"
     return text
 
 

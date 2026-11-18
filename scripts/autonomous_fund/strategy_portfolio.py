@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 from .execution_quality import prior_cost_reference
 from .journal import encode
 from .risk import RiskError, instant, number
-from .scorecard import _exchange_sessions, _idea_session_close, _regime_interval
+from .scorecard import MIN_BETA_OBSERVATIONS, _exchange_sessions, _idea_session_close, _regime_interval
 from .strategy_portfolio_exposure import position_exposure
 from .strategy_validation import _daily_sessions, digest, following_session, metrics
 
@@ -205,6 +205,59 @@ def _paired_advantage(days, base, combined):
             "trailing_sessions_excluded": len(days) % width}
 
 
+def _benchmark_risk(db, days, paths, base, combined, candidate, now):
+    """Descriptive beta using a common raw benchmark from the frozen replay inputs."""
+    tapes, benchmarks = [], set()
+    for identity in paths:
+        proposal = db.execute("SELECT proposal FROM fund_strategy_versions WHERE id=? AND version=?", identity).fetchone()
+        snapshot = db.execute("SELECT f.at,d.body FROM fund_strategy_forward f JOIN fund_strategy_datasets d "
+                              "ON d.digest=json_extract(f.body,'$.frozen_dataset_hash') "
+                              "WHERE f.id=? AND f.version=? AND f.day=?", (*identity, days[-1])).fetchone()
+        if not proposal or not snapshot or instant(snapshot[0]) > now:
+            return {"status": "missing_frozen_benchmark"}
+        benchmark = json.loads(proposal[0]).get("validation", {}).get("benchmark")
+        benchmarks.add(benchmark)
+        if not benchmark or len(benchmarks) > 1:
+            return {"status": "different_benchmarks"}
+        try:
+            bars = json.loads(snapshot[1])["bars"][benchmark]
+            covered = [(bar["day"], float(number(bar["close"]))) for bar in bars
+                       if bar["day"] <= days[-1] and instant(bar["available_at"]) <= now]
+            if not all(math.isfinite(close) and close > 0 for _, close in covered):
+                return {"status": "invalid_frozen_benchmark"}
+            sessions = _daily_sessions(covered[0][0], days[-1])
+            previous = {next_day: day for (day, _, _), (next_day, _, _) in zip(sessions, sessions[1:])}
+            closes = dict(covered)
+            tapes.append({day: closes[day] / closes[previous[day]] - 1 for day in days
+                          if day in closes and previous.get(day) in closes})
+        except (ArithmeticError, KeyError, IndexError, TypeError, ValueError):
+            return {"status": "missing_frozen_benchmark"}
+    benchmark = benchmarks.pop()
+    close_days = [day for day in days if all(day in tape for tape in tapes)]
+    covered = {"benchmark": benchmark, "matched_sessions": len(close_days), "evaluation_sessions": len(days)}
+    if any(not math.isclose(tapes[0][day], tape[day], rel_tol=1e-9, abs_tol=1e-12)
+           for day in close_days for tape in tapes[1:]):
+        return {**covered, "status": "conflicting_benchmark_receipts"}
+    if len(close_days) < MIN_BETA_OBSERVATIONS:
+        return {**covered, "status": "insufficient_benchmark_sessions"}
+    market = [tapes[0][day] for day in close_days]
+    variance = statistics.variance(market)
+    if not math.isfinite(variance) or variance <= RETURN_EPSILON ** 2:
+        return {**covered, "status": "undefined_benchmark_beta"}
+    shared = set(close_days)
+    indexes = [i for i, day in enumerate(days) if day in shared]
+    actual = [base[i] for i in indexes]
+    candidate_values = [paths[candidate][day] for day in close_days]
+    try:
+        correlation = statistics.correlation(actual, candidate_values)
+    except statistics.StatisticsError:
+        correlation = None
+    return {**covered, "status": "observed", "base_beta": statistics.covariance(actual, market) / variance,
+            "combined_beta": statistics.covariance([combined[i] for i in indexes], market) / variance,
+            "candidate_beta": statistics.covariance(candidate_values, market) / variance,
+            "candidate_base_correlation": correlation}
+
+
 def _cost_stress(days, paths, weights, fee, slippage, base_return, combined_return):
     """Hold the base at declared costs and stress transfers in the combined arm."""
     initial = combined_return - base_return
@@ -273,13 +326,17 @@ def evaluate_studies(db, now):
             except (ArithmeticError, RiskError):
                 result["status"] = "unusable_portfolio_path"
             else:
-                paired = _paired_advantage(days, arms["base"].pop("daily_returns"), arms["combined"].pop("daily_returns"))
+                base_daily, combined_daily = arms["base"].pop("daily_returns"), arms["combined"].pop("daily_returns")
+                paired = _paired_advantage(days, base_daily, combined_daily)
                 stress = _cost_stress(days, paths, scaled["combined"], fee, slippage,
                                       arms["base"]["net_return"], arms["combined"]["net_return"])
                 exposure = position_exposure(db, days, paths, scaled, _identity(plan["candidate"]), now)
+                benchmark_risk = _benchmark_risk(db, days, paths, base_daily, combined_daily,
+                                                _identity(plan["candidate"]), now)
                 result.update(status="observed" if len(days) >= CALIBRATION_SESSIONS else "limited_sample",
                               evaluation_sessions=len(days), evaluation_end=days[-1], **arms,
                               paired_advantage=paired, transfer_cost_stress=stress, position_exposure=exposure,
+                              benchmark_risk=benchmark_risk,
                               incremental_net_return=arms["combined"]["net_return"] - arms["base"]["net_return"],
                               change_in_max_drawdown=arms["combined"]["max_drawdown"] - arms["base"]["max_drawdown"])
         elif days or now > _idea_session_close(start):

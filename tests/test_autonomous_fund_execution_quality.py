@@ -40,6 +40,23 @@ def fill(db, key="a", side="buy", quantity=10, price=101, fee=1, seconds=1, exec
         "trade_cost": fee, "execution_id": execution}, seconds)
 
 
+def test_new_native_clocks_measure_each_stage_and_keep_unfilled_orders_in_ack_sample():
+    with database() as db:
+        ev(db, "startup", {"mode": "local"})
+        ev(db, "decision_accepted", {"id": "planned"}, 1)
+        for key in ("order-one", "order-two"):
+            ev(db, "order_submitted", {"intent_id": key, "broker_id": key, "kind": "allocation",
+               "symbol": "ALFA", "quantity": 10, "side": "buy", "decision_id": "planned",
+               "send_at": (NOW + timedelta(seconds=3)).isoformat()}, 5)
+        fill(db, key="order-one", seconds=11)
+        metrics = analyze(db, NOW + timedelta(seconds=12))["groups"]["local"]
+    assert metrics["stage_latency"] == {
+        "decision_to_send": {"samples": 2, "p95_seconds": 2},
+        "send_to_ack": {"samples": 2, "p95_seconds": 2},
+        "send_to_first_fill": {"samples": 1, "p95_seconds": 8},
+    }
+
+
 def test_notional_weighted_buy_sell_shortfall_and_known_fees_are_separate_from_spread():
     db = database()
     ev(db, "startup", {"mode": "local"})

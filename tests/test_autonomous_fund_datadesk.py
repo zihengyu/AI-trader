@@ -606,6 +606,55 @@ def test_the_economic_calendar_keeps_the_market_moving_releases_and_needs_a_fred
         "Employment Situation", "Consumer Price Index", "FOMC meeting decision with economic projections"]
 
 
+def test_calendar_rechecks_issuer_pages_without_refetching_the_schedule(tmp_path):
+    from scripts.autonomous_fund.macro_releases import SOURCES
+    when = datetime.fromisoformat("2026-11-10T08:25:00-05:00")
+    calls = []
+    retail_attempt = 0
+
+    def get(url, **kwargs):
+        nonlocal retail_attempt
+        calls.append(url)
+        if url == SOURCES[0][1]:
+            retail_attempt += 1
+            if retail_attempt == 1:
+                raise TimeoutError("synthetic issuer timeout")
+            day = 9 if retail_attempt == 2 else 10
+            html = (f"<h4>FOR IMMEDIATE RELEASE: Tuesday, November {day}, 2026</h4>"
+                    "<div><strong>Advance Estimates of U.S. Retail and Food Services</strong><br />"
+                    "Advance estimates of U.S. retail and food services sales increased in the fixture.</div>")
+            return SimpleNamespace(raise_for_status=lambda: None, text=html)
+        if url == SOURCES[1][1]:
+            return SimpleNamespace(raise_for_status=lambda: None, text="<p>unexpected issuer layout</p>")
+        if "fomccalendars" in url:
+            return SimpleNamespace(raise_for_status=lambda: None, text=FED_PAGE)
+        releases = [{"release_id": 1, "release_name": "Advance Monthly Sales for Retail and Food Services", "date": "2026-11-10"},
+                    {"release_id": 2, "release_name": "Industrial Production and Capacity Utilization", "date": "2026-11-10"}]
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {"release_dates": releases})
+
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: when,
+                    environ={"FRED_API_KEY": "synthetic"}, calendar_get=get)
+
+    def state():
+        desk._job_calendar(when)
+        items = desk.store.get("2026-11-10", "econ_calendar")["releases"]
+        return {item["release_id"]: item for item in items if "release_id" in item}
+
+    assert state()[1]["publication_status"] == "scheduled"
+    when += timedelta(minutes=5)
+    assert state()[1]["publication_status"] == "fetch_failed"
+    when += timedelta(minutes=5)
+    assert state()[1]["publication_status"] == "unconfirmed"
+    when += timedelta(minutes=5)
+    assert state()[1]["publication_status"] == "confirmed"
+    when += timedelta(minutes=40)
+    result = state()
+    assert "summary" in result[1] and "error" not in result[1]
+    assert result[2]["publication_status"] == "fetch_failed"
+    assert calls.count(SOURCES[0][1]) == 3
+    assert sum("api.stlouisfed.org" in url for url in calls) == 1
+
+
 def test_the_context_carries_premarket_before_and_early_in_the_session_and_upcoming_releases(tmp_path):
     strategy = runner(tmp_path)
     store = strategy.daily_store

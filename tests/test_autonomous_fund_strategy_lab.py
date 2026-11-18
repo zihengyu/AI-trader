@@ -103,6 +103,28 @@ def lab(tmp_path, **settings):
     return StrategyLab(journal, policy(), StrategyLabSettings(**settings))
 
 
+def test_offline_intake_preserves_the_runner_policy_and_checks_one_candidate(tmp_path):
+    from scripts.autonomous_fund.lab import check_data, open_lab
+    engine = lab(tmp_path, admission="paper_library", allocation_mode="validated_only", max_jobs_per_day=3)
+    engine.journal.event(NOW, "startup", {"strategy_lab_policy": engine.policy,
+                                         "research_budget": {"project_usd": "7"}})
+    engine.submit(proposal("selected"), NOW)
+    saved = engine.journal.get_meta("strategy_lab_policy")
+    offline = open_lab(tmp_path, {})  # The CLI's defaults differ from the running account.
+    assert offline.settings == engine.settings
+    assert offline.budget.settings.project_usd == "7"
+    assert engine.journal.get_meta("strategy_lab_policy") == saved
+    data = dataset()
+    valid = check_data(tmp_path, data, "selected", "v1", NOW)
+    assert valid["ready_for_validation_input"] and not valid["receipt_gaps"]
+    stale = {**data, "bars": {"BASE": data["bars"]["BASE"]}}
+    result = check_data(tmp_path, stale, "selected", "v1", NOW)
+    assert result["symbols_missing_from_this_snapshot"] == ["ALFA"]
+    assert result["receipt_gaps"] == ["snapshot_provenance_unbound"]
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_jobs").fetchone()[0] == 0
+
+
 def test_nonfactor_proposal_and_no_ideas_are_accepted_without_trading(tmp_path):
     from scripts.autonomous_fund.strategy import Research
     research = Research(summary="No new opportunity", evidence=[{
@@ -386,6 +408,7 @@ def test_research_task_cannot_promote_a_strategy(tmp_path):
 
 
 def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.lab import forward_readiness
     from scripts.autonomous_fund.strategy_admission import library, verify_allocations
     data = dataset(170)
     formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
@@ -399,6 +422,12 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     observed, result = forward_one_session_at_a_time(engine, dataset(210), 170, monkeypatch)
     assert result["observations"] == 40
     assert result["passed"] and engine.rows()[0]["state"] == "paper_active"
+    with engine.journal.connection() as db:
+        readiness = forward_readiness(db, observed + timedelta(seconds=10), engine.admission_policy)
+        assert readiness["ready"] == ["synthetic-research / v1"] and not readiness["waiting"]
+        previous = forward_readiness(db, observed + timedelta(seconds=10),
+                                     {**engine.admission_policy, "policy_hash": "new-policy"})
+        assert previous["previous_policy"] == ["synthetic-research / v1"] and not previous["ready"]
     comparison, = engine.context(observed + timedelta(seconds=10))["competition"]["strategies"]
     assert comparison["return_basis"] == "prospective"
     assert comparison["risk_matched"]["prospective_prefix_sessions"] == 40

@@ -250,6 +250,8 @@ MANAGER_PROMPT = (
     "During regular sessions research_status describes saved premarket research and its original times. "
     "It may be unavailable, invalid or from a previous session. Continue your own assessment with "
     "current read-only tools; verify material claims and disclose gaps in your rationale. "
+    "For economic releases, use the desk's confirmed issuer result when available, with its observation time. "
+    "A scheduled date, an unconfirmed result or a fetch failure leaves publication unknown. "
     "Missing research is not a reason to wait for the researcher, nor permission to invent evidence. "
     "Return the COMPLETE desired portfolio as targets of symbol and weight in [0,1]. "
     "Omitted positions are to be liquidated, an empty list means all cash. "
@@ -1101,6 +1103,7 @@ class AutonomousFund(Strategy):
                            "cash_management_symbol": self.cash_sweep.symbol if self.cash_sweep else None,
                            "comparison_protocol": self.comparison_protocol,
                            "strategy_lab_policy": self.strategy_lab.policy if self.strategy_lab is not None else None,
+                           "research_budget": asdict(self.strategy_lab.budget.settings) if self.strategy_lab is not None else None,
                            "performance": {"benchmarks": self.performance.definitions(),
                                            "data_costs_usd_per_month": self.performance.data_costs_usd_per_month},
                            "quant_risk": asdict(self.quant), "approval": asdict(approval_policy),

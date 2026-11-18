@@ -560,7 +560,7 @@ class DataDesk:
         if name == "global":
             return 1800 if is_open else (900 if local.weekday() < 5 else 4 * 3600)
         if name == "calendar":
-            return 6 * 3600
+            return (outcome or {}).get("next_poll_seconds", 6 * 3600)
         if name == "bars":
             return 900 if (outcome or {}).get("failed") else 3600
         if name == "snapshot":
@@ -809,6 +809,12 @@ class DataDesk:
         import requests
         get = self._gets["calendar"] or requests.get
         today = instant(now).astimezone(NEW_YORK).date()
+        stored = self.store.get(trading_day(now), "econ_calendar") or {}
+        stamp = stored.get("schedule_as_of")
+        if stamp and timedelta(0) <= instant(now) - instant(stamp) < timedelta(hours=6):
+            releases = stored["releases"]
+            return self._save_calendar(now, get, releases, stored["other_releases"], stored["fomc_unavailable"],
+                                       schedule_as_of=stamp, prior=releases)
         rows = []
         for page in range(5):  # Hundreds of releases a week: page through the window, at most 5000 rows.
             response = get(FRED_RELEASE_DATES, timeout=20, params={
@@ -830,14 +836,24 @@ class DataDesk:
         except Exception as exc:
             fomc, unavailable = [], str(exc)[:120] if isinstance(exc, RiskError) else type(exc).__name__
         releases = sorted(major + fomc, key=lambda r: (r["date"], r["release"]))
+        return self._save_calendar(now, get, releases, other, unavailable,
+                                   schedule_as_of=instant(now).isoformat(), prior=stored.get("releases", ()))
+
+    def _save_calendar(self, now, get, releases, other, unavailable, *, schedule_as_of, prior):
+        from .macro_releases import release_status
+        releases, retry = release_status(releases, now, get, self.clock, prior)
         self.store.put(trading_day(now), "econ_calendar", {
-            "as_of": instant(now).isoformat(), "window_days": CALENDAR_DAYS, "releases": releases,
+            "as_of": instant(now).isoformat(), "schedule_as_of": schedule_as_of,
+            "window_days": CALENDAR_DAYS, "releases": releases,
             "other_releases": other, "fomc_unavailable": unavailable,
             "source": "FRED release calendar (St. Louis Fed); FOMC meetings from federalreserve.gov",
-            "note": "Dates only, not verified publication timestamps. Check each release separately against "
-                    "its issuing agency's calendar and published result for the exact date and time. "
-                    "A missing desk headline does not mean the official release is unpublished."})
-        return {"major": len(major), "fomc": len(fomc), "other": other, "fomc_unavailable": unavailable}
+            "note": "Scheduled entries are dates. A confirmed release includes a dated issuer result and "
+                    "the desk's observation clock. Unconfirmed or failed issuer checks leave publication unknown."})
+        fomc = sum(item.get("source") == "federalreserve.gov FOMC calendar" for item in releases)
+        result = {"major": len(releases) - fomc, "fomc": fomc, "other": other, "fomc_unavailable": unavailable}
+        if retry < 6 * 3600:
+            result["next_poll_seconds"] = retry
+        return result
 
     def _job_macro(self, now):
         from .macro import MacroWatch

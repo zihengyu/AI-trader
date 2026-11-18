@@ -78,6 +78,30 @@ def test_frozen_risk_budget_removes_extra_market_exposure_on_new_dates(tmp_path,
     assert engine.journal.pending() == []
 
 
+def test_portfolio_uses_one_shared_frozen_benchmark_to_report_overlap(tmp_path, tape):
+    engine = lab(tmp_path)
+    market = [.012 if index % 2 == 0 else -.006 for index in range(len(tape))]
+    for key, scale in (("base", 1), ("candidate", 2)):
+        store(engine, key, tape, [scale * value for value in market])
+    data = dataset(len(tape))
+    close = 100
+    for row, change in zip(data["bars"]["BASE"], market):
+        close *= 1 + change
+        row["close"] = close
+    last, clock = tape[-1]
+    with engine.journal.connection() as db:
+        db.execute("INSERT INTO fund_strategy_datasets VALUES(?,?,?)", ("shared", clock.isoformat(), encode(data)))
+        db.execute("UPDATE fund_strategy_forward SET body=json_set(body,'$.frozen_dataset_hash','shared') WHERE day=?", (last,))
+    declare(engine, spec(), tape[25][1] + timedelta(hours=1))
+    study, = studies(engine, clock + timedelta(hours=1))
+    result = study["benchmark_risk"]
+    assert result["status"] == "observed"
+    assert result["base_beta"] == pytest.approx(1)
+    assert result["combined_beta"] == pytest.approx(1)
+    assert result["candidate_beta"] == pytest.approx(2)
+    assert result["candidate_base_correlation"] == pytest.approx(1)
+
+
 def closing_holdings(row, positions, *, unpaid=0):
     equity = number(row["net_economic_equity"]) + 12  # Separate previously incurred research expense.
     cash = equity - sum(positions.values()) * 100 - unpaid

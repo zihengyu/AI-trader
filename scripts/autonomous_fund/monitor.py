@@ -810,7 +810,14 @@ class Monitor:
             return (("text", message) if len(message) <= 4000 else
                     ("document", message[:900] + "\n完整理由见附件。", f"approval-{body['details']['id']}.txt", message))
         from .notifications import LONG_MESSAGE, readable
-        message = readable(body.get("kind"), body.get("details"), sequence, now=now) or text
+        kind, details = body.get("kind"), body.get("details")
+        if kind == "decision_changed" and isinstance(details, dict) and details.get("decision_id"):
+            from .decision_activity import plan_execution
+            with operator_connection(self.root) as db:
+                db.execute("BEGIN")
+                execution = plan_execution(db, details["decision_id"], now)
+            details = {**details, "execution_status": execution}
+        message = readable(kind, details, sequence, now=now) or text
         if len(message) <= LONG_MESSAGE:
             return ("text", message)
         # A long research text arrives whole, as a document.

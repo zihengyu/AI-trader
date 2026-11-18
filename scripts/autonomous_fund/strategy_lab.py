@@ -27,7 +27,7 @@ from .strategy_validation import (check_dataset, digest, following_session, impl
 
 
 class StrategyLab:
-    def __init__(self, journal, policy, settings=None, budget_settings=None):
+    def __init__(self, journal, policy, settings=None, budget_settings=None, *, publish_policy=True):
         self.journal, self.policy = journal, copy.deepcopy(policy)
         self.settings = settings or StrategyLabSettings()
         self.policy["research_execution"] = {"initial_capital": self.settings.initial_capital_usd,
@@ -67,7 +67,11 @@ class StrategyLab:
                     id TEXT NOT NULL, version TEXT NOT NULL, at TEXT NOT NULL,
                     dataset TEXT NOT NULL, sessions TEXT NOT NULL, PRIMARY KEY(id,version));
             """)
-        journal.set_meta("strategy_lab_policy", {**asdict(self.settings), "policy_hash": digest(self.policy)})
+        self.admission_policy = {**asdict(self.settings), "policy_hash": digest(self.policy)}
+        if publish_policy:
+            journal.set_meta("strategy_lab_policy", self.admission_policy)
+        elif journal.get_meta("strategy_lab_policy") != self.admission_policy:
+            raise RiskError("Offline research requires the current runner's frozen lab policy")
 
     @staticmethod
     def _event(db, key, version, now, kind, body):
@@ -450,7 +454,9 @@ class StrategyLab:
                 state = "paused"
             elif job["kind"] == "forward" and result.get("passed") and self.settings.admission == "paper_library" and (
                     result.get("observations", 0) >= self.settings.min_forward_sessions):
-                state = "paper_active"
+                current = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
+                if current and json.loads(current[0]) == self.admission_policy:
+                    state = "paper_active"
             db.execute("UPDATE fund_strategy_versions SET state=? WHERE id=? AND version=?",
                        (state, row["id"], row["version"]))
             self._event(db, row["id"], row["version"], finished,

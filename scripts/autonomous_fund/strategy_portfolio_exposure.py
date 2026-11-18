@@ -11,7 +11,7 @@ from .strategy_validation import digest
 RECONCILIATION_TOLERANCE = Decimal("1e-10")
 
 
-def _cash_symbols(db, identity):
+def _policy_exposures(db, identity):
     row = db.execute("SELECT policy,policy_hash FROM fund_strategy_versions WHERE id=? AND version=?",
                      identity).fetchone()
     policy = json.loads(row[0]) if row else None
@@ -20,7 +20,8 @@ def _cash_symbols(db, identity):
     symbols = {symbol for symbol, kind in policy["universe"].items() if kind == "cash_equivalent"}
     if policy.get("cash_symbol"):
         symbols.add(policy["cash_symbol"])
-    return symbols
+    groups = {name: frozenset(members) for name, _, members in policy.get("groups", ())}
+    return symbols, groups
 
 
 def _closing_book(raw, day, cash_symbols):
@@ -89,12 +90,15 @@ def position_exposure(db, days, paths, scaled, candidate, now):
     unavailable = {"status": "unavailable", "evaluation_sessions": len(days), "covered_sessions": 0}
     identities = scaled["combined"]
     try:
-        cash_symbols = {key: _cash_symbols(db, key) for key in identities}
+        policies = {key: _policy_exposures(db, key) for key in identities}
     except (TypeError, ValueError):
         return {**unavailable, "missing_by_reason": {"missing_or_inconsistent_policy": len(days)}}
     receipts = {key: {day: (at, raw) for day, at, raw in db.execute(
         "SELECT day,at,body FROM fund_strategy_forward WHERE id=? AND version=? AND day BETWEEN ? AND ?",
         (*key, days[0], days[-1]))} for key in identities}
+    first_groups = next(iter(policies.values()))[1]
+    shared_groups = {group: members for group, members in first_groups.items()
+                     if all(other.get(group) == members for _, other in policies.values())}
 
     missing, peak, latest = Counter(), {arm: 0.0 for arm in scaled}, None
     for day in days:
@@ -104,7 +108,7 @@ def position_exposure(db, days, paths, scaled, candidate, now):
                 at, raw = receipts[key][day]
                 if instant(at) > now:
                     raise ValueError("Closing holdings published after cutoff")
-                books[key] = _closing_book(raw, day, cash_symbols[key])
+                books[key] = _closing_book(raw, day, policies[key][0])
         except (ArithmeticError, KeyError, TypeError, ValueError):
             missing["missing_or_invalid_closing_book"] += 1
             continue
@@ -123,7 +127,14 @@ def position_exposure(db, days, paths, scaled, candidate, now):
         largest = [{"symbol": symbol, "base_weight": base_symbols.get(symbol, 0.0),
                     "combined_weight": combined_symbols.get(symbol, 0.0)}
                    for symbol in sorted(sizes, key=lambda symbol: (-sizes[symbol], symbol))[:5]]
-        latest = {"day": day, "base": base, "combined": combined, "largest_risk_securities": largest}
+        risk_groups = {
+            name: {"base_weight": math.fsum(base_symbols.get(symbol, 0.0) for symbol in members),
+                   "combined_weight": math.fsum(combined_symbols.get(symbol, 0.0) for symbol in members),
+                   "candidate_weight": math.fsum(sleeve_symbols[candidate].get(symbol, 0.0) for symbol in members)}
+            for name, members in shared_groups.items()
+            if members & (base_symbols.keys() | combined_symbols.keys())}
+        latest = {"day": day, "base": base, "combined": combined, "largest_risk_securities": largest,
+                  "risk_groups": risk_groups}
         for arm in scaled:
             peak[arm] = max(peak[arm], latest[arm]["max_single_security_weight"])
 

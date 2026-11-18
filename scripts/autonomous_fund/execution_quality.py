@@ -13,11 +13,11 @@ REFERENCE_LOOKBACK_DAYS = 90
 def analyze(db, until, *, since=None):
     cutoff = instant(until)
     start = instant(since) if since is not None else None
-    orders, callbacks, cumulative, states, modes = {}, {}, {}, {}, []
+    orders, callbacks, cumulative, states, modes, accepted = {}, {}, {}, {}, [], {}
     incomplete = set()
     conflicting = set()
     for seq, at, kind, raw in db.execute("SELECT sequence,at,kind,body FROM events WHERE kind IN "
-            "('startup','order_submitted','order_observed','fill','fill_reconciled','fill_details_unavailable') "
+            "('startup','decision_accepted','order_submitted','order_observed','fill','fill_reconciled','fill_details_unavailable') "
             "AND julianday(at)<=julianday(?) ORDER BY sequence", (cutoff.isoformat(),)):
         at = instant(at)
         if at > cutoff:
@@ -25,6 +25,9 @@ def analyze(db, until, *, since=None):
         body = json.loads(raw)
         if kind == "startup":
             modes.append((at, seq, body.get("mode", "unknown")))
+            continue
+        if kind == "decision_accepted":
+            accepted[body.get("id")] = at
             continue
         key = str(body.get("broker_id") or "")
         if not key:
@@ -75,7 +78,8 @@ def analyze(db, until, *, since=None):
             except (RiskError, TypeError, ValueError):
                 continue
     rows, groups, costs = [], {}, {}
-    for key, (submitted, sequence, body) in orders.items():
+    for key, (acknowledged, sequence, body) in orders.items():
+        submitted = acknowledged
         # Older order events can carry iteration-start time. The immutable send
         # preparation receipt is the more precise clock, including at cutoffs.
         prepared = submissions.get(body.get("intent_id"))
@@ -83,6 +87,13 @@ def analyze(db, until, *, since=None):
             if prepared > cutoff:
                 continue
             submitted = prepared
+        try:
+            sent = instant(body["send_at"])
+            if not (prepared or sent) <= sent <= acknowledged:
+                sent = None
+        except (KeyError, TypeError, ValueError):
+            sent = None
+        submitted = sent or submitted
         if start is not None and submitted < start:
             continue
         available_modes = [m for at, seq, m in modes if at <= submitted and seq <= sequence]
@@ -92,6 +103,13 @@ def analyze(db, until, *, since=None):
             "beyond_quote_usd": 0., "known_fees_usd": 0., "fees_unknown_orders": 0,
             "arrival_unknown_orders": 0, "invalid_fill_orders": 0, "first_fill_observation_seconds": []})
         group.setdefault("incomplete_fill_orders", 0)
+        stages = group.setdefault("stage_samples", {"decision_to_send": [], "send_to_ack": [],
+                                                    "send_to_first_fill": []})
+        if sent is not None:
+            stages["send_to_ack"].append((acknowledged - sent).total_seconds())
+            plan_at = accepted.get(body.get("decision_id"))
+            if plan_at is not None and plan_at <= sent and body.get("kind") == "allocation":
+                stages["decision_to_send"].append((sent - plan_at).total_seconds())
         evidence = costs.setdefault(mode, {"matched_orders": 0, "unclosed_quantity_orders": 0,
             "verified_executed_notional": number(0), "matched_executed_notional": number(0),
             "matched_arrival_notional": number(0), "fees": number(0), "shortfall": number(0), "max_quote_age_seconds": 0.})
@@ -148,6 +166,8 @@ def analyze(db, until, *, since=None):
         latency = (min(observed) - submitted).total_seconds()
         if latency >= 0:
             group["first_fill_observation_seconds"].append(latency)
+            if sent is not None:
+                stages["send_to_first_fill"].append(latency)
         fee = sum(fees) if all(f is not None for f in fees) else None
         executed_notional = sum(q * price for q, price in zip(quantities, prices))
         evidence["verified_executed_notional"] += executed_notional
@@ -162,7 +182,8 @@ def analyze(db, until, *, since=None):
         if quote is not None and quote[3] > submitted:
             quote = None
         row = {"broker_id": key, "mode": mode, "quantity": str(total), "fee_usd": float(fee) if fee is not None else None,
-               "submission_clock": "send_preparation_receipt" if prepared is not None else "legacy_order_event",
+               "submission_clock": ("native_send_start" if sent is not None else
+                                    "send_preparation_receipt" if prepared is not None else "legacy_order_event"),
                "filled_fraction": float(total / number(body["quantity"])),
                "first_fill_observation_seconds": latency if latency >= 0 else None}
         if quote is None:
@@ -197,6 +218,11 @@ def analyze(db, until, *, since=None):
         times = sorted(group.pop("first_fill_observation_seconds"))
         group["first_fill_observation_p95_seconds"] = times[max(0, (95 * len(times) + 99) // 100 - 1)] if times else None
         group["latency_samples"] = len(times)
+        group["stage_latency"] = {}
+        for stage, values in group.pop("stage_samples").items():
+            ordered = sorted(values)
+            group["stage_latency"][stage] = {"samples": len(ordered),
+                "p95_seconds": ordered[(95 * len(ordered) + 99) // 100 - 1] if ordered else None}
         sample = costs[mode]
         arrival = sample["matched_arrival_notional"]
         executed = sample["verified_executed_notional"]
@@ -215,7 +241,7 @@ def analyze(db, until, *, since=None):
             "meaning": "Notional-weighted implementation shortfall from recorded bid/ask, never order limits. "
                        "Cumulative fills replace callbacks; explicit execution IDs deduplicate callbacks. "
                        "Matched costs use only orders with both complete fees and reconciled filled quantity. "
-                       "Latency starts at send preparation where recorded, otherwise the legacy order-event clock; "
+                       "Latency starts at native send where recorded, then send preparation, then the legacy order-event clock; "
                        "it is time to observation, not exchange fill latency. Open/unfilled orders are censored. "
                        "Local and paper observations are separated; neither proves live impact/queue calibration."}
 
@@ -232,6 +258,13 @@ def lines(report):
         out.append(f"  未成交中已终结 {row['terminal_unfilled']}、仍挂单或状态未知 {row['open_or_unknown']}；"
                    f"成交明细不完整 {row.get('incomplete_fill_orders', 0)}，成交证据无效 {row['invalid_fill_orders']}，等待时间样本 {row['latency_samples']}，"
                    f"P95 {wait}。")
+        stages = row.get("stage_latency", {})
+        samples = [f"{label} {stages[key]['p95_seconds']:.2f} 秒（{stages[key]['samples']} 笔）"
+                   for key, label in (("decision_to_send", "决策到送单"), ("send_to_ack", "送单到回执"),
+                                      ("send_to_first_fill", "送单到首次成交观测"))
+                   if stages.get(key, {}).get("samples")]
+        if samples:
+            out.append("  分段耗时 P95 " + "，".join(samples) + "。")
         paired = row.get("matched_costs")
         if paired:
             coverage = paired["verified_notional_coverage"]

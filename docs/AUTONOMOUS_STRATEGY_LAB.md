@@ -258,6 +258,14 @@ security level, so an ETF appears as one security. The calculation does not
 estimate fund constituents, embedded leverage or factor exposures. The exposure
 report is research evidence for the Manager and operator.
 
+Frozen risk groups with matching membership across participating sleeves also report
+their closing shares in the base and combined arms. These groups can overlap.
+A separate descriptive panel shows the realized beta of both arms and the
+candidate against their common frozen raw-price benchmark, plus candidate-to-base
+return correlation. It requires at least 20 paired prospective return dates and
+reports the matched coverage. Conflicting benchmark observations, different
+benchmark definitions and a flat reference leave this panel unavailable.
+
 The cost sensitivity uses the same sessions and allocation scales. It keeps
 the base arm at its declared costs and adds 5, 10, 25, 50 and 100 basis points
 per dollar of combined-arm transfer. Each scenario replays the self-financing
@@ -409,6 +417,22 @@ Controlled import of an operator-owned snapshot and one deterministic job:
 python -m scripts.autonomous_fund.lab import-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json
 python -m scripts.autonomous_fund.lab run-once --run-dir artifacts/fund-local
 ```
+
+Offline imports and workers use the selected account's frozen lab and budget
+settings. The runner owns the published admission settings. Older startup
+records without a saved research budget use the supplied research-budget config.
+Use the following read-only check to review one candidate's snapshot before
+importing it.
+
+```bash
+python -m scripts.autonomous_fund.lab check-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json --strategy-id candidate-id --version v1
+```
+
+The check shows missing symbols, receipt gaps and benchmark session coverage.
+Daily incremental snapshots can omit data that was already frozen in the book.
+Lab status shows the next opening deadline, current versions awaiting timestamped
+signals, queued forward jobs and the remaining daily job slots. Versions that
+carry an older execution fingerprint remain visible with a revalidation label.
 
 An imported dataset contains `bars` by symbol (day, timezone-aware open/close and
 availability timestamps, positive raw OHLCV), optional dated `features`, action

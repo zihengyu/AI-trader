@@ -44,6 +44,9 @@ def test_the_summary_gives_daily_cost_the_annual_pace_and_the_break_even_excess_
     summary = cost_summary(rows, equity=10_000, now=NOW + timedelta(days=1))
     assert summary["today_usd"] == 1.0 and summary["window_usd"] == 4.0 and summary["days_with_calls"] == 2
     assert summary["by_role_usd"] == {"manager": 3.0, "researcher": 1.0} and summary["unpriced_calls"] == 1
+    assert summary["today_by_purpose"]["manager"] == {"calls": 2, "known_usd": 1.0, "unpriced_calls": 1}
+    assert summary["unpriced_details"] == [
+        {"model": "m/research", "purpose": "manager", "reason": "usage_incomplete", "calls": 1}]
     assert summary["annual_pace_usd"] == 504.0 and summary["break_even_excess_return"] == pytest.approx(0.0504)
     assert not summary["complete"]
 

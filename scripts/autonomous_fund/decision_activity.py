@@ -192,6 +192,50 @@ def _clock(value):
     return f"{instant(value).astimezone(ZONE):%m-%d %H:%M:%S}"
 
 
+def plan_execution(db, decision_id, now):
+    """Exact plan receipts visible to the sender at the time of delivery."""
+    now = instant(now)
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_decisions'").fetchone():
+        return None
+    plan = db.execute("SELECT accepted_at,until_at FROM fund_decisions WHERE id=?", (decision_id,)).fetchone()
+    if plan is None or instant(plan[0]) > now:
+        return None
+    since, until = plan
+    def events(kinds, field, key):
+        return [(at, kind, json.loads(body)) for at, kind, body in db.execute(
+            "SELECT at,kind,body FROM events WHERE kind IN (%s) AND julianday(at)>=julianday(?) "
+            "AND julianday(at)<=julianday(?) AND json_valid(body) AND json_extract(body,?)=? ORDER BY sequence"
+            % ",".join("?" * len(kinds)), (*kinds, since, now.isoformat(), "$." + field, key))
+                if instant(since) <= instant(at) <= now]
+
+    rows = events(("order_submitted", "allocation_complete"), "decision_id", decision_id)
+    orders = {body["broker_id"]: body for _, kind, body in rows
+              if kind == "order_submitted" and body.get("kind") == "allocation" and body.get("broker_id")}
+    complete = any(kind == "allocation_complete" for _, kind, _ in rows)
+    filled = terminal = observed_fill = 0
+    for key, order in orders.items():
+        observations = events(("fill", "fill_reconciled", "order_observed", "local_order_canceled"), "broker_id", key)
+        reported = {}
+        for _, kind, item in observations:
+            if kind in {"order_observed", "local_order_canceled"}:
+                reported[kind] = item
+        status = reported.get("order_observed", {}).get("status")
+        terminal += int("local_order_canceled" in reported or status in {"canceled", "cancelled", "expired", "rejected"})
+        receipts = recent_trades(observations, now, limit=len(observations))
+        callbacks = {row.get("execution_id") or index: row for index, row in enumerate(receipts)}
+        quantity = max(sum((number(row["quantity"]) for row in callbacks.values()), number(0)),
+                       number(reported.get("order_observed", {}).get("filled_quantity") or 0))
+        observed_fill += int(quantity > 0)
+        filled += int(quantity >= number(order["quantity"]))
+    expired = now >= instant(until)
+    from .market_data import SessionClock
+    session = SessionClock(now=lambda: now).status()
+    return {"at": now.isoformat(), "orders": len(orders), "filled": filled,
+            "orders_with_fill": observed_fill, "terminal": terminal, "complete": complete, "expired": expired,
+            "session_open": session["open"], "next_open": session.get("next_open"), "valid_until": until,
+            "valid_at_next_open": bool(session.get("next_open") and instant(session["next_open"]) < instant(until))}
+
+
 def lines(data, timeline=False, *, event_sequence=None):
     decisions = data["decisions"]
     if event_sequence is not None:
