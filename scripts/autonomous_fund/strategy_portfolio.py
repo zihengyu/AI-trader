@@ -207,11 +207,12 @@ def _paired_advantage(days, base, combined):
 
 def _benchmark_risk(db, days, paths, base, combined, candidate, now):
     """Descriptive beta using a common raw benchmark from the frozen replay inputs."""
+    from .strategy_evidence import load_frozen_dataset
+
     tapes, benchmarks = [], set()
     for identity in paths:
         proposal = db.execute("SELECT proposal FROM fund_strategy_versions WHERE id=? AND version=?", identity).fetchone()
-        snapshot = db.execute("SELECT f.at,d.body FROM fund_strategy_forward f JOIN fund_strategy_datasets d "
-                              "ON d.digest=json_extract(f.body,'$.frozen_dataset_hash') "
+        snapshot = db.execute("SELECT f.at,json_extract(f.body,'$.frozen_dataset_hash') FROM fund_strategy_forward f "
                               "WHERE f.id=? AND f.version=? AND f.day=?", (*identity, days[-1])).fetchone()
         if not proposal or not snapshot or instant(snapshot[0]) > now:
             return {"status": "missing_frozen_benchmark"}
@@ -220,7 +221,7 @@ def _benchmark_risk(db, days, paths, base, combined, candidate, now):
         if not benchmark or len(benchmarks) > 1:
             return {"status": "different_benchmarks"}
         try:
-            bars = json.loads(snapshot[1])["bars"][benchmark]
+            bars = load_frozen_dataset(db, snapshot[1])["bars"][benchmark]
             covered = [(bar["day"], float(number(bar["close"]))) for bar in bars
                        if bar["day"] <= days[-1] and instant(bar["available_at"]) <= now]
             if not all(math.isfinite(close) and close > 0 for _, close in covered):

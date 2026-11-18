@@ -1559,13 +1559,13 @@ class AutonomousFund(Strategy):
                 accepted.append(lab.submit(proposal, now, proposer=(getattr(self, "agent_models", None) or {}).get(
                     "researcher", "researcher"), source_call_id=source_call_id))
             except Exception as exc:
-                errors.append({"strategy_id": proposal.get("strategy_id"),
+                errors.append({"strategy_id": proposal.get("strategy_id"), "version": proposal.get("version"), "action": "proposal",
                                "error": str(exc)[:300] if isinstance(exc, ValueError) else type(exc).__name__})
         for update in research.get("research_tasks", []):
             try:
                 lab.update_task(update, now)
             except Exception as exc:
-                errors.append({"strategy_id": update.get("strategy_id"),
+                errors.append({"strategy_id": update.get("strategy_id"), "version": update.get("version"), "action": "task",
                                "error": str(exc)[:300] if isinstance(exc, ValueError) else type(exc).__name__})
         if accepted or errors or research.get("research_direction"):
             try:
@@ -1574,6 +1574,11 @@ class AutonomousFund(Strategy):
                                    "source_call_id": source_call_id})
             except Exception:
                 self.log_message("Strategy research receipt is pending; market research is retained.", color="yellow")
+        try:
+            budget = lab.budget.summary(now)
+        except Exception:
+            budget = None
+        return {"registered": accepted, "errors": errors, "budget": budget}
 
     def _strategy_lab_tick(self, *, now=None):
         try:
@@ -1640,9 +1645,10 @@ class AutonomousFund(Strategy):
                             "Do not submit orders or treat this research as an executable portfolio decision.", context=context)
             research = self._record_agent("researcher", result)
             validate_evidence(research["evidence"], self.get_datetime(), False)
-            self._record_strategy_research(research, self.get_datetime())
+            registration = self._record_strategy_research(research, self.get_datetime())
             packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
                       "session_open": opens_at.isoformat(), "phase": slot, "research": research,
+                      "strategy_registration": registration,
                       "model": result.model, "cache_hit": result.cache_hit}
             try:
                 packet["idea_ids"] = self._register_ideas(research, packet)
@@ -1659,7 +1665,8 @@ class AutonomousFund(Strategy):
                 "evidence_count": len(research["evidence"]),
                 "ideas": [{k: idea.get(k) for k in ("symbol", "direction", "horizon_sessions", "confidence", "thesis")}
                           for idea in research.get("ideas", [])[:8]],
-                "strategy_research": strategy_research_lines(research, context.get("strategy_lab")),
+                "registered_idea_count": len(packet["idea_ids"]),
+                "strategy_research": strategy_research_lines(research, context.get("strategy_lab"), registration=registration),
                 "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
                              for e in research["evidence"][:8]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")

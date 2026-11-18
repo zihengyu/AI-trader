@@ -505,14 +505,13 @@ def review_after_close(strategy):
             else:
                 break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
-        if hasattr(strategy, "_record_strategy_research"):
-            strategy._record_strategy_research(research, strategy.get_datetime())
+        registration = strategy._record_strategy_research(research, strategy.get_datetime()) if hasattr(strategy, "_record_strategy_research") else None
         # The input the saved research answered (with its refreshed costs), never the format-correction
         # diagnostic of a rejected first answer: the review manager builds on this snapshot.
         saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
             **session, "completed_at": strategy.get_datetime().isoformat(),
             "context": {key: value for key, value in research_context.items() if key != "structured_answer_correction"},
-            "research": research, "model": result.model, "mock": strategy.scripted})
+            "research": research, "strategy_registration": registration, "model": result.model, "mock": strategy.scripted})
         if hasattr(strategy, "_call_outcome"):
             strategy._call_outcome()  # This researcher call's answer is the review's saved research.
     # Persist the successful Flash stage: a Pro error/restart does not pay to
@@ -638,6 +637,8 @@ def review_after_close(strategy):
               "research": saved["research"], "review": review, "session": saved["context"]["session"]}
     if saved["context"].get("strategy_lab") is not None:
         packet["strategy_lab"] = saved["context"]["strategy_lab"]
+    if saved.get("strategy_registration") is not None:
+        packet["strategy_registration"] = saved["strategy_registration"]
     # The monitor can render immediately after this commit, before projections
     # below are written. Bind the exact research input, including on manager
     # retries that reuse a previously completed research stage.

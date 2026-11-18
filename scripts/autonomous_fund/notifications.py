@@ -422,30 +422,43 @@ def _simulation_lines(events):
     return lines
 
 
-def strategy_research_lines(research, lab=None):
+def strategy_research_lines(research, lab=None, *, registration=None):
     """Saved research only; never look up a later candidate state for an old report."""
     research, lab = research or {}, lab or {}
     proposals, tasks = research.get("strategy_proposals") or [], research.get("research_tasks") or []
     candidates = lab.get("candidates") or []
-    if not (research.get("research_direction") or proposals or tasks or candidates):
+    if registration is None and not (research.get("research_direction") or proposals or tasks or candidates):
         return []
     labels = {"candidate": "候选", "needs_formalization": "待形式化", "needs_adapter": "待适配",
               "needs_data": "待补数据", "awaiting_new_holdout": "等待新的独立测试数据",
               "shadow": "独立影子观察", "paper_active": "模拟策略库准入", "rejected": "验证未通过",
               "paused": "暂停", "retired": "退役", "forward_incomplete": "前瞻留证不足，须重验"}
     lines = ["策略研发：", "研究方向：" + (research.get("research_direction") or "本轮未另行记录")]
+    registered = {tuple(item) for item in (registration or {}).get("registered", [])}
+    if registration is not None:
+        lines.append(f"本轮确认登记 {len(registered)} 条策略提案。")
     for proposal in proposals[:4]:
+        identity = proposal["strategy_id"], proposal["version"]
+        if registration is not None and identity not in registered:
+            continue
         kind = "策略改进" if proposal.get("parent_version") else "新策略提案"
         lines.append(f"- {kind}：{proposal['name']}（{proposal['strategy_id']} / {proposal['version']}）")
         lines.append("  假设：" + proposal["hypothesis"][:200])
+    for error in (registration or {}).get("errors", []):
+        label = "提案登记失败" if error["action"] == "proposal" else "研究任务更新失败"
+        lines.append(f"- {label}：{error['strategy_id']} / {error['version']} · {error['error']}")
+    failed_tasks = {(error["strategy_id"], error["version"]) for error in (registration or {}).get("errors", [])
+                    if error["action"] == "task"}
     for task in tasks[:8]:
+        if (task["strategy_id"], task["version"]) in failed_tasks:
+            continue
         lines.append(f"- 持续研究：{task['strategy_id']} / {task['version']} · {task['action']}")
         lines.append("  下一步：" + task["next_step"][:200])
     if candidates:
         lines.append("研究输入时的实验进度：")
         for row in candidates[:8]:
             lines.append(f"- {row['id']} / {row['version']}：{labels.get(row['state'], row['state'])}")
-    budget = lab.get("budget") or {}
+    budget = (registration.get("budget") if registration is not None else lab.get("budget")) or {}
     if budget.get("monthly_limit_usd") is not None:
         lines.append(f"研究资源本月占用 ${budget.get('monthly_committed_usd', 0):.2f} / "
                      f"${budget['monthly_limit_usd']}（含未知费用预留，非提供方账单）。")
@@ -613,7 +626,8 @@ def daily_report(root, sequence):
     for title, values in (("保留教训", review["retained_lessons"]), ("撤回假设", review["retired_hypotheses"]),
                           ("数据缺项", session["account_observation_gaps"] + review["data_gaps"])):
         lines.extend([f"## {title}", "", *[f"- {item}" for item in values], ""])
-    strategy_lines = strategy_research_lines(packet["research"], packet.get("strategy_lab"))
+    strategy_lines = strategy_research_lines(packet["research"], packet.get("strategy_lab"),
+                                             registration=packet.get("strategy_registration"))
     if strategy_lines:
         lines.extend(["## 策略研发与验证", "", *strategy_lines, ""])
     if lab_activity:
@@ -716,7 +730,9 @@ def readable(kind, details, sequence=None, *, now=None):
             lines += [f"• {e.get('source')}（{_when(e.get('available_at') or e.get('observed_at'))}）" for e in evidence]
         ideas = details.get("ideas")
         if ideas:
-            lines += ["", f"投资想法 {len(ideas)} 条（已登记为预测，之后按收盘价打分）："]
+            count = details.get("registered_idea_count")
+            label = "已登记为预测，之后按收盘价打分" if count is None else f"本轮新登记预测 {count} 条"
+            lines += ["", f"投资想法 {len(ideas)} 条（{label}）："]
             lines += [f"• {i.get('symbol')} {DIRECTIONS.get(i.get('direction'), i.get('direction'))}，"
                       f"{i.get('horizon_sessions')} 个交易日，把握 {_percent(i.get('confidence'))}：{(i.get('thesis') or '')[:120]}"
                       for i in ideas]

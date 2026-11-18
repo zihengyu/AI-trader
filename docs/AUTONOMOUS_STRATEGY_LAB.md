@@ -132,10 +132,13 @@ fixed-parameter walk-forward diagnostics, declared-parameter sensitivity and an
 additional observed-friction stress. A defensive mandate is assessed against
 its declared protection objective and is never labeled evidence of alpha.
 
+The scheduler checks required symbols, feature fields, execution costs and
+exchange sessions before freezing a final window or assigning a compute slot.
+Missing requirements remain visible in `strategy-lab` and the research context.
 The first eligible validation freezes the exact benchmark sessions and input
 snapshot digest for the version. The queued validation retains that snapshot.
-If it diagnoses missing data, a new attested snapshot can repair those same
-sessions. Adding later prices never moves the splits. New variants need a final
+If the worker later diagnoses missing data, a new attested snapshot can repair
+those same sessions. Adding later prices never moves the splits. New variants need a final
 window disjoint from already reserved windows. Exploratory training, validation
 and sensitivity tests remain available before a window can be reserved. They
 skip the final test. Source coverage or modeled-cost gaps also skip it. Agent
@@ -161,8 +164,10 @@ series in small off-hours batches using its existing market-data source. The
 extra history is cached separately from the runner's risk inputs. Short history,
 unavailable series and provider failures remain visible to the researcher and
 under `fund-logs.sh strategy-lab`. The desk retries missing completed bars and
-prioritizes trading during a provider cooldown. No operator data entry is needed
-for this exploratory path.
+prioritizes trading during a provider cooldown. The lab builds a snapshot for
+each candidate's input set so other versions cannot shorten its usable history.
+Invalid adapter bundles leave the independent cache queue available and are
+reported until their replacement is accepted.
 
 Passed historical versions enter an independent forward book. The worker first
 evaluates the last completed close with fresh capital. Each accepted close then
@@ -170,7 +175,10 @@ produces the next signal. The journal binds that signal to the strategy and
 policy hashes, exact input dataset, exchange open and job. The signal must be
 saved before the next exchange open and match the signal actually used in the
 simulated fill. Later historical corrections cannot rewrite a recorded input or
-signal. An imported batch can provide replay results, with each session labeled
+signal. Forward snapshots reference the previous frozen input and the incoming
+immutable source, and their reconstructed content is checked against the same
+digest used in evidence receipts. Legacy full snapshots remain readable. An
+imported batch can provide replay results, with each session labeled
 as prospective or replayed. Replayed sessions do not qualify. A missed signal
 remains a gap for that version. A new revalidation version earns its own
 genuinely forward sample. The benchmark uses independent capital over the same

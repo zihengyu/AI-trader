@@ -472,22 +472,54 @@ def test_no_holdout_details_in_research_context_and_new_variants_wait(tmp_path):
     assert exploratory["status"] == "awaiting_new_holdout" and "final" not in exploratory["tests"]
 
 
-@pytest.mark.parametrize("gap", ["feature", "benchmark_session"])
-def test_binding_a_new_snapshot_cannot_move_or_replace_a_reserved_holdout(tmp_path, gap):
+@pytest.mark.parametrize("gap", ["feature", "non_numeric", "benchmark_session", "declared_series"])
+def test_preflight_does_not_spend_the_holdout_or_a_slot_on_incomplete_data(tmp_path, gap):
+    from scripts.autonomous_fund.lab import check_data
+
     engine = lab(tmp_path)
     history = dataset(170)
+    candidate = proposal()
     if gap == "feature":
         history["bars"]["ALFA"][155].pop("event")
-    else:
+    elif gap == "non_numeric":
+        history["bars"]["ALFA"][155]["event"] = None
+    elif gap == "benchmark_session":
         del history["bars"]["BASE"][155]
+    else:
+        candidate["data_symbols"] = ["RELEASE"]
+        candidate["implementation"]["rules"][0]["entry"] = 'field("RELEASE", "value") > 0'
     first = attest(history)
-    corrected = dataset(171)
+    engine.submit(candidate, NOW)
+    checked = check_data(tmp_path, first, candidate["strategy_id"], "v1", NOW)
+    assert not checked["ready_for_validation_input"] and checked["input_gap"]["status"] == "needs_data"
+    assert engine.schedule(first, NOW) == []
+    assert engine.run_one(NOW) is None
+    with engine.journal.connection() as db:
+        for table in ("fund_strategy_holdouts", "fund_strategy_cohorts", "fund_research_reservations"):
+            assert db.execute(f"SELECT count(*) FROM {table}").fetchone()[0] == 0
+    assert engine.context(NOW)["candidates"][0]["validation"]["reason"] == checked["input_gap"]["reason"]
+
+    # Another version can use that unconsumed window when its own inputs are complete.
+    later = NOW + timedelta(minutes=1)
+    engine.submit(proposal("ready-independently"), later)
+    engine.schedule(dataset(), later, candidate=("ready-independently", "v1"))
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT id FROM fund_strategy_holdouts").fetchone()[0] == "ready-independently"
+
+
+def test_binding_a_new_snapshot_cannot_move_or_replace_a_reserved_holdout(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import strategy_lab
+
+    engine = lab(tmp_path)
+    first, corrected = dataset(170), dataset(171)
     engine.submit(proposal(), NOW)
     first_job, = engine.schedule(first, NOW)
-    # A newer snapshot can repair the same window after the verifier has
-    # diagnosed the gap. It cannot replace the reserved first validation.
     assert engine.schedule(corrected, NOW) == []
-    report = engine.run_one(NOW)
+    # A failure that is only detected at execution time leaves the original
+    # holdout reserved. A subsequent snapshot must still use those sessions.
+    with monkeypatch.context() as patch:
+        patch.setattr(strategy_lab, "run_worker", lambda *_: {"status": "needs_data", "passed": False})
+        report = engine.run_one(NOW)
     assert report["status"] == "needs_data" and "final" not in report.get("tests", {})
     with engine.journal.connection() as db:
         receipt = db.execute("SELECT dataset,sessions FROM fund_strategy_holdouts").fetchone()
@@ -582,7 +614,6 @@ def test_data_desk_automatically_fills_candidate_history_without_writing_trading
 
     engine = lab(tmp_path)
     research = proposal()
-    research["data_symbols"] = ["event-release-series"]
     research["implementation"]["rules"][0]["entry"] = 'field("ALFA", "close") > 0'
     engine.submit(research, NOW)
     session_dates = mcal.get_calendar("NYSE").schedule(start_date="2025-01-02", end_date=NOW.date()).index[-140:]
@@ -607,7 +638,7 @@ def test_data_desk_automatically_fills_candidate_history_without_writing_trading
     assert desk.enabled("strategy_history", NOW)
     result = desk.run_job("strategy_history")
     assert calls == [("ALFA", 140, "day")]
-    assert result["fetched"] == 1 and result["pending"] == 0 and result["missing_source"] == ["event-release-series"]
+    assert result["fetched"] == 1 and result["pending"] == 0 and result["missing_source"] == []
     assert desk.store.get(day, "bars/ALFA") == original
     assert desk._job_strategy_history(NOW)["fetched"] == 0  # A repeat consumes no provider call.
     assert len(calls) == 1
@@ -637,9 +668,9 @@ def test_repeated_cache_revision_schedules_once_on_the_existing_worker(tmp_path,
                                mode="local", observe_only=False, halt_path=tmp_path / "STOP", get_datetime=lambda: NOW)
     original, threads = engine.schedule, []
 
-    def schedule(data, now):
+    def schedule(data, now, **kwargs):
         threads.append(get_ident())
-        return original(data, now)
+        return original(data, now, **kwargs)
 
     monkeypatch.setattr(engine, "schedule", schedule)
     monkeypatch.setattr(engine, "run_one", lambda _now: None)
@@ -670,6 +701,40 @@ def test_repeated_cache_revision_schedules_once_on_the_existing_worker(tmp_path,
             engine._executor.shutdown()
 
 
+def test_independent_cache_jobs_keep_their_depth_when_the_formal_file_is_broken(tmp_path):
+    from scripts.autonomous_fund.datastore import DailyStore
+    from scripts.autonomous_fund.risk import trading_day
+    from scripts.autonomous_fund.strategy_lab_runtime import prepare_inputs
+
+    engine = lab(tmp_path, max_history_rows=520)
+    store = DailyStore(tmp_path / "daily")
+    data = dataset()
+    for name, symbols in (("first", ("ALFA", "BASE")), ("second", ("BETA", "INDEX"))):
+        candidate = proposal(name)
+        candidate["instruments"] = [symbols[0]]
+        candidate["validation"]["benchmark"] = symbols[1]
+        candidate["implementation"]["rules"][0].update(symbol=symbols[0], entry=f'field("{symbols[0]}", "close") > 0')
+        engine.submit(candidate, NOW)
+        for symbol, fixture in zip(symbols, ("ALFA", "BASE")):
+            store.put(trading_day(NOW), "bars/" + symbol,
+                      {"rows": [[row[k] for k in ("day", "close", "volume", "open", "high", "low")]
+                                for row in data["bars"][fixture]]})
+
+    inbox = tmp_path / "strategy_lab_snapshot.json"
+    inbox.write_text("{broken JSON", encoding="utf-8")
+    state = SimpleNamespace(strategy_lab=engine, daily_store=store, halt_path=tmp_path / "STOP")
+    prepare_inputs(state, NOW)
+    assert engine.journal.get_meta("strategy_lab_last_intake")["coverage_gaps"] == ["JSONDecodeError"]
+    with engine.journal.connection() as db:
+        jobs = db.execute("SELECT j.strategy_id,d.body FROM fund_strategy_jobs j JOIN fund_strategy_datasets d "
+                          "ON d.digest=j.dataset WHERE j.state='queued' ORDER BY j.strategy_id").fetchall()
+    assert {key: {symbol: len(rows) for symbol, rows in json.loads(body)["bars"].items()} for key, body in jobs} == {
+        "first": {"ALFA": 170, "BASE": 170}, "second": {"BETA": 170, "INDEX": 170}}
+    inbox.write_text(json.dumps(data), encoding="utf-8")
+    prepare_inputs(state, NOW + timedelta(seconds=30))
+    assert engine.journal.get_meta("strategy_lab_last_intake")["coverage_gaps"] == []
+
+
 def test_live_lab_poll_does_not_depend_on_a_trading_iteration():
     from scripts.autonomous_fund.strategy_lab_runtime import poll_live_inputs
 
@@ -691,7 +756,9 @@ def test_live_lab_poll_does_not_depend_on_a_trading_iteration():
 def test_old_policy_queue_does_not_keep_waking_worker(tmp_path):
     engine = lab(tmp_path)
     engine.submit(proposal(), NOW)
-    assert engine.schedule(dataset(5), NOW)
+    # Create a real queued job before changing its policy; short history now
+    # produces a preflight gap without entering the queue.
+    assert engine.schedule(dataset(), NOW)
     with engine.journal.connection() as db:
         db.execute("UPDATE fund_strategy_versions SET policy_hash='previous-policy'")
     assert not engine.kick(NOW)
@@ -742,6 +809,7 @@ def test_research_task_cannot_promote_a_strategy(tmp_path):
 def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     from scripts.autonomous_fund.lab import forward_audit, forward_readiness
     from scripts.autonomous_fund.strategy_admission import library, verify_allocations
+    from scripts.autonomous_fund.strategy_evidence import load_frozen_dataset
     data = dataset(170)
     formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
     engine = lab(tmp_path, admission="paper_library", min_forward_sessions=40)
@@ -762,6 +830,12 @@ def test_frozen_forward_books_admission_and_degradation(tmp_path, monkeypatch):
     assert sum(item["sessions"] for item in result["regimes"].values()) == 40
     assert 0 < result["volume_participation"]["max_fraction_of_daily_volume"] < 1
     with engine.journal.connection() as db:
+        links = db.execute("SELECT body FROM fund_strategy_datasets WHERE json_type(body,'$.forward_base')='text'").fetchall()
+        assert len(links) == 40 and sum(len(row[0]) for row in links) < 8000
+        latest = db.execute("SELECT body FROM fund_strategy_forward ORDER BY day DESC LIMIT 1").fetchone()[0]
+        frozen = json.loads(latest)["frozen_dataset_hash"]
+        rebuilt = load_frozen_dataset(db, frozen)
+        assert digest(rebuilt) == frozen and rebuilt['bars'] == dataset(210)['bars']
         readiness = forward_readiness(db, observed + timedelta(seconds=10), engine.admission_policy)
         assert readiness["ready"] == ["synthetic-research / v1"] and not readiness["waiting"]
         previous = forward_readiness(db, observed + timedelta(seconds=10),
@@ -1116,6 +1190,10 @@ def test_researcher_handoff_registers_a_strategy_without_a_manager_or_order_call
 
     def research(**kwargs):
         result = original(**kwargs)
+        now = strategy.get_datetime()
+        budget = strategy.strategy_lab.budget
+        charge = budget.reserve(now, "synthetic-notice", "research_model", "0.50")
+        budget.settle(charge, now, "0.20", {})
         body = result.parsed.model_dump()
         body.update(research_direction="Synthetic event research", strategy_proposals=[proposal()])
         result.parsed = Research.model_validate(body)
@@ -1127,6 +1205,10 @@ def test_researcher_handoff_registers_a_strategy_without_a_manager_or_order_call
     assert len(calls) == 1 and calls[0]["context"]["orders_enabled"] is False
     assert strategy.strategy_lab.rows()[0]["state"] == "candidate"
     assert strategy.premarket_research["research"]["strategy_proposals"][0]["strategy_id"] == proposal()["strategy_id"]
+    [notice] = [r["body"]["details"] for r in strategy.journal.all_events()
+                if r["kind"] == "notification" and r["body"]["kind"] == "premarket_research"]
+    text = "\n".join(notice["strategy_research"])
+    assert "本轮确认登记 1 条策略提案" in text and "$0.20 / $30" in text
     assert not strategy.journal.pending()
     assert not any(r["kind"] == "decision" for r in strategy.journal.all_events())
 
@@ -1167,4 +1249,9 @@ def test_optional_lab_storage_failure_does_not_discard_market_research(tmp_path,
     strategy.before_market_opens()
     assert strategy.premarket_research and len(calls) == 1
     assert strategy.premarket_research["research"]["summary"]
+    [notice] = [r["body"]["details"] for r in strategy.journal.all_events()
+                if r["kind"] == "notification" and r["body"]["kind"] == "premarket_research"]
+    text = "\n".join(notice["strategy_research"])
+    assert "本轮确认登记 0 条策略提案" in text and "提案登记失败" in text
+    assert "private path" not in text and "新策略提案" not in text
     assert not strategy.journal.pending()

@@ -124,7 +124,7 @@ def queue_forward_notice(db, now, opened):
 
 def check_data(root, data, key, version, now, *, artifacts_dir=None):
     from .strategy_lab import has_source_artifact_receipt
-    from .strategy_validation import check_snapshot_as_of, snapshot_limitations, source_artifact_gaps
+    from .strategy_validation import check_snapshot_as_of, historical_input_gap, snapshot_limitations, source_artifact_gaps
 
     path = Path(root) / "state.sqlite3"
     if not path.is_file():
@@ -137,6 +137,7 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
         current = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
         settings = json.loads(current[0]) if current else {}
         fingerprint = check_snapshot_as_of(data, now, settings.get("max_history_rows"))
+        locked = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?", (key, version)).fetchone()
         recorded = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_source_artifacts'").fetchone()
                         and has_source_artifact_receipt(db, fingerprint, now))
     proposal, policy = json.loads(row[0]), json.loads(row[1])
@@ -152,12 +153,14 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
         gaps.append("source_artifacts_unchecked")
     missing = sorted((required - data["bars"].keys()) |
                      (features - data["bars"].keys() - data.get("features", {}).keys()))
+    gap = (historical_input_gap(proposal, data, policy, locked_sessions=json.loads(locked[0]) if locked else None)
+           if proposal.get("implementation") and row[2] in {"candidate", "needs_data", "awaiting_new_holdout"} else None)
     return {"strategy_id": key, "version": version, "state": row[2], "snapshot_digest": fingerprint,
             "receipt_gaps": gaps, "symbols_missing_from_this_snapshot": missing,
             "source_artifacts_required": required_artifacts, "source_artifacts_recorded": recorded,
             "source_artifacts_matched_this_check": matched,
             "benchmark_sessions_in_snapshot": len(data["bars"].get(proposal["validation"]["benchmark"], ())),
-            "ready_for_validation_input": not gaps and not missing}
+            "input_gap": gap, "ready_for_validation_input": not gaps and not missing and not gap}
 
 
 def execution_calibration(root, now, *, opening_minutes=15, data=None, artifacts_dir=None):
@@ -230,6 +233,13 @@ def report(root):
         for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid"):
             proposal = json.loads(row["proposal"])
             lines.append(f"- {row['id']} / {row['version']} [{row['state']}] 研究任务：{row['task_state']}｜{proposal['name']}")
+            preflight = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? "
+                                   "AND kind IN ('historical_pass','validation') ORDER BY sequence DESC LIMIT 1",
+                                   (row["id"], row["version"])).fetchone()
+            if preflight and (gap := json.loads(preflight[0])).get("preflight"):
+                details = {key: gap[key] for key in ("missing_symbols", "missing_feature", "observed_sessions", "required_sessions")
+                           if key in gap}
+                lines.append("  验证前置缺口：" + gap["reason"] + (" " + json.dumps(details, ensure_ascii=False) if details else ""))
             job = db.execute("SELECT j.kind,r.at,r.body FROM fund_strategy_jobs j JOIN fund_strategy_results r "
                              "ON r.job_id=j.id WHERE j.strategy_id=? AND j.version=? ORDER BY r.at DESC LIMIT 1",
                              (row["id"], row["version"])).fetchone()

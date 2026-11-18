@@ -22,7 +22,8 @@ from .research_budget import ResearchBudget, ResearchBudgetSettings
 from .risk import RiskError, instant, number, trading_day
 from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, StrategyProposal, daily_sample_requirements
 from .strategy_program import validate_program
-from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, implementation_hash,
+from .strategy_evidence import load_frozen_dataset, merge_forward_input
+from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, historical_input_gap, implementation_hash,
                                   planned_sessions, snapshot_limitations, source_artifact_gaps)
 
 
@@ -180,7 +181,7 @@ class StrategyLab:
         return not snapshot_limitations(data, require_receipts=True) and (
             not self.settings.require_source_artifacts or has_source_artifact_receipt(db, fingerprint, now))
 
-    def schedule(self, data, now, *, artifacts_dir=None):
+    def schedule(self, data, now, *, artifacts_dir=None, candidate=None):
         fingerprint = self.record_dataset(data, now, artifacts_dir=artifacts_dir)
         policy_hash = digest(self.policy)
         created = []
@@ -192,36 +193,39 @@ class StrategyLab:
             previous_cutoff = db.execute("SELECT max(cutoff) FROM fund_strategy_cohorts").fetchone()[0]
             new_windows = []
             for row in rows:
-                if row["policy_hash"] != policy_hash:
+                if row["policy_hash"] != policy_hash or (candidate and candidate != (row["id"], row["version"])):
                     # Historical evidence keeps its policy. It cannot authorize
                     # a strategy under a different account risk configuration.
                     continue
                 body = json.loads(row["proposal"])
-                if set(body["instruments"] + [body["validation"]["benchmark"]]) - data["bars"].keys():
-                    continue
                 if row["state"] in {"candidate", "needs_data", "awaiting_new_holdout"}:
                     kind = "exploratory"
                     plan = body["validation"]
                     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
-                    days = [r["day"] for r in data["bars"][plan["benchmark"]]]
                     lock = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                       (row["id"], row["version"])).fetchone()
+                    sessions = json.loads(lock[0]) if lock else None
                     if lock:
-                        sessions = json.loads(lock[0])
                         # Keep an eligible queued job when an exploratory or
                         # narrower snapshot arrives while it is waiting.
-                        if not complete or not set(sessions).issubset(days):
+                        if not complete:
                             continue
                         if db.execute("SELECT 1 FROM fund_strategy_jobs WHERE strategy_id=? AND version=? "
                                       "AND kind='historical' AND state IN ('queued','running')",
                                       (row["id"], row["version"])).fetchone():
                             continue
+                    # A shared provider snapshot need not contain every strategy.
+                    # A scoped cache snapshot, however, is specifically for this version.
+                    if candidate is None and plan["benchmark"] not in data["bars"]:
+                        continue
+                    if gap := historical_input_gap(body, data, self.policy, locked_sessions=sessions):
+                        self._record_preflight_gap(db, row, now, gap)
+                        continue
+                    days = [r["day"] for r in data["bars"][plan["benchmark"]]]
+                    if lock:
                         kind = "historical"
-                    elif complete and len(days) >= total and (
+                    elif complete and (
                             not self.policy.get("cash_symbol") or body["implementation"]["adapter"] == "daily_cash_rules_v1"):
-                        # Reserve exchange dates even when the source missed an
-                        # interior bar. The repaired snapshot must fill that
-                        # date instead of shifting the entire test interval.
                         sessions = planned_sessions(days, total)
                         if previous_cutoff and sessions[-plan["final_sessions"]] <= previous_cutoff:
                             db.execute("UPDATE fund_strategy_versions SET state='awaiting_new_holdout' WHERE id=? AND version=?",
@@ -238,7 +242,7 @@ class StrategyLab:
                     # Exploratory inputs can be kept for historical research.
                     # They must not supersede a queued forward job or become
                     # an immutable seed for later admission checks.
-                    if not complete:
+                    if not complete or set(body["instruments"] + [body["validation"]["benchmark"]]) - data["bars"].keys():
                         continue
                     kind = "forward"
                     passed = db.execute("SELECT at FROM fund_strategy_events WHERE id=? AND version=? "
@@ -265,6 +269,21 @@ class StrategyLab:
                            (max(end for _, _, end in new_windows), instant(now).isoformat(),
                             encode([[key, version] for key, version, _ in new_windows])))
         return created
+
+    def _record_preflight_gap(self, db, row, now, gap):
+        identity = row["id"], row["version"]
+        if db.execute("SELECT 1 FROM fund_strategy_jobs WHERE strategy_id=? AND version=? "
+                      "AND state IN ('queued','running')", identity).fetchone():
+            return
+        # Keep a sealed-window wait visible while the exploratory data is being filled.
+        state = row["state"] if row["state"] == "awaiting_new_holdout" else gap["status"]
+        event = {**gap, "state": state, "preflight": True}
+        previous = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? "
+                              "AND kind IN ('validation','historical_pass') ORDER BY sequence DESC LIMIT 1", identity).fetchone()
+        if previous and json.loads(previous[0]) == event:
+            return
+        db.execute("UPDATE fund_strategy_versions SET state=? WHERE id=? AND version=?", (state, *identity))
+        self._event(db, *identity, now, "validation", event)
 
     def _claim(self, now):
         with self.journal.connection() as db:
@@ -323,34 +342,17 @@ class StrategyLab:
                             "ORDER BY sequence LIMIT 1", (row["id"], row["version"])).fetchone()
         if not passed:
             raise RiskError("Forward research requires a frozen historical validation record")
-        historical = db.execute("SELECT d.body FROM fund_strategy_jobs j JOIN fund_strategy_datasets d ON j.dataset=d.digest "
+        historical = db.execute("SELECT j.dataset FROM fund_strategy_jobs j "
                                 "JOIN fund_strategy_results r ON r.job_id=j.id WHERE j.strategy_id=? AND j.version=? "
                                 "AND j.kind='historical' AND j.id=?",
                                 (row["id"], row["version"], json.loads(passed[1])["job_id"])).fetchone()
         if historical is None:
             raise RiskError("The frozen historical job or its source snapshot is missing")
-        seed = json.loads(historical[0])
-        if records:
-            # Stored forward inputs, not today's corrected copy of old history.
-            frozen = json.loads(records[-1][0])["frozen_dataset_hash"]
-            seed = json.loads(db.execute("SELECT body FROM fund_strategy_datasets WHERE digest=?", (frozen,)).fetchone()[0])
-        for symbol, values in dataset["bars"].items():
-            known = {r["day"] for r in seed["bars"].get(symbol, [])}
-            last = max(known) if known else ""
-            seed["bars"].setdefault(symbol, []).extend(r for r in values if r["day"] > last)
-        for symbol, values in dataset.get("features", {}).items():
-            known = seed.setdefault("features", {}).setdefault(symbol, [])
-            last = instant(known[-1]["at"]) if known else None
-            known.extend(r for r in values if last is None or instant(r["at"]) > last)
-        existing = {digest(a) for a in seed.get("actions", [])}
-        seed.setdefault("actions", []).extend(a for a in dataset.get("actions", []) if digest(a) not in existing)
-        # Coverage cannot become true merely because a later snapshot asserts it.
-        seed["coverage"] = {k: v is True and dataset.get("coverage", {}).get(k) is True
-                            for k, v in seed.get("coverage", {}).items()}
-        # The constituent snapshots retain their own receipts in the journal.
-        # The merged replay data is derived and has a separate digest.
-        seed.pop("provenance", None)
-        return seed, passed[0], [json.loads(r[0])["receipt"] for r in records], json.loads(passed[1])["forward_plan"]
+        receipts = [json.loads(r[0]) for r in records]
+        # Use the saved prefix and incoming snapshot, including legacy full prefixes.
+        base = receipts[-1]["frozen_dataset_hash"] if receipts else historical[0]
+        seed = merge_forward_input(load_frozen_dataset(db, base), dataset)
+        return seed, passed[0], [r["receipt"] for r in receipts], json.loads(passed[1])["forward_plan"], base
 
     @staticmethod
     def _save_next_signal(db, row, job, result, last_bar, finished, dataset):
@@ -413,15 +415,15 @@ class StrategyLab:
         with self.journal.connection() as db:
             row = dict(db.execute("SELECT * FROM fund_strategy_versions WHERE id=? AND version=?",
                                   (job["strategy_id"], job["version"])).fetchone())
-            data = json.loads(db.execute("SELECT body FROM fund_strategy_datasets WHERE digest=?", (job["dataset"],)).fetchone()[0])
+            data = load_frozen_dataset(db, job["dataset"])
             qualified_input = digest(data) == job["dataset"] and self._qualified_input(db, data, job["dataset"], now)
             trials = sum(instant(created) <= now for (created,) in db.execute("SELECT created_at FROM fund_strategy_versions"))
             holdout = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                  (row["id"], row["version"])).fetchone()
-            forward_at, prior, forward_plan, input_issue = None, [], None, None
+            forward_at, prior, forward_plan, input_issue, forward_base = None, [], None, None, None
             if job["kind"] == "forward" and qualified_input:
                 try:
-                    data, forward_at, prior, forward_plan = self._forward_input(db, row, data)
+                    data, forward_at, prior, forward_plan, forward_base = self._forward_input(db, row, data)
                 except RiskError as exc:
                     input_issue = str(exc)
                 except (KeyError, TypeError, ValueError):
@@ -461,8 +463,10 @@ class StrategyLab:
                           "reason": "Forward data coverage is incomplete; receipts retained"}
             used = db.execute("SELECT coalesce(sum(length(body)),0) FROM fund_strategy_datasets").fetchone()[0]
             used += db.execute("SELECT coalesce(sum(length(body)),0) FROM fund_strategy_results").fetchone()[0]
-            extra_data = len(encode(data).encode()) if job["kind"] == "forward" and result.get("series") and not db.execute(
-                "SELECT 1 FROM fund_strategy_datasets WHERE digest=?", (digest(data),)).fetchone() else 0
+            frozen = digest(data) if forward_base and result.get("series") else None
+            link = encode({"forward_base": forward_base, "forward_source": job["dataset"]})
+            extra_data = len(link.encode()) if frozen and not db.execute(
+                "SELECT 1 FROM fund_strategy_datasets WHERE digest=?", (frozen,)).fetchone() else 0
             if used + extra_data + len(encode(result).encode()) > self.settings.max_artifact_bytes:
                 result = {"status": "worker_error", "passed": False, "error": "ArtifactBudgetExceeded"}
             if job["kind"] == "forward" and result.get("series"):
@@ -470,7 +474,6 @@ class StrategyLab:
                 if series[:len(prior)] != prior:
                     result = {"status": "needs_data", "passed": False, "reason": "Forward history changed; receipts retained"}
                 else:
-                    frozen = digest(data)
                     prospective = self._forward_evidence(db, row, series, benchmark_bars)
                     result["statistical_passed"] = result["passed"]
                     result["prospective_sessions"] = len(prospective)
@@ -480,7 +483,7 @@ class StrategyLab:
                     result["passed"] = (result["passed"] and qualification["status"] == "passed"
                                         and not result["replayed_sessions"] and not result["degraded"])
                     db.execute("INSERT OR IGNORE INTO fund_strategy_datasets VALUES(?,?,?)",
-                               (frozen, finished.isoformat(), encode(data)))
+                               (frozen, finished.isoformat(), link))
                     for receipt in series[len(prior):]:
                         evidence = "prospective" if receipt["day"] in prospective else "replay"
                         db.execute("INSERT INTO fund_strategy_forward VALUES(?,?,?,?,?,?)",
@@ -589,6 +592,9 @@ class StrategyLab:
                             events[category] = json.loads(body)
                 registration, task = events.get("registered", {}), events.get("research_task")
                 state = events.get("validation", registration).get("state", "unavailable")
+                gap = events.get("validation", {})
+                if gap.get("preflight"):
+                    result = gap
                 task_state = {"pause": "paused", "retire": "retired"}.get(task["action"] if task else None, "open")
                 # Final holdout trades, returns and parameter-level diagnostics
                 # are operator-only; ordinary SQL/research capability is intact.
@@ -608,6 +614,9 @@ class StrategyLab:
                                                   "regimes": result.get("regimes"),
                                                   "prospective_sessions": result.get("prospective_sessions"),
                                                   "replayed_sessions": result.get("replayed_sessions"),
+                                                  **({key: result[key] for key in ("missing_symbols", "missing_feature",
+                                                                                   "observed_sessions", "required_sessions")
+                                                      if key in result}),
                                                   "reason": result.get("reason")}})
         from .strategy_admission import library
         from .strategy_competition import compare

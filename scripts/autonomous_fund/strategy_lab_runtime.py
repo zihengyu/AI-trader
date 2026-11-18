@@ -115,14 +115,7 @@ def cached_snapshot(strategy, now, *, symbols=None):
             "availability_estimate_reason": "Completed-session boundaries; original provider publication times are unavailable."}
 
 
-def prepare_inputs(strategy, now):
-    lab = strategy.strategy_lab
-    if strategy.halt_path.exists() or regular_session_open(now):
-        return
-    rows = lab.rows()
-    candidates = tuple((row["id"], row["version"], row["task_state"], row["state"] in {"shadow", "paper_active"})
-                       for row in rows if row["task_state"] == "open" or row["state"] in {"shadow", "paper_active"})
-    policy = lab.admission_policy["policy_hash"]
+def _prepare_inbox(strategy, lab, now, candidates, policy):
     inbox = lab.journal.root / "strategy_lab_snapshot.json"
     try:
         stat = inbox.stat()
@@ -171,23 +164,61 @@ def prepare_inputs(strategy, now):
                     "at": instant(now).isoformat(), "coverage_gaps": gaps, "schedule_key": key})
             strategy._strategy_lab_inbox_receipt = receipt
 
+
+def prepare_inputs(strategy, now):
+    lab = strategy.strategy_lab
+    if strategy.halt_path.exists() or regular_session_open(now):
+        return
+    rows = lab.rows()
+    candidates = tuple((row["id"], row["version"], row["task_state"], row["state"] in {"shadow", "paper_active"})
+                       for row in rows if row["task_state"] == "open" or row["state"] in {"shadow", "paper_active"})
+    policy = lab.admission_policy["policy_hash"]
+    try:
+        _prepare_inbox(strategy, lab, now, candidates, policy)
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+        # A malformed or temporarily unavailable provider bundle cannot block
+        # independently cached data from reaching the exploratory queue.
+        gap = str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__
+        previous = lab.journal.get_meta("strategy_lab_last_intake", {})
+        if previous.get("coverage_gaps") != [gap]:
+            lab.journal.set_meta("strategy_lab_last_intake", {"at": instant(now).isoformat(), "coverage_gaps": [gap]})
+        strategy._strategy_lab_inbox_receipt = None
+
     store = getattr(strategy, "daily_store", None)
     if store is None:
         return
-    symbols = _cache_symbols(strategy, rows)
+    groups = {}
+    for row in rows:
+        if row["policy_hash"] == policy:
+            symbols = _cache_symbols(strategy, (row,))
+            if symbols:
+                groups.setdefault(symbols, []).append((row["id"], row["version"]))
+
     day = trading_day(now)
     research = research_history_store(lab.journal.root)
+    symbols = sorted({symbol for group in groups for symbol in group})
     cache = tuple((symbol, store.version(day, "bars/" + symbol), research.version(day, "bars/" + symbol))
                   for symbol in symbols)
-    receipt = day, completed_daily_cutoff(now), candidates, cache
-    if receipt != getattr(strategy, "_strategy_lab_cache_receipt", None):
+    receipt = day, completed_daily_cutoff(now), groups, cache
+    if receipt == getattr(strategy, "_strategy_lab_cache_receipt", None):
+        return
+
+    previous = lab.journal.get_meta("strategy_lab_cache_content", {})
+    previous = previous if isinstance(previous, dict) else {}  # Older ledgers stored the pooled snapshot digest.
+    saved = {}
+    for symbols, identities in groups.items():
         data = cached_snapshot(strategy, now, symbols=symbols)
-        if data is not None:
-            content = digest([digest(data), candidates, policy])
-            if content != lab.journal.get_meta("strategy_lab_cache_content"):
-                lab.schedule(data, now)
-                lab.journal.set_meta("strategy_lab_cache_content", content)
-        strategy._strategy_lab_cache_receipt = receipt
+        if data is None:
+            continue
+        content = digest([digest(data), policy])
+        for identity in identities:
+            key = digest(identity)
+            if content != previous.get(key):
+                lab.schedule(data, now, candidate=identity)
+            saved[key] = content
+    if saved != previous:
+        lab.journal.set_meta("strategy_lab_cache_content", saved)
+    strategy._strategy_lab_cache_receipt = receipt
 
 
 def tick(strategy, *, now=None):

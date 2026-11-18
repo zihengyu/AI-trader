@@ -102,7 +102,7 @@ def implementation_hash():
     sources = {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                for name in ("strategy_validation.py", "strategy_program.py", "strategy_worker.py", "comparison.py",
                             "strategy_cash.py", "cash.py", "risk.py", "strategy_definition.py",
-                            "strategy_lab.py", "strategy_admission.py")}
+                            "strategy_lab.py", "strategy_admission.py", "strategy_evidence.py")}
     return digest({"sources": sources, "python": list(sys.version_info[:3]),
                    "dependencies": {name: package_version(name) for name in ("pydantic", "pandas-market-calendars")}})
 
@@ -453,45 +453,43 @@ def volume_participation(series, bars):
             "median_fraction_of_daily_volume": statistics.median(ratios) if ratios else None}
 
 
-def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True, locked_sessions=None,
-             require_receipts=False):
-    proposal = StrategyProposal.model_validate(proposal).model_dump()
-    if proposal["validation"]["method"] != "daily_forward_v1":
-        return {"status": "needs_adapter", "passed": False, "reason": "A suitable independent validation adapter is required"}
-    if proposal["implementation"] is None or validate_program(proposal["implementation"], proposal["instruments"]) != "ready":
-        return {"status": "needs_adapter", "passed": False}
+def historical_input_gap(proposal, data, policy, *, locked_sessions=None):
+    """Identify deterministic input gaps before claiming a slot or exposing a final window."""
     if policy.get("fee_rate") is None or policy.get("slippage") is None:
         return {"status": "needs_data", "passed": False, "reason": "Verified execution costs are unavailable"}
     if policy.get("shared_data_cost_usd_per_session", "0") is None:
         return {"status": "needs_data", "passed": False, "reason": "The account's shared data cost is unknown"}
-    identity = check_dataset(data)
     plan = proposal["validation"]
-    required = daily_sample_requirements(plan)
-    short = {key: required[key] for key in ("validation_sessions", "final_sessions") if plan[key] < required[key]}
-    if short:
-        return {"status": "needs_formalization", "passed": False, "minimum_sessions": short,
-                "reason": "Declared split cannot supply the required nonoverlapping blocks after purging"}
     symbols = set(proposal["instruments"]) | {plan["benchmark"]}
     if proposal["implementation"]["adapter"] == "daily_cash_rules_v1":
         if not policy.get("cash_symbol") or not (policy.get("cash_management") or {}).get("enabled"):
             return {"status": "needs_data", "passed": False, "reason": "Cash-management policy unavailable"}
         symbols.add(policy["cash_symbol"])
     if symbols - data["bars"].keys():
-        return {"status": "needs_data", "passed": False, "reason": "Missing required instrument history"}
+        return {"status": "needs_data", "passed": False, "reason": "Missing required instrument history",
+                "missing_symbols": sorted(symbols - data["bars"].keys())}
     histories = {**data["bars"], **data.get("features", {})}
+    missing = sorted(symbol for symbol in proposal.get("data_symbols", ()) if not histories.get(symbol))
+    if missing:
+        return {"status": "needs_data", "passed": False, "reason": "A declared data series is unavailable",
+                "missing_symbols": missing}
+    parameters = parameter_values(proposal["implementation"])
     for rule in proposal["implementation"]["rules"]:
         for field in ("entry", "exit", "weight"):
-            for call in ast.walk(parse(rule[field], parameter_values(proposal["implementation"]))):
+            for call in ast.walk(parse(rule[field], parameters)):
                 if not isinstance(call, ast.Call) or call.func.id not in {"field", "mean", "stdev", "ret"}:
                     continue
                 # Dynamic field names are deliberately unsupported: the controller
                 # must know and disclose each data dependency before execution.
                 if not call.args or not isinstance(call.args[0], ast.Constant) or type(call.args[0].value) is not str:
-                    raise RiskError("Data-series identifiers must be declared constants")
+                    return {"status": "needs_formalization", "passed": False,
+                            "reason": "Data-series identifiers must be declared constants"}
                 symbol = call.args[0].value
                 column = "close" if call.func.id == "ret" else (
                     call.args[1].value if len(call.args) > 1 and isinstance(call.args[1], ast.Constant) else None)
-                if symbol not in histories or not column or any(column not in r for r in histories[symbol]):
+                rows = histories.get(symbol)
+                if not rows or not column or any(type(value) not in {int, float} or not math.isfinite(value)
+                                                 for value in (row.get(column) for row in rows)):
                     return {"status": "needs_data", "passed": False, "reason": "A required strategy feature is unavailable",
                             "missing_feature": {"symbol": symbol, "column": column}}
     # The benchmark calendar is authoritative. Missing symbol sessions fail,
@@ -503,14 +501,38 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
         return {"status": "needs_data", "passed": False, "reason": "Benchmark history has missing exchange sessions"}
     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
     if len(days) < total:
-        return {"status": "needs_data", "passed": False, "reason": "Insufficient predeclared split history"}
-    if locked_sessions is None:
-        days = days[-total:]
-    else:
-        locked_days = [day for day in days if locked_sessions[0] <= day <= locked_sessions[-1]]
-        if locked_days != locked_sessions or len(locked_days) != total:
-            return {"status": "needs_data", "passed": False, "reason": "Snapshot does not cover the locked validation sessions"}
-        days = locked_days
+        return {"status": "needs_data", "passed": False, "reason": "Insufficient predeclared split history",
+                "observed_sessions": len(days), "required_sessions": total}
+    if locked_sessions and (len(locked_sessions) != total or
+                            [day for day in days if day >= locked_sessions[0]] != locked_sessions):
+        return {"status": "needs_data", "passed": False, "reason": "Snapshot does not cover the locked validation sessions"}
+    expected = locked_sessions or days[-total:]
+    expected = set(expected)
+    missing = sorted(s for s in symbols if expected - {row["day"] for row in data["bars"][s]})
+    if missing:
+        return {"status": "needs_data", "passed": False, "reason": "Instruments lack required exchange sessions",
+                "missing_symbols": missing}
+    return None
+
+
+def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True, locked_sessions=None,
+             require_receipts=False):
+    proposal = StrategyProposal.model_validate(proposal).model_dump()
+    if proposal["validation"]["method"] != "daily_forward_v1":
+        return {"status": "needs_adapter", "passed": False, "reason": "A suitable independent validation adapter is required"}
+    if proposal["implementation"] is None or validate_program(proposal["implementation"], proposal["instruments"]) != "ready":
+        return {"status": "needs_adapter", "passed": False}
+    identity = check_dataset(data)
+    plan = proposal["validation"]
+    required = daily_sample_requirements(plan)
+    short = {key: required[key] for key in ("validation_sessions", "final_sessions") if plan[key] < required[key]}
+    if short:
+        return {"status": "needs_formalization", "passed": False, "minimum_sessions": short,
+                "reason": "Declared split cannot supply the required nonoverlapping blocks after purging"}
+    if gap := historical_input_gap(proposal, data, policy, locked_sessions=locked_sessions):
+        return gap
+    total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
+    days = locked_sessions if locked_sessions is not None else [r["day"] for r in data["bars"][plan["benchmark"]]][-total:]
     train_end = plan["train_sessions"]
     valid_end = train_end + plan["validation_sessions"]
     gap = plan["holding_sessions"]
