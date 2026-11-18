@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- The autonomous-fund data desk fills missing or deeper daily history requested by registered Strategy Lab candidates off-hours, reuses current cache coverage, and reports unavailable inputs. The lab automatically checks original artifacts delivered with a formal snapshot and resumes when matching originals arrive. Unverified caches remain exploratory.
 - Strategy Lab adds a read-only per-version forward audit of the frozen qualification window. It links dated signals, jobs, source checks and paired observations, exposes missed sessions and replays, and compares modeled economics on the contiguous prospective prefix against the predeclared passive reference. Linked Researcher call costs remain separately visible.
 - Strategy Lab can verify original artifact bytes during offline intake and require a saved check of each exact snapshot for formal historical and forward validation. Candidate preflight shares the importer's publication checks. An offline opening-window calibration report separates local and paper orders by recorded send time and reports delays, missing clocks, censored fills, matched trading costs and directional shortfall against verified raw opening prices.
 - Portfolio contribution studies reconstruct matched closing security weights from prospective sleeve books. Manager and operator views report concentration, overlapping names, cash partitions and exposure coverage alongside the NAV comparison.

@@ -536,6 +536,92 @@ def test_snapshot_provenance_at_the_automatic_ingest(tmp_path, monkeypatch):
         engine.record_dataset(attest(late), NOW)
 
 
+def test_automatic_intake_rechecks_originals_delivered_after_the_snapshot(tmp_path):
+    from scripts.autonomous_fund.strategy_lab_runtime import prepare_inputs
+
+    engine = lab(tmp_path, require_source_artifacts=True)
+    engine.submit(proposal(), NOW)
+    data = dataset()
+    (tmp_path / "strategy_lab_snapshot.json").write_text(json.dumps(data), encoding="utf-8")
+    state = SimpleNamespace(strategy_lab=engine, halt_path=tmp_path / "STOP")
+    prepare_inputs(state, NOW)
+    assert engine.journal.get_meta("strategy_lab_last_intake")["coverage_gaps"] == ["source_artifacts_unchecked"]
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
+
+    originals = tmp_path / "strategy_lab_source_artifacts"
+    originals.mkdir()
+    content = {key: value for key, value in data.items() if key != "provenance"}
+    source = originals / data["provenance"]["snapshot_sha256"]
+    source.write_bytes(b"incorrect artifact")
+    later = NOW + timedelta(minutes=1)
+    prepare_inputs(state, later)
+    assert "source_artifact_mismatch" in engine.journal.get_meta("strategy_lab_last_intake")["coverage_gaps"][0]
+
+    # An adapter atomically publishes corrected bytes without touching the snapshot.
+    body = json.dumps(content, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    staging = originals / "staging"
+    staging.write_bytes(body)
+    staging.replace(source)
+    prepare_inputs(state, later + timedelta(minutes=1))
+    assert engine.journal.get_meta("strategy_lab_last_intake")["coverage_gaps"] == []
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT dataset FROM fund_strategy_source_artifacts").fetchone()[0] == digest(data)
+        assert db.execute("SELECT kind FROM fund_strategy_jobs WHERE state='queued'").fetchone()[0] == "historical"
+    assert "final" in engine.run_one(later + timedelta(minutes=1))["tests"]
+
+
+@pytest.mark.parametrize("mode", ["local", "paper"])
+def test_data_desk_automatically_fills_candidate_history_without_writing_trading_prices(tmp_path, mode):
+    import pandas as pd
+    import pandas_market_calendars as mcal
+
+    from scripts.autonomous_fund.datadesk import DataDesk
+    from scripts.autonomous_fund.strategy_lab_runtime import prepare_inputs
+    from .test_autonomous_fund_datadesk import config
+
+    engine = lab(tmp_path)
+    research = proposal()
+    research["data_symbols"] = ["event-release-series"]
+    research["implementation"]["rules"][0]["entry"] = 'field("ALFA", "close") > 0'
+    engine.submit(research, NOW)
+    session_dates = mcal.get_calendar("NYSE").schedule(start_date="2025-01-02", end_date=NOW.date()).index[-140:]
+    closes = [100 + i / 10 for i in range(len(session_dates))]
+    frame = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
+                          "volume": 10000}, index=session_dates)
+    calls = []
+
+    def prices(asset, length, timestep):
+        calls.append((asset.symbol, length, timestep))
+        return SimpleNamespace(df=frame.tail(length))
+
+    settings = config()
+    settings["universe"].update(policy()["universe"])
+    desk = DataDesk(tmp_path, settings, mode, source=SimpleNamespace(get_historical_prices=prices),
+                    clock=lambda: NOW, sleep=lambda _: None, environ={})
+    day = NOW.date().isoformat()
+    baseline = [(stamp.date(), close, 10000, close, close, close) for stamp, close in zip(session_dates, closes)]
+    desk.store.save_bars(day, "BASE", 140, baseline, cutoff=NOW.date() + timedelta(days=1))
+    desk.store.save_bars(day, "ALFA", 40, baseline[-40:], cutoff=NOW.date() + timedelta(days=1))
+    original = desk.store.get(day, "bars/ALFA")
+    assert desk.enabled("strategy_history", NOW)
+    result = desk.run_job("strategy_history")
+    assert calls == [("ALFA", 140, "day")]
+    assert result["fetched"] == 1 and result["pending"] == 0 and result["missing_source"] == ["event-release-series"]
+    assert desk.store.get(day, "bars/ALFA") == original
+    assert desk._job_strategy_history(NOW)["fetched"] == 0  # A repeat consumes no provider call.
+    assert len(calls) == 1
+
+    state = SimpleNamespace(strategy_lab=engine, daily_store=desk.store, universe={"ALFA", "BASE"}, halt_path=tmp_path / "STOP")
+    prepare_inputs(state, NOW)
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT kind FROM fund_strategy_jobs").fetchone()[0] == "exploratory"
+        assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
+    result = engine.run_one(NOW)
+    assert result["status"] == "needs_data" and "final" not in result.get("tests", {})
+    assert "publication_times_complete" in result["limitations"]
+
+
 def test_repeated_cache_revision_schedules_once_on_the_existing_worker(tmp_path, monkeypatch):
     from scripts.autonomous_fund.datastore import DailyStore
     from scripts.autonomous_fund.risk import trading_day

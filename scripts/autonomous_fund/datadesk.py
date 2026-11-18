@@ -23,6 +23,7 @@ calendar   scheduled US releases (CPI, jobs, GDP, PCE, PPI,       every 6 hours 
 earnings   the earnings calendar                                  every earnings_minutes
 bars       completed daily bars (local mode; paper mode keeps     from 06:00 New York (corporate actions are
            the broker's own and the runner writes them back)      applied by then) until complete, then hourly
+strategy_history missing or deeper daily history for Strategy Lab   in bounded batches outside the regular session
 snapshot   market_snapshot from those bars                        every 15 minutes, written when it changes
 sec        SEC company facts due for a refresh                    every 12 hours
 =========  =====================================================  ==========================================
@@ -50,7 +51,7 @@ import os
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -64,7 +65,7 @@ HEARTBEAT_SECONDS = 15
 STALE_QUOTE_MINUTES = 15
 GAUGES = ("SPY", "QQQ", "IWM", "DIA")  # Broad market gauges for the intraday pulse.
 JOBS = ("news", "intraday", "premarket", "global", "macro", "calendar", "earnings", "bars", "snapshot", "sec",
-        "short_volume", "index_history")
+        "short_volume", "index_history", "strategy_history")
 GLOBAL_MARKETS = {
     "ES=F": "S&P 500 E-mini futures", "NQ=F": "Nasdaq-100 E-mini futures", "RTY=F": "Russell 2000 E-mini futures",
     "^VIX": "CBOE VIX index", "^TNX": "CBOE 10-year Treasury yield index", "DX-Y.NYB": "US dollar index",
@@ -89,6 +90,7 @@ FRED_RELEASE_DATES = "https://api.stlouisfed.org/fred/releases/dates"
 SUSPECT_MOVE = 0.25  # A gap this large versus the previous close is more likely a split or bad data.
 YAHOO_PAUSE_SECONDS = 0.3
 MAX_FAILURES_IN_A_ROW = 3
+STRATEGY_HISTORY_BATCH = 4  # Leave time for the higher-priority jobs between downloads.
 
 
 def cooldown_path(run_dir):
@@ -258,6 +260,8 @@ class DeskStatus:
             jobs[name] = {"updated_minutes_ago": round(age / 60, 1) if age is not None else None,
                           **({"error": job["error"]} if job.get("error") else {}),
                           **({"note": job["note"]} if job.get("note") and not job.get("error") else {})}
+            if name == "strategy_history" and job.get("result") and not job.get("error"):
+                jobs[name]["coverage"] = job["result"]
         return {"running": self.alive(now, state), "heartbeat_at": state.get("heartbeat_at"),
                 "busy_with": state.get("running"), "datasets": jobs}
 
@@ -473,6 +477,7 @@ class DataDesk:
         from .news import NewsSettings
         from .risk import Limits
         from .strategy import history_length, risk_settings
+        from .strategy_definition import StrategyLabSettings
         self.run_dir, self.config, self.mode = Path(run_dir), config, mode
         self.environ = os.environ if environ is None else environ
         self.clock = clock or (lambda: datetime.now(timezone.utc))
@@ -483,6 +488,8 @@ class DataDesk:
         self.tradable = sorted(s for s, kind in self.universe.items() if kind != "cash_equivalent" and s != sweep)
         self.quant = risk_settings(config, set(self.universe), Limits(**config["limits"]))[0]
         self.lab = FactorSettings.from_config(config.get("factor_lab"))
+        self.strategy_lab = StrategyLabSettings.from_config(config.get("strategy_lab"))
+        self._strategy_history_attempts = {}
         self.length = history_length(self.quant, self.lab if self.lab.enabled else None)
         self.stocks = sorted({s for s, kind in self.universe.items() if kind == "stock"} |
                              (set(self.lab.research_universe) if self.lab.enabled else set()))
@@ -533,6 +540,9 @@ class DataDesk:
             return self.mode in {"local", "paper"} and self.lab.enabled and bool(self.stocks or self.tradable)
         if name == "index_history":
             return self.mode in {"local", "paper"} and self.lab.enabled and self.lab.index_membership
+        if name == "strategy_history":
+            return (self.mode in {"local", "paper"} and self.strategy_lab.enabled
+                    and not self.market_open(now) and not (self.run_dir / "STOP").exists())
         return {"news": self.news_settings.enabled, "macro": self.macro_settings.enabled, "global": True,
                 "calendar": True, "earnings": self.event_settings.enabled, "snapshot": True,
                 "sec": self.lab.enabled and bool(str(self.environ.get("FUND_SEC_USER_AGENT", "")).strip())}[name]
@@ -567,6 +577,8 @@ class DataDesk:
             return 900
         if name == "short_volume":
             return 3600
+        if name == "strategy_history":
+            return 60 if (outcome or {}).get("pending") else 300
         return 12 * 3600
 
     def due(self, now):
@@ -894,6 +906,72 @@ class DataDesk:
         if result["failed"] and not result["fetched"] and not result["already_stored"]:
             first = sorted(result["failed"].items())[0]
             raise RiskError(f"daily bars failed for all {len(symbols)} symbols (first: {first[0]}: {first[1]})"[:200])
+        return result
+
+    def _job_strategy_history(self, now):
+        from .session_calendar import completed_daily_cutoff
+        from .strategy_lab_runtime import history_requests, research_history_store
+        from .strategy_validation import _daily_sessions
+
+        path = self.run_dir / "state.sqlite3"
+        if not path.is_file():
+            raise Idle("waiting for a Strategy Lab account journal")
+        # This adapter uses the US equity session. Keep futures, currencies and
+        # overseas indices with their own publication clocks out of this cache.
+        available_symbols = self.universe.keys() | set(self.stocks) | set(GAUGES)
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            requests, unsupported = history_requests(db, available_symbols)
+        result = {"requested": len(requests), "fetched": 0, "pending": 0, "missing_source": sorted(unsupported),
+                  "short_history": {}}
+        if not requests:
+            return result
+
+        day, cutoff = trading_day(now), completed_daily_cutoff(now)
+        store = research_history_store(self.run_dir)
+        completed = _daily_sessions((cutoff - timedelta(days=14)).isoformat(), cutoff.isoformat())
+        latest = max(session for session, _, _ in completed if session < str(cutoff))
+        needed = []
+        for symbol, length in requests.items():
+            shared = self.store.bars(day, symbol, length, cutoff=cutoff)
+            saved = store.bars(day, symbol, length, cutoff=cutoff)
+            if shared and len(shared) >= length and str(shared[-1][0]) == latest:
+                continue
+            if saved and str(saved[-1][0]) == latest:
+                if len(saved) < length:
+                    result["short_history"][symbol] = {"requested": length, "observed": len(saved)}
+                continue
+            needed.append(symbol)
+        if not needed:
+            return result
+
+        self._yield_to_trading(now)
+        from lumibot.entities import Asset
+        from .strategy import daily_rows
+
+        # Retry failed symbols after untouched ones so a bad series cannot starve others.
+        self._strategy_history_attempts = {s: at for s, at in self._strategy_history_attempts.items() if s in needed}
+        batch = sorted(needed, key=lambda s: (self._strategy_history_attempts.get(s, ""), s))[:STRATEGY_HISTORY_BATCH]
+
+        def fetch(symbol):
+            self._strategy_history_attempts[symbol] = now.isoformat()
+            if (self.run_dir / "STOP").exists() or self.market_open(self.clock()):
+                raise RiskError("research history collection paused")
+            length = requests[symbol]
+            result = self._data().get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
+            rows = [row for row in daily_rows(result) if str(row[0]) < str(cutoff)]
+            if not rows or str(rows[-1][0]) != latest:
+                raise RiskError("latest completed session unavailable")
+            store.save_bars(day, symbol, length, rows, cutoff=cutoff)
+            return len(rows)
+
+        results = self._requests(batch, fetch)
+        failures = {s: str(rows)[:120] if isinstance(rows, RiskError) else type(rows).__name__
+                    for s, rows in results.items() if isinstance(rows, Exception)}
+        fetched = len(results) - len(failures)
+        store.prune(day)
+        result.update(fetched=fetched, pending=len(needed) - fetched, failed=failures)
+        result["short_history"].update({s: {"requested": requests[s], "observed": n} for s, n in results.items()
+                                        if isinstance(n, int) and n < requests[s]})
         return result
 
     def _reference(self):

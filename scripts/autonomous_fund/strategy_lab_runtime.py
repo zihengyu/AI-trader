@@ -1,29 +1,67 @@
 """Thin fund-owned bridge to the lab; cached reads only, no research order path."""
 import json
+import math
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from stat import S_ISDIR
 from threading import Event, Lock, Thread
 
-from .risk import instant, trading_day
+from .risk import RiskError, instant, trading_day
 from .session_calendar import completed_daily_cutoff, regular_session_open
 from .strategy_lab import has_source_artifact_receipt, load_snapshot
 from .strategy_validation import digest, snapshot_limitations
+
+
+HISTORICAL_STATES = ("candidate", "needs_data", "awaiting_new_holdout")
+
+
+def history_symbols(proposal, cash_symbol):
+    symbols = set(proposal["instruments"] + proposal.get("data_symbols", []) + [proposal["validation"]["benchmark"]])
+    if cash_symbol:
+        symbols.add(cash_symbol)
+    return symbols
+
+
+def research_history_store(root):
+    from .datastore import DailyStore
+
+    return DailyStore(root / "cache" / "strategy_lab" / "daily")
+
+
+def history_requests(db, universe):
+    """Read the frozen versions the running lab can actually schedule."""
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_versions'").fetchone():
+        return {}, set()
+    saved = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
+    policy = json.loads(saved[0]) if saved else {}
+    if not policy.get("enabled"):
+        return {}, set()
+    requests, unsupported = {}, set()
+    for body, frozen in db.execute(
+            "SELECT proposal,policy FROM fund_strategy_versions WHERE policy_hash=? AND task_state='open' "
+            "AND state IN (?,?,?)", (policy["policy_hash"], *HISTORICAL_STATES)):
+        proposal, frozen = json.loads(body), json.loads(frozen)
+        cash = frozen.get("cash_symbol")
+        symbols = history_symbols(proposal, cash)
+        plan = proposal["validation"]
+        requested = sum(plan[key] for key in ("train_sessions", "validation_sessions", "final_sessions"))
+        depth = min(requested, policy["max_history_rows"] // len(symbols))
+        for symbol in symbols:
+            if symbol not in universe | {cash} or any(char in symbol for char in ("/", "\\", "\x00")):
+                unsupported.add(symbol)
+            elif depth:
+                requests[symbol] = max(requests.get(symbol, 0), depth)
+    return requests, unsupported - requests.keys()
 
 
 def _cache_symbols(strategy, rows):
     cash = strategy.strategy_lab.policy.get("cash_symbol")
     requested = set()
     for row in rows:
-        if row["task_state"] != "open":
-            continue
-        proposal = json.loads(row["proposal"])
-        requested.update(proposal["instruments"])
-        requested.update(proposal.get("data_symbols", []))
-        requested.add(proposal["validation"]["benchmark"])
-    if requested and cash:
-        requested.add(cash)
+        if row["task_state"] == "open" and row["state"] in HISTORICAL_STATES:
+            requested.update(history_symbols(json.loads(row["proposal"]), cash))
     # A model-supplied feature name is never a path to arbitrary local data.
-    return tuple(sorted(symbol for symbol in requested if (symbol in strategy.universe or symbol == cash)
+    return tuple(sorted(symbol for symbol in requested if symbol
                         and not any(char in symbol for char in ("/", "\\", "\x00"))))
 
 
@@ -35,10 +73,14 @@ def cached_snapshot(strategy, now, *, symbols=None):
     symbols = _cache_symbols(strategy, lab.rows()) if symbols is None else symbols
     raw_bars = {}
     day = trading_day(now)
+    research = research_history_store(lab.journal.root)
+    # Keep each symbol on a single price series. The widest series with the
+    # newest completed bar wins, so a deeper stale pull cannot hide fresh data.
     for symbol in symbols:
-        cached = store.get(day, "bars/" + symbol)
-        if cached and cached.get("rows"):
-            raw_bars[symbol] = cached["rows"]
+        histories = [(cache.get(day, "bars/" + symbol) or {}).get("rows", []) for cache in (store, research)]
+        rows = max(histories, key=lambda rows: (rows[-1][0], len(rows)) if rows else ("", 0))
+        if rows:
+            raw_bars[symbol] = rows
     if not raw_bars:
         return None
     import pandas_market_calendars as mcal
@@ -46,6 +88,9 @@ def cached_snapshot(strategy, now, *, symbols=None):
     schedule = mcal.get_calendar("NYSE").schedule(start_date=min(days), end_date=max(days))
     bounds = {str(day.date()): (row.market_open, row.market_close) for day, row in schedule.iterrows()}
     bars = {}
+    per_symbol = lab.settings.max_history_rows // len(raw_bars)
+    if not per_symbol:
+        return None
     for symbol, values in raw_bars.items():
         rows = []
         for raw in values:
@@ -53,11 +98,14 @@ def cached_snapshot(strategy, now, *, symbols=None):
             open_at, close_at = bounds.get(day, (None, None))
             if open_at is None or instant(close_at) > instant(now):
                 continue
+            if any(not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0
+                   for value in (opened, high, low, close, volume)) or not low <= min(opened, close) <= max(opened, close) <= high:
+                continue  # A malformed row remains a gap in an exploratory snapshot.
             rows.append({"day": day, "at": close_at.isoformat(), "open_at": open_at.isoformat(),
                          "available_at": close_at.isoformat(), "open": opened, "high": high, "low": low,
                          "close": close, "volume": volume, "availability_estimated": True})
         if rows:
-            bars[symbol] = rows
+            bars[symbol] = rows[-per_symbol:]
     if not bars:
         return None
     return {"bars": bars, "actions": [],
@@ -89,13 +137,34 @@ def prepare_inputs(strategy, now):
         _, data, fingerprint = loaded
         with lab.journal.connection() as db:
             verified = lab.settings.require_source_artifacts and has_source_artifact_receipt(db, fingerprint, now)
-        receipt = revision, candidates, verified
+        artifacts = lab.journal.root / "strategy_lab_source_artifacts"
+        artifact_revision = None
+        if lab.settings.require_source_artifacts and not verified:
+            try:
+                stat = artifacts.stat()
+                if S_ISDIR(stat.st_mode):
+                    artifact_revision = (stat.st_ino, stat.st_mtime_ns)
+            except FileNotFoundError:
+                pass  # The data adapter may deliver the original files later.
+        receipt = revision, candidates, verified, artifact_revision
         if receipt != getattr(strategy, "_strategy_lab_inbox_receipt", None):
-            key = digest([fingerprint, candidates, verified, policy])
+            key = digest([fingerprint, candidates, verified, policy, artifact_revision])
             previous = lab.journal.get_meta("strategy_lab_last_intake", {})
             if previous.get("schedule_key") != key:
-                lab.schedule(data, now)
                 gaps = snapshot_limitations(data, require_receipts=True)
+                if artifact_revision is not None and not gaps:
+                    try:
+                        lab.schedule(data, now, artifacts_dir=artifacts)
+                    except RiskError as exc:
+                        if not str(exc).startswith("Source artifact verification failed: "):
+                            raise
+                        gaps = [str(exc)]
+                    else:
+                        verified = True
+                        key = digest([fingerprint, candidates, verified, policy, None])
+                        receipt = revision, candidates, verified, None
+                if not verified or artifact_revision is None:
+                    lab.schedule(data, now)
                 if lab.settings.require_source_artifacts and not verified and not gaps:
                     gaps = ["source_artifacts_unchecked"]
                 lab.journal.set_meta("strategy_lab_last_intake", {
@@ -107,7 +176,9 @@ def prepare_inputs(strategy, now):
         return
     symbols = _cache_symbols(strategy, rows)
     day = trading_day(now)
-    cache = tuple((symbol, store.version(day, "bars/" + symbol)) for symbol in symbols)
+    research = research_history_store(lab.journal.root)
+    cache = tuple((symbol, store.version(day, "bars/" + symbol), research.version(day, "bars/" + symbol))
+                  for symbol in symbols)
     receipt = day, completed_daily_cutoff(now), candidates, cache
     if receipt != getattr(strategy, "_strategy_lab_cache_receipt", None):
         data = cached_snapshot(strategy, now, symbols=symbols)

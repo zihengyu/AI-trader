@@ -154,6 +154,16 @@ the session-boundary publication estimate as an estimate. It never invents
 original publication receipts, current-universe completeness or delisting
 returns. Such inputs can yield research diagnostics but cannot pass admission.
 
+The data desk reads executable open candidates and fills requested daily history
+for their instruments, benchmarks, cash sleeve and known supplemental market
+series. It reuses sufficiently deep, current daily caches and downloads missing
+series in small off-hours batches using its existing market-data source. The
+extra history is cached separately from the runner's risk inputs. Short history,
+unavailable series and provider failures remain visible to the researcher and
+under `fund-logs.sh strategy-lab`. The desk retries missing completed bars and
+prioritizes trading during a provider cooldown. No operator data entry is needed
+for this exploratory path.
+
 Passed historical versions enter an independent forward book. The worker first
 evaluates the last completed close with fresh capital. Each accepted close then
 produces the next signal. The journal binds that signal to the strategy and
@@ -424,7 +434,8 @@ the operational model budget retain their separate owner.
 Budget exhaustion pauses optional research only. It does not disable account
 polling, risk checks, reconciliation, protective exits or existing orders. The
 lab uses the data desk's cached data without new provider downloads on the
-trading thread. A bounded single-worker queue prioritizes forward observations.
+trading thread. The data desk fills candidate history in its own service.
+A bounded single-worker queue prioritizes forward observations.
 Technical failures retain their failed leases and may retry the identical
 immutable job within budgets; they are not negative investment evidence.
 Leases support restart recovery and prevent a stale worker from overwriting
@@ -449,7 +460,8 @@ bash scripts/fund-logs.sh strategy-lab
 python -m scripts.autonomous_fund.lab status --run-dir artifacts/fund-local
 ```
 
-Controlled import of an operator-owned snapshot and one deterministic job:
+For diagnosis or replay, a snapshot can also be imported offline and one
+deterministic job can be run explicitly:
 
 ```bash
 python -m scripts.autonomous_fund.lab import-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json
@@ -513,22 +525,29 @@ delistings, action terms, publication times and normalization separately.
 The Lab rejects future and invalid timestamps and excessive inputs, and treats
 missing manifests, altered snapshots or estimated timestamps as exploratory.
 
-For automated intake, atomically replace `strategy_lab_snapshot.json` in the
-account's run directory from an authorized data adapter. The existing off-hours
-hook imports the file and starts the available jobs. To build the forward record,
+For unattended formal validation, an authorized data adapter atomically
+publishes `strategy_lab_snapshot.json` in the account's run directory. When
+original bytes are required, it also publishes its content-addressed originals
+in `strategy_lab_source_artifacts/` below that directory. The off-hours hook
+verifies the originals, imports the file and starts the available jobs. Atomic
+delivery of missing or corrected originals triggers a new check even when the
+snapshot has not changed. Missing or mismatched originals keep formal validation
+blocked and appear in status. To build the forward record,
 deliver each completed daily bar and its evidence before the following open.
 Daily additions can carry only that session and new available observations. The
 Lab joins them to the immutable previously accepted inputs. Check status for
 prospective and replayed session counts, the last validation, and remaining
-budget. With strict source evidence enabled, verify and import each snapshot
-offline before its validation deadline. The regular runner can reuse the saved
-check without reading the original files. The existing background worker reads
-and verifies the snapshot. Local and broker paper services poll the inbox even
+budget. The existing background worker reads and verifies the snapshot.
+Local and broker paper services poll the inbox even
 while the market is closed and the strategy is waiting for its next iteration.
 The runner retains the last scheduled identities for
 the data cache and inbox, including candidate state, policy and source proof.
-An unchanged input can be skipped after a rewrite or restart. Provider access and evidence
-collection remain the operator's responsibility.
+An unchanged input can be skipped after a rewrite or restart. Formal validation
+needs a configured feed that actually supplies the requested original evidence.
+The desk's current day-bar, macro and earnings caches do not establish complete
+historical publication, revision and universe coverage for arbitrary candidates.
+Missing evidence keeps a candidate in research until an authorized feed can
+provide it automatically.
 
 Review a frozen candidate's first forward window using the selected account's
 read-only journal. The audit shows the planned NYSE window, opened sessions

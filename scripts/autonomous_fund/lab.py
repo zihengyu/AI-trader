@@ -207,6 +207,7 @@ def forward_audit(root, key, version, now):
 
 
 def report(root):
+    from .datadesk import DeskStatus
     from .execution_quality import reference_lines
     from .strategy_competition import compare_saved
 
@@ -342,6 +343,21 @@ def report(root):
                     gaps = "，".join(f"{labels[reason]} {count} 日" for reason, count in exposure["missing_by_reason"].items())
                     lines.append(f"  持仓覆盖缺口包括{gaps}。")
         lines.append("后台任务：" + json.dumps(states, ensure_ascii=False))
+        desk = DeskStatus(root).summary(now)
+        history = desk.get("datasets", {}).get("strategy_history", {}) if desk["running"] else {}
+        if coverage := history.get("coverage"):
+            lines.append(f"数据员自动补数追踪 {coverage['requested']} 个日线序列，待补 {coverage['pending']} 个。")
+            if coverage.get("missing_source"):
+                lines.append("缺少适用行情或特征来源：" + json.dumps(coverage["missing_source"], ensure_ascii=False))
+            if coverage.get("short_history"):
+                lines.append("历史长度不足：" + json.dumps(coverage["short_history"], ensure_ascii=False))
+            if coverage.get("failed"):
+                lines.append("最近补数失败：" + json.dumps(coverage["failed"], ensure_ascii=False))
+        if message := history.get("error") or history.get("note"):
+            lines.append("数据员补数状态：" + message)
+        intake = db.execute("SELECT value FROM meta WHERE key='strategy_lab_last_intake'").fetchone()
+        if intake and (gaps := json.loads(intake[0]).get("coverage_gaps")):
+            lines.append("正式验证数据缺口：" + "、".join(gaps))
         forward = forward_readiness(db, now, policy)
         lines.append(f"前瞻截止 {forward['next_open']}，已留证 {len(forward['ready'])}，待留证 {len(forward['waiting'])}，"
                      f"前瞻排队 {forward['queued_forward_jobs']}，今日剩余任务名额 {forward['daily_slots_left']}。")
