@@ -62,6 +62,38 @@ def test_schema_override_and_each_retry_are_bound_to_distinct_call_ids(tmp_path)
     assert load_call(tmp_path, second['id'])['input']['agent']['output_schema'] == PostmarketReview.model_json_schema()
 
 
+def test_application_tool_diagnostics_link_errors_and_no_tool_warning_to_the_exact_call(tmp_path):
+    from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent
+    from scripts.autonomous_fund.evidence import load_call
+    from scripts.autonomous_fund.log_errors import error_records
+
+    failure = AgentTraceEvent(kind='tool_result', tool_name='duckdb_query', payload={'tool_error': True,
+        'error': {'type': 'BinderException', 'message': 'PRIVATE_QUERY_BODY', 'retryable': False}})
+    corrected = AgentTraceEvent(kind='tool_result', tool_name='duckdb_query', payload={'rows': ['PRIVATE_RESULT']})
+    calls = [AgentTraceEvent(kind='tool_call', tool_name='duckdb_query') for _ in range(2)]
+    results = iter([AgentRunResult('research answer', 'fixture/model', [calls[0], failure, calls[1], corrected]),
+                    AgentRunResult('context-only answer', 'fixture/model', [], warnings=[{'kind': 'no_tool_calls'}])])
+    strategy = fund(tmp_path, runner=lambda **_: next(results))
+    messages = []
+    strategy.log_message = lambda message, **_: messages.append(message)
+    strategy._agent_call('manager', purpose='shadow', context={})
+    strategy._agent_call('manager', purpose='postmarket_review', context={})
+
+    first, second = event(strategy, 'agent_call_finished')
+    details = first['tool_diagnostics']
+    assert details['tool_calls'] == details['tool_results'] == 2
+    assert details['failed_results'] == 1
+    assert details['failures'] == [{'tool': 'duckdb_query', 'error_type': 'BinderException', 'retryable': False}]
+    assert details['tools_with_later_success'] == ['duckdb_query']
+    assert second['tool_diagnostics']['no_tool_calls_warning'] is True
+    assert load_call(tmp_path, first['id'])['result']['tool_diagnostics'] == details
+    assert load_call(tmp_path, second['id'])['result']['tool_diagnostics']['tool_calls'] == 0
+    records = error_records([{'MESSAGE': message} for message in messages])
+    assert len(records) == 2 and first['id'] in records[0] and 'shadow' in records[0]
+    assert second['id'] in records[1] and 'postmarket_review' in records[1]
+    assert 'PRIVATE_' not in ''.join(records) and 'PRIVATE_' not in json.dumps([first, second])
+
+
 def test_failed_call_keeps_its_input_and_unknown_usage_without_inventing_a_result(tmp_path):
     from scripts.autonomous_fund.evidence import audit, load_call
 

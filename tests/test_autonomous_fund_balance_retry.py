@@ -138,10 +138,12 @@ def test_native_local_snapshot_still_rejects_unavailable_actions_during_backgrou
         broker._close_connection()
 
 
-def test_history_backoff_keeps_the_first_cause_until_recovery_without_provider_payload(monkeypatch):
+def test_history_backoff_keeps_the_first_cause_until_recovery_without_provider_payload(monkeypatch, caplog):
+    import logging
     from scripts.autonomous_fund.market_data import YahooRealtimeData
     from .test_autonomous_fund_local import Clock
     clock, timer, reads = Clock(), [100.0], []
+    caplog.set_level(logging.INFO, logger="scripts.autonomous_fund.market_data")
     monkeypatch.setattr("scripts.autonomous_fund.market_data.time.monotonic", lambda: timer[0])
 
     def unavailable(*args):
@@ -160,10 +162,13 @@ def test_history_backoff_keeps_the_first_cause_until_recovery_without_provider_p
     assert source.diagnostics()["source_failures"][0]["failed_at"] == first["failed_at"]
     assert len(reads) == 1
     assert "private-provider-response" not in str(source.diagnostics()) + str(failure.value.diagnostic)
+    assert caplog.text.count("local_source_unavailable") == 1
+    assert "cause=TimeoutError" in caplog.text and "private-provider-response" not in caplog.text
     timer[0] += 16
     source.fetch = clock.fetch
     assert source.get_quote(Asset("BETA")).price > 0
     assert source.diagnostics()["source_failures"] == []
+    assert caplog.text.count("local_source_recovered") == 1
 
 
 def test_another_symbols_success_does_not_clear_the_failed_series_diagnostic():

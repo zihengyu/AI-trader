@@ -1,4 +1,5 @@
 """Live Yahoo adapter for the local simulator; no brokerage credentials."""
+import logging
 import threading
 import time
 import os
@@ -40,6 +41,8 @@ from lumibot.entities import Bars, Quote
 
 from .risk import MarketDataUnavailable, NoCompletedMinute, RiskError, instant, number
 from .session_calendar import _session_bounds, _session_close, regular_session_open, completed_daily_cutoff
+
+_LOG = logging.getLogger(__name__)
 
 
 class SessionClock:
@@ -360,6 +363,10 @@ class YahooRealtimeData(DataSource):
                     self._source_errors.move_to_end(key)
                     while len(self._source_errors) > 60:
                         self._source_errors.popitem(last=False)
+                if not failure:
+                    _LOG.warning("FUND local_source_unavailable: source=%s symbol=%s interval=%s period=%s "
+                                 "cause=%s first_retry_seconds=%d", self.SOURCE, symbol, interval, period,
+                                 type(exc).__name__, delay)
                 if self.on_backoff is not None:
                     try:
                         self.on_backoff(time.time() + delay)
@@ -373,6 +380,9 @@ class YahooRealtimeData(DataSource):
                 self._failures.pop(key, None)
                 self._source_errors.pop(key, None)
             self._cache[key] = (time.monotonic(), frame.copy(), cutoff)
+            if failure:
+                _LOG.info("FUND local_source_recovered: source=%s symbol=%s interval=%s period=%s",
+                          self.SOURCE, symbol, interval, period)
             return frame
 
     def _download(self, symbol, interval, period, now):

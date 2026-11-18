@@ -52,6 +52,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         # Native polling and strategy iterations can both request a sync. Keep
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
+        self._opening_balance_retry_at = None
         # State commits and native events must agree, but cancellations must not
         # wait for another thread's market-data I/O under the polling lock.
         self._order_state_lock = threading.RLock()
@@ -169,8 +170,32 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return number(db.execute("SELECT receivables FROM local_account WHERE id=1").fetchone()[0])
 
     def _get_balances_at_broker(self, quote_asset, strategy):
+        """Native sync can leave its prior balances in place while an opening mark is pending."""
         with self._poll_lock:
-            return self._read_balances(quote_asset, strategy)
+            if self.opening_balance_deferred():
+                return None
+            try:
+                return self.read_confirmed_balances(quote_asset, strategy)
+            except OpeningValuationPending:
+                return None
+
+    def opening_balance_deferred(self):
+        retry_at = self._opening_balance_retry_at
+        return retry_at is not None and self.data_source.get_datetime() < retry_at
+
+    def read_confirmed_balances(self, quote_asset, strategy):
+        """Fresh fund evidence for decisions, with the full valuation diagnostic on failure."""
+        with self._poll_lock:
+            try:
+                balances = self._read_balances(quote_asset, strategy)
+            except OpeningValuationPending as exc:
+                # The background poll can see a trade before the first minute
+                # closes. Never delay a native refresh past that first bar.
+                now = self.data_source.get_datetime()
+                self._opening_balance_retry_at = min(now + timedelta(seconds=5), instant(exc.diagnostic["first_bar_at"]))
+                raise
+            self._opening_balance_retry_at = None
+            return balances
 
     def ledger_audit(self, *, strict=True):
         """Trade guards reconcile money facts; non-strict research audits include NAV history.

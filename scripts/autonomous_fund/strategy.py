@@ -1823,6 +1823,9 @@ class AutonomousFund(Strategy):
         """
         if getattr(self, "mode", None) != "local":
             return super().update_broker_balances(force_update=force_update)
+        deferred = getattr(self.broker, "opening_balance_deferred", None)
+        if deferred is not None and deferred():
+            return False
         if not force_update and monotonic() < getattr(self, "_local_balance_retry_at", 0):
             return False
         updated = super().update_broker_balances(force_update=force_update)
@@ -1848,7 +1851,9 @@ class AutonomousFund(Strategy):
     def _snapshot_account(self):
         orders = self._orders()
         if self.mode in {"paper", "local"}:
-            cash, _, equity = self.broker._get_balances_at_broker(self.quote_asset, self)
+            read = (getattr(self.broker, "read_confirmed_balances", self.broker._get_balances_at_broker)
+                    if self.mode == "local" else self.broker._get_balances_at_broker)
+            cash, _, equity = read(self.quote_asset, self)
             positions = self.broker._pull_positions(self)
         else:
             positions = self.get_positions()
@@ -2301,7 +2306,7 @@ class AutonomousFund(Strategy):
         model = getattr(self, "agent_models", {}).get(name) or (
             getattr(self, "triage_model", None) if name == "triage" else None) or (
             getattr(self, "probe_agents", None) or {}).get(name) or "unknown"
-        from .evidence import capture_input, capture_result
+        from .evidence import capture_input, capture_result, tool_diagnostics
         try:
             input_evidence = capture_input(self.journal, self.get_datetime(), self._current_call, self.agents[name],
                 kwargs, model=model, prompt_version=getattr(self, "prompt_version", None),
@@ -2315,8 +2320,17 @@ class AutonomousFund(Strategy):
             **({"research_reservation": reservation, "research_project": project}
                if self._current_call.get("research_reservation") else {})})
         result_evidence = {"status": "no_result"}
+        tool_evidence = None
         try:
             result = self.agents[name].run(**kwargs)
+            try:
+                tool_evidence = tool_diagnostics(result)
+                if tool_evidence and (tool_evidence["failed_results"] or tool_evidence["no_tool_calls_warning"]):
+                    self.log_message("FUND agent_tool_diagnostics: " + encode({
+                        "call_id": key, "role": name, "purpose": purpose, "cache_hit": bool(getattr(result, "cache_hit", False)),
+                        **tool_evidence}), color="yellow")
+            except Exception:
+                pass  # Optional observability cannot discard a returned answer.
             if input_evidence["status"] == "recorded":
                 try:
                     result_evidence = capture_result(self.journal, key, result)
@@ -2336,7 +2350,8 @@ class AutonomousFund(Strategy):
             raise
         finally:
             self.journal.event(self.get_datetime(), "agent_call_finished", {
-                "id": key, "name": name, "result_evidence": result_evidence})
+                "id": key, "name": name, "result_evidence": result_evidence,
+                **({"tool_diagnostics": tool_evidence} if tool_evidence is not None else {})})
 
     def _notify_fund(self, kind, details):
         """Queue application events; keep Strategy.notify's native public contract."""

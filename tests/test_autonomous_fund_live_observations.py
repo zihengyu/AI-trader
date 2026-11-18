@@ -109,6 +109,7 @@ def test_independent_valuation_discloses_stale_marks_and_recovers_without_retime
 
 
 def test_local_iteration_waits_for_the_opening_quote_and_resumes_with_current_evidence(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.risk import MarketDataUnavailable, OpeningValuationPending
     from scripts.autonomous_fund.journal import Journal
     from scripts.autonomous_fund.local_broker import LocalPaperBroker
     from scripts.autonomous_fund.market_data import YahooRealtimeData
@@ -151,6 +152,22 @@ def test_local_iteration_waits_for_the_opening_quote_and_resumes_with_current_ev
         strategy._decide = lambda account, now, paused: decisions.append(account)
 
         clock.value = opened + timedelta(seconds=1)
+        native_reads, balance_warnings = [], []
+        read_balances = broker._read_balances
+
+        def count_read(*args):
+            native_reads.append(clock.value)
+            return read_balances(*args)
+
+        monkeypatch.setattr(broker, "_read_balances", count_read)
+        monkeypatch.setattr(strategy.logger, "warning", lambda message, *args, **kwargs: balance_warnings.append(str(message)))
+        refreshed_at = getattr(strategy, "last_broker_balances_update", None)
+        strategy._executor.sync_broker()
+        strategy._executor.sync_broker()
+        assert strategy.update_broker_balances(force_update=True) is False
+        assert native_reads == [clock.value]
+        assert all("balance refresh failed" not in item for item in balance_warnings)
+        assert strategy.last_broker_balances_update == refreshed_at
         strategy.on_trading_iteration()
         strategy.on_trading_iteration()
         pending = [row["body"]["details"] for row in journal.all_events() if row["kind"] == "notification"
@@ -165,6 +182,9 @@ def test_local_iteration_waits_for_the_opening_quote_and_resumes_with_current_ev
 
         # Once the first minute should be available, continued lag is a regular failure with evidence.
         clock.value = opened + timedelta(seconds=61)
+        with pytest.raises(MarketDataUnavailable) as failure:
+            broker._get_balances_at_broker(None, strategy)
+        assert not isinstance(failure.value, OpeningValuationPending)
         strategy.on_trading_iteration()
         notices = [row["body"]["kind"] for row in journal.all_events() if row["kind"] == "notification"]
         assert notices.count("opening_valuation_pending") == 1 and "blocked" in notices
@@ -174,6 +194,7 @@ def test_local_iteration_waits_for_the_opening_quote_and_resumes_with_current_ev
         # Supply a newly completed bar while it is still within the quote-age limit.
         clock.value = opened + timedelta(seconds=90)
         source._cache.pop(("ALFA", "1m", "5d"))
+        assert strategy.update_broker_balances(force_update=True) is True
         strategy.on_trading_iteration()
         assert len(decisions) == 1 and decisions[0].positions == {"ALFA": 5}
         assert journal.get_meta("session_open_notified") == "2026-11-03"
@@ -273,7 +294,8 @@ def test_fill_update_waits_for_a_post_fill_account_and_survives_monitor_restart(
 def test_target_notice_explicitly_describes_a_plan_before_the_fill():
     text = readable("decision_changed", {"at": str(NOW), "changes": [{"symbol": "ALFA", "from": ".05", "to": "0"}],
                                           "cash_weight": "1"})
-    assert "计划卖出／减仓" in text and "成交更新" in text
+    # This event compares target weights even when no sale was needed or sent.
+    assert "目标下调：ALFA 5%→0%" in text and "实际交易以成交更新为准" in text
 
 
 def test_confirmed_fill_is_disclosed_during_snapshot_outage_then_followed_by_the_updated_account(tmp_path):

@@ -117,6 +117,45 @@ def capture_input(journal, now, call, agent, kwargs, *, model, prompt_version=No
     return {'status': 'recorded', 'sha256': digest}
 
 
+def _tool_label(value):
+    if (isinstance(value, str) and 0 < len(value) <= 80 and value.isascii()
+            and value.replace('.', '_').replace('-', '_').isidentifier()):
+        return value
+    return None
+
+
+def tool_diagnostics(result):
+    """Summarize native tool evidence without copying queries, payloads or provider messages."""
+    calls, results = getattr(result, 'tool_calls', None), getattr(result, 'tool_results', None)
+    if calls is None or results is None:
+        return None
+    failed = []
+    failed_names, later_successes = set(), set()
+    for event in results:
+        name = _tool_label(getattr(event, 'tool_name', None))
+        payload = getattr(event, 'payload', None)
+        if not isinstance(payload, dict):
+            continue
+        if payload.get('tool_error') is True:
+            error = payload.get('error')
+            error = error if isinstance(error, dict) else {}
+            entry = {'tool': name, 'error_type': _tool_label(error.get('type'))}
+            if category := _tool_label(error.get('category')):
+                entry['category'] = category
+            if type(error.get('retryable')) is bool:
+                entry['retryable'] = error['retryable']
+            failed.append(entry)
+            if name:
+                failed_names.add(name)
+        elif name in failed_names and payload.get('ok') is not False and not payload.get('error'):
+            later_successes.add(name)
+    no_tools = any(isinstance(warning, dict) and warning.get('kind') == 'no_tool_calls'
+                   for warning in (getattr(result, 'warnings', None) or ()))
+    return {'tool_calls': len(calls), 'tool_results': len(results), 'failed_results': len(failed),
+            'failures': failed[:10], 'tools_with_later_success': sorted(later_successes)[:10],
+            'no_tool_calls_warning': no_tools}
+
+
 def capture_result(journal, call_id, result):
     """Retain the raw returned answer; validation and adoption remain separate journal facts."""
     parsed = getattr(result, 'parsed', None)
@@ -124,6 +163,9 @@ def capture_result(journal, call_id, result):
         parsed = parsed.model_dump(mode='json')
     body = {key: getattr(result, key, None) for key in ('summary', 'model', 'usage', 'cache_hit', 'parse_error', 'served_models')}
     body['parsed'] = parsed
+    diagnostics = tool_diagnostics(result)
+    if diagnostics is not None:
+        body['tool_diagnostics'] = diagnostics
     with journal.connection() as db:
         db.execute('BEGIN IMMEDIATE')
         row = db.execute('SELECT result_hash FROM fund_evidence_calls WHERE call_id=?', (call_id,)).fetchone()

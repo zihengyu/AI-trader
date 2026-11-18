@@ -11,7 +11,8 @@ ERROR = re.compile(
     r"|Main process exited|Failed to |Server supervision stopped"
     r"|FUND (?:\w*error|stopped|stop_active|watchdog_stop|server_supervision_stop|auto_resume_exhausted"
     r"|price_alert_unavailable|price_alert_recovered|price_observation_rejected|local_market_data_pending"
-    r"|opening_valuation_pending|closing_valuation_pending):"
+    r"|local_source_unavailable|local_source_recovered"
+    r"|opening_valuation_pending|closing_valuation_pending|agent_tool_diagnostics):"
     r"|\[observability_warning\]"
 )
 TRACE = re.compile(
