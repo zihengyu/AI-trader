@@ -44,11 +44,19 @@ class StrategyProgram(BaseModel):
         return value
 
 
+class StrategyReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    strategy_id: str = Field(min_length=1, max_length=80)
+    version: str = Field(min_length=1, max_length=80)
+    digest: str = Field(min_length=64, max_length=64)
+
+
 class ValidationPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     method: str = Field(default="daily_forward_v1", min_length=1, max_length=80)
     benchmark: str = Field(min_length=1, max_length=24)
     benchmark_weight: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
+    reference_strategy: StrategyReference | None = None
     holding_sessions: int = Field(ge=1, le=252)
     train_sessions: int = Field(default=180, ge=40, le=5000)
     validation_sessions: int = Field(default=60, ge=20, le=10000)
@@ -105,6 +113,14 @@ class StrategyProposal(BaseModel):
     implementation: StrategyProgram | None = None
     # Extensible research details are inert JSON text, not trusted instructions.
     additional_research: str = Field(default="", max_length=12000)
+
+
+def proposal_body(proposal):
+    body = StrategyProposal.model_validate(proposal).model_dump()
+    if body["validation"]["reference_strategy"] is None:
+        # Preserve the digest of previously registered passive-only proposals.
+        del body["validation"]["reference_strategy"]
+    return body
 
 
 class ResearchTaskUpdate(BaseModel):
@@ -172,6 +188,10 @@ RESEARCH_GUIDANCE = (
     "Review saved tasks and failures before proposing a new version. strategy_proposals records the full "
     "hypothesis, entry/exit/sizing, data needs, costs, falsification and predeclared validation. "
     "If you choose to test a complete strategy, register the specification and comparison before evaluating it. "
+    "To add an executable comparison to daily_forward_v1, use validation.reference_strategy with the ID, "
+    "version and digest of a strategy already registered under the same policy. Read its saved identity via "
+    "strategy_research; never guess a digest. Predeclare a holding horizon covering both strategies. A paired "
+    "comparison shares the candidate's evaluation calendar and keeps the passive benchmark as a qualification floor. "
     "Specify fixed-allocation and volatility-scaled alternatives separately so their results remain reproducible. "
     "Validation method daily_forward_v1 supports the documented daily evidence protocol; propose any other "
     "method when its assumptions do not fit, with an explanation in validation.rationale. It remains a "

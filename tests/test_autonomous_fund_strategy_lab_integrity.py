@@ -15,7 +15,7 @@ from scripts.autonomous_fund.strategy_definition import StrategyLabSettings, Str
 from scripts.autonomous_fund.strategy_lab import StrategyLab, run_worker
 from scripts.autonomous_fund.strategy_validation import check_dataset, replay
 from tests.test_autonomous_fund_strategy_lab import (NOW, attest, cash_dataset, dataset, forward_one_session_at_a_time,
-                                                   lab, policy, proposal)
+                                                   lab, policy, proposal, register_comparison)
 
 
 @pytest.mark.parametrize("cash_adapter", [False, True])
@@ -88,7 +88,8 @@ def test_cash_signal_uses_the_same_buffer_and_friction_as_replay():
     assert float(result["next_targets"]["ALFA"]) == pytest.approx(expected)
 
 
-def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_reference", [False, True])
+def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_path, monkeypatch, with_reference):
     from scripts.autonomous_fund.execution import ExecutionState, OrderAuthorizationChanged, require_submission_authority
     from scripts.autonomous_fund.risk import Intent, Limits, number
     from scripts.autonomous_fund.strategy_admission import library
@@ -106,6 +107,12 @@ def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_
     journal = Journal(tmp_path, "synthetic-verified-sleeve")
     engine = StrategyLab(journal, configured, StrategyLabSettings(admission="paper_library", min_forward_sessions=40))
     formed = instant(initial["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    if with_reference:
+        control = proposal("comparison-control")
+        control["implementation"]["rules"][0].update(entry="False", weight="0")
+        register_comparison(engine, candidate, control, formed)
+        engine.update_task({"strategy_id": control["strategy_id"], "version": "v1", "action": "pause",
+                            "findings": "Fixed comparator", "next_step": "Keep its version frozen"}, formed)
     engine.submit(candidate, formed)
     engine.schedule(initial, formed)
     assert engine.run_one(formed)["passed"]
@@ -130,6 +137,17 @@ def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_
         state.accept({**decision, "targets": [{"symbol": "ALFA", "weight": .1}]}, now, {"ALFA", "BASE"}, Limits())
     with journal.connection() as db:
         assert require_submission_authority(db, "synthetic-intent", now)["source"] == "automatic"
+        if with_reference:
+            day, original = db.execute("SELECT day,body FROM fund_strategy_signals WHERE id=? AND version=? "
+                                       "ORDER BY day DESC LIMIT 1", (allocation["strategy_id"], "v1")).fetchone()
+            signal = json.loads(original)
+            signal.pop("strategy_reference")
+            db.execute("UPDATE fund_strategy_signals SET body=? WHERE id=? AND version=? AND day=?",
+                       (json.dumps(signal), allocation["strategy_id"], "v1", day))
+            with pytest.raises(RiskError, match="frozen comparison signal"):
+                verify_allocations(db, decision, now, purchase=True)
+            db.execute("UPDATE fund_strategy_signals SET body=? WHERE id=? AND version=? AND day=?",
+                       (original, allocation["strategy_id"], "v1", day))
         db.execute("UPDATE meta SET value='unreadable' WHERE key='strategy_lab_policy'")
         with pytest.raises(OrderAuthorizationChanged, match="strategy_admission_changed"):
             require_submission_authority(db, "synthetic-intent", now)

@@ -22,7 +22,7 @@ from pathlib import Path
 
 from .comparison import Book, project
 from .risk import RiskError, instant, number
-from .strategy_definition import StrategyProposal, daily_sample_requirements
+from .strategy_definition import daily_sample_requirements, proposal_body
 from .strategy_program import StrategyRuleError, history_requirements, parameter_values, targets, validate_program
 
 
@@ -33,6 +33,37 @@ COVERAGE_FIELDS = ("raw_prices", "corporate_actions_complete", "point_in_time_me
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      allow_nan=False, default=str).encode()).hexdigest()
+
+
+def verify_reference(proposal, reference):
+    identity = proposal["validation"].get("reference_strategy")
+    if identity is None and reference is None:
+        return
+    if identity is None or reference is None or identity != {
+            "strategy_id": reference["strategy_id"], "version": reference["version"], "digest": digest(reference)}:
+        raise RiskError("Reference strategy does not match its frozen identity")
+    if (reference["strategy_id"], reference["version"]) == (proposal["strategy_id"], proposal["version"]):
+        raise RiskError("A strategy version cannot be its own executable reference")
+    if proposal["validation"]["holding_sessions"] < reference["validation"]["holding_sessions"]:
+        raise RiskError("The comparison holding horizon must cover both strategies")
+
+
+def comparison_inputs(proposal, reference, policy):
+    verify_reference(proposal, reference)
+    if reference is None:
+        return policy, None
+    # The candidate owns the window and calendar. The reference contributes
+    # only its frozen rules, inputs and costs, regardless of its own study plan.
+    paired_reference = {**reference, "validation": proposal["validation"]}
+    shared = {**policy}
+    for fee in ("fee_rate", "slippage"):
+        if policy.get(fee) is not None:
+            shared[fee] = str(max(number(policy[fee]), number(proposal["costs"][fee]), number(reference["costs"][fee])))
+    data_cost = policy.get("shared_data_cost_usd_per_session", "0")
+    if data_cost is not None:
+        shared["shared_data_cost_usd_per_session"] = str(max(number(data_cost), number(proposal["costs"]["daily_data_usd"]),
+                                                           number(reference["costs"]["daily_data_usd"])))
+    return shared, paired_reference
 
 
 def snapshot_limitations(data, *, require_receipts=False):
@@ -405,6 +436,15 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
             "implementation": "next_open_whole_share_v1"}
 
 
+def replay_strategy_reference(reference, data, policy, days, **options):
+    try:
+        return replay(reference, data, policy, days, **options)
+    except StrategyRuleError as exc:
+        raise StrategyRuleError(f"Reference strategy: {exc}") from exc
+    except RiskError as exc:
+        raise RiskError(f"Reference strategy: {exc}") from exc
+
+
 def metrics(series, initial):
     values = [float(initial), *[float(r["net_economic_equity"]) for r in series]]
     if any(not math.isfinite(v) or v <= 0 for v in values):
@@ -504,7 +544,17 @@ def _historical_feature_rows(rows, initial_close, final_close, depth):
     return [row for row in visible if instant(row["at"]) >= lower]
 
 
-def historical_input_gap(proposal, data, policy, *, locked_sessions=None):
+def historical_input_gap(proposal, data, policy, *, locked_sessions=None, reference=None):
+    paired_policy, paired_reference = comparison_inputs(proposal, reference, policy)
+    gap = _historical_arm_gap(proposal, data, paired_policy, locked_sessions)
+    if not gap and paired_reference is not None:
+        gap = _historical_arm_gap(paired_reference, data, paired_policy, locked_sessions)
+        if gap:
+            return {**gap, "reason": "Reference strategy: " + gap["reason"]}
+    return gap
+
+
+def _historical_arm_gap(proposal, data, policy, locked_sessions):
     """Identify deterministic input gaps before claiming a slot or exposing a final window."""
     if policy.get("fee_rate") is None or policy.get("slippage") is None:
         return {"status": "needs_data", "passed": False, "reason": "Verified execution costs are unavailable"}
@@ -583,8 +633,8 @@ def historical_input_gap(proposal, data, policy, *, locked_sessions=None):
 
 
 def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow_final=True, locked_sessions=None,
-             require_receipts=False):
-    proposal = StrategyProposal.model_validate(proposal).model_dump()
+             require_receipts=False, reference=None):
+    proposal = proposal_body(proposal)
     if proposal["validation"]["method"] != "daily_forward_v1":
         return {"status": "needs_adapter", "passed": False, "reason": "A suitable independent validation adapter is required"}
     if proposal["implementation"] is None or validate_program(proposal["implementation"], proposal["instruments"]) != "ready":
@@ -596,8 +646,9 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
     if short:
         return {"status": "needs_formalization", "passed": False, "minimum_sessions": short,
                 "reason": "Declared split cannot supply the required nonoverlapping blocks after purging"}
-    if gap := historical_input_gap(proposal, data, policy, locked_sessions=locked_sessions):
+    if gap := historical_input_gap(proposal, data, policy, locked_sessions=locked_sessions, reference=reference):
         return gap
+    paired_policy, paired_reference = comparison_inputs(proposal, reference, policy)
     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
     days = locked_sessions if locked_sessions is not None else [r["day"] for r in data["bars"][plan["benchmark"]]][-total:]
     train_end = plan["train_sessions"]
@@ -610,14 +661,16 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
     limitations = snapshot_limitations(data, require_receipts=require_receipts)
     if policy.get("cash_symbol") and proposal["implementation"]["adapter"] != "daily_cash_rules_v1":
         limitations.append("cash_sweep_execution_adapter_required")
+    if paired_reference and policy.get("cash_symbol") and paired_reference["implementation"]["adapter"] != "daily_cash_rules_v1":
+        limitations.append("reference_cash_sweep_execution_adapter_required")
     results, receipts = {}, {}
     for name, window in windows.items():
         if name == "final" and (not allow_final or limitations):
             continue
-        actual = replay(proposal, data, policy, window, initial_capital=initial_capital)
-        reference = replay(proposal, data, policy, window, initial_capital=initial_capital,
-                           static_weight=plan["benchmark_weight"])
-        a, b = metrics(actual["series"], initial_capital), metrics(reference["series"], initial_capital)
+        actual = replay(proposal, data, paired_policy, window, initial_capital=initial_capital)
+        passive = replay(proposal, data, policy, window, initial_capital=initial_capital,
+                         static_weight=plan["benchmark_weight"])
+        a, b = metrics(actual["series"], initial_capital), metrics(passive["series"], initial_capital)
         result = test_excess(a, b, plan, trials)
         # Additional equal-to-observed friction is a conservative cost stress;
         # it does not claim to reproduce changed fills or market impact.
@@ -628,7 +681,15 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
                          "reference": {k: v for k, v in b.items() if k != "daily_returns"},
                          "regimes": regime_outcomes(window, a, b, data["bars"][plan["benchmark"]]),
                          "start": window[0], "end": window[-1]}
-        receipts[name] = {"strategy": actual, "reference": reference}
+        receipts[name] = {"strategy": actual, "reference": passive}
+        if paired_reference is not None:
+            control = replay_strategy_reference(paired_reference, data, paired_policy, window, initial_capital=initial_capital)
+            c = metrics(control["series"], initial_capital)
+            comparison = test_excess(a, c, plan, trials)
+            results[name]["strategy_reference"] = {**comparison, "net_return": c["net_return"],
+                                                   "max_drawdown": c["max_drawdown"]}
+            results[name]["passed"] &= comparison["passed"]
+            receipts[name]["strategy_reference"] = control
     # Fixed-version expanding-history evaluations: each subsequent fold may use
     # earlier observations for signals, never later observations or refit params.
     validation_days = windows["validation"]
@@ -637,14 +698,18 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
              for i in range(splits)]
     walk = []
     for window in folds:
-        actual = replay(proposal, data, policy, window, initial_capital=initial_capital)
-        reference = replay(proposal, data, policy, window, initial_capital=initial_capital,
-                           static_weight=plan["benchmark_weight"])
-        a, b = metrics(actual["series"], initial_capital), metrics(reference["series"], initial_capital)
+        actual = replay(proposal, data, paired_policy, window, initial_capital=initial_capital)
+        passive = replay(proposal, data, policy, window, initial_capital=initial_capital,
+                         static_weight=plan["benchmark_weight"])
+        a, b = metrics(actual["series"], initial_capital), metrics(passive["series"], initial_capital)
         walk.append({"start": window[0], "end": window[-1], "net_excess": a["net_return"] - b["net_return"],
                      "net_return": a["net_return"], "max_drawdown": a["max_drawdown"]})
+        if paired_reference is not None:
+            control = replay_strategy_reference(paired_reference, data, paired_policy, window, initial_capital=initial_capital)
+            walk[-1]["strategy_reference_net_excess"] = a["net_return"] - metrics(control["series"], initial_capital)["net_return"]
     agreeing = sum(r["net_return"] > 0 and r["max_drawdown"] <= plan["max_drawdown"] and (
-        r["net_excess"] > plan["min_net_excess"] if plan["purpose"] == "excess_return" else True) for r in walk)
+        min(r["net_excess"], r.get("strategy_reference_net_excess", math.inf)) > plan["min_net_excess"]
+        if plan["purpose"] == "excess_return" else True) for r in walk)
     sensitivity = []
     parameters = parameter_values(proposal["implementation"])
     for key, value in parameters.items():
@@ -657,11 +722,13 @@ def validate(proposal, data, policy, *, initial_capital="10000", trials=1, allow
                 if parameter["name"] == key:
                     parameter["value"] = trial
             try:
-                replayed = replay(changed, data, policy, validation_days, initial_capital=initial_capital)
+                replayed = replay(changed, data, paired_policy, validation_days, initial_capital=initial_capital)
                 stats = metrics(replayed["series"], initial_capital)
                 good = stats["net_return"] > 0 and stats["max_drawdown"] <= plan["max_drawdown"]
                 if plan["purpose"] == "excess_return":
-                    good &= stats["net_return"] > results["validation"]["reference"]["net_return"]
+                    validation = results["validation"]
+                    good &= stats["net_return"] > max(validation["reference"]["net_return"],
+                                                      validation.get("strategy_reference", {}).get("net_return", -math.inf))
                 sensitivity.append({"parameter": key, "value": trial, "passed": bool(good)})
             except (RiskError, ArithmeticError, ValueError):
                 sensitivity.append({"parameter": key, "value": trial, "passed": False})

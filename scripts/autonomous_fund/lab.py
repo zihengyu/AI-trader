@@ -18,6 +18,7 @@ FORWARD_REASON_TEXT = {
 
 def forward_readiness(db, now, policy, *, opened=None, budget=None):
     from .research_budget import ResearchBudget, micros
+    from .strategy_evidence import reference_signal_ready
 
     now = instant(now)
     if opened is None:
@@ -29,7 +30,7 @@ def forward_readiness(db, now, policy, *, opened=None, budget=None):
             _, opened = following_session(trading_day(now))
     opened = instant(opened)
     day = trading_day(opened)
-    rows = db.execute("SELECT v.id,v.version,v.digest,v.policy_hash,s.at,s.body FROM fund_strategy_versions v "
+    rows = db.execute("SELECT v.id,v.version,v.digest,v.policy_hash,v.proposal,s.at,s.body FROM fund_strategy_versions v "
                       "LEFT JOIN fund_strategy_signals s ON s.id=v.id AND s.version=v.version AND s.day=? "
                       "WHERE v.state IN ('shadow','paper_active') ORDER BY v.id,v.version", (day,)).fetchall()
     ready, waiting, previous_policy, reasons, missed = [], [], [], {}, {}
@@ -52,7 +53,7 @@ def forward_readiness(db, now, policy, *, opened=None, budget=None):
         cost = micros(budget.validation_reservation_usd)
         shared_cap = (ResearchBudget._spent(db, "r.day=?", (now_day,)) + cost > micros(budget.daily_usd) or
                       ResearchBudget._spent(db, "r.month=?", (now_day[:7],)) + cost > micros(budget.monthly_usd))
-    for key, version, digest, fingerprint, at, body in rows:
+    for key, version, digest, fingerprint, proposal, at, body in rows:
         identity = f"{key} / {version}"
         if fingerprint != policy.get("policy_hash"):
             previous_policy.append(identity)
@@ -61,6 +62,9 @@ def forward_readiness(db, now, policy, *, opened=None, budget=None):
             signal = json.loads(body) if body else {}
             bound = (at and instant(at) <= now and instant(at) < opened and instant(signal["open_at"]) == opened
                      and signal.get("proposal_digest") == digest and signal.get("policy_hash") == fingerprint)
+            strategy_reference = json.loads(proposal)["validation"].get("reference_strategy")
+            if bound and strategy_reference is not None:
+                bound = reference_signal_ready(signal.get("strategy_reference"), strategy_reference, signal.get("as_of"))
         except (KeyError, TypeError, ValueError):
             bound = False
         (ready if bound else waiting).append(identity)
@@ -124,13 +128,14 @@ def queue_forward_notice(db, now, opened):
 
 def check_data(root, data, key, version, now, *, artifacts_dir=None):
     from .strategy_lab import has_source_artifact_receipt
+    from .strategy_evidence import load_reference
     from .strategy_validation import check_snapshot_as_of, historical_input_gap, snapshot_limitations, source_artifact_gaps
 
     path = Path(root) / "state.sqlite3"
     if not path.is_file():
         raise RiskError("An existing, explicitly selected account journal is required")
     with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as db:
-        row = db.execute("SELECT proposal,policy,state FROM fund_strategy_versions WHERE id=? AND version=?",
+        row = db.execute("SELECT proposal,policy,state,policy_hash,created_at FROM fund_strategy_versions WHERE id=? AND version=?",
                          (key, version)).fetchone()
         if row is None:
             raise RiskError("Unknown strategy version in the selected account")
@@ -140,11 +145,17 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
         locked = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?", (key, version)).fetchone()
         recorded = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_source_artifacts'").fetchone()
                         and has_source_artifact_receipt(db, fingerprint, now))
-    proposal, policy = json.loads(row[0]), json.loads(row[1])
-    required = set(proposal["instruments"]) | {proposal["validation"]["benchmark"]}
+        proposal, policy = json.loads(row[0]), json.loads(row[1])
+        reference, gap = None, None
+        try:
+            reference = load_reference(db, proposal, row[3], row[4])
+        except RiskError as exc:
+            gap = {"status": "needs_formalization", "reason": str(exc)[:500]}
+    arms = (proposal,) if reference is None else (proposal, reference)
+    required = {symbol for arm in arms for symbol in arm["instruments"]} | {proposal["validation"]["benchmark"]}
     if policy.get("cash_symbol"):
         required.add(policy["cash_symbol"])
-    features = set(proposal.get("data_symbols", ()))
+    features = {symbol for arm in arms for symbol in arm.get("data_symbols", ())}
     gaps = (snapshot_limitations(data, require_receipts=True) if artifacts_dir is None
             else source_artifact_gaps(data, artifacts_dir))
     required_artifacts = policy.get("research_execution", {}).get("require_source_artifacts", False)
@@ -153,8 +164,9 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
         gaps.append("source_artifacts_unchecked")
     missing = sorted((required - data["bars"].keys()) |
                      (features - data["bars"].keys() - data.get("features", {}).keys()))
-    gap = (historical_input_gap(proposal, data, policy, locked_sessions=json.loads(locked[0]) if locked else None)
-           if proposal.get("implementation") and row[2] in {"candidate", "needs_data", "awaiting_new_holdout"} else None)
+    if not gap and proposal.get("implementation") and row[2] in {"candidate", "needs_data", "awaiting_new_holdout"}:
+        gap = historical_input_gap(proposal, data, policy, locked_sessions=json.loads(locked[0]) if locked else None,
+                                   reference=reference)
     return {"strategy_id": key, "version": version, "state": row[2], "snapshot_digest": fingerprint,
             "receipt_gaps": gaps, "symbols_missing_from_this_snapshot": missing,
             "source_artifacts_required": required_artifacts, "source_artifacts_recorded": recorded,
@@ -233,6 +245,8 @@ def report(root):
         for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid"):
             proposal = json.loads(row["proposal"])
             lines.append(f"- {row['id']} / {row['version']} [{row['state']}] 研究任务：{row['task_state']}｜{proposal['name']}")
+            if reference := proposal["validation"].get("reference_strategy"):
+                lines.append(f"  可执行对照 {reference['strategy_id']} / {reference['version']}")
             if row["state"] in {"needs_formalization", "needs_adapter"}:
                 registration = db.execute("SELECT json_extract(body,'$.feasibility_error') "
                                           "FROM fund_strategy_events WHERE id=? AND version=? AND kind='registered' "
@@ -290,6 +304,9 @@ def report(root):
                 for name, test in result.get("tests", {}).items():
                     lines.append(f"  {name}: passed={test.get('passed')}；净超额={test.get('net_excess')}；"
                                  f"非重叠样本={test.get('nonoverlapping_blocks')}；HAC t={test.get('hac_t')}")
+                    if comparison := test.get("strategy_reference"):
+                        lines.append(f"  {name} 相对可执行对照的净超额 {comparison['net_excess']:+.2%}，"
+                                     f"通过={comparison['passed']}")
         states = dict(db.execute("SELECT state,count(*) FROM fund_strategy_jobs GROUP BY state"))
         for study in comparison["portfolio_comparison"]["studies"]:
             title = f"组合对照 {study['plan']['study_id']}（{study['status']}）"

@@ -2,7 +2,35 @@
 import json
 
 from .risk import RiskError, instant
-from .strategy_validation import digest
+from .strategy_program import validate_program
+from .strategy_validation import digest, verify_reference
+
+
+def load_reference(db, proposal, policy_hash, registered_at):
+    reference = proposal["validation"].get("reference_strategy")
+    if reference is None:
+        return None
+    row = db.execute("SELECT proposal,digest,policy_hash,created_at FROM fund_strategy_versions "
+                     "WHERE id=? AND version=?", (reference["strategy_id"], reference["version"])).fetchone()
+    if (row is None or row[1] != reference["digest"] or row[2] != policy_hash
+            or instant(row[3]) > instant(registered_at)):
+        raise RiskError("Reference strategy requires an existing exact version under the same frozen policy")
+    body = json.loads(row[0])
+    verify_reference(proposal, body)
+    if body.get("implementation") is None or validate_program(body["implementation"], body["instruments"]) != "ready":
+        raise RiskError("Reference strategy requires a supported executable daily implementation")
+    return body
+
+
+def reference_signal_ready(signal, reference, as_of):
+    return (isinstance(signal, dict) and signal.get("identity") == reference and bool(signal.get("as_of"))
+            and bool(as_of) and instant(signal["as_of"]) == instant(as_of)
+            and isinstance(signal.get("raw_targets"), dict))
+
+
+def reference_signal_matches(signal, receipt, reference):
+    return (reference_signal_ready(signal, reference, receipt.get("signal_as_of"))
+            and signal["raw_targets"] == receipt.get("raw_signal"))
 
 
 def merge_forward_input(seed, incoming):

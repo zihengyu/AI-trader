@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- Strategy Lab can freeze a registered executable version as a paired comparator in daily validation. Both arms share input and execution assumptions, and forward qualification needs timely signals from both arms as well as the existing passive hurdle.
 - The Autonomous Fund regression workflow tests Strategy Lab, ledger, risk, approvals and execution recovery on Windows and Linux. Strategy Lab status surfaces the reason a proposal is awaiting formalization or a validation adapter.
 - The autonomous-fund daily report distinguishes news hits, schedule advances, recorded model calls, and actual changes to validated targets. It reports confirmed cash-sweep arrival friction, a passive cash-equivalent benchmark, and the required session and evidence status for the official FRED VIX close.
 - The autonomous-fund data desk collects read-only Alpaca IEX quotes, trades, completed minutes and corporate actions alongside saved Yahoo runtime observations in local mode with Alpaca credentials. `fund-logs.sh sources [YYYY-MM-DD]` reports session-phase coverage, matched differences and rate-limit evidence. Intraday source selection and the virtual ledger continue to use their existing paths.

@@ -8,6 +8,7 @@ from itertools import takewhile
 from .costs import scripted, unpriced_reason
 from .risk import RiskError, instant, number, trading_day
 from .strategy_competition import _risk_matched
+from .strategy_evidence import reference_signal_matches, reference_signal_ready
 from .strategy_validation import _daily_sessions, metrics
 
 
@@ -30,7 +31,7 @@ def _event(db, key, version, kind, cutoff):
     return next(((instant(at), json.loads(body)) for at, body in rows if instant(at) <= cutoff), (None, {}))
 
 
-def _paired_result(db, key, version, cutoff, *, checkpoint_job=None):
+def _paired_result(db, key, version, cutoff, *, checkpoint_job=None, strategy_reference=False):
     rows = db.execute("SELECT r.at,r.body FROM fund_strategy_results r JOIN fund_strategy_jobs j ON j.id=r.job_id "
                       "WHERE j.strategy_id=? AND j.version=? AND j.kind='forward' AND julianday(r.at)<=julianday(?) "
                       "AND (? IS NULL OR r.job_id=?) ORDER BY julianday(r.at) DESC,r.rowid DESC",
@@ -45,6 +46,11 @@ def _paired_result(db, key, version, cutoff, *, checkpoint_job=None):
                 continue
             days = [row["day"] for row in own]
             if days == sorted(set(days)) and days == [row["day"] for row in reference]:
+                if strategy_reference:
+                    control = result.get("strategy_reference_series") or []
+                    if days != [row["day"] for row in control]:
+                        continue
+                    return instant(at), dict(zip(days, zip(own, reference, control)))
                 return instant(at), dict(zip(days, zip(own, reference)))
         except (AttributeError, KeyError, TypeError, ValueError):
             continue
@@ -90,7 +96,8 @@ def _source_status(db, dataset, at, require_verification):
     return "snapshot_recorded"
 
 
-def _session_state(opened, closed, cutoff, signal_ok, recorded_forward, forward_body, pair, result_at, signal):
+def _session_state(opened, closed, cutoff, signal_ok, recorded_forward, forward_body, pair, result_at, signal,
+                   strategy_reference):
     if cutoff < opened:
         return "ready_for_open" if signal_ok else "awaiting_signal"
     if recorded_forward is not None:
@@ -105,6 +112,11 @@ def _session_state(opened, closed, cutoff, signal_ok, recorded_forward, forward_
             return "inconsistent_evidence"
         if pair is None:
             return "paired_result_unavailable"
+        if strategy_reference is not None:
+            control = forward_body.get("strategy_reference_receipt") or {}
+            if control != pair[2] or not reference_signal_matches(signal.get("strategy_reference") or {}, control,
+                                                                  strategy_reference):
+                return "inconsistent_evidence"
         return "prospective" if recorded_forward <= result_at and receipt == pair[0] else "inconsistent_evidence"
     if not signal_ok:
         return "invalid_signal" if signal else "missed_signal"
@@ -114,7 +126,7 @@ def _session_state(opened, closed, cutoff, signal_ok, recorded_forward, forward_
 def _economics(pairs, days, capital):
     if not days:
         return {"status": "no_contiguous_prospective_evidence", "sessions": 0}
-    strategy, reference = map(list, zip(*(pairs[day] for day in days)))
+    strategy, reference, *extra = map(list, zip(*(pairs[day] for day in days)))
 
     def summary(series):
         report = metrics(series, capital)
@@ -127,9 +139,13 @@ def _economics(pairs, days, capital):
 
     try:
         own, passive = summary(strategy), summary(reference)
-        return {"status": "observed", "sessions": len(days), "through": days[-1], "strategy": own,
-                "passive_reference": passive, "net_difference": own["net_return"] - passive["net_return"],
-                "risk_matched": _risk_matched(strategy, reference, days)}
+        result = {"status": "observed", "sessions": len(days), "through": days[-1], "strategy": own,
+                  "passive_reference": passive, "net_difference": own["net_return"] - passive["net_return"],
+                  "risk_matched": _risk_matched(strategy, reference, days)}
+        if extra:
+            control = summary(extra[0])
+            result["strategy_reference"] = {**control, "net_difference": own["net_return"] - control["net_return"]}
+        return result
     except (ArithmeticError, KeyError, TypeError, ValueError):
         return {"status": "unreadable_economic_evidence", "sessions": len(days)}
 
@@ -146,6 +162,9 @@ def audit_forward(db, key, version, cutoff):
     audit = {"strategy_id": key, "version": version, "as_of": cutoff.isoformat(), "proposal_digest": row[3],
              "policy_hash": row[4], "passive_reference": reference,
              "originating_research_call": _originating_call(db, key, version, cutoff)}
+    strategy_reference = plan.get("reference_strategy")
+    if strategy_reference is not None:
+        audit["strategy_reference"] = strategy_reference
     frozen, precommitment = _event(db, key, version, "historical_pass", cutoff)
     if frozen is None:
         return {**audit, "status": "awaiting_historical_pass"}
@@ -156,7 +175,7 @@ def audit_forward(db, key, version, cutoff):
     checkpoint_at, checkpoint = _event(db, key, version, "forward_qualification", cutoff)
     checkpoint_job = checkpoint.get("job_id")
     result_at, paired = (None, {}) if checkpoint_at and not checkpoint_job else _paired_result(
-        db, key, version, cutoff, checkpoint_job=checkpoint_job)
+        db, key, version, cutoff, checkpoint_job=checkpoint_job, strategy_reference=strategy_reference is not None)
     execution = policy["research_execution"]
     requires_artifacts = execution.get("require_source_artifacts", False)
     args = key, version, window[0][0], window[-1][0], cutoff.isoformat()
@@ -183,8 +202,10 @@ def audit_forward(db, key, version, cutoff):
                          and signal_source_status in source_states and signal_result is not None
                          and instant(signal_result) <= signal_at
                          and _source_status(db, signal_dataset, signal_at, False) == "snapshot_recorded")
+            if signal_ok and strategy_reference is not None:
+                signal_ok = reference_signal_ready(signal.get("strategy_reference"), strategy_reference, previous_close)
             status = _session_state(opened, closed, cutoff, signal_ok, recorded, observation,
-                                    paired.get(day), result_at, signal)
+                                    paired.get(day), result_at, signal, strategy_reference)
             if status == "prospective" and observation_source_status not in source_states:
                 status = "inconsistent_evidence"
         except (AttributeError, KeyError, TypeError, ValueError):

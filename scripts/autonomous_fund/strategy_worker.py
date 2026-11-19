@@ -26,29 +26,35 @@ def main():
 
 
 def evaluate(payload):
-    from scripts.autonomous_fund.strategy_validation import (COVERAGE_FIELDS, check_dataset, forward_days,
-                                                           implementation_hash, metrics, regime_outcomes, replay,
-                                                           test_excess, validate, volume_participation)
-    from scripts.autonomous_fund.strategy_definition import daily_sample_requirements
+    from scripts.autonomous_fund.strategy_validation import (COVERAGE_FIELDS, check_dataset, comparison_inputs,
+                                                            forward_days, implementation_hash, metrics, regime_outcomes,
+                                                            replay, replay_strategy_reference, test_excess, validate,
+                                                            volume_participation)
+    from scripts.autonomous_fund.strategy_definition import daily_sample_requirements, proposal_body
     from scripts.autonomous_fund.strategy_program import StrategyRuleError
     try:
         expected = payload["policy"].get("research_execution", {}).get("source_hash")
         if expected is not None and expected != implementation_hash():
             raise ValueError("Research execution implementation changed; a new version and validation are required")
         proposal, data = payload["proposal"], payload["data"]
+        policy, reference = payload["policy"], payload.get("reference")
+        paired_policy, paired_reference = comparison_inputs(proposal, reference, policy)
+        identity = proposal["validation"].get("reference_strategy")
         if payload["kind"] in {"historical", "exploratory"}:
             if payload["kind"] == "historical" and expected is not None and not payload.get("locked_sessions"):
                 return {"status": "needs_data", "passed": False, "reason": "The historical window was not locked"}
-            result = validate(proposal, data, payload["policy"],
+            result = validate(proposal, data, policy,
                               initial_capital=payload["initial_capital"], trials=payload["trials"],
                               allow_final=payload["kind"] == "historical", locked_sessions=payload.get("locked_sessions"),
-                              require_receipts=expected is not None)
+                              require_receipts=expected is not None, reference=reference)
             if result["passed"]:
-                from scripts.autonomous_fund.strategy_definition import StrategyProposal
-                normalized = StrategyProposal.model_validate(proposal).model_dump()
+                normalized = proposal_body(proposal)
+                options = {"initial_capital": payload["initial_capital"], "initial_signal": True}
                 try:
-                    initial = replay(normalized, data, payload["policy"], [],
-                                     initial_capital=payload["initial_capital"], initial_signal=True)
+                    initial = replay(normalized, data, paired_policy, [], **options)
+                    if paired_reference is not None:
+                        control = replay_strategy_reference(paired_reference, data, paired_policy, [], **options)
+                        result["next_strategy_reference_signal"] = {**next_signal(control), "identity": identity}
                 except StrategyRuleError:
                     raise
                 except ValueError as exc:
@@ -63,11 +69,17 @@ def evaluate(payload):
                 result = {"status": "awaiting_forward", "passed": False}
             else:
                 args = dict(initial_capital=payload["initial_capital"])
-                actual = replay(proposal, data, payload["policy"], days, **args)
-                baseline = replay(proposal, data, payload["policy"], days,
+                actual = replay(proposal, data, paired_policy, days, **args)
+                baseline = replay(proposal, data, policy, days,
                                   static_weight=plan["benchmark_weight"], **args)
                 a, b = metrics(actual["series"], payload["initial_capital"]), metrics(baseline["series"], payload["initial_capital"])
                 test = test_excess(a, b, plan, payload["trials"])
+                control = (replay_strategy_reference(paired_reference, data, paired_policy, days, **args)
+                           if paired_reference is not None else None)
+                if control:
+                    control_metrics = metrics(control["series"], payload["initial_capital"])
+                    test["strategy_reference"] = test_excess(a, control_metrics, plan, payload["trials"])
+                    test["passed"] &= test["strategy_reference"]["passed"]
                 frozen = payload.get("forward_plan") or {
                     "required_sessions": daily_sample_requirements(plan)["forward_sessions"],
                     "trials": payload["trials"],
@@ -75,9 +87,14 @@ def evaluate(payload):
                 required = frozen["required_sessions"]
                 qualification = {**frozen, "status": "collecting"}
                 if len(days) >= required:
-                    prefix = test_excess(metrics(actual["series"][:required], payload["initial_capital"]),
+                    prefix_actual = metrics(actual["series"][:required], payload["initial_capital"])
+                    prefix = test_excess(prefix_actual,
                                          metrics(baseline["series"][:required], payload["initial_capital"]),
                                          plan, frozen["trials"])
+                    if control:
+                        prefix_control = metrics(control["series"][:required], payload["initial_capital"])
+                        prefix["strategy_reference"] = test_excess(prefix_actual, prefix_control, plan, frozen["trials"])
+                        prefix["passed"] &= prefix["strategy_reference"]["passed"]
                     qualification.update(status="passed" if prefix["passed"] else "failed",
                                          start=days[0], end=days[required - 1], test=prefix)
                 complete = all(data.get("coverage", {}).get(k) is True for k in COVERAGE_FIELDS)
@@ -100,6 +117,9 @@ def evaluate(payload):
                                       or relative_loss > plan["max_relative_loss"],
                           "coverage_complete": complete, "recent_relative_loss": relative_loss,
                           "cost_usd": actual["cost_usd"], "next_signal": next_signal(actual)}
+                if control:
+                    result["strategy_reference_series"] = control["series"]
+                    result["next_strategy_reference_signal"] = {**next_signal(control), "identity": identity}
     except StrategyRuleError as exc:
         result = {"status": "needs_formalization", "passed": False, "reason": str(exc)[:500]}
     except Exception as exc:

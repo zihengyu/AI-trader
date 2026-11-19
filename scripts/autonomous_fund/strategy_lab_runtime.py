@@ -9,6 +9,7 @@ from threading import Event, Lock, Thread
 from .risk import RiskError, instant, trading_day
 from .session_calendar import completed_daily_cutoff, regular_session_open
 from .strategy_lab import has_source_artifact_receipt, load_snapshot
+from .strategy_evidence import load_reference
 from .strategy_validation import digest, snapshot_limitations
 
 
@@ -72,8 +73,10 @@ def _research_progress(db, policy_hash, now):
     return {"milestones": updates, "cursor": cursor, "more": False}
 
 
-def history_symbols(proposal, cash_symbol):
+def history_symbols(proposal, cash_symbol, reference=None):
     symbols = set(proposal["instruments"] + proposal.get("data_symbols", []) + [proposal["validation"]["benchmark"]])
+    if reference is not None:
+        symbols.update(reference["instruments"] + reference.get("data_symbols", []))
     if cash_symbol:
         symbols.add(cash_symbol)
     return symbols
@@ -94,12 +97,16 @@ def history_requests(db, universe):
     if not policy.get("enabled"):
         return {}, set()
     requests, unsupported = {}, set()
-    for body, frozen in db.execute(
-            "SELECT proposal,policy FROM fund_strategy_versions WHERE policy_hash=? AND task_state='open' "
+    for body, frozen, created_at in db.execute(
+            "SELECT proposal,policy,created_at FROM fund_strategy_versions WHERE policy_hash=? AND task_state='open' "
             "AND state IN (?,?,?)", (policy["policy_hash"], *HISTORICAL_STATES)):
         proposal, frozen = json.loads(body), json.loads(frozen)
         cash = frozen.get("cash_symbol")
-        symbols = history_symbols(proposal, cash)
+        try:
+            reference = load_reference(db, proposal, policy["policy_hash"], created_at)
+        except RiskError:
+            continue  # The scheduler exposes the invalid reference receipt.
+        symbols = history_symbols(proposal, cash, reference)
         plan = proposal["validation"]
         requested = sum(plan[key] for key in ("train_sessions", "validation_sessions", "final_sessions"))
         depth = min(requested, policy["max_history_rows"] // len(symbols))
@@ -116,7 +123,14 @@ def _cache_symbols(strategy, rows):
     requested = set()
     for row in rows:
         if row["task_state"] == "open" and row["state"] in HISTORICAL_STATES:
-            requested.update(history_symbols(json.loads(row["proposal"]), cash))
+            proposal, reference = json.loads(row["proposal"]), None
+            if proposal["validation"].get("reference_strategy") is not None:
+                with strategy.strategy_lab.journal.connection() as db:
+                    try:
+                        reference = load_reference(db, proposal, row["policy_hash"], row["created_at"])
+                    except RiskError:
+                        continue
+            requested.update(history_symbols(proposal, cash, reference))
     # A model-supplied feature name is never a path to arbitrary local data.
     return tuple(sorted(symbol for symbol in requested if symbol
                         and not any(char in symbol for char in ("/", "\\", "\x00"))))

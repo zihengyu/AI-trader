@@ -134,6 +134,29 @@ also pays its declared model cost. Changing proposal costs never changes
 the passive book. Unknown account data costs leave qualification incomplete.
 Model and data overhead reduce economic NAV as accounting charges.
 
+### Executable strategy comparisons
+
+For `daily_forward_v1`, `validation.reference_strategy` may name an already
+registered strategy by `strategy_id`, `version` and `digest`. The version must
+be executable under the same frozen account policy. The candidate's declared
+holding horizon must cover both designs. The control contributes its saved
+rules, instruments, data dependencies and declared costs. Its own study dates,
+benchmark and nested references do not affect the paired run.
+
+Both executable arms start with independent equal capital and use the same
+candidate session windows, snapshot and account risk policy. Fees, friction
+and shared data costs use the highest applicable floor of the two arms and
+account. Each arm keeps its own declared model overhead. The passive benchmark
+remains a separate qualification hurdle. A paired validation must pass against
+both references. With a cash-management policy, both executable arms need a
+compatible cash adapter for formal validation.
+
+The data desk and preflight include both arms' inputs. The forward journal must
+retain both signals before the same open and match both to the observed replay.
+The audit reports paired net economics for the uninterrupted prospective prefix.
+Hypotheses outside the daily adapters remain available as research tasks until
+an executable adapter and a compatible independent verifier exist.
+
 ## Historical and forward validation
 
 The frozen plan specifies training, validation, final and forward periods,

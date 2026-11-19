@@ -105,6 +105,120 @@ def lab(tmp_path, **settings):
     return StrategyLab(journal, policy(), StrategyLabSettings(**settings))
 
 
+def register_comparison(engine, candidate, control, now):
+    engine.submit(control, now)
+    saved, = engine.rows()
+    candidate["validation"]["reference_strategy"] = {
+        "strategy_id": saved["id"], "version": saved["version"], "digest": saved["digest"]}
+    return candidate["validation"]["reference_strategy"]
+
+
+@pytest.mark.parametrize("issue", ["wrong_digest", "other_policy", "unsupported_adapter", "longer_horizon"])
+def test_executable_comparison_requires_a_frozen_compatible_reference(tmp_path, issue):
+    engine = lab(tmp_path)
+    candidate, control = proposal(), proposal("reference-alternative")
+    if issue == "unsupported_adapter":
+        control["implementation"]["adapter"] = "future_implementation"
+    if issue == "longer_horizon":
+        control["validation"]["holding_sessions"] = 4
+    identity = register_comparison(engine, candidate, control, NOW)
+    if issue == "wrong_digest":
+        identity["digest"] = "0" * 64
+    if issue == "other_policy":
+        engine = StrategyLab(engine.journal, {**policy(), "fee_rate": "0.001"})
+    engine.submit(candidate, NOW)
+    saved = engine.context(NOW, strategy_id=candidate["strategy_id"])["candidates"][0]
+    assert saved["state"] == "needs_formalization"
+    assert saved["feasibility_error"]
+    assert engine.schedule(dataset(), NOW, candidate=(candidate["strategy_id"], "v1")) == []
+
+
+@pytest.mark.parametrize("paired_receipt", [True, False])
+def test_executable_reference_uses_shared_history_and_binds_both_forward_signals(tmp_path, paired_receipt):
+    from scripts.autonomous_fund.lab import check_data, forward_audit, forward_readiness
+    from scripts.autonomous_fund.strategy_lab_runtime import history_requests
+
+    configured = policy()
+    configured["universe"]["BETA"] = "unlevered_etf"
+    engine = StrategyLab(Journal(tmp_path, "synthetic-comparison"), configured)
+    candidate, control = proposal(), proposal("reference-alternative")
+    control["instruments"], control["data_symbols"] = ["BETA"], ["EVENTS"]
+    control["implementation"]["rules"][0].update(symbol="BETA", entry='field("EVENTS", "value") > 0',
+                                                   exit="False", weight="0.25")
+    control["validation"].update(benchmark="UNUSED", holding_sessions=1)
+    control["costs"]["fee_rate"] = .001
+    data = dataset()
+    data["bars"]["BETA"] = [dict(row) for row in data["bars"]["BASE"]]
+    onset = data["bars"]["BASE"][0]["at"]
+    data["features"] = {"EVENTS": [{"at": onset, "available_at": onset, "value": 1.0}]}
+    data = attest(data)
+    formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    identity = register_comparison(engine, candidate, control, formed - timedelta(minutes=1))
+    engine.update_task({"strategy_id": control["strategy_id"], "version": "v1", "action": "pause",
+                        "findings": "Only used as an independent comparator", "next_step": "Keep the fixed rules"}, formed)
+    engine.submit(candidate, formed)
+    key = candidate["strategy_id"]
+    with engine.journal.connection() as db:
+        requests, unsupported = history_requests(db, {"ALFA", "BASE", "BETA", "EVENTS"})
+    assert set(requests) == {"ALFA", "BASE", "BETA", "EVENTS"} and not unsupported
+    missing = attest({**data, "bars": {k: v for k, v in data["bars"].items() if k != "BETA"}})
+    check = check_data(tmp_path, missing, key, "v1", formed)
+    assert check["symbols_missing_from_this_snapshot"] == ["BETA"]
+    assert check["input_gap"]["reason"].startswith("Reference strategy:")
+    assert engine.schedule(missing, formed, candidate=(key, "v1")) == []
+    assert engine.schedule(data, formed, candidate=(key, "v1"))
+    result = engine.run_one(formed)
+    assert result["passed"] and result["tests"]["final"]["strategy_reference"]["passed"]
+    receipts = result["receipts"]["final"]
+    assert [row["day"] for row in receipts["strategy"]["series"]] == [
+        row["day"] for row in receipts["strategy_reference"]["series"]]
+    assert receipts["strategy_reference"]["series"][-1]["positions"].keys() == {"BETA"}
+
+    with engine.journal.connection() as db:
+        day, body = db.execute("SELECT day,body FROM fund_strategy_signals WHERE id=?", (key,)).fetchone()
+        signal = json.loads(body)
+        assert signal["strategy_reference"]["identity"] == identity
+        if not paired_receipt:
+            signal.pop("strategy_reference")
+            db.execute("UPDATE fund_strategy_signals SET body=? WHERE id=? AND day=?", (json.dumps(signal), key, day))
+
+    later = dataset(171)
+    later["bars"]["BETA"] = [dict(row) for row in later["bars"]["BASE"]]
+    next_open = instant(later["bars"]["BASE"][-1]["open_at"])
+    with engine.journal.connection() as db:
+        readiness = forward_readiness(db, formed + timedelta(minutes=1), engine.admission_policy, opened=next_open)
+    assert (f"{key} / v1" in readiness["ready"]) is paired_receipt
+    observed = instant(later["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    daily = attest({**later, "bars": {symbol: rows[-1:] for symbol, rows in later["bars"].items()}})
+    assert engine.schedule(daily, observed, candidate=(key, "v1"))
+    forward = engine.run_one(observed)
+    assert forward["prospective_sessions"] == int(paired_receipt)
+    assert forward["replayed_sessions"] == int(not paired_receipt)
+    audit = forward_audit(tmp_path, key, "v1", observed + timedelta(minutes=1))
+    assert audit["strategy_reference"] == identity
+    assert audit["sessions"][0]["status"] == ("prospective" if paired_receipt else "replayed")
+    if paired_receipt:
+        assert "strategy_reference" in audit["economic_comparison"]
+
+
+def test_beating_a_cash_control_does_not_bypass_the_passive_qualification_floor():
+    from scripts.autonomous_fund.strategy_definition import proposal_body
+
+    candidate, control = proposal(), proposal("cash-alternative")
+    control["implementation"]["rules"][0].update(entry="False", weight="0")
+    control = proposal_body(control)
+    candidate["validation"]["reference_strategy"] = {
+        "strategy_id": control["strategy_id"], "version": control["version"], "digest": digest(control)}
+    data = dataset()
+    for index, row in enumerate(data["bars"]["BASE"]):
+        opened, closed = 100 * 1.01 ** index, 100 * 1.01 ** (index + 1)
+        row.update(open=opened, low=opened, close=closed, high=closed)
+    result = validate(candidate, attest(data), policy(), reference=control)
+    final = result["tests"]["final"]
+    assert final["strategy_reference"]["passed"] and final["net_excess"] < 0
+    assert not final["passed"] and not result["passed"]
+
+
 def test_offline_intake_preserves_the_runner_policy_and_checks_one_candidate(tmp_path):
     from scripts.autonomous_fund.lab import check_data, open_lab
     engine = lab(tmp_path, admission="paper_library", allocation_mode="validated_only", max_jobs_per_day=3)

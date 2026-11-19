@@ -10,6 +10,7 @@ from datetime import timedelta
 from .risk import RiskError, instant, number
 from .session_calendar import completed_daily_cutoff
 from .strategy_definition import StrategyAllocation
+from .strategy_evidence import reference_signal_ready
 from .strategy_validation import following_session
 
 
@@ -47,9 +48,15 @@ def library_entry(db, key, version, now, policy):
     if (bound["proposal_digest"] != row["digest"] or bound["policy_hash"] != policy["policy_hash"]
             or bound["targets"] != result["next_targets"]):
         raise RiskError("Strategy allocation does not match its recorded target")
+    plan = json.loads(row["proposal"])["validation"]
+    if reference := plan.get("reference_strategy"):
+        control = bound.get("strategy_reference")
+        if (not reference_signal_ready(control, reference, bound.get("as_of"))
+                or control != result.get("next_strategy_reference_signal")):
+            raise RiskError("Strategy allocation lacks its frozen comparison signal")
     return {"strategy_id": key, "version": version, "digest": row["digest"],
             "next_targets": result["next_targets"], "observations": result["observations"],
-            "as_of": evidence[1], "purpose": json.loads(row["proposal"])["validation"]["purpose"]}
+            "as_of": evidence[1], "purpose": plan["purpose"]}
 
 
 def verify_allocations(db, decision, now, *, purchase=False):
