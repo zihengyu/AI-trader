@@ -272,6 +272,55 @@ def test_uncompiled_implementation_retains_the_complete_research_hypothesis(tmp_
     assert engine.schedule(dataset(), NOW) == []
 
 
+@pytest.mark.parametrize(("field", "expression", "reason"), [
+    ("entry", "1", "Boolean"),
+    ("exit", "True and 2", "Boolean operands"),
+    ("weight", "False", "numeric"),
+    ("weight", 'mean("ALFA", "close", p_window)', "integer lookback"),
+    ("entry", 'field("ALFA") > 0', "argument count"),
+])
+def test_static_rule_errors_explain_the_field_and_do_not_queue(tmp_path, field, expression, reason):
+    engine, candidate = lab(tmp_path), proposal()
+    candidate["implementation"]["parameters"] = {"p_window": 0}
+    candidate["implementation"]["rules"][0][field] = expression
+    engine.submit(candidate, NOW)
+    saved, = engine.context(NOW)["candidates"]
+    assert saved["state"] == "needs_formalization"
+    assert f"ALFA.{field}" in saved["feasibility_error"] and reason in saved["feasibility_error"]
+    assert engine.schedule(dataset(), NOW) == []
+
+
+def test_data_dependent_rule_error_is_not_classified_as_missing_data(tmp_path):
+    engine, candidate = lab(tmp_path), proposal()
+    candidate["implementation"]["rules"][0]["weight"] = '2 * field("ALFA", "event")'
+    engine.submit(candidate, NOW)
+    assert engine.rows()[0]["state"] == "candidate"
+    assert engine.schedule(dataset(), NOW)
+    result = engine.run_one(NOW)
+    assert result["status"] == "needs_formalization" and "ALFA.weight" in result["reason"]
+    assert engine.rows()[0]["state"] == "needs_formalization"
+
+
+def test_forward_rule_error_stops_scheduling_that_version(tmp_path):
+    engine, candidate, data = lab(tmp_path), proposal(), dataset()
+    candidate["implementation"]["rules"][0]["weight"] = '0.25 + field("ALFA", "event") / 4'
+    formed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    engine.submit(candidate, formed)
+    assert engine.schedule(data, formed)
+    assert engine.run_one(formed)["passed"]
+    assert engine.rows()[0]["state"] == "shadow"
+
+    later = dataset(171)
+    later["bars"]["ALFA"][-1]["event"] = 4.0
+    observed = instant(later["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    daily = attest({**later, "bars": {symbol: rows[-1:] for symbol, rows in later["bars"].items()}})
+    assert engine.schedule(daily, observed)
+    result = engine.run_one(observed)
+    assert result["status"] == "needs_formalization" and "ALFA.weight" in result["reason"]
+    assert engine.rows()[0]["state"] == "needs_formalization"
+    assert engine.schedule(daily, observed + timedelta(minutes=1)) == []
+
+
 def test_a_novel_validation_method_is_not_forced_into_daily_significance_tests():
     candidate = proposal()
     candidate["validation"]["method"] = "rare_event_prospective_protocol"
@@ -1144,6 +1193,52 @@ def test_missing_features_and_benchmark_gaps_are_not_failed_investment_hypothese
     data["bars"]["BASE"].pop(70)
     result = validate(proposal(), data, policy())
     assert result["status"] == "needs_data" and "exchange sessions" in result["reason"]
+
+
+def test_history_before_warmup_does_not_block_scheduling_or_move_the_holdout(tmp_path):
+    from scripts.autonomous_fund.strategy_validation import historical_input_gap
+
+    engine, candidate, data = lab(tmp_path), proposal(), dataset()
+    candidate["implementation"]["parameters"] = {"p_window": 5}
+    candidate["implementation"]["rules"][0]["entry"] = 'mean("ALFA", "event", p_window) > 0'
+    expected = [row["day"] for row in data["bars"]["BASE"][-140:]]
+    data["bars"]["BASE"].pop(1)
+    data["bars"]["ALFA"][1].pop("event")
+    assert historical_input_gap(candidate, data, policy(), locked_sessions=expected) is None
+    engine.submit(candidate, NOW)
+    assert engine.schedule(attest(data), NOW)
+    with engine.journal.connection() as db:
+        locked, = db.execute("SELECT sessions FROM fund_strategy_holdouts").fetchone()
+    assert json.loads(locked) == expected
+    assert engine.run_one(NOW)["status"] == "historical_pass"
+
+
+@pytest.mark.parametrize(("symbol", "index", "expression"), [
+    ("ALFA", 27, 'mean("ALFA", "event", 5) > 0'),
+    ("ALFA", 29, "True"),
+    ("BASE", 29, 'field("ALFA", "event") > 0'),
+    ("BASE", 1, "session_index >= 4"),
+])
+def test_required_warmup_and_absolute_index_history_still_reject_gaps(symbol, index, expression):
+    from scripts.autonomous_fund.strategy_validation import historical_input_gap
+
+    candidate, data = proposal(), dataset()
+    candidate["implementation"]["rules"][0]["entry"] = expression
+    data["bars"][symbol].pop(index)
+    result = historical_input_gap(candidate, data, policy())
+    assert result["status"] == "needs_data" and result["missing_symbols"] == [symbol]
+
+
+def test_delayed_bar_keeps_earlier_observations_in_the_required_warmup():
+    from scripts.autonomous_fund.strategy_validation import historical_input_gap
+
+    candidate, data = proposal(), dataset()
+    candidate["implementation"]["rules"][0]["entry"] = 'mean("ALFA", "event", 5) > 0'
+    rows = data["bars"]["ALFA"]
+    rows[29]["available_at"] = rows[30]["at"]
+    rows[24].pop("event")
+    result = historical_input_gap(candidate, data, policy())
+    assert result["status"] == "needs_data" and result["missing_feature"] == {"symbol": "ALFA", "column": "event"}
 
 
 def test_an_experiment_configuration_cannot_change_under_the_same_version(tmp_path):

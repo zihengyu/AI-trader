@@ -5,7 +5,6 @@ close execute at the following open. Unpaid declared dividends are receivables,
 not spendable cash. Missing evidence never becomes a successful validation.
 """
 import copy
-import ast
 import hashlib
 import json
 import math
@@ -24,7 +23,7 @@ from pathlib import Path
 from .comparison import Book, project
 from .risk import RiskError, instant, number
 from .strategy_definition import StrategyProposal, daily_sample_requirements
-from .strategy_program import parameter_values, parse, targets, validate_program
+from .strategy_program import StrategyRuleError, history_requirements, parameter_values, targets, validate_program
 
 
 COVERAGE_FIELDS = ("raw_prices", "corporate_actions_complete", "point_in_time_membership",
@@ -493,6 +492,18 @@ def volume_participation(series, bars):
             "median_fraction_of_daily_volume": statistics.median(ratios) if ratios else None}
 
 
+def _historical_feature_rows(rows, initial_close, final_close, depth):
+    """Select rows that can enter a rolling window during this experiment."""
+    visible = [row for row in rows if instant(row["available_at"]) <= final_close]
+    if depth is None:
+        return visible
+    initial = [row for row in visible if instant(row["available_at"]) <= initial_close]
+    if len(initial) < depth:
+        return visible
+    lower = instant(initial[-depth]["at"])
+    return [row for row in visible if instant(row["at"]) >= lower]
+
+
 def historical_input_gap(proposal, data, policy, *, locked_sessions=None):
     """Identify deterministic input gaps before claiming a slot or exposing a final window."""
     if policy.get("fee_rate") is None or policy.get("slippage") is None:
@@ -508,50 +519,66 @@ def historical_input_gap(proposal, data, policy, *, locked_sessions=None):
     if symbols - data["bars"].keys():
         return {"status": "needs_data", "passed": False, "reason": "Missing required instrument history",
                 "missing_symbols": sorted(symbols - data["bars"].keys())}
-    histories = {**data["bars"], **data.get("features", {})}
+    bars = data["bars"]
+    histories = {**bars, **data.get("features", {})}
     missing = sorted(symbol for symbol in proposal.get("data_symbols", ()) if not histories.get(symbol))
     if missing:
         return {"status": "needs_data", "passed": False, "reason": "A declared data series is unavailable",
                 "missing_symbols": missing}
-    parameters = parameter_values(proposal["implementation"])
-    for rule in proposal["implementation"]["rules"]:
-        for field in ("entry", "exit", "weight"):
-            for call in ast.walk(parse(rule[field], parameters)):
-                if not isinstance(call, ast.Call) or call.func.id not in {"field", "mean", "stdev", "ret"}:
-                    continue
-                # Dynamic field names are deliberately unsupported: the controller
-                # must know and disclose each data dependency before execution.
-                if not call.args or not isinstance(call.args[0], ast.Constant) or type(call.args[0].value) is not str:
-                    return {"status": "needs_formalization", "passed": False,
-                            "reason": "Data-series identifiers must be declared constants"}
-                symbol = call.args[0].value
-                column = "close" if call.func.id == "ret" else (
-                    call.args[1].value if len(call.args) > 1 and isinstance(call.args[1], ast.Constant) else None)
-                rows = histories.get(symbol)
-                if not rows or not column or any(type(value) not in {int, float} or not math.isfinite(value)
-                                                 for value in (row.get(column) for row in rows)):
-                    return {"status": "needs_data", "passed": False, "reason": "A required strategy feature is unavailable",
-                            "missing_feature": {"symbol": symbol, "column": column}}
-    # The benchmark calendar is authoritative. Missing symbol sessions fail,
-    # rather than silently shortening the tested interval to an intersection.
-    days = [r["day"] for r in data["bars"][plan["benchmark"]]]
-    if locked_sessions:
-        days = [day for day in days if day <= locked_sessions[-1]]
-    if days and days != planned_sessions(days):
-        return {"status": "needs_data", "passed": False, "reason": "Benchmark history has missing exchange sessions"}
+    try:
+        requirements, uses_index = history_requirements(proposal["implementation"])
+    except StrategyRuleError as exc:
+        return {"status": "needs_formalization", "passed": False, "reason": str(exc)}
+    benchmark = plan["benchmark"]
+    days = [row["day"] for row in bars[benchmark]]
     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
-    if len(days) < total:
+    if locked_sessions is None and len(days) < total:
         return {"status": "needs_data", "passed": False, "reason": "Insufficient predeclared split history",
                 "observed_sessions": len(days), "required_sessions": total}
-    if locked_sessions and (len(locked_sessions) != total or
-                            [day for day in days if day >= locked_sessions[0]] != locked_sessions):
+    expected = days[-total:] if locked_sessions is None else list(locked_sessions)
+    if locked_sessions is not None and (len(expected) != total or set(expected) - set(days)):
         return {"status": "needs_data", "passed": False, "reason": "Snapshot does not cover the locked validation sessions"}
-    expected = locked_sessions or days[-total:]
-    expected = set(expected)
-    missing = sorted(s for s in symbols if expected - {row["day"] for row in data["bars"][s]})
+    sessions = _daily_sessions(expected[0], expected[-1])
+    if expected != [day for day, _, _ in sessions]:
+        return {"status": "needs_data", "passed": False, "reason": "Benchmark history has missing exchange sessions"}
+
+    prior = _daily_sessions(min(days[0], expected[0]), expected[0])[:-1]
+    initial_close = prior[-1][2] if prior else sessions[0][2]
+    final_close = sessions[-1][2]
+    # The preceding close forms the initial signal. An absolute session index
+    # also depends on all earlier benchmark sessions in the supplied history.
+    depths = dict.fromkeys([*proposal["instruments"], benchmark], 1) if prior else {}
+    if prior and uses_index:
+        depths[benchmark] = None
+    first_observation = {}
+    for (symbol, column), depth in requirements.items():
+        rows = _historical_feature_rows(histories.get(symbol, ()), initial_close, final_close, depth)
+        if not rows or any(type(value) not in {int, float} or not math.isfinite(value)
+                           for value in (row.get(column) for row in rows)):
+            return {"status": "needs_data", "passed": False, "reason": "A required strategy feature is unavailable",
+                    "missing_feature": {"symbol": symbol, "column": column}}
+        if symbol in symbols:
+            previous = depths.get(symbol, 0)
+            depths[symbol] = None if previous is None or depth is None else max(previous, depth)
+            first_observation[symbol] = min(first_observation.get(symbol, expected[0]), rows[0]["day"])
+
+    expected_set = set(expected)
+    missing = sorted(symbol for symbol in symbols if expected_set - {row["day"] for row in bars[symbol]})
     if missing:
         return {"status": "needs_data", "passed": False, "reason": "Instruments lack required exchange sessions",
                 "missing_symbols": missing}
+    for symbol, depth in sorted(depths.items()):
+        # Preserve a genuine series start. Detect internal holes in the prior
+        # sessions used by a lookback, including older rows used after a delay.
+        days = [row["day"] for row in bars[symbol]]
+        warmup = planned_sessions([min(days[0], expected[0]), expected[0]])[:-1]
+        if depth is not None:
+            earlier = first_observation.get(symbol, expected[0])
+            warmup = set(warmup[-depth:]) | {day for day in warmup if day >= earlier}
+        required = set(warmup) | expected_set
+        if required - set(days):
+            return {"status": "needs_data", "passed": False, "reason": "Strategy history has missing exchange sessions in its window or warm-up",
+                    "missing_symbols": [symbol]}
     return None
 
 

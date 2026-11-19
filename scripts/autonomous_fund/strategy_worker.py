@@ -30,6 +30,7 @@ def evaluate(payload):
                                                            implementation_hash, metrics, regime_outcomes, replay,
                                                            test_excess, validate, volume_participation)
     from scripts.autonomous_fund.strategy_definition import daily_sample_requirements
+    from scripts.autonomous_fund.strategy_program import StrategyRuleError
     try:
         expected = payload["policy"].get("research_execution", {}).get("source_hash")
         if expected is not None and expected != implementation_hash():
@@ -48,6 +49,8 @@ def evaluate(payload):
                 try:
                     initial = replay(normalized, data, payload["policy"], [],
                                      initial_capital=payload["initial_capital"], initial_signal=True)
+                except StrategyRuleError:
+                    raise
                 except ValueError as exc:
                     result["forward_signal_error"] = str(exc)[:500]
                 else:
@@ -97,6 +100,8 @@ def evaluate(payload):
                                       or relative_loss > plan["max_relative_loss"],
                           "coverage_complete": complete, "recent_relative_loss": relative_loss,
                           "cost_usd": actual["cost_usd"], "next_signal": next_signal(actual)}
+    except StrategyRuleError as exc:
+        result = {"status": "needs_formalization", "passed": False, "reason": str(exc)[:500]}
     except Exception as exc:
         # No private payload/paths/provider responses in controller diagnostics.
         result = {"status": "needs_data", "passed": False, "error": type(exc).__name__,

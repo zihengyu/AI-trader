@@ -276,7 +276,7 @@ class StrategyLab:
                       "AND state IN ('queued','running')", identity).fetchone():
             return
         # Keep a sealed-window wait visible while the exploratory data is being filled.
-        state = row["state"] if row["state"] == "awaiting_new_holdout" else gap["status"]
+        state = row["state"] if row["state"] == "awaiting_new_holdout" and gap["status"] == "needs_data" else gap["status"]
         event = {**gap, "state": state, "preflight": True}
         previous = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? "
                               "AND kind IN ('validation','historical_pass') ORDER BY sequence DESC LIMIT 1", identity).fetchone()
@@ -508,6 +508,8 @@ class StrategyLab:
             state = row["state"]
             if job["kind"] in {"historical", "exploratory"} and result.get("status") != "worker_error":
                 state = "shadow" if result.get("passed") else result.get("status", "rejected")
+            elif result.get("status") == "needs_formalization":
+                state = "needs_formalization"
             elif result.get("degraded"):
                 state = "paused"
             elif job["kind"] == "forward" and (result.get("qualification") or {}).get("status") == "failed":

@@ -93,6 +93,9 @@ parameters represented as typed name/value/integer entries for strict provider
 schema compatibility. Supported operations include bounded arithmetic, comparisons,
 Boolean logic, `field`, `mean`, `ret`, `stdev`, `min`, `max` and `abs`. State includes
 holding sessions, current position weight, entry price and session index.
+Registration checks expression types, function arguments and known lookback bounds.
+If a rule fails only on evaluated data or state, the worker reports the affected
+rule as needing formalization. Missing observations remain data gaps.
 
 This can express stateful entry/exit, trend/reversal, cross-asset comparisons and
 dated event/macro conditions. It does not require cross-sectional factor scores.
@@ -149,6 +152,10 @@ its declared protection objective and is never labeled evidence of alpha.
 
 The scheduler checks required symbols, feature fields, execution costs and
 exchange sessions before freezing a final window or assigning a compute slot.
+Coverage checks use the selected exchange sessions and relevant warm-up rows.
+The preceding close, indicator lookbacks and absolute benchmark session indexes
+retain the history they require. An older gap outside that scope does not move
+or invalidate the selected window.
 Missing requirements remain visible in `strategy-lab` and the research context.
 The first eligible validation freezes the exact benchmark sessions and input
 snapshot digest for the version. The queued validation retains that snapshot.
