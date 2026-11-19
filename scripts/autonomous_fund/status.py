@@ -436,7 +436,7 @@ def summary(root, mode, now=None):
                      + (f"；市场：{open_text}" if open_text else ""))
         if beat.get("valuation_error"):
             lines.append(f"账户估值暂未更新：{beat['valuation_error']}；账户区块保留上次成功快照及其时间。")
-        if beat.get("market_data_error"):
+        if beat.get("market_data_error") and beat["market_data_error"] != beat.get("valuation_error"):
             lines.append(f"成交等待新行情：{beat['market_data_error']}；自动重试，原订单仍遵守限价和有效期。")
     lines.append(desk_line(root, now))
     book = root / "state.sqlite3"

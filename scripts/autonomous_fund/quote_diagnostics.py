@@ -81,7 +81,8 @@ def inspect(root, *, mode="local", symbol=None, now=None):
             "symbols": [{"symbol": name, "observation": quotes.get(name), "pending_alert": pending.get(name),
                          # Do not expose raw provider errors, account fields or unrequested symbols.
                          "request_failures": [{key: row[key] for key in (
-                             "interval", "failed_at", "consecutive_failures", "retry_in_seconds") if key in row}
+                             "interval", "period", "first_failed_at", "first_error_type", "failed_at",
+                             "consecutive_failures", "retry_in_seconds") if key in row}
                              for row in failures if row["symbol"] == name]} for name in sorted(names)]}
 
 
@@ -141,8 +142,13 @@ def lines(report):
                        f"  最近拒绝时推送{stream}：{_source_clock(detail.get('stream_as_of'), detail.get('checked_at'))}",
                        f"  最近拒绝时图表成交源：{_source_clock(detail.get('chart_as_of'), detail.get('checked_at'))}"]
         for failure in row["request_failures"]:
-            output.append(f"  快照中的请求故障：最近失败 {_clock(failure.get('failed_at'))}；"
+            series = "/".join(str(failure.get(key) or "未知") for key in ("interval", "period"))
+            first = failure.get("first_error_type") or "未知"
+            output.append(f"  快照中的请求故障（{series}）：首次 {first} {_clock(failure.get('first_failed_at'))}；"
+                          f"最近失败 {_clock(failure.get('failed_at'))}；"
                           f"连续请求失败次数 {failure.get('consecutive_failures', '?')}。")
+            if failure.get("retry_in_seconds") is not None:
+                output.append(f"  记录时距下次可请求约 {failure['retry_in_seconds']} 秒。")
     if not report["symbols"]:
         output.append("所选账户尚无可展示的逐标的记录；不会从其他账户或数据源补取。")
     if "quality" in report:

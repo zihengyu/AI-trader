@@ -3,6 +3,7 @@
 Uses native Strategy.update_broker_balances and the application's real local
 broker path, with synthetic clocks/data and no paid inference or external APIs.
 """
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -83,12 +84,16 @@ def test_background_retry_is_private_to_each_strategy_instance(monkeypatch):
     assert first_reads == second_reads == [100]
 
 
-def test_native_local_snapshot_still_rejects_unavailable_actions_during_background_retry(tmp_path, monkeypatch):
+@pytest.mark.parametrize("closed", [False, True])
+def test_native_local_snapshot_still_rejects_unavailable_actions_during_background_retry(tmp_path, monkeypatch, closed):
+    from yfinance.exceptions import YFRateLimitError
+
     from scripts.autonomous_fund.journal import Journal
     from scripts.autonomous_fund.local_broker import LocalPaperBroker
     from scripts.autonomous_fund.market_data import YahooRealtimeData
     from scripts.autonomous_fund.run import ScriptedRuntime
     from scripts.autonomous_fund.strategy import account_digest
+    from .test_autonomous_fund_closed_ledger import CLOSE, closing_feed
     from .test_autonomous_fund_local import Clock, advance, submit
     from .test_autonomous_fund_quant import LIMITS
 
@@ -96,6 +101,7 @@ def test_native_local_snapshot_still_rejects_unavailable_actions_during_backgrou
     monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
     clock, timer = Clock(), [100.0]
     monkeypatch.setattr("scripts.autonomous_fund.strategy.monotonic", lambda: timer[0])
+    monkeypatch.setattr("scripts.autonomous_fund.market_data.time.monotonic", lambda: timer[0])
     source = YahooRealtimeData(now=clock, fetch=clock.fetch)
     config = {"model": "deepseek/deepseek-flash", "limits": {}, "mandate": {"capital_usd": None},
               "universe": {"ALFA": "stock"}, "cash_sweep": {"enabled": False}, "critic": {"enabled": False}}
@@ -111,29 +117,56 @@ def test_native_local_snapshot_still_rejects_unavailable_actions_during_backgrou
         advance(clock, source)
         broker.do_polling()
         assert broker._pull_broker_order(order.identifier)["filled"] == 5
+        if closed:
+            closing_feed(clock, source)
+            clock.value = CLOSE + timedelta(hours=2)
+            broker.do_polling()
         strategy._snapshot()
         before = (strategy._portfolio_value, strategy.last_broker_balances_update)
+        last_valuation = broker._last_valuation
+        original = source.fetch
+        attempts, warnings = [], []
 
         def failed_actions(symbol, interval, period):
             if interval == "1d":
-                raise TimeoutError("synthetic private provider response")
-            return clock.fetch(symbol, interval, period)
+                attempts.append((symbol, interval, period))
+                raise YFRateLimitError()
+            return original(symbol, interval, period)
 
         source.fetch = failed_actions
         source._cache.clear()  # Only this fixture's source cache.
         strategy.last_broker_balances_update = -1e9
+        monkeypatch.setattr(strategy.logger, "warning", lambda message, *args, **kwargs: warnings.append(str(message)))
+        strategy._executor.sync_broker()
+        strategy._executor.sync_broker()
         assert strategy.update_broker_balances(force_update=False) is False
         assert strategy.update_broker_balances(force_update=False) is False
-        with pytest.raises(MarketDataUnavailable):
+        with pytest.raises(MarketDataUnavailable) as failure:
             strategy._snapshot()
+        assert failure.value.diagnostic["operation"] == "corporate_actions"
         assert strategy.get_cash() is None  # An explicit query must not return the retained native value.
         assert strategy._portfolio_value == before[0]
         assert strategy.last_broker_balances_update == -1e9
-        # Restore this fixture's independent source; an explicit refresh need not wait 15 seconds.
-        source.fetch = clock.fetch
-        source._failures.clear()
+        assert attempts == [("ALFA", "1d", "6mo")]
+        assert not [line for line in warnings if "balance refresh failed" in line]
+        broker.do_polling()
+        timer[0] += 16
+        clock.value += timedelta(seconds=16)
+        broker.do_polling()  # Another rate limit, followed by the same pending status.
+        broker.do_polling()
+        notices = [item["body"]["details"] for item in journal.all_events()
+                   if item["kind"] == "notification" and item["body"]["kind"] == "local_market_data_pending"]
+        assert notices == [{"operation": "corporate_actions", "symbol": "ALFA"}]
+        assert broker._last_valuation == last_valuation and "公司行动" in broker._valuation_error
+        assert len(attempts) == 2
+
+        source.fetch = original
+        timer[0] += 31
+        clock.value += timedelta(seconds=31)
         assert strategy.update_broker_balances(force_update=True) is True
         assert strategy.get_cash() == pytest.approx(broker._get_balances_at_broker(None, strategy)[0])
+        broker.do_polling()
+        assert not broker._market_data_error and not broker._valuation_error
     finally:
         broker._close_connection()
 
@@ -165,6 +198,13 @@ def test_history_backoff_keeps_the_first_cause_until_recovery_without_provider_p
     assert caplog.text.count("local_source_unavailable") == 1
     assert "cause=TimeoutError" in caplog.text and "private-provider-response" not in caplog.text
     timer[0] += 16
+    clock.value += timedelta(seconds=16)
+    with pytest.raises(MarketDataUnavailable):
+        source.get_quote(Asset("BETA"))
+    latest = source.diagnostics()["source_failures"][0]
+    assert latest["consecutive_failures"] == 2 and latest["first_error_type"] == "TimeoutError"
+    assert latest["first_failed_at"] == first["failed_at"] and latest["failed_at"] != first["failed_at"]
+    timer[0] += 31
     source.fetch = clock.fetch
     assert source.get_quote(Asset("BETA")).price > 0
     assert source.diagnostics()["source_failures"] == []

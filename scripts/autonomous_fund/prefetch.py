@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from .risk import RiskError, trading_day
 
 
-def fetch_bars(store, day, symbols, length, data):
+def fetch_bars(store, day, symbols, length, data, *, before_fetch=None):
     """Completed daily bars for every symbol not yet stored today: {"fetched", "already_stored", "failed"}."""
     from lumibot.entities import Asset
     from .strategy import daily_rows
@@ -30,6 +30,8 @@ def fetch_bars(store, day, symbols, length, data):
         if store.bars(day, symbol, length) is not None:
             bars["already_stored"] += 1
             continue
+        if before_fetch is not None:
+            before_fetch()
         try:
             source = data.get_historical_prices(Asset(symbol, asset_type="stock"), length, timestep="day")
             rows = [row for row in daily_rows(source) if str(row[0]) < str(day)]

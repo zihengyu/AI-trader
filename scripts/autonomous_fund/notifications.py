@@ -846,7 +846,10 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"下一次开盘：{_when(details['next_open'])}；计划有效至：{_when(details['valid_until'])}。\n"
                 "开盘后须重新核对计划有效期、账户、报价和风控；过期计划须重新决策，不能据此认定已买卖或成交。")
     elif kind == "local_market_data_pending":
-        text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
+        if isinstance(details, dict) and details.get("operation") == "corporate_actions":
+            text = f"⏳ {details['symbol']} 的公司行动历史暂不可用。账户估值待核验，系统会自动重试。"
+        else:
+            text = f"⏳ 行情暂不可用，成交等待新行情，系统会自动重试：{details}"
     elif kind == "opening_valuation_pending" and isinstance(details, dict):
         text = (f"⏳ 开盘估值等待 {details['symbol']} 的本交易日有效报价。"
                 f"首根一分钟线最早于 {_when(details['first_bar_at'])} 收完。"

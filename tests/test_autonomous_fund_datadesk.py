@@ -118,6 +118,36 @@ def test_bars_and_snapshot_fill_the_store_once_and_the_snapshot_is_rewritten_onl
     assert store.version(DAY, "market_snapshot") == version
 
 
+def test_daily_bar_job_yields_to_the_runner_during_its_yahoo_backoff(tmp_path):
+    from scripts.autonomous_fund.datadesk import yahoo_cooldown_writer
+
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: NOW, environ={})
+    yahoo_cooldown_writer(tmp_path)((NOW + timedelta(minutes=1)).timestamp())
+    assert desk.run_job("bars") is None
+    state = DeskStatus(tmp_path).read()["jobs"]["bars"]
+    assert "the desk waits" in state["note"] and state["error"] is None
+    assert desk._source is None  # The job yielded before opening a market-data source.
+    assert desk.next_run["bars"] == NOW + timedelta(minutes=1)
+
+
+def test_daily_bar_batch_yields_if_runner_backoff_begins_mid_batch(tmp_path):
+    from scripts.autonomous_fund.datadesk import yahoo_cooldown_writer
+    from tests.test_autonomous_fund_prefetch import frame
+
+    calls = []
+
+    def fetch(asset, length, timestep):
+        calls.append(asset.symbol)
+        yahoo_cooldown_writer(tmp_path)((NOW + timedelta(minutes=1)).timestamp())
+        return SimpleNamespace(df=frame())
+
+    desk = DataDesk(tmp_path, config(), "local", source=SimpleNamespace(get_historical_prices=fetch),
+                    clock=lambda: NOW, environ={})
+    assert desk.run_job("bars") is None
+    assert len(calls) == 1 and desk.store.bars(DAY, calls[0], desk.length)
+    assert desk.next_run["bars"] == NOW + timedelta(minutes=1)
+
+
 # ----- News into the shared journal ------------------------------------------------------------------
 
 RSS = ("<rss><channel>{items}</channel></rss>")

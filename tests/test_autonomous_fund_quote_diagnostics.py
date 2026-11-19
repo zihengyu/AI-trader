@@ -97,10 +97,13 @@ def test_removed_alert_is_not_reclassified_as_a_current_fault(tmp_path):
 
 def test_source_request_failures_are_visible_without_provider_payloads(tmp_path):
     snapshot(tmp_path, market_data={"source_failures": [{"symbol": "CHAR", "interval": "1m",
+        "period": "5d", "first_failed_at": NOW.isoformat(), "first_error_type": "YFRateLimitError",
         "failed_at": NOW.isoformat(), "consecutive_failures": 3, "error": "SYNTHETIC_PRIVATE_VALUE"}]})
     report = inspect(tmp_path, now=NOW)
     assert [row["symbol"] for row in report["symbols"]] == ["CHAR"]
-    assert "3" in "\n".join(lines(report)) and "SYNTHETIC_PRIVATE_VALUE" not in json.dumps(report)
+    text = "\n".join(lines(report))
+    assert "连续请求失败次数 3" in text and "首次 YFRateLimitError" in text and "1m/5d" in text
+    assert "SYNTHETIC_PRIVATE_VALUE" not in json.dumps(report)
 
 
 def test_corrupt_heartbeat_or_ledger_is_disclosed_without_writing(tmp_path):

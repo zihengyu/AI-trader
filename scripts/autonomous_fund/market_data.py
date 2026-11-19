@@ -307,6 +307,12 @@ class YahooRealtimeData(DataSource):
             raise RiskError("Local market data accepts US stocks/ETFs only")
         return asset.symbol
 
+    def history_in_backoff(self, symbol, interval, period):
+        """Inspect the same per-series deadline used by the provider request path."""
+        with self._request_lock:
+            pending = self._failures.get((symbol, interval, period))
+            return pending is not None and time.monotonic() < pending[1]
+
     def _history(self, asset, interval, period, required_through=None):
         symbol, now = self._symbol(asset), self.get_datetime()
         key = (symbol, interval, period)
@@ -352,11 +358,16 @@ class YahooRealtimeData(DataSource):
             except Exception as exc:
                 count = (failure[0] if failure else 0) + 1
                 delay = min(300, 15 * 2 ** min(count - 1, 5))
-                error = str(exc) if isinstance(exc, RiskError) else type(exc).__name__
+                error_type = type(exc).__name__
+                error = str(exc) if isinstance(exc, RiskError) else error_type
                 diagnostic = {"reason": "source_unavailable", "symbol": symbol, "interval": interval,
                               "period": period, "failed_at": self.get_datetime().isoformat(), "error": error,
+                              "error_type": error_type,
                               "consecutive_failures": count}
                 with self._request_lock:
+                    previous = self._source_errors.get(key, {})
+                    diagnostic["first_failed_at"] = previous.get("first_failed_at", diagnostic["failed_at"])
+                    diagnostic["first_error_type"] = previous.get("first_error_type", error_type)
                     self._failures[key] = (count, time.monotonic() + delay)
                     self._stats["failures"] += 1
                     self._source_errors[key] = diagnostic

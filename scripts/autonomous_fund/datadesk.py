@@ -177,6 +177,10 @@ INTRADAY_RETRY_SECONDS = 60
 class Idle(Exception):
     """A job with nothing to do yet (for example no account journal): neither a success nor an error."""
 
+    def __init__(self, message, *, retry_at=None):
+        super().__init__(message)
+        self.retry_at = retry_at
+
 
 @dataclass(frozen=True)
 class DeskSettings:
@@ -612,7 +616,7 @@ class DataDesk:
         except Idle as reason:
             failures, outcome = 0, None
             job.update({"note": str(reason), "error": None})
-            wait = self.interval(name, now)
+            wait = ((reason.retry_at - now).total_seconds() if reason.retry_at is not None else self.interval(name, now))
         except Exception as exc:
             failures = self.failures.get(name, 0) + 1
             job.update({"error": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__,
@@ -662,7 +666,7 @@ class DataDesk:
         """Leave Yahoo to the trading process while its own Yahoo requests are failing."""
         until = yahoo_paused_until(self.run_dir, now)
         if until is not None:
-            raise Idle(f"Yahoo is failing for the trading process; the desk waits until {until.isoformat()}")
+            raise Idle(f"Yahoo is failing for the trading process; the desk waits until {until.isoformat()}", retry_at=until)
 
     def _requests(self, symbols, fetch):
         """Paced reads; three consecutive source failures stop the round."""
@@ -892,11 +896,14 @@ class DataDesk:
 
     def _job_bars(self, now):
         from .prefetch import fetch_bars
+        self._yield_to_trading(now)
         symbols = sorted(set(self.universe) | set(self.stocks) | {self.quant.stress_benchmark} | set(GAUGES))
         day, source = trading_day(now), self._data()
-        result = fetch_bars(self.store, day, symbols, self.length, source)
+        result = fetch_bars(self.store, day, symbols, self.length, source,
+                            before_fetch=lambda: self._yield_to_trading(self.clock()))
         reference = self._reference()
         if reference is not None:
+            self._yield_to_trading(self.clock())
             from .action_quality import refresh
             from .bar_quality import check_store
             # Cross-checked here, off the trading process; it reuses these verdicts.

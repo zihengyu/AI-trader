@@ -1830,7 +1830,7 @@ class AutonomousFund(Strategy):
         """
         if getattr(self, "mode", None) != "local":
             return super().update_broker_balances(force_update=force_update)
-        deferred = getattr(self.broker, "opening_balance_deferred", None)
+        deferred = getattr(self.broker, "balance_refresh_deferred", None)
         if deferred is not None and deferred():
             return False
         if not force_update and monotonic() < getattr(self, "_local_balance_retry_at", 0):

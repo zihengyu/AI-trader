@@ -53,6 +53,7 @@ class LocalPaperBroker(CachedMarketHours, Broker):
         # risk snapshots and fills serial, including across a minute boundary.
         self._poll_lock = threading.RLock()
         self._opening_balance_retry_at = None
+        self._balance_backoff_series = None
         # State commits and native events must agree, but cancellations must not
         # wait for another thread's market-data I/O under the polling lock.
         self._order_state_lock = threading.RLock()
@@ -170,18 +171,33 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             return number(db.execute("SELECT receivables FROM local_account WHERE id=1").fetchone()[0])
 
     def _get_balances_at_broker(self, quote_asset, strategy):
-        """Native sync can leave its prior balances in place while an opening mark is pending."""
+        """Report a temporary gap to native sync without returning a stale balance."""
         with self._poll_lock:
-            if self.opening_balance_deferred():
+            if self.balance_refresh_deferred():
                 return None
             try:
                 return self.read_confirmed_balances(quote_asset, strategy)
             except OpeningValuationPending:
                 return None
+            except MarketDataUnavailable:
+                if self.balance_refresh_deferred():
+                    return None
+                raise
 
-    def opening_balance_deferred(self):
+    def balance_refresh_deferred(self):
         retry_at = self._opening_balance_retry_at
-        return retry_at is not None and self.data_source.get_datetime() < retry_at
+        if retry_at is not None and self.data_source.get_datetime() < retry_at:
+            return True
+        series = self._balance_backoff_series
+        check = getattr(self.data_source, "history_in_backoff", None)
+        return series is not None and check is not None and check(*series)
+
+    def _remember_balance_backoff(self, exc):
+        detail = exc.diagnostic or {}
+        if detail.get("reason") in {"source_backoff", "source_unavailable"}:
+            series = detail.get("symbol"), detail.get("interval"), detail.get("period")
+            if all(series):
+                self._balance_backoff_series = series
 
     def read_confirmed_balances(self, quote_asset, strategy):
         """Fresh fund evidence for decisions, with the full valuation diagnostic on failure."""
@@ -194,7 +210,11 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 now = self.data_source.get_datetime()
                 self._opening_balance_retry_at = min(now + timedelta(seconds=5), instant(exc.diagnostic["first_bar_at"]))
                 raise
+            except MarketDataUnavailable as exc:
+                self._remember_balance_backoff(exc)
+                raise
             self._opening_balance_retry_at = None
+            self._balance_backoff_series = None
             return balances
 
     def ledger_audit(self, *, strict=True):
@@ -599,7 +619,20 @@ class LocalPaperBroker(CachedMarketHours, Broker):
                 active.append((row, order))
             # STOP, expiry and capital-authority cancellations require no market data.
             # An action-history outage must not leave those orders active.
-            self._corporate_actions()
+            try:
+                self._corporate_actions()
+            except MarketDataUnavailable as exc:
+                self._remember_balance_backoff(exc)
+                detail = exc.diagnostic or {}
+                if detail.get("operation") == "corporate_actions":
+                    symbol = detail["symbol"]
+                    message = f"{symbol} 的公司行动历史暂不可用"
+                    self._valuation_error = message
+                    self._note_market_data_pending(message, details={"operation": "corporate_actions", "symbol": symbol})
+                    return
+                raise
+            if self._valuation_error and self._valuation_error == self._market_data_error:
+                self._valuation_error = None  # Corporate-action check succeeded after an outage.
             for row, order in active:
                 if self.matching_enabled and self.is_market_open():
                     try:
@@ -650,10 +683,10 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             except Exception:
                 pass
 
-    def _note_market_data_pending(self, message):
+    def _note_market_data_pending(self, message, *, details=None):
         if message != self._market_data_error:
             self.journal.event(self.data_source.get_datetime(), "notification", {
-                "kind": "local_market_data_pending", "details": message})
+                "kind": "local_market_data_pending", "details": message if details is None else details})
         self._market_data_error = message
 
     def _match(self, row, order):
@@ -864,8 +897,14 @@ class LocalPaperBroker(CachedMarketHours, Broker):
             asset = Asset(position["symbol"], asset_type="stock")
             if observations is not None and asset.symbol not in observations:
                 continue
-            actions = (observations[asset.symbol] if observations is not None else
-                       self.data_source.corporate_actions(asset, since=position["opened_at"]))
+            if observations is not None:
+                actions = observations[asset.symbol]
+            else:
+                try:
+                    actions = self.data_source.corporate_actions(asset, since=position["opened_at"])
+                except MarketDataUnavailable as exc:
+                    exc.diagnostic = {**(exc.diagnostic or {}), "operation": "corporate_actions", "symbol": asset.symbol}
+                    raise
             for action in actions:
                 if action["date"] <= trading_day(instant(position["opened_at"])):
                     continue
