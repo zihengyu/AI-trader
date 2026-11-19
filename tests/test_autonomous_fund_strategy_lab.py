@@ -158,12 +158,10 @@ def test_strict_sources_gate_holdout_and_forward_with_exact_offline_receipts(tmp
     with pytest.raises(RiskError, match="source_artifact_mismatch:raw_prices"):
         engine.schedule(data, formed, artifacts_dir=artifacts)
     original.unlink()
-    saved = tmp_path / "elsewhere"
-    saved.write_bytes(raw)
-    original.symlink_to(saved)
+    original.mkdir()
     with pytest.raises(RiskError, match="source_artifact_unreadable:raw_prices"):
         engine.schedule(data, formed, artifacts_dir=artifacts)
-    original.unlink()
+    original.rmdir()
     original.write_bytes(raw)
     checked = check_data(tmp_path, data, key, "v1", formed, artifacts_dir=artifacts)
     assert checked["ready_for_validation_input"] and checked["source_artifacts_matched_this_check"]
@@ -197,6 +195,26 @@ def test_strict_sources_gate_holdout_and_forward_with_exact_offline_receipts(tmp
     assert check_data(tmp_path, daily, key, "v1", observed)["source_artifacts_recorded"]
     assert not check_data(tmp_path, data, key, "v1", formed - timedelta(seconds=1))["source_artifacts_recorded"]
     assert not engine.journal.pending()
+
+
+def test_source_artifact_rejects_a_symlink_to_matching_bytes(tmp_path):
+    from scripts.autonomous_fund.strategy_validation import COVERAGE_FIELDS, source_artifact_gaps
+
+    data = dataset()
+    raw = b"synthetic original provider bytes"
+    checksum = hashlib.sha256(raw).hexdigest()
+    for receipt in data["provenance"]["claims"].values():
+        receipt["artifact_sha256"] = checksum
+    saved = tmp_path / "elsewhere"
+    saved.write_bytes(raw)
+    try:
+        (tmp_path / checksum).symlink_to(saved)
+    except OSError as exc:
+        # Keep the file, digest and directory cases running on Windows without link privileges.
+        if getattr(exc, "winerror", None) != 1314:
+            raise
+        pytest.skip("Windows runner cannot create file symlinks")
+    assert source_artifact_gaps(data, tmp_path) == [f"source_artifact_unreadable:{key}" for key in COVERAGE_FIELDS]
 
 
 @pytest.mark.parametrize("field", ["feature_available_at", "actions"])
@@ -234,11 +252,14 @@ def test_nonfactor_proposal_and_no_ideas_are_accepted_without_trading(tmp_path):
 
 
 def test_unsupported_mechanisms_remain_feasibility_tasks(tmp_path):
+    from scripts.autonomous_fund.lab import report
+
     engine, candidate = lab(tmp_path), proposal()
     candidate["implementation"] = {"adapter": "novel_path_dependent_model", "implementation_notes": "inert code text"}
     engine.submit(candidate, NOW)
     assert engine.rows()[0]["state"] == "needs_adapter"
     assert engine.schedule(dataset(), NOW) == []
+    assert any("需要支持 novel_path_dependent_model 的回测适配器" in line for line in report(tmp_path))
 
 
 def test_uncompiled_implementation_retains_the_complete_research_hypothesis(tmp_path):
@@ -259,6 +280,8 @@ def test_a_novel_validation_method_is_not_forced_into_daily_significance_tests()
 
 
 def test_impossible_purged_windows_remain_researchable_without_spending_the_holdout(tmp_path):
+    from scripts.autonomous_fund.lab import report
+
     engine = lab(tmp_path)
     candidate = proposal()
     candidate["validation"]["holding_sessions"] = 5  # 10 complete blocks plus a five-session purge needs 55 days.
@@ -267,11 +290,22 @@ def test_impossible_purged_windows_remain_researchable_without_spending_the_hold
     assert saved["state"] == "needs_formalization"
     assert saved["source_call_id"] == "synthetic-research-call"
     assert "55" in saved["feasibility_error"]
+    assert any(saved["feasibility_error"] in line for line in report(tmp_path))
     assert engine.schedule(dataset(), NOW) == []
     with engine.journal.connection() as db:
         assert db.execute("SELECT count(*) FROM fund_strategy_holdouts").fetchone()[0] == 0
     assert validate(candidate, dataset(), policy())["minimum_sessions"] == {
         "validation_sessions": 55, "final_sessions": 55}
+
+
+@pytest.mark.parametrize("implementation", [None, {"adapter": "daily_rules_v1", "rules": []}])
+def test_status_explains_when_a_saved_proposal_has_no_executable_rules(tmp_path, implementation):
+    from scripts.autonomous_fund.lab import report
+
+    engine, candidate = lab(tmp_path), proposal()
+    candidate["implementation"] = implementation
+    engine.submit(candidate, NOW)
+    assert any("尚未提交可执行规则" in line for line in report(tmp_path))
 
 
 def test_versions_are_immutable_and_failures_survive_revisions(tmp_path):

@@ -1,5 +1,8 @@
 """Frozen regular-session closing marks and independent local-book reconciliation."""
 import json
+import os
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -264,12 +267,23 @@ def test_audit_cli_is_read_only_and_uses_the_configured_account(tmp_path):
     env.chmod(0o600)
     book = tmp_path / "state.sqlite3"
     digest = hashlib.sha256(book.read_bytes()).hexdigest()
-    result = script("fund-logs.sh", tmp_path, env, "audit")
+
+    def run_audit():
+        # Exercise the Linux wrapper where supported and the same CLI directly on Windows.
+        if sys.platform != "win32":
+            return script("fund-logs.sh", tmp_path, env, "audit")
+        variables = {key: value for key, value in os.environ.items() if not key.startswith("FUND_")}
+        variables["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run([sys.executable, "-m", "scripts.autonomous_fund.run", "audit-ledger",
+                               "--env-file", str(env)], capture_output=True, encoding="utf-8",
+                              env=variables, timeout=60)
+
+    result = run_audit()
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["status"] == "verified"
     assert hashlib.sha256(book.read_bytes()).hexdigest() == digest
     env.write_text(f"FUND_MODE=local\nFUND_RUN_DIR={tmp_path / 'missing'}\n")
-    result = script("fund-logs.sh", tmp_path, env, "audit")
+    result = run_audit()
     assert result.returncode == 2 and json.loads(result.stdout)["status"] == "unavailable"
     assert not (tmp_path / "missing").exists()
 

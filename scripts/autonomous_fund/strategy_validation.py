@@ -63,6 +63,46 @@ def snapshot_limitations(data, *, require_receipts=False):
     return missing
 
 
+def _open_source_artifact(path):
+    if os.name != "nt":
+        return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    get_file_info = kernel32.GetFileInformationByHandleEx
+    get_file_info.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    get_file_info.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = (wintypes.HANDLE,)
+    close_handle.restype = wintypes.BOOL
+
+    GENERIC_READ, FILE_SHARE_READ, FILE_SHARE_DELETE, OPEN_EXISTING = 0x80000000, 1, 4, 3
+    FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    FILE_ATTRIBUTE_TAG_INFO_CLASS = 9
+    handle = create_file(os.fspath(path), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
+                         None, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        # Check the opened object, so a path replacement cannot redirect the read.
+        info = (wintypes.DWORD * 2)()  # FILE_ATTRIBUTE_TAG_INFO: FileAttributes, ReparseTag.
+        if not get_file_info(handle, FILE_ATTRIBUTE_TAG_INFO_CLASS, info, ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info[0] & (stat.FILE_ATTRIBUTE_REPARSE_POINT | stat.FILE_ATTRIBUTE_DIRECTORY):
+            raise OSError("The source artifact must be a regular file, without a reparse point")
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY | os.O_NOINHERIT)
+    except BaseException:
+        close_handle(handle)
+        raise
+
+
 def source_artifact_gaps(data, directory):
     """Match original bytes against bound receipts without following receipt references."""
     gaps = snapshot_limitations(data, require_receipts=True)
@@ -74,7 +114,7 @@ def source_artifact_gaps(data, directory):
         expected = data["provenance"]["claims"][key]["artifact_sha256"]
         if expected not in checks:
             try:
-                fd = os.open(directory / expected, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                fd = _open_source_artifact(directory / expected)
                 try:
                     if not stat.S_ISREG(os.fstat(fd).st_mode):
                         checks[expected] = "unreadable"

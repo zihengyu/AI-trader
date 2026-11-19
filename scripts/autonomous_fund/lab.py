@@ -233,6 +233,18 @@ def report(root):
         for row in db.execute("SELECT * FROM fund_strategy_versions ORDER BY created_at,rowid"):
             proposal = json.loads(row["proposal"])
             lines.append(f"- {row['id']} / {row['version']} [{row['state']}] 研究任务：{row['task_state']}｜{proposal['name']}")
+            if row["state"] in {"needs_formalization", "needs_adapter"}:
+                registration = db.execute("SELECT json_extract(body,'$.feasibility_error') "
+                                          "FROM fund_strategy_events WHERE id=? AND version=? AND kind='registered' "
+                                          "ORDER BY sequence DESC LIMIT 1", (row["id"], row["version"])).fetchone()
+                reason = registration[0] if registration else None
+                implementation = proposal.get("implementation") or {}
+                if reason:
+                    lines.append("  登记检查：" + reason)
+                elif row["state"] == "needs_adapter" and "adapter" in implementation:
+                    lines.append(f"  登记检查：需要支持 {implementation['adapter']} 的回测适配器。")
+                elif not implementation.get("rules"):
+                    lines.append("  登记检查：尚未提交可执行规则。")
             preflight = db.execute("SELECT body FROM fund_strategy_events WHERE id=? AND version=? "
                                    "AND kind IN ('historical_pass','validation') ORDER BY sequence DESC LIMIT 1",
                                    (row["id"], row["version"])).fetchone()

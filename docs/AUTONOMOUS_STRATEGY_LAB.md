@@ -502,6 +502,8 @@ python -m scripts.autonomous_fund.lab check-data --run-dir artifacts/fund-local 
 ```
 
 The check shows missing symbols, receipt gaps and benchmark session coverage.
+Lab status shows the recorded feasibility reason for proposals awaiting
+formalization or an adapter, including the case where no rules were submitted.
 Daily incremental snapshots can omit data that was already frozen in the book.
 Lab status shows the next opening deadline, current versions awaiting timestamped
 signals, queued forward jobs and the remaining daily job slots. Versions that
@@ -526,7 +528,9 @@ set them using reviewed evidence. The `provenance` object has two fields.
   retrievable `reference` to the relevant evidence and its `artifact_sha256`.
 
 Retain the original evidence for review. Put each original artifact in a local
-directory under its lowercase SHA-256 digest as the filename. The following
+directory under its lowercase SHA-256 digest as the filename. Byte verification
+works on Windows and Linux and requires regular files. Symbolic links and
+Windows reparse points at artifact filenames are rejected. The following
 commands verify those bytes against the four coverage receipts. The first
 command is read-only. The second records a successful check against the exact
 snapshot and schedules eligible work. A supplied directory with missing or
@@ -642,6 +646,8 @@ buy/sell comparison against verified raw opening prices.
 Regression runs cover the existing fund lifecycle, risk, approvals,
 execution and reporting. Synthetic passes establish software behavior, never
 investment returns or real-model strategy creativity.
+The Autonomous Fund regression workflow runs a deterministic subset on Windows
+and Linux for relevant version-branch pushes and pull requests.
 
 ## Next qualification increments
 
