@@ -141,12 +141,64 @@ def test_read_only_review_survives_missing_closing_snapshot(tmp_path):
 def test_next_premarket_research_receives_versioned_memo(tmp_path):
     strategy, calls = review_harness(tmp_path)
     strategy.after_market_closes()
+    assert calls[0][1]["context"]["research_cycle"]["mode"] == "postmarket_deep_research"
+    strategy.get_datetime = lambda: CLOSE + timedelta(hours=4)
+    strategy.before_market_opens()
+    assert len(calls) == 2  # Restart outside the scheduled window reuses completed research.
     strategy.get_datetime = lambda: CLOSE + timedelta(hours=16, minutes=25)
     strategy.before_market_opens()
     context = calls[-1][1]["context"]
     assert context["phase"] == "before_market_opens"
+    assert context["research_cycle"]["mode"] == "premarket_update"
+    assert context["research_cycle"]["previous_postmarket"]["session_date"] == "2026-11-02"
     assert context["strategy_memory"]["version"] == 1
     assert "持续性" in context["strategy_memory"]["review"]["strategy_memo"]
+
+
+def test_validation_followup_reuses_saved_cursor_and_keeps_later_results(tmp_path):
+    from .test_autonomous_fund_strategy_lab import policy, proposal
+    from scripts.autonomous_fund.strategy_lab import StrategyLab
+
+    strategy, calls = review_harness(tmp_path)
+    engine = strategy.strategy_lab = StrategyLab(strategy.journal, policy())
+    engine.submit(proposal(), TRADE)
+    strategy.after_market_closes()
+    assert events(strategy, "postmarket_research")[0]["strategy_lab_research_cursor"] == 0
+
+    recheck = CLOSE + timedelta(hours=4)
+    strategy.get_datetime = lambda: recheck
+    with strategy.journal.connection() as db:
+        engine._event(db, "synthetic-research", "v1", CLOSE, "validation",
+                      {"preflight": True, "state": "needs_data"})
+    strategy.before_market_opens()
+    assert len(calls) == 2  # A retryable data gap alone does not buy another model call.
+
+    with strategy.journal.connection() as db:
+        engine._event(db, "synthetic-research", "v1", recheck, "historical_pass",
+                      {"state": "shadow", "status": "passed", "tests": {"final": {"net": 0.19}}})
+        engine._event(db, "synthetic-research", "v1", recheck + timedelta(hours=1),
+                      "forward_qualification", {"status": "failed", "private_returns": [0.24]})
+    run_research = strategy.agents["researcher"].run
+    strategy.agents["researcher"].run = lambda **_: (_ for _ in ()).throw(RuntimeError("temporary"))
+    strategy.before_market_opens()
+    assert not events(strategy, "premarket_research")
+
+    strategy.agents["researcher"].run = run_research
+    strategy.before_market_opens()
+    strategy.before_market_opens()
+    assert len(calls) == 3
+    context = calls[-1][1]["context"]
+    cycle = context["research_cycle"]
+    assert context["orders_enabled"] is False and cycle["mode"] == "validation_followup"
+    assert cycle["lab_progress"]["milestones"] == [{"id": "synthetic-research", "version": "v1",
+        "kind": "historical_pass", "at": recheck.isoformat(), "state": "shadow", "status": "passed"}]
+    assert events(strategy, "premarket_research")[0]["strategy_lab_research_cursor"] == cycle["lab_progress"]["cursor"]
+
+    strategy.get_datetime = lambda: CLOSE + timedelta(hours=16, minutes=25)
+    strategy.before_market_opens()
+    progress = calls[-1][1]["context"]["research_cycle"]["lab_progress"]
+    assert [row["kind"] for row in progress["milestones"]] == ["forward_qualification"]
+    assert not strategy.journal.pending()
 
 
 def test_future_review_never_teaches_historical_strategy(tmp_path):

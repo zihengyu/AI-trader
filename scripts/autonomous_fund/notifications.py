@@ -791,6 +791,8 @@ def readable(kind, details, sequence=None, *, now=None):
                 f"{details.get('title', '')}\n{details.get('message', '')}")
     elif kind == "premarket_research":
         phase = {"before_market_opens": "开盘前", "closed_startup": "休市期间"}.get(details.get("phase"), "盘前")
+        if details.get("research_mode") == "validation_followup":
+            phase = "休市期间 · 策略验证跟进"
         lines = [f"📊 盘前研究 · {phase}（开盘 {_when(details.get('session_open'))}）", "", details.get("summary") or ""]
         evidence = details.get("evidence") or []
         if evidence:

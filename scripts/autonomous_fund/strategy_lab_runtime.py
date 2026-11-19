@@ -15,6 +15,63 @@ from .strategy_validation import digest, snapshot_limitations
 HISTORICAL_STATES = ("candidate", "needs_data", "awaiting_new_holdout")
 
 
+def research_cycle(journal, now, lab, mode):
+    """Read the prior close and unreviewed validation milestones for scheduled research."""
+    now = instant(now)
+    cutoff = now.isoformat()
+    with journal.connection() as db:
+        stages = db.execute("SELECT at,body FROM events WHERE kind='postmarket_research' "
+                            "AND julianday(at)<=julianday(?) ORDER BY sequence DESC", (cutoff,))
+        previous = None
+        for at, body in stages:
+            packet = json.loads(body)
+            if max(instant(at), instant(packet["completed_at"]), instant(packet["market_close"])) <= now:
+                previous = {key: packet[key] for key in ("session_date", "market_close", "completed_at")}
+                previous["summary"] = packet["research"]["summary"][:1200]
+                previous["research_direction"] = packet["research"].get("research_direction", "")
+                break
+        progress = None
+        if lab is not None:
+            try:
+                progress = _research_progress(db, lab.admission_policy["policy_hash"], now)
+            except Exception as exc:
+                progress = {"status": "unavailable", "error": type(exc).__name__}
+    return {"mode": mode, "previous_postmarket": previous, "lab_progress": progress}
+
+
+def _research_progress(db, policy_hash, now):
+    receipts = db.execute("SELECT at,json_extract(body,'$.completed_at'),"
+                          "json_extract(body,'$.strategy_lab_research_cursor') FROM events "
+                          "WHERE kind IN ('premarket_research','postmarket_research') AND julianday(at)<=julianday(?) "
+                          "AND json_type(body,'$.strategy_lab_research_cursor')='integer' ORDER BY sequence DESC",
+                          (now.isoformat(),))
+    cursor = next((seq for at, completed, seq in receipts if max(instant(at), instant(completed)) <= now), 0)
+    # The researcher needs outcomes that can change the next task. Preflight
+    # gaps, repeated data pulls and per-session forward marks stay in lab context.
+    milestones = db.execute("""
+        SELECT e.sequence,e.id,e.version,e.kind,e.at,e.body FROM fund_strategy_events e
+        JOIN fund_strategy_versions v ON v.id=e.id AND v.version=e.version
+        LEFT JOIN fund_strategy_jobs j ON j.id=json_extract(e.body,'$.job_id')
+        WHERE e.sequence>? AND v.policy_hash=? AND (
+            e.kind IN ('historical_pass','forward_qualification') OR
+            (e.kind='validation' AND (j.kind='historical' OR
+                (j.kind='forward' AND json_extract(e.body,'$.state') IN ('paused','forward_incomplete')))))
+        ORDER BY e.sequence LIMIT 9
+        """, (cursor, policy_hash))
+    updates = []
+    for seq, key, version, kind, at, payload in milestones:
+        # Do not acknowledge later sequence numbers around an unfinished cutoff.
+        if instant(at) > now:
+            break
+        if len(updates) == 8:
+            return {"milestones": updates, "cursor": cursor, "more": True}
+        body = json.loads(payload)
+        updates.append({"id": key, "version": version, "kind": kind, "at": at,
+                        **{field: body[field] for field in ("state", "status") if field in body}})
+        cursor = seq
+    return {"milestones": updates, "cursor": cursor, "more": False}
+
+
 def history_symbols(proposal, cash_symbol):
     symbols = set(proposal["instruments"] + proposal.get("data_symbols", []) + [proposal["validation"]["benchmark"]])
     if cash_symbol:

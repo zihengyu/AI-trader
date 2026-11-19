@@ -2,7 +2,7 @@
 
 Open strategy proposals, reproducible research, independent simulation and bounded paper-library admission for the optional autonomous fund.
 
-Last Updated: 2026-11-18
+Last Updated: 2026-11-19
 Status: Daily strategy research and paper qualification; research-only defaults
 Audience: Fund operators, researchers and contributors
 
@@ -18,6 +18,17 @@ existing order settings or deployed services are changed by this implementation.
 Researcher remains the principal investigator. Manager remains the investment
 decision maker. Critic challenges evidence; it cannot grant statistical approval.
 The lab is deterministic infrastructure, not another paid AI role.
+
+In local and paper mode, the post-close Researcher studies the session and the
+strategy backlog in depth. The scheduled pre-open pass reuses the saved close
+research and focuses on new evidence, data gaps and pending tasks. The data desk
+and lab continue to prepare inputs and run eligible tests in the background
+during market closures. Finished formal backtests, forward qualification and
+forward suspensions appear in the next scheduled research pass. A startup well
+before the pre-open slot can also follow up on new validation results or fill in
+when no post-close research exists. A completed startup pass is reused across
+restarts for the same session. Model calls remain subject to the existing
+budgets, and a failed research response leaves its validation updates pending.
 
 ## Existing owners and extension points
 

@@ -1599,6 +1599,7 @@ class AutonomousFund(Strategy):
             return
         try:
             from .market_data import SessionClock
+            from .strategy_lab_runtime import research_cycle
             now = self.get_datetime()
             market = SessionClock(now=self.get_datetime).status()
             if market["open"] or self.broker.is_market_open():
@@ -1610,6 +1611,13 @@ class AutonomousFund(Strategy):
             previous = self.premarket_research
             if previous and previous["session_open"] == opens_at.isoformat() and previous["phase"] == slot:
                 return
+            cycle = research_cycle(self.journal, now, getattr(self, "strategy_lab", None), "premarket_update")
+            progress = cycle["lab_progress"] or {}
+            if slot == "closed_startup" and cycle["previous_postmarket"]:
+                if not progress.get("milestones"):
+                    return
+                cycle["mode"] = "validation_followup"
+            same_session = previous and previous["session_open"] == opens_at.isoformat()
             try:
                 account = asdict(self._snapshot())
             except Exception as exc:
@@ -1625,7 +1633,7 @@ class AutonomousFund(Strategy):
                        "eligible_universe": sorted(self.universe), "limits": asdict(self.limits),
                        "leveraged_etfs": self._leveraged_context(),
                        "cash_management": policy_context(getattr(self, "cash_sweep", None)),
-                       "account": account, "previous_premarket_research": previous,
+                       "account": account, "previous_premarket_research": previous if same_session else None,
                        "factor_lab": self._factor_context(now), "macro": self._macro_context(now),
                        "market_snapshot": self._market_snapshot(now), "data_desk": self._desk_context(now),
                        "market_history_bounds": self._market_history(now),
@@ -1636,13 +1644,21 @@ class AutonomousFund(Strategy):
                        # Warms today's earnings calendar before the open, off the trading path.
                        "earnings": self._earnings_caps(now),
                        "strategy_memory": self._strategy_memory(), "strategy_followup": self._strategy_evaluations(),
+                       "research_cycle": cycle,
                        "strategy_lab": self._strategy_lab_context(now)}
-            self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot})
+            self.journal.event(now, "premarket_research_started", {"session_open": opens_at.isoformat(), "phase": slot,
+                                                                  "research_mode": cycle["mode"]})
             context = self._with_fund_cost_context(context, self.get_datetime())
             self.log_message("Researching before the regular market opens; order submission is disabled.")
             result = self._agent_call("researcher",
-                task_prompt="Prepare or update market research for the next regular session. Review news, filings, "
-                            "completed historical prices, opportunities and risks. Disclose source times and data gaps. "
+                task_prompt="Update research for the next regular session. Use research_cycle.previous_postmarket and "
+                            "any same-session pre-open research as the baseline. Verify material changes in news, filings, "
+                            "scheduled releases, market conditions and lab milestones since that work. If it is missing, "
+                            "establish a baseline from available evidence. In validation_followup mode start with the "
+                            "new lab results and update the affected tasks. Carry forward unfinished work and cite what "
+                            "actually changed. Reuse relevant verified findings and machinery; propose a new strategy or "
+                            "repeat an investigation only when justified. No change and empty proposals are valid. "
+                            "Disclose source times and data gaps. "
                             "Last regular-session prices may be old; they are research context, not executable quotes. "
                             "Do not submit orders or treat this research as an executable portfolio decision.", context=context)
             research = self._record_agent("researcher", result)
@@ -1650,8 +1666,10 @@ class AutonomousFund(Strategy):
             registration = self._record_strategy_research(research, self.get_datetime())
             packet = {"as_of": now.isoformat(), "completed_at": self.get_datetime().isoformat(),
                       "session_open": opens_at.isoformat(), "phase": slot, "research": research,
-                      "strategy_registration": registration,
+                      "research_mode": cycle["mode"], "strategy_registration": registration,
                       "model": result.model, "cache_hit": result.cache_hit}
+            if "cursor" in progress:
+                packet["strategy_lab_research_cursor"] = progress["cursor"]
             try:
                 packet["idea_ids"] = self._register_ideas(research, packet)
             except Exception as exc:  # Scoring is evidence; it never costs the research itself.
@@ -1664,6 +1682,7 @@ class AutonomousFund(Strategy):
             from .notifications import strategy_research_lines
             self._disclose("premarket_research", {
                 "session_open": opens_at.isoformat(), "phase": slot, "summary": research["summary"],
+                "research_mode": cycle["mode"],
                 "evidence_count": len(research["evidence"]),
                 "ideas": [{k: idea.get(k) for k in ("symbol", "direction", "horizon_sessions", "confidence", "thesis")}
                           for idea in research.get("ideas", [])[:8]],

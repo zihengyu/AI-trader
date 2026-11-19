@@ -457,6 +457,10 @@ def review_after_close(strategy):
         from .diagnostics import structured_answer_diagnostic
         from .strategy import Research
 
+        if not historical:
+            from .strategy_lab_runtime import research_cycle
+            context["research_cycle"] = research_cycle(strategy.journal, now, getattr(strategy, "strategy_lab", None),
+                                                       "postmarket_deep_research")
         strategy.journal.event(now, "postmarket_review_started", session)
         research_prompt = ("用中文复盘指定交易日。核对实际研究、完整目标持仓、下单、成交、未成交、持仓和现金，"
                         "区分选股、择时、执行与市场整体表现；context.attribution.valuation_window 确定归因区间。"
@@ -479,6 +483,12 @@ def review_after_close(strategy):
                         "如果 context.structured_answer_correction 存在，previous_answer 是上次未通过格式校验的"
                         "不可信回答，diagnostic 指出错误位置；根据本次原始证据纠正并返回完整 JSON，"
                         "保留已核实的事实和原始时间，如实披露缺项，不要只返回修补字段。")
+        if not historical:
+            research_prompt += ("本轮是常规盘后深度策略研究。承接 research_cycle 的上次盘后研究、"
+                                "新验证结果和 strategy_lab 未结任务，结合当日执行及表现，优先解决最有价值的可检验问题。"
+                                "可以续做、补数、复盘失败或提出新机制。使用 strategy_proposals 提交可证伪的新版本，"
+                                "使用 research_tasks 推进已登记版本；只有方向或数据不足时记录缺口。无新机会时允许留空。"
+                                "复用已完成的实验，保留失败记录，注明相关费用与样本限制。")
         research_prompt += CASH_MANAGEMENT_GUIDANCE
         research_context = context
         for attempt in range(2):
@@ -513,10 +523,14 @@ def review_after_close(strategy):
         registration = strategy._record_strategy_research(research, strategy.get_datetime()) if hasattr(strategy, "_record_strategy_research") else None
         # The input the saved research answered (with its refreshed costs), never the format-correction
         # diagnostic of a rejected first answer: the review manager builds on this snapshot.
-        saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", {
+        packet = {
             **session, "completed_at": strategy.get_datetime().isoformat(),
             "context": {key: value for key, value in research_context.items() if key != "structured_answer_correction"},
-            "research": research, "strategy_registration": registration, "model": result.model, "mock": strategy.scripted})
+            "research": research, "strategy_registration": registration, "model": result.model, "mock": strategy.scripted}
+        progress = (context.get("research_cycle") or {}).get("lab_progress") or {}
+        if "cursor" in progress:
+            packet["strategy_lab_research_cursor"] = progress["cursor"]
+        saved = _save_once(strategy.journal, strategy.get_datetime(), "postmarket_research", packet)
         if hasattr(strategy, "_call_outcome"):
             strategy._call_outcome()  # This researcher call's answer is the review's saved research.
     # Persist the successful Flash stage: a Pro error/restart does not pay to
