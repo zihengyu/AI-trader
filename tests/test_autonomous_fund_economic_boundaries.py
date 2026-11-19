@@ -115,6 +115,35 @@ def test_report_discloses_gaps_when_other_adjacent_intervals_can_still_be_compar
     assert "不是连续全期收益" in fund_scoreboard_line(board)
 
 
+def test_intraday_mark_cannot_finish_scoreboard_and_late_receipt_can(tmp_path):
+    from scripts.autonomous_fund.cash import CashSweep
+    from tests.test_autonomous_fund_quant import harness
+
+    strategy = harness(tmp_path, mode="local")
+    strategy.cash_sweep = CashSweep("PARK")
+    journal = strategy.journal
+    prior = instant("2026-11-17T21:00:00Z")
+    end = instant("2026-11-18T21:00:00Z")
+    interim = end - timedelta(hours=3)
+    journal.event(prior, "account", {"equity": 10000})
+    journal.event(prior, "benchmark", {"SPY": "100", "PARK": "100"})
+    journal.event(interim, "account", {"equity": 10020})
+    journal.event(interim, "benchmark", {"SPY": "120", "PARK": "90"})
+    pending = strategy._fund_scoreboard(end)
+    assert pending["status"] == "insufficient_sample" and pending["missing_account_intervals"] == 1
+
+    journal.event(end + timedelta(minutes=1), "account", {
+        "equity": 10010, "valuation": {"session_close": end.isoformat(), "book_existed_at_close": True},
+        "benchmark_observations": {"SPY": {"price": 101, "as_of": end.isoformat()},
+                                   "PARK": {"price": 90, "as_of": interim.isoformat()}},
+    })
+    board = strategy._fund_scoreboard(end + timedelta(minutes=2))
+    assert board["sessions"] == 1 and board["missing_account_intervals"] == 0
+    assert board["account_return"] == pytest.approx(.001)
+    assert board["benchmarks"]["spy"]["return"] == pytest.approx(.01)
+    assert board["cash_comparison"]["return"] is None
+
+
 def test_one_corrupt_cached_bar_keeps_other_bars_without_filling_the_gap(tmp_path):
     import sqlite3
     folder = tmp_path / "cache/daily/2026-11-10/bars"

@@ -61,7 +61,19 @@ def event_bodies(db, sequences):
     return bodies
 
 
-def session_benchmarks(db, accounts, *, until):
+def account_mark_close(received_at, declared=None, *, book_existed=True):
+    """An explicit exchange-close receipt, or a legacy mark written at the bell."""
+    from .session_calendar import _session_close
+    try:
+        received = instant(received_at)
+        mark = instant(declared) if declared else received
+        closed = _session_close(mark.astimezone(ZoneInfo("America/New_York")).date())
+    except (TypeError, ValueError):
+        return None
+    return closed if book_existed and closed is not None and mark == closed <= received else None
+
+
+def session_benchmarks(db, accounts, *, until, strict_closes=False):
     """Benchmark evidence matched to each account valuation, keyed by its New York session.
 
     Prefer the account's durable, source-timed observations, including closing
@@ -78,6 +90,10 @@ def session_benchmarks(db, accounts, *, until):
     schedule = mcal.get_calendar("NYSE").schedule(start_date=min(chosen), end_date=max(chosen))
     windows = {day.date().isoformat(): (row.market_open, min(row.market_close, chosen[day.date().isoformat()][0]))
                for day, row in schedule.iterrows() if day.date().isoformat() in chosen}
+    # Durable closing NAVs require benchmark observations from that same close.
+    # Scalar legacy benchmark events have no separate source clock.
+    exact = {day for day, (_, body) in chosen.items()
+             if strict_closes and (body.get("valuation") or {}).get("session_close")}
 
     def price(value):
         if isinstance(value, bool):
@@ -94,7 +110,8 @@ def session_benchmarks(db, accounts, *, until):
         observed = instant(at)
         day = observed.astimezone(zone).date().isoformat()
         window = windows.get(day)
-        if observed > cutoff or window is None or not window[0] <= observed <= window[1]:
+        if (observed > cutoff or window is None or not window[0] <= observed <= window[1]
+                or day in exact):
             continue
         for symbol, value in json.loads(body).items():
             value = price(value)
@@ -111,7 +128,8 @@ def session_benchmarks(db, accounts, *, until):
             except (RiskError, TypeError, ValueError):
                 continue
             value, window = price(observation.get("price")), windows.get(day)
-            if value is not None and window is not None and window[0] <= observed <= window[1]:
+            if (value is not None and window is not None and window[0] <= observed <= window[1]
+                    and (day not in exact or observed == window[1])):
                 result.setdefault(day, {})[symbol] = value
     # Supplemental receipts can arrive after NAV was frozen, including on the
     # next date. Bind to their original close; never use a later live tick.
@@ -126,6 +144,7 @@ def session_benchmarks(db, accounts, *, until):
             window = windows.get(day)
             value = price(item.get("price"))
             if (window is not None and close == chosen[day][0] and window[0] <= source <= window[1]
+                    and (day not in exact or source == close)
                     and value is not None):
                 result.setdefault(day, {}).setdefault(item["symbol"], value)
         except (KeyError, RiskError, TypeError, ValueError):

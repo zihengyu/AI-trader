@@ -165,7 +165,7 @@ class MacroWatch:
             raise RiskError("FRED returned no finite dated observations")
         return observations
 
-    def context(self, as_of_day, may_fetch=None):
+    def context(self, as_of_day, may_fetch=None, *, vix_session=None):
         """may_fetch(): when False, series not fetched yet are `deferred` to a later call."""
         today = date.fromisoformat(str(as_of_day)[:10])
         series, deferred = {}, []
@@ -210,5 +210,18 @@ class MacroWatch:
                                 "unavailable": str(error)[:200] if isinstance(error, RiskError) else type(error).__name__}
             else:
                 series[name] = {"meaning": meaning, **summarize(cached[1], today)}
-        return {"source": "FRED (St. Louis Fed)", "as_of_day": today.isoformat(), "series": series,
-                "regime": regime(series), "deferred": deferred}
+        result = {"source": "FRED (St. Louis Fed)", "as_of_day": today.isoformat(), "series": series,
+                  "regime": regime(series), "deferred": deferred}
+        if vix_session is not None and not self.historical:
+            cached_vix = self._raw.get("VIXCLS")
+            observations = cached_vix[1] if cached_vix and not isinstance(cached_vix[1], Exception) else []
+            required = vix_session.isoformat()
+            latest, value = max(((day, val) for day, val in observations if day <= required and val > 0),
+                                key=lambda row: row[0], default=(None, None))
+            result["official_vix_close"] = {
+                "source": "FRED/VIXCLS", "required_session": required,
+                "status": "confirmed" if latest == required else "awaiting_evidence",
+                "value": value if latest == required else None,
+                "latest_observation_session": latest, "latest_observation_value": value,
+            }
+        return result

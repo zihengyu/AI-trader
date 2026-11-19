@@ -41,6 +41,16 @@ def test_few_down_days_are_marked_insufficient_and_unknown_parts_are_not_zero():
     assert score([])["down_days"] == {"days": 0, "dates": []} and score([])["beta_lower_on_down_days_by"] is None
 
 
+def test_interim_windows_do_not_count_as_full_down_days():
+    legacy = review("2026-11-18", -.03, 0)
+    legacy["market_close"] = "2026-11-18T21:00:00Z"
+    legacy["session"] = {"last_observed_account": {"at": "2026-11-18T17:25:00Z"}}
+    current = review("2026-11-19", -.03, 0, status="partial")
+    current["attribution"]["valuation_window"] = {"kind": "account_observations"}
+    paired = score([legacy, current, review("2026-11-20", -.03, -.01)])
+    assert paired["sessions"] == 1 and paired["down_days"]["dates"] == ["2026-11-20"]
+
+
 def test_protective_exits_on_down_days_are_valued_on_the_next_session():
     reviews = [review("2026-10-01", -0.03, -0.02), review("2026-10-02", 0.001, 0.0)]
     closes = {"ALFA": [("2026-10-01", 95.0), ("2026-10-02", 90.0)]}

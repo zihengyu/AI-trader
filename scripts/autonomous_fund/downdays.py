@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from math import isfinite
 
+from .attribution import observation_only
 from .risk import instant
 from .scorecard import ZONE, _forward
 
@@ -53,7 +54,7 @@ def score(reviews, triggers=(), closes=None, *, sessions=None):
     days = {}
     for body in reviews:
         item = body.get("attribution") or {}
-        if item.get("status") not in {"complete", "partial"}:
+        if item.get("status") not in {"complete", "partial"} or observation_only(body):
             continue
         benchmark, fund = item.get("benchmark_return"), item.get("observed_return")
         if not _number(benchmark) or not _number(fund) or not item.get("session_date"):

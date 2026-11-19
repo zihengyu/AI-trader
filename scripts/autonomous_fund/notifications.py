@@ -103,6 +103,7 @@ HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recov
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
                 "model_cost_budget_exhausted", "decision_drought", "malformed_notification_body",
                 "holding_without_market_data", "quote_quality_error", "strategy_lab_open_pending", "strategy_lab_open_missed",
+                "protective_valuation_pending", "closing_valuation_pending",
                 "optional_model_budget_exhausted"}
 
 
@@ -127,6 +128,8 @@ def _regime_note(group):
 def fund_scoreboard_line(fund):
     """One line: since inception, net of every cost, against each benchmark (scoreboard.py); None when not computed."""
     if not fund or fund.get("status") != "computed":
+        if fund and fund.get("missing_account_intervals"):
+            return f"缺 {fund['missing_account_intervals']} 个收盘估值区间，累计收益等待足够的收盘证据。"
         return None
 
     def label(name, weights):
@@ -135,7 +138,8 @@ def fund_scoreboard_line(fund):
         parts = " + ".join(f"{float(w) * 100:.0f}% {s}" for s, w in weights.items())
         return f"{'风险匹配基准' if name == 'risk_matched' else name}（{parts}）"
     costs = fund["model_costs_usd"] + fund.get("known_data_costs_usd", fund.get("data_costs_usd") or 0)
-    text = (f"扣除全部成本后的基金收益（{fund['since']} 至 {fund['through']}，{fund['sessions']} 个交易日）："
+    title = "扣除已知成本后的基金收益" if fund.get("net_is_upper_bound") else "扣除全部成本后的基金收益"
+    text = (f"{title}（{fund['since']} 至 {fund['through']}，{fund['sessions']} 个交易日）："
             f"账户收益 {_percent(fund['account_return'])}（已扣交易费用和滑点，含现金利息），"
             f"模型和数据费用 ${costs:.2f}（占起始资金 {_percent(fund.get('costs_share_of_starting_equity'))}），"
             f"净收益 {_percent(fund['net_return'])}")
@@ -149,6 +153,9 @@ def fund_scoreboard_line(fund):
              for name, row in (fund.get("benchmarks") or {}).items()]
     if marks:
         text += "；同期 " + "、".join(marks)
+    if comparison := fund.get("cash_comparison"):
+        text += (f"；同期被动持有 {comparison['symbol']}（按已记录价格和分配） {_percent(comparison['return'])}"
+                 f"（净超额 {_percent(comparison['net_excess'])}）")
     pace = (fund.get("cost_pace") or {}).get("share_of_equity_per_year")
     if pace is not None:
         text += (f"。按最近 {fund['cost_pace']['sessions']} 个交易日的花费，系统一年的费用约占资金 {_percent(pace)}，"
@@ -254,9 +261,16 @@ def attribution_lines(result):
         return ["无数据（这次复盘没有归因）。"]
     if result.get("status") == "unavailable":
         return [f"不可用：{result.get('reason')}"]
-    lines = [f"- 观测收益 {_percent(result['observed_return'])}（{result['previous_session']} → {result['session_date']}，"
-             f"基准 {result['benchmark']} {_percent(result.get('benchmark_return'))}）"]
-    lines += [f"- {ATTRIBUTION_LABELS[key]}：{_percent(value)}" for key, value in result["components"].items()]
+    window = result.get("valuation_window") or {}
+    observed = window.get("kind") == "account_observations"
+    lines = []
+    if window:
+        label = "账户观测窗口（收盘归因待确认）" if observed else "收盘至收盘窗口"
+        lines.append(f"- {label}：{window['start_at']} → {window['end_at']}")
+    lines.append(f"- 观测收益 {_percent(result['observed_return'])}（{result['previous_session']} → {result['session_date']}，"
+                 f"基准 {result['benchmark']} {_percent(result.get('benchmark_return'))}）")
+    labels = {**ATTRIBUTION_LABELS, **({"timing": "交易择时（相对窗口终点）"} if observed else {})}
+    lines += [f"- {labels[key]}：{_percent(value)}" for key, value in result["components"].items()]
     lines.append(f"- 未解释（收盘前估值、分红、公司行为等，不强行配平）：{_percent(result['unexplained'])}")
     costs = result.get("fund_costs")
     if costs and costs.get("share") is not None:
@@ -268,8 +282,20 @@ def attribution_lines(result):
         if costs.get("data_usd") is None:
             text += "（另有未知数据费用未计入，净收益仅为上限）"
         lines.append(text)
+        if result.get("benchmark_return") is not None and result.get("net_return") is not None:
+            excess = (result["net_return"] - result["benchmark_return"]) * 10000
+            lines.append(f"- 扣已知费用后对同窗 {result['benchmark']} 超额 {excess:+.2f} 个基点。")
         if window := result.get("cost_window"):
             lines.append(f"- 费用窗口：{window['start_at']} → {window['end_at']}；期末账户估值之后的调用另计。")
+    if parking := result.get("cash_sweep_execution"):
+        text = (f"- 系统现金扫单：{parking['fills']} 笔成交，名义金额 ${parking['notional']:.2f}，"
+                f"到达价及费用齐全 {parking['priced_fills']} 笔")
+        if parking["priced_fills"]:
+            friction = parking["observed_friction_usd"]
+            text += f"；已核对买入摩擦 ${friction:.2f}"
+            if parking["priced_fills"] == parking["fills"] and parking["notional"] > 0:
+                text += f"（{friction / parking['notional'] * 10000:.1f} 个基点）"
+        lines.append(text + "。停放收益、退出费用和扫单带宽需在相同期间对照。")
     groups = result.get("selection_by_group") or {}
     if groups:
         lines.append("- 选股按组：" + "；".join(f"{name} {_percent(value)}" for name, value in groups.items()))
@@ -393,6 +419,11 @@ def _watch_lines(events, day):
     omitted = set(news[:-20])
     shown = [row for i, row in enumerate(events) if i not in omitted]
     lines = ["；".join(f"{kind} × {count}" for kind, count in sorted(counts.items())) or "没有盯盘触发记录。"]
+    if news:
+        advanced = sum(events[i]["body"].get("schedule_advanced") is True for i in news)
+        unknown = sum("schedule_advanced" not in events[i]["body"] for i in news)
+        lines.append(f"新闻命中 {len(news)} 条，确认实际提前复核安排 {advanced} 次"
+                     + (f"，旧记录无法核实是否提前 {unknown} 条。" if unknown else "。"))
     if omitted:
         lines += [f"新闻提前复核仅展示最近 20 条，省略 {len(omitted)} 条；保护性触发和价格提醒全部保留。"
                   f"完整记录仍保留在账本，可用 bash scripts/fund-logs.sh decisions {day} 查看时间线。"]
@@ -437,6 +468,8 @@ def strategy_research_lines(research, lab=None, *, registration=None):
     registered = {tuple(item) for item in (registration or {}).get("registered", [])}
     if registration is not None:
         lines.append(f"本轮确认登记 {len(registered)} 条策略提案。")
+        if not proposals and research.get("research_direction"):
+            lines.append("本轮提交了研究方向，完整策略申请为 0 条。验证队列按已登记的策略版本运行。")
     for proposal in proposals[:4]:
         identity = proposal["strategy_id"], proposal["version"]
         if registration is not None and identity not in registered:
@@ -517,14 +550,42 @@ def daily_report(root, sequence):
             "SELECT kind,body FROM events WHERE kind IN ('scorecard','factor_tests') AND "
             "json_extract(body,'$.session_date')=? ORDER BY sequence", (day,))]
         lab_activity = _strategy_day_activity(db, day, cutoff)
+        zone = ZoneInfo("America/New_York")
+        from datetime import datetime
+        start = datetime.fromisoformat(day).replace(tzinfo=zone)
+        calls = Counter(purpose or role or "unknown" for at, purpose, role in db.execute(
+            "SELECT at,json_extract(body,'$.purpose'),json_extract(body,'$.name') FROM events "
+            "WHERE kind='agent' AND json_valid(body) AND julianday(at)>=julianday(?) AND julianday(at)<=julianday(?)",
+            (start.isoformat(), cutoff.isoformat())) if start <= instant(at) <= cutoff
+            and instant(at).astimezone(zone).date().isoformat() == day)
     from .report import report
+    from .attribution import observation_only
+    from .decision_activity import activity
+    from .call_value import PURPOSE_LABELS
     snapshot = report(root, write_files=False, as_of=cutoff)
     review, session = packet["review"], packet["session"]
-    zone = ZoneInfo("America/New_York")
+    activity_day = activity(root, day, now=cutoff)
+    changes = activity_day["changes"]
+    decisions_line = (f"通过校验的 AI 决策 {activity_day['validated']} 次，首次记录 {changes.get('initial', 0)} 次，"
+                      f"调整目标权重 {changes.get('portfolio', 0) + changes.get('minor', 0)} 次，"
+                      f"调整交易价位 {changes.get('levels', 0)} 次，维持目标 {changes.get('maintain', 0)} 次。")
+    calls_line = f"当日截至报告的模型调用记录 {sum(calls.values())} 次"
+    if calls:
+        calls_line += "（" + "、".join(f"{PURPOSE_LABELS.get(purpose, purpose)} {count}" for purpose, count in calls.most_common()) + "）"
     day_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
                   if instant(at).astimezone(zone).date().isoformat() == day and kind in TRADE_KINDS]
     watch_events = [{"at": at, "kind": kind, "body": body} for at, kind, body in events
                     if instant(at).astimezone(zone).date().isoformat() == day and kind in WATCH_KINDS]
+    attribution = packet.get("attribution")
+    ending = session.get("last_observed_account")
+    interim_attribution = observation_only(packet)
+    mixed_legacy = (attribution and attribution.get("status") in {"complete", "partial"}
+                    and not attribution.get("valuation_window") and interim_attribution)
+    visible_attribution = ({**attribution, "benchmark_return": None} if mixed_legacy else attribution)
+    attribution_text = attribution_lines(visible_attribution)
+    if mixed_legacy:
+        attribution_text = ["历史复盘将账户盘中观测与日线基准并列。同期比较请以账户表中的对齐观测为准。",
+                            *attribution_text]
     lines = [f"# {day} 模拟账户日报及盘后复盘", "",
              f"报告截止：{packet['completed_at']}；模式：{snapshot['mode']}；Mock：{packet['mock']}",
              f"模型：{encode(packet['models'])}；策略备忘版本：{packet['version']}", "",
@@ -540,7 +601,7 @@ def daily_report(root, sequence):
              f"运行至报告截止的最大观测回撤：{snapshot['max_observed_drawdown']}",
              f"运行至报告截止的已确认交易费用 USD：{snapshot['observed_fees']}（null 表示不完整）",
              f"运行至报告截止的模型 usage：{encode(snapshot['model_usage_by_model'])}",
-             _cost_text(snapshot.get("model_costs")),
+             "报告截止的模型费用（按纽约日历日及滚动期间）：", _cost_text(snapshot.get("model_costs")),
              "交易费用和滑点已包含在账户收益中，不重复扣除；模型费用按所列窗口统计，"
              "数据费用及完整系统净收益见下方记分卡／经济对照，未知费用不按零计算。",
              f"没有确认结束的模型调用（用量未知）：{encode(snapshot['unfinished_model_calls'])}",
@@ -554,8 +615,9 @@ def daily_report(root, sequence):
              f"{snapshot['mandate']['reserved_cash']}（为空表示整个专用账户都由 AI 管理）",
              "约束遵守情况（AI 自评，需人工抽查）：" + (review.get("mandate_compliance") or "本次未填写"), "",
              "## 盯盘触发（止损／止盈／价格提醒／提前复核）", "",
+             decisions_line, calls_line + "。",
              *_watch_lines(watch_events, day),
-             "## 当日归因（代码按收盘价计算）", ""] + attribution_lines(packet.get("attribution")) + [
+             "## 当日归因（代码计算）", ""] + attribution_text + [
              "", "## AI 记分卡（只用已完成收盘价客观打分）", ""]
     # Only this session's card: an earlier one under today's heading would be stale.
     card = _review_scorecard(packet, related)
@@ -637,12 +699,18 @@ def daily_report(root, sequence):
                   session["limitations"], "", "## 原始研究", "", packet["research"]["summary"], "",
                   encode(packet["research"]["evidence"])])
     caption = f"LumiBot 模拟账户 · {day} 盘后日报"
-    attribution = packet.get("attribution") or {}
+    attribution = visible_attribution or {}
     if attribution.get("status") in {"complete", "partial"}:
         observed = attribution["observed_return"]
         benchmark = attribution.get("benchmark_return")
         net = attribution.get("net_return")
-        caption += f"\n日度归因｜账户 {_percent(observed, 3)}｜{attribution['benchmark']} {_percent(benchmark, 3)}"
+        window = attribution.get("valuation_window") or {}
+        if interim_attribution:
+            end_at = window.get("end_at") or (ending or {}).get("at")
+            caption += f"\n账户观测截至 {_when(end_at)}，收盘估值待确认"
+        caption += f"\n{'阶段归因' if interim_attribution else '日度归因'}｜账户 {_percent(observed, 3)}"
+        if benchmark is not None:
+            caption += f"｜同窗 {attribution['benchmark']} {_percent(benchmark, 3)}"
         if net is not None:
             caption += f"\n扣已知费用后 {_percent(net, 3)}"
             if benchmark is not None:
@@ -854,6 +922,9 @@ def readable(kind, details, sequence=None, *, now=None):
         text = (f"⏳ 开盘估值等待 {details['symbol']} 的本交易日有效报价。"
                 f"首根一分钟线最早于 {_when(details['first_bar_at'])} 收完。"
                 "新鲜成交价或已完成分钟线到达后，系统会继续检查。")
+    elif kind == "protective_valuation_pending" and isinstance(details, dict):
+        level = "止损" if details.get("kind") == "stop_loss" else "止盈"
+        text = f"⚠️ {details['symbol']} 报价触及{level}阈值，完整账户估值待恢复，保护指令保留待复核。"
     elif kind == "price_alert_unavailable" and isinstance(details, dict):
         reason = {"Stale, future or nonpositive observation": "报价过期、时间异常或价格无效",
                   "Missing source quote timestamp": "报价缺少源时间戳"}.get(details.get("error"), details.get("error"))
@@ -1406,7 +1477,18 @@ def weekly_document(root, sequence):
         lines += ["", "AI 调用价值（被采用＝已记录结果通过校验并被使用；未记录采用结果不能证明未使用；"
                   "改变目标组合＝增删证券或权重变动至少 1 个百分点）："] + value
     lines += ["", "## 三、本周归因合计【事实，代码按收盘价计算】", ""]
-    usable = [r.get("attribution") for r in reviews if (r.get("attribution") or {}).get("status") in {"complete", "partial"}]
+    from .attribution import observation_only
+    usable, pending_closes = [], 0
+    for review in reviews:
+        item = review.get("attribution") or {}
+        if item.get("status") not in {"complete", "partial"}:
+            continue
+        if observation_only(review):
+            pending_closes += 1
+            continue
+        usable.append(item)
+    if pending_closes:
+        lines.append(f"- 有 {pending_closes} 天的复盘只有阶段观测，收盘归因未纳入合计。")
     if usable:
         totals, unknown = {}, {}
         for item in usable:

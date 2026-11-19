@@ -337,6 +337,8 @@ MANAGER_PROMPT = (
     "cannot authorize a candidate strategy. Empty strategy_allocations is valid; never invent library entries. "
     "risk.event_risk caps a stock reporting earnings today or on the next business day (no stop catches an "
     "overnight gap); macro gives FRED yields, the curve, credit spreads and the VIX as regime context. "
+    "For a rule based on the official VIX close, use macro.official_vix_close for the required session. "
+    "Awaiting evidence means the condition is unknown. Keep the observation date when discussing an earlier close. "
     "market_history_bounds says whether the latest session (benchmark volatility, daily move and drawdown, stock "
     "correlation) is outside the history the risk estimates and scorecards came from; when it is, those estimates "
     "likely understate risk. scorecards.down_days shows how much of the market's large falls and rises the fund "
@@ -2431,6 +2433,7 @@ class AutonomousFund(Strategy):
                 })
                 if emitted is not False:
                     self._record_price_observation_rejected({**detail, "phase": "opening_valuation"})
+                self._watch_during_valuation_gap()
                 return
             except MarketDataUnavailable as exc:
                 detail = exc.diagnostic or {}
@@ -2439,6 +2442,7 @@ class AutonomousFund(Strategy):
                         self._record_price_observation_rejected({**detail, "phase": "account_snapshot"})
                 else:
                     self._disclose_failure("blocked", exc, phase="trading_iteration")
+                self._watch_during_valuation_gap()
                 return
             now = self.get_datetime()
             self._announce_session_open(now, account)
@@ -3401,9 +3405,21 @@ class AutonomousFund(Strategy):
         if retry:
             earliest = max(earliest, instant(retry))
         self._triggers = (getattr(self, "_triggers", []) + [{"at": str(now), "reason": reason, **(detail or {})}])[-20:]
-        if self.next_review is None or earliest < self.next_review:
+        advanced = self.next_review is None or earliest < self.next_review
+        if advanced:
             self.next_review = earliest
-        self.journal.event(now, "review_triggered", {"reason": reason, "review_at": earliest.isoformat(), **(detail or {})})
+        self.journal.event(now, "review_triggered", {"reason": reason, "review_at": earliest.isoformat(),
+                                                     "schedule_advanced": advanced, **(detail or {})})
+
+    def _watch_during_valuation_gap(self):
+        """Keep alerts and cancellation working while new orders need a complete account."""
+        if self.mode not in {"local", "paper"} or getattr(self, "observe_only", False):
+            return
+        now = self.get_datetime()
+        if self.journal.pending():
+            self._bookkeeping(lambda: self._manage_open_orders(now, reprice=False))
+        if getattr(self, "quant", None) is not None:
+            self._bookkeeping(lambda: self._watch(None, now, submit=False))
 
     def _watch(self, account, now, submit=True):
         """Run the watcher and batch its sampled diagnostic evidence after each attempt."""
@@ -3444,7 +3460,8 @@ class AutonomousFund(Strategy):
         self._prune_alert_health(alerts)
         latest = self.execution.latest(now)
         latest_targets = {t["symbol"] for t in json.loads(latest["body"])["targets"]} if latest else set()
-        symbols = set(account.positions) | (latest_targets & set(self.universe))
+        positions = account.positions if account is not None else None
+        symbols = (set(positions) if positions is not None else set(levels)) | (latest_targets & set(self.universe))
         prices = {}
         for symbol in sorted(symbols):
             try:
@@ -3456,14 +3473,30 @@ class AutonomousFund(Strategy):
                 if not isinstance(exc, RiskError):
                     raise
                 continue  # No fresh evidence: nothing is triggered from stale data.
-        equity = number(account.equity)
+        if positions is None:
+            # A crossing is still observable, but quantities and open-book
+            # invariants are unknown. Leave persisted exit instructions armed.
+            for symbol in sorted(set(levels) & set(prices)):
+                price = prices[symbol]
+                try:
+                    price.validate(self.get_datetime(), self.limits)
+                except RiskError:
+                    continue
+                level, bid = levels[symbol], number(price.bid)
+                stop, profit = level.get("stop_loss"), level.get("take_profit")
+                if (stop and bid <= number(stop)) or (profit and bid >= number(profit)):
+                    self._disclose("protective_valuation_pending", {"symbol": symbol,
+                        "kind": "stop_loss" if stop and bid <= number(stop) else "take_profit"})
+            levels = {}
+            positions = {}
+        equity = number(account.equity) if account is not None else None
         for symbol in sorted(s for s, level in levels.items() if level["state"] == "triggered"
-                             and s not in account.positions):
+                             and s not in positions):
             # The exit completed; a newer decision's deferred levels for it take effect now.
             self.execution.finish_level(symbol)
             levels = self.execution.levels()
         needed = set()
-        for symbol in sorted(set(levels) & set(account.positions)):
+        for symbol in sorted(set(levels) & set(positions)):
             level, price = levels[symbol], prices.get(symbol)
             if price is None:
                 continue
@@ -3500,7 +3533,7 @@ class AutonomousFund(Strategy):
                     self.journal.event(now, "protective_escalated", {"symbol": symbol, "bid": str(price.bid),
                                                                      "stop_loss": level["stop_loss"]})
                     self._request_review(now, "stop_loss", {"symbol": symbol, "bid": str(price.bid)})
-            held = number(account.positions[symbol])
+            held = number(positions[symbol])
             quantity = int(held) - keep
             if quantity <= 0:
                 # A partial take-profit keeps the stop on the remaining shares.
@@ -3562,7 +3595,8 @@ class AutonomousFund(Strategy):
         news = getattr(self, "news", None)
         if news is not None:
             queries = [q["query"] for q in json.loads(latest["body"]).get("news_watch", [])] if latest else []
-            news.watch(set(self.universe) | symbols, set(account.positions), queries)
+            if account is not None:
+                news.watch(set(self.universe) | symbols, set(positions), queries)
             for row in news.take_material():
                 self._request_review(now, "news", {"material": row["material"], "title": row["title"][:200],
                                                    "source": row["source"], "symbols": row["symbols"],
@@ -3696,9 +3730,10 @@ class AutonomousFund(Strategy):
                                                 "body": bodies[mark[0]]} for mark in (before, ending))
 
     def _attribution(self, session, now):
-        """Code-computed attribution of a completed session (attribution.py) for the review; never raises."""
-        from .attribution import attribute
-        from .review import _events
+        """Attribute the same account window preserved by the review."""
+        from .attribution import attribute, observed_prices
+        from .evaluation import account_mark_close
+        from .review import _event_day, _events
         day = session["session_date"]
         try:
             if getattr(self, "quant", None) is None:
@@ -3706,13 +3741,22 @@ class AutonomousFund(Strategy):
             zone = ZoneInfo("America/New_York")
             rows = _events(self.journal, instant(now), kinds=("fill", "fill_reconciled", "order_submitted"))
 
-            def local_day(row):
-                closed = (row["body"].get("valuation") or {}).get("session_close") if row["kind"] == "account" else None
-                return instant(closed or row["at"]).astimezone(zone).date().isoformat()
-            before, ending = self._attribution_marks(day, now, zone)
-            if before is None or ending is None:
+            if "baseline_account" in session:
+                before, ending = session["baseline_account"], session["last_observed_account"]
+            else:
+                before, ending = self._attribution_marks(day, now, zone)
+            if before is None or ending is None or _event_day(before, zone) >= _event_day(ending, zone):
                 return {"status": "unavailable", "session_date": day,
                         "reason": "needs an account mark before the session and one during it"}
+            confirmed = []
+            for row in (before, ending):
+                valuation = row["body"].get("valuation") or {}
+                confirmed.append(account_mark_close(row["at"], valuation.get("session_close"),
+                                  book_existed=valuation.get("book_existed_at_close", True)))
+            start_at, end_at = (close or instant(row["at"]) for close, row in zip(confirmed, (before, ending)))
+            close_window = self.mode not in {"local", "paper"} or all(confirmed)
+            window_prices = None if close_window else (
+                observed_prices(before, start_at, self.limits), observed_prices(ending, end_at, self.limits))
             start, end = before["body"], ending["body"]
             from .capital import Units
             with self.journal.connection() as db:
@@ -3726,30 +3770,39 @@ class AutonomousFund(Strategy):
             try:
                 with self.journal.connection() as db:
                     from .execution import observed_arrivals
-                    arrivals = observed_arrivals(db, as_of=now)
+                    arrivals = observed_arrivals(db, as_of=end_at)
             except Exception:
                 arrivals = {}
             orders = {}
             for row in rows:
-                if row["kind"] in {"fill", "fill_reconciled"} and local_day(row) == day:
+                if row["kind"] in {"fill", "fill_reconciled"} and start_at < instant(row["at"]) <= end_at:
                     orders.setdefault(str(row["body"].get("broker_id")), {}).setdefault(row["kind"], []).append(row["body"])
             fills = []
             for broker_id, kinds in orders.items():
                 # A reconciled record is the whole order; callbacks may be its partial fills: never both.
                 chosen = kinds["fill_reconciled"][-1:] if "fill_reconciled" in kinds else kinds["fill"]
-                arrival = arrivals.get((submitted.get(broker_id) or {}).get("intent_id"))
+                order = submitted.get(broker_id) or {}
+                arrival = arrivals.get(order.get("intent_id"))
                 fills += [{"symbol": b["symbol"], "side": b["side"], "quantity": b["quantity"], "price": b["price"],
-                           "fee": b.get("trade_cost"), "arrival": arrival} for b in chosen]
-            symbols = ({"SPY"} | set(start.get("positions") or {}) | set(start.get("cash_equivalents") or {}) |
-                       {f["symbol"] for f in fills})
+                           "fee": b.get("trade_cost"), "arrival": arrival, "order_kind": order.get("kind")} for b in chosen]
+            risk_symbols = set(start.get("positions") or {})
+            if close_window:
+                symbols = {"SPY"} | risk_symbols | set(start.get("cash_equivalents") or {}) | {f["symbol"] for f in fills}
+            else:
+                symbols = risk_symbols | {"SPY"} if risk_symbols else set()
             closes = {symbol: self._daily_closes(symbol, now) for symbol in sorted(symbols)}
             groups = {}
             for name, _, members in self.quant.groups:
                 for member in members:
                     groups.setdefault(member, name)
-            result = attribute(start, end, fills, closes, local_day(before), day, groups)
+            result = attribute(start, end, fills, closes, _event_day(before, zone).isoformat(), day, groups,
+                               window_prices=window_prices)
             if result.get("status") in {"complete", "partial"}:
-                self._attribute_fund_costs(result, before["at"], ending["at"])
+                if not close_window:
+                    result["status"] = "partial"
+                result["valuation_window"] = {"kind": "close_to_close" if close_window else "account_observations",
+                                             "start_at": start_at.isoformat(), "end_at": end_at.isoformat()}
+                self._attribute_fund_costs(result, start_at, end_at)
             return result
         except Exception as exc:
             return {"status": "unavailable", "session_date": day,
@@ -3850,7 +3903,7 @@ class AutonomousFund(Strategy):
                 self._request_cancel(pending, order, now, "protective_priority_cancel",
                                      {"protect": sorted(self._protective_needed)})
 
-    def _manage_open_orders(self, now):
+    def _manage_open_orders(self, now, *, reprice=True):
         """Cancel expired-target orders, and cancel stale limits so they can be repriced.
 
         Cancellation is only requested here. A replacement is planned on a later
@@ -3921,7 +3974,7 @@ class AutonomousFund(Strategy):
             submitted = self.execution.submitted_at(pending["id"])
             interval = (getattr(policy, "protective_reprice_seconds", 60) if protective
                         else getattr(policy, "reprice_after_seconds", None))
-            if (interval is not None and submitted is not None and
+            if (reprice and interval is not None and submitted is not None and
                     (protective or cash_order or redemption or latest["state"] == "active") and
                     (instant(now) - submitted).total_seconds() >= interval):
                 cancel(pending, order, "order_reprice_cancel", {"age_seconds": (instant(now) - submitted).total_seconds()})
@@ -4776,17 +4829,19 @@ class AutonomousFund(Strategy):
         key = (trading_day(now), completed_daily_cutoff(now))
         cached = getattr(self, "_fund_scoreboard_cache", None)
         if cached and cached[0] == key:
-            return cached[1]
+            if not cached[1].get("missing_account_intervals") or (
+                    len(cached) > 2 and 0 <= (instant(now) - cached[2]).total_seconds() < 60):
+                return cached[1]
         try:
             result = self._compute_fund_scoreboard(now, key[1])
         except Exception as exc:  # Context and reports only: never costs the iteration.
             return {"status": "unavailable", "reason": str(exc)[:200] if isinstance(exc, RiskError) else type(exc).__name__}
-        self._fund_scoreboard_cache = (key, result)
+        self._fund_scoreboard_cache = (key, result, instant(now))
         return result
 
     def _compute_fund_scoreboard(self, now, cutoff):
         from datetime import date
-        from .evaluation import nav_marks, event_bodies, session_benchmarks
+        from .evaluation import account_mark_close, nav_marks, event_bodies, session_benchmarks
         from .ledger_audit import audit_connection
         from .performance import PerformanceSettings
         from .scoreboard import compute, cost_ledger
@@ -4797,16 +4852,28 @@ class AutonomousFund(Strategy):
             integrity = audit_connection(db)
             if integrity["status"] == "failed":
                 return {"status": "unavailable", "reason": "the ledger audit failed; account marks are not trusted"}
-            closing = {}
-            for sequence, at, _, equity, close, _ in nav_marks(db, until=moment, excluded=set(
-                    integrity.get("invalid_account_sequences", []))):
+            closing, observed_days = {}, set()
+            local = getattr(self, "mode", "local") == "local"
+            candidates = nav_marks(db, until=moment, excluded=set(
+                    integrity.get("invalid_account_sequences", [])))
+            declared = event_bodies(db, [row[0] for row in candidates if row[4]])
+            for sequence, at, _, equity, close, _ in candidates:
+                valuation = (declared.get(sequence, {}).get("valuation") or {})
+                if close and not valuation.get("book_existed_at_close", True):
+                    continue
                 when = close or at
                 day = instant(when).astimezone(zone).date()
-                if day < cutoff and equity is not None:
-                    closing[day] = (sequence, when, "account", {"equity": equity})
+                if day >= cutoff or equity is None:
+                    continue
+                observed_days.add(day)
+                if local:
+                    when = account_mark_close(at, close)
+                    if when is None:
+                        continue
+                closing[day] = (sequence, when, "account", {"equity": equity})
             packets = event_bodies(db, [row[0] for row in closing.values()])
             marks_by_day = session_benchmarks(db, [(row[0], row[1], packets[row[0]])
-                                                  for row in closing.values()], until=moment)
+                                                  for row in closing.values()], until=moment, strict_closes=local)
             # Preserve source-time and partial-symbol evidence; midnight recovery
             # receipts belong to their valuation session, not their arrival date.
             benchmarks = [(seq, at, "benchmark", marks_by_day[day.isoformat()])
@@ -4819,7 +4886,8 @@ class AutonomousFund(Strategy):
             calls, data_charges = cost_ledger(db, moment.isoformat())
         events = [(at, kind, body) for _, at, kind, body in sorted([*closing.values(), *benchmarks, *rows], key=lambda row: row[0])]
         from .scorecard import _exchange_sessions
-        sessions = {date.fromisoformat(day) for day in _exchange_sessions(str(min(closing)), str(cutoff))} if closing else set()
+        sessions = {date.fromisoformat(day) for day in _exchange_sessions(str(min(observed_days)), str(cutoff))
+                    if date.fromisoformat(day) < cutoff} if observed_days else set()
         pairs, marks = session_pairs(events, sessions, zone)
         actions = {}
         for _, kind, body in events:
@@ -4830,10 +4898,9 @@ class AutonomousFund(Strategy):
         result = compute(pairs, calls, None, settings.definitions(), marks, actions, sweep=sweep,
                          data_charges=data_charges)
         # Only adjacent sessions with both account observations are comparable.
-        window = sorted(day for day in sessions if min(closing) <= day <= max(closing)) if closing else []
-        result["missing_account_intervals"] = max(0, len(window) - 1 - len(pairs))
+        result["missing_account_intervals"] = max(0, len(sessions) - 1 - len(pairs))
         if result["missing_account_intervals"]:
-            result["meaning"] += "; missing account intervals are excluded, not bridged; not a continuous full-period return"
+            result["meaning"] += ". Missing account intervals are excluded from the continuous return."
         return result
 
     def _market_history(self, now):
@@ -4896,15 +4963,28 @@ class AutonomousFund(Strategy):
         if watch is None:
             return None
         from .macro import SERIES
+        from .session_calendar import _session_close, completed_daily_cutoff
         day = trading_day(now)
-        key = (day, self._desk_version(now, *(f"fred_{name}" for name in SERIES)))  # Desk refreshes hourly.
+        cutoff = completed_daily_cutoff(now)
+        key = (day, cutoff, self._desk_version(now, *(f"fred_{name}" for name in SERIES)))  # Desk refreshes hourly.
         cached = getattr(self, "_macro_cache", None)
         if cached and cached[0] == key:
             return cached[1]
+        vix_context = {}
+        if self.mode in {"local", "paper"}:
+            expected = cutoff - timedelta(days=1)
+            while _session_close(expected) is None:
+                expected -= timedelta(days=1)
+            vix_context = {"vix_session": expected}
         try:
-            result = watch.context(day, may_fetch=self._may_prepare)
+            result = watch.context(day, may_fetch=self._may_prepare, **vix_context)
         except Exception as exc:
             result = {"unavailable": type(exc).__name__}
+            if vix_context:
+                result["official_vix_close"] = {"source": "FRED/VIXCLS", "required_session": expected.isoformat(),
+                    "status": "awaiting_evidence", "value": None}
+        if "official_vix_close" in result:
+            result["official_vix_close"]["context_at"] = instant(now).isoformat()
         if not result.get("deferred"):  # Series not fetched yet are fetched in a later iteration.
             self._macro_cache = (key, result)
         return result

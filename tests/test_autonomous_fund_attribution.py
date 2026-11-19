@@ -138,4 +138,44 @@ def test_the_review_receives_the_attribution_and_keeps_it(tmp_path):
         sequence = db.execute("SELECT sequence FROM events WHERE kind='postmarket_review'").fetchone()[0]
     text = daily_document(tmp_path, sequence)
     text = text[1] if isinstance(text, tuple) else text
-    assert "## 当日归因（代码按收盘价计算）\n\n不可用：quantitative risk history is off" in text
+    assert "## 当日归因（代码计算）\n\n不可用：quantitative risk history is off" in text
+
+
+def test_partial_session_uses_same_window_prices_fills_and_costs(tmp_path):
+    from scripts.autonomous_fund.risk import instant
+    from tests.test_autonomous_fund_quant import harness
+
+    strategy = harness(tmp_path, mode="local")
+    start = instant("2026-11-09T21:00:00Z")
+    end = instant("2026-11-10T17:23:19Z")
+    closing = instant("2026-11-10T21:00:00Z")
+    strategy._daily_closes = lambda *_: pytest.fail("cash-only observation does not require daily prices")
+    for at, equity, spy, parking in ((start, 20000, 500, 50), (end, 19996, 499.25, 50.03)):
+        strategy.journal.event(at, "account", {
+            "equity": equity, "cash_equivalents": {"PARK": 20}, "positions": {},
+            "benchmark_observations": {"SPY": {"price": spy, "as_of": at.isoformat()}},
+            "valuation": {"quotes": {"PARK": {"price": parking, "as_of": at.isoformat()}}},
+        })
+    sent = end - timedelta(hours=1)
+    strategy.journal.event(sent, "order_submitted", {"broker_id": "park", "intent_id": "park", "kind": "cash_sweep"})
+    with strategy.journal.connection() as db:
+        db.execute("INSERT INTO fund_orders VALUES(?,?,?,?,?,?)", ("park", "plan", "PARK", "buy", sent.isoformat(), "50.15"))
+        db.execute("INSERT INTO fund_order_quotes VALUES(?,?,?,?,?)", (
+            "park", "50.05", "50.08", sent.isoformat(), sent.isoformat()))
+    strategy.journal.event(sent + timedelta(minutes=1), "fill", {
+        "broker_id": "park", "symbol": "PARK", "trade_cost": .4, "side": "buy", "quantity": 8, "price": 50.13})
+    strategy.journal.event(end + timedelta(minutes=1), "fill", {
+        "broker_id": "late", "symbol": "PARK", "trade_cost": 7, "side": "buy", "quantity": 4, "price": 50.13})
+    strategy.journal.event(sent, "agent", {"model": "fixture", "cost_usd": 1.6})
+    strategy.journal.event(end + timedelta(minutes=1), "agent", {"model": "fixture", "cost_usd": 9})
+
+    result = strategy._attribution({"session_date": "2026-11-10"}, closing)
+    assert result["status"] == "partial"
+    assert result["valuation_window"] == {
+        "kind": "account_observations", "start_at": start.isoformat(), "end_at": end.isoformat()}
+    assert result["benchmark_return"] == pytest.approx(-.0015)
+    assert result["components"]["fees"] == pytest.approx(-.4 / 20000)
+    assert result["cash_sweep_execution"]["observed_friction_usd"] == pytest.approx(.8)
+    assert result["fund_costs"]["model_usd"] == pytest.approx(1.6)
+    rendered = "\n".join(attribution_lines(result))
+    assert "账户观测窗口" in rendered and "+12.20 个基点" in rendered and "19.9 个基点" in rendered

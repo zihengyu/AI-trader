@@ -171,6 +171,8 @@ RESEARCH_GUIDANCE = (
     "strategy category. No daily proposal quota: empty strategy_proposals/research_tasks are valid. "
     "Review saved tasks and failures before proposing a new version. strategy_proposals records the full "
     "hypothesis, entry/exit/sizing, data needs, costs, falsification and predeclared validation. "
+    "If you choose to test a complete strategy, register the specification and comparison before evaluating it. "
+    "Specify fixed-allocation and volatility-scaled alternatives separately so their results remain reproducible. "
     "Validation method daily_forward_v1 supports the documented daily evidence protocol; propose any other "
     "method when its assumptions do not fit, with an explanation in validation.rationale. It remains a "
     "feasibility task until a suitable independent verifier exists. Never force all mechanisms into one test. "

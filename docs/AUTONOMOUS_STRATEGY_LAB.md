@@ -43,6 +43,10 @@ daily proposal quota. A proposal records identity/version/parent/change type,
 economic hypothesis, mechanism, instruments, optional additional input series,
 market conditions, entry/exit/sizing, holding period, failure conditions, data
 requirements, costs, predeclared validation and optional implementation details.
+Daily reports distinguish a research direction from a registered proposal. A
+complete strategy experiment starts with a saved version and its declared
+comparison. Fixed allocations and volatility-scaled rules need distinct
+specifications so each result can be reproduced.
 
 The mechanism is free text, not an enum. Supplemental research text and an
 unsupported implementation remain inert data. The initial executable adapters are

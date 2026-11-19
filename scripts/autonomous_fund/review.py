@@ -373,7 +373,7 @@ def _evidence_catalog(saved):
         catalog.append({"ref": ref, "context_path": f"research.evidence[{index - 1}]", **evidence})
     for key in ("session", "factor_lab", "scorecards", "attribution", "strategy_memory", "strategy_followup",
                 "operator_mandate", "limits", "eligible_universe", "cash_management", "fund_scoreboard",
-                "post_close_plan"):
+                "post_close_plan", "macro"):
         if original.get(key) is not None:
             ref = f"context:{key}"
             refs.append(ref)
@@ -428,6 +428,7 @@ def review_after_close(strategy):
             scorecards = {"unavailable": str(exc) if isinstance(exc, RiskError) else type(exc).__name__}
     mandate = getattr(strategy, "mandate", None)
     from .cash import policy_context
+    inputs = _inputs(rows, session, now)
     context = {"as_of": now.isoformat(), "historical": historical, "phase": "postmarket_review",
                "orders_enabled": False, "eligible_universe": sorted(strategy.universe),
                "cash_management": policy_context(getattr(strategy, "cash_sweep", None)),
@@ -441,9 +442,10 @@ def review_after_close(strategy):
                "market_history_bounds": strategy._market_history(now) if hasattr(strategy, "_market_history") else None,
                "fund_scoreboard": strategy._fund_scoreboard(now) if hasattr(strategy, "_fund_scoreboard") else None,
                "fund_capital": strategy._capital_context() if hasattr(strategy, "_capital_context") else None,
+               "macro": strategy._macro_context(now) if hasattr(strategy, "_macro_context") else None,
                # Code-computed; the review must not re-estimate where the return came from.
-               "attribution": strategy._attribution(session, now) if hasattr(strategy, "_attribution") else None,
-               "session": _inputs(rows, session, now),
+               "attribution": strategy._attribution(inputs, now) if hasattr(strategy, "_attribution") else None,
+               "session": inputs,
                "post_close_plan": _post_close_plan(strategy, session, now)}
     if hasattr(strategy, "_with_fund_cost_context"):
         context = strategy._with_fund_cost_context(context, strategy.get_datetime())
@@ -457,8 +459,11 @@ def review_after_close(strategy):
 
         strategy.journal.event(now, "postmarket_review_started", session)
         research_prompt = ("用中文复盘指定交易日。核对实际研究、完整目标持仓、下单、成交、未成交、持仓和现金，"
-                        "区分选股、择时、执行与市场整体表现：context.attribution 是代码按收盘价算出的当日归因"
-                        "（市场 beta、选股、现金等价物、当日交易择时、相对到达价的滑点、费用和未解释部分），以它为准，不要自行估算，"
+                        "区分选股、择时、执行与市场整体表现；context.attribution.valuation_window 确定归因区间。"
+                        "account_observations 只覆盖所列账户观测时点，按同窗基准比较，不得写成收盘收益。"
+                        "事件发布晚于窗口终点时，该窗口无法检验事件后的影响。"
+                        "宏观官方收盘值引用 context.macro.official_vix_close 的观测日期和状态；待发布或缺证不算阈值失败。"
+                        "核对央行事件优先使用官方发布和原文。"
                         "缺失的部分如实说明。可使用只读研究工具，核对消息与价格的真实时间。"
                         "引用日志证据请使用 event:<sequence>，外部资料请给出来源和时间。"
                         "披露数据缺失、陈旧估值和费用不确定性；不要编造收盘净值或把没成交当成成交。"
@@ -545,6 +550,8 @@ def review_after_close(strategy):
     manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
                     "post_close_plan 若存在，是收盘后才接受的当前目标意图；单独说明有效期与待执行状态，不能算作盘中决策、下单或成交。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
+                    "引用归因时保留 valuation_window 的终点与同窗基准；用窗口内实际观测来判断事件影响。"
+                    "官方 VIX 收盘证据以 context.macro.official_vix_close 的日期和状态为准，缺证保留为未知。"
                     "自主改进选股与择时的判断方法，分别列出可检验的调整、依据、验证条件和失效条件；"
                     "evidence_refs 必须逐字复制 context.allowed_evidence_refs 中的值，保持原有大小写和标点。"
                     "优先使用 evidence_catalog 中的短编号（event:序号、research:序号、context:字段名），"

@@ -240,8 +240,17 @@ def test_macro_and_earnings_follow_the_desks_intraday_refreshes(tmp_path):
     # Desk context must not overwrite Strategy.macro, which owns the FRED tools.
     strategy.macro_watch = MacroWatch(MacroSettings(), environ={}, get=offline, store=store)
     assert strategy._macro_context(NOW)["series"]["DGS10"]["latest"] == 4.0
+    assert strategy._macro_context(NOW)["official_vix_close"]["status"] == "awaiting_evidence"
     store.put(DAY, "fred_DGS10", [["2026-10-30", 4.0], ["2026-11-02", 4.25]])  # The desk's hourly refresh.
+    store.put(DAY, "fred_VIXCLS", [["2026-10-30", 19.75], ["2026-11-02", 24.75]])
     assert strategy._macro_context(NOW)["series"]["DGS10"]["latest"] == 4.25
+    close = strategy._macro_context(NOW)["official_vix_close"]
+    assert close["status"] == "confirmed" and close["required_session"] == "2026-11-02" and close["value"] == 24.75
+    later = strategy._macro_context(NOW.replace(hour=22))["official_vix_close"]
+    assert later["required_session"] == DAY and later["value"] is None
+    assert later["status"] == "awaiting_evidence" and later["latest_observation_value"] == 24.75
+    store.put(DAY, "fred_VIXCLS", [["2026-11-02", 24.75], [DAY, 24.0]])
+    assert strategy._macro_context(NOW.replace(hour=22))["official_vix_close"]["value"] == 24.0
     strategy.config = {"universe": {"ALFA": "stock", "BETA": "stock"}}
     strategy.earnings = EarningsCalendar(strategy.journal, EventSettings(), environ={}, yahoo=offline, store=store)
     store.put(DAY, "earnings", {s: {"source": "yahoo", "dates": ["2026-12-01"], "error": None} for s in ("ALFA", "BETA")})

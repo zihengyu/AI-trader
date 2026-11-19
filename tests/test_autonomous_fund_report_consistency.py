@@ -126,11 +126,13 @@ def test_daily_bounds_routine_news_details_and_preserves_protective_evidence(tmp
     strategy, _ = completed(tmp_path)
     for index in range(65):
         strategy.journal.event(TRADE + timedelta(seconds=index), 'review_triggered', {
-            'reason': 'news', 'title': f'synthetic-headline-{index:03d}'})
+            'reason': 'news', 'title': f'synthetic-headline-{index:03d}',
+            **({'schedule_advanced': index == 0} if index < 2 else {})})
     strategy.journal.event(TRADE, 'protective_trigger', {'symbol': 'ALFA', 'trigger': 'stop_loss'})
     text = daily_document(tmp_path, review_sequence(strategy.journal))[1]
     watch = text.split('## 盯盘触发')[1].split('## 当日归因')[0]
     assert 'review_triggered × 65' in watch and 'protective_trigger × 1' in watch
+    assert '新闻命中 65 条，确认实际提前复核安排 1 次，旧记录无法核实是否提前 63 条' in watch
     assert 'synthetic-headline-064' in watch and 'synthetic-headline-000' not in watch
     assert 'stop_loss' in watch and '完整记录仍保留在账本' in watch
     assert len([r for r in strategy.journal.all_events() if r['kind'] == 'review_triggered']) == 65

@@ -83,9 +83,11 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
         benchmarks[definition["name"]] = {
             "weights": definition["weights"], "return": value,
             "net_excess": (net - 1) - value if value is not None else None}
-    cash = None
+    cash = cash_comparison = None
     if sweep:
         value = _chained({"weights": {sweep: "1"}}, window, marks, actions)
+        cash_comparison = {"symbol": sweep, "return": value,
+                           "net_excess": net - 1 - value if value is not None else None}
         if value is not None and len(pairs) >= MIN_CASH_SESSIONS:
             annual = (1 + value) ** (TRADING_DAYS / len(pairs)) - 1
             cash = {"symbol": sweep, "return": value, "annual_yield": annual,
@@ -101,7 +103,7 @@ def compute(pairs, calls, data_cost_per_session, definitions, marks, actions, *,
             "benchmarks": benchmarks,
             "cost_pace": {"sessions": len(recent), "usd_per_session": sum(recent) / len(recent),
                           "share_of_equity_per_year": pace},
-            "cash": cash,
+            "cash": cash, "cash_comparison": cash_comparison,
             "meaning": "account_return is after trading fees and slippage and includes cash interest; net_return "
                        "also subtracts model and data costs, which the fund pays whatever you decide; each benchmark "
                        "is its total return over the same completed sessions and net_excess is net_return minus it; "

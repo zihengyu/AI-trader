@@ -36,6 +36,37 @@ def groups(root, **kwargs):
     return inspect(root, until=kwargs.pop("until", NOW + timedelta(minutes=10)), **kwargs)["groups"]
 
 
+def test_equity_gap_preserves_other_quotes_and_only_manages_existing_orders(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.risk import Intent
+
+    strategy = watching(tmp_path, {"ALFA": quote(95), "BETA": quote(110)})
+    strategy.mode = "local"
+    strategy.broker = SimpleNamespace(do_polling=lambda: None)
+    strategy._strategy_lab_tick = lambda: None
+    strategy._reconcile = lambda: None
+    strategy._disclose_failure = lambda *args, **kwargs: pytest.fail("unexpected strategy error")
+    strategy._decide = lambda *args: pytest.fail("decision needs a confirmed account")
+    strategy._submit = lambda *args, **kwargs: pytest.fail("submission needs a confirmed account")
+    def missing_valuation():
+        raise MarketDataUnavailable("Cash-equivalent quote unavailable", diagnostic={"symbol": "PARK"})
+    monkeypatch.setattr(strategy, "_snapshot", missing_valuation)
+    accept(strategy, [{"symbol": "ALFA", "weight": .05, "stop_loss": 98.0}],
+           [{"symbol": "BETA", "above": 105.0, "reason": "Synthetic level"}])
+    strategy.journal.reserve(Intent("ALFA", "buy", 1, number(100)), NOW, strategy.limits)
+    manage = []
+    monkeypatch.setattr(strategy, "_manage_open_orders", lambda now, *, reprice: manage.append((now, reprice)))
+
+    strategy.on_trading_iteration()
+
+    assert manage == [(NOW, False)]
+    assert strategy.execution.alerts() == []
+    assert strategy.execution.levels()["ALFA"]["state"] == "active"
+    assert any(kind == "protective_valuation_pending" and details["symbol"] == "ALFA"
+               for kind, details in strategy.notices)
+    assert {(item["symbol"], item["purpose"], item["accepted"]) for item in groups(tmp_path)} == {
+        ("ALFA", "portfolio_watch", 1), ("BETA", "price_alert", 1)}
+
+
 def test_recorded_denominator_rejections_recovery_and_age_distribution(tmp_path):
     journal = Journal(tmp_path, "synthetic-quality")
     ages = [0, 1, 2, 10, 11, 30, 31, 60, 61, -1, None]
