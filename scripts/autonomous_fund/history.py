@@ -16,6 +16,8 @@ from zoneinfo import ZoneInfo
 from .risk import RiskError, instant, number
 
 URL = "https://data.alpaca.markets/v2/stocks/{symbol}/bars"
+SNAPSHOTS_URL = "https://data.alpaca.markets/v2/stocks/snapshots"
+MINUTES_URL = "https://data.alpaca.markets/v2/stocks/bars"
 ACTIONS_URL = "https://data.alpaca.markets/v1/corporate-actions"
 ZONE = ZoneInfo("America/New_York")
 PRICE_ADJUSTMENT = "split,spin-off"
@@ -73,6 +75,39 @@ class AlpacaDailyHistory:
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
         self.get = get or requests.get
         self.feed = "sip"
+
+    def iex_snapshots(self, symbols):
+        """Batched IEX observations for the read-only parallel collector."""
+        response = self.get(SNAPSHOTS_URL, headers=self.headers, timeout=5,
+                            params={"symbols": ",".join(symbols), "feed": "iex"})
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RiskError("Invalid Alpaca stock snapshot response")
+        return payload
+
+    def iex_final_minutes(self, symbols, closed_at):
+        """Request the exact closing regular-session minute after the exchange closes."""
+        closed_at = instant(closed_at)
+        start = closed_at - timedelta(minutes=1)
+        response = self.get(MINUTES_URL, headers=self.headers, timeout=5, params={
+            "symbols": ",".join(symbols), "feed": "iex", "timeframe": "1Min", "adjustment": "raw",
+            "start": start.isoformat(), "end": (closed_at - timedelta(seconds=1)).isoformat(), "limit": 10000,
+        })
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict) or not isinstance(payload.get("bars"), dict) or payload.get("next_page_token"):
+            raise RiskError("Incomplete Alpaca closing-minute response")
+        result = {}
+        for symbol, bars in payload["bars"].items():
+            for bar in bars or []:
+                try:
+                    if instant(bar["t"]) == start:
+                        result[symbol] = bar
+                        break
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return result
 
     def _pages(self, symbol, params):
         rows, token = [], None

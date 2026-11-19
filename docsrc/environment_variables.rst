@@ -1415,6 +1415,10 @@ minute OHLCV and an explicit spread proxy are not exchange bid/ask quotes.
 The ``check`` command verifies public data and key presence without inference.
 Alpaca ``paper`` execution requires ``ALPACA_API_KEY`` and ``ALPACA_API_SECRET`` from a paper
 account. ``ALPACA_IS_PAPER`` defaults to true; an explicit false value is rejected.
+In ``local`` mode, the same optional key pair enables the reference daily history
+and the data desk's read-only comparison of Alpaca IEX and Yahoo observations.
+Run ``bash scripts/fund-logs.sh sources`` to view saved observations. The
+collector does not supply quotes for decisions, simulated fills or ledger updates.
 The application has no live mode and disables automatic dotenv discovery. Inject
 secrets through the process environment or your own secret manager; alternatively,
 select your own untracked secret file explicitly with ``--env-file`` (existing

@@ -316,7 +316,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", nargs="?", default="start", help="start (default) runs FUND_MODE from .env",
                         choices=["start", "mock", "backtest", "paper", "local", "check", "report", "audit-ledger", "stop", "resume", "attach-order", "reset-drawdown", "adjust-reserve", "validate-risk", "factor-lab", "acceptance", "show-config", "schwab-check", "serve", "status", "decisions", "approvals", "approve", "reject", "monitor", "notify-test", "qualify", "rehearse", "prefetch", "datadesk", "prune", "weekly", "experiments", "settle-position",
-                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence", "quotes", "strategy-lab"])
+                                 "subscribe", "redeem", "capital", "deposit", "withdraw", "economics", "evidence", "quotes", "strategy-lab", "sources"])
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--run-dir", type=Path, help="Account directory; default FUND_RUN_DIR or artifacts/fund-<mode>")
     parser.add_argument("--model", default=os.environ.get("AI_MODEL"))
@@ -325,7 +325,7 @@ def main(argv=None):
     parser.add_argument("--start", default="2025-01-06")
     parser.add_argument("--end", default="2025-02-14")
     parser.add_argument("--data-dir", type=Path)
-    parser.add_argument("--session-date", help="decisions: New York date YYYY-MM-DD (default: today in New York)")
+    parser.add_argument("--session-date", help="decisions/sources: New York date YYYY-MM-DD (sources defaults to all saved sessions)")
     parser.add_argument("--event", dest="decision_event", type=int,
                         help="decisions: expand one validated event's complete rationale in the selected account/date")
     parser.add_argument("--scripted", action="store_true", help="Historical mechanical tests only; never paper")
@@ -481,6 +481,16 @@ def main(argv=None):
         from .quote_diagnostics import inspect, lines
         print("\n".join(lines(inspect(args.run_dir, symbol=args.symbol,
             mode=(os.environ.get("FUND_MODE") or "local").strip().lower()))))
+        return
+    if args.mode == "sources":
+        from .market_observation import observation_lines
+        from .settings import alpaca_keys
+
+        try:
+            lines = observation_lines(args.run_dir, args.session_date, configured=all(alpaca_keys(os.environ)))
+        except ValueError:
+            parser.error("sources --session-date requires a valid New York date YYYY-MM-DD")
+        print("\n".join(lines))
         return
     if args.mode == "evidence":
         from .evidence import audit, lines, load_call

@@ -168,8 +168,8 @@ SETTINGS = {
     "FUND_FACTOR_LAB": (("factor_lab", "enabled"), _bool, False, "外部", "是否开启因子实验室：AI 复盘时提出因子，代码客观检验"),
     "FUND_MODEL_KNOWLEDGE_CUTOFF_JSON": (("factor_lab", "model_knowledge_cutoff"), _json, False, "外部",
                                          "各模型训练数据截止日 JSON，例如 {\"deepseek-chat\": \"YYYY-MM-DD\"}；之后的样本单独记为干净样本外，未填写的模型标为可能受记忆影响"),
-    "ALPACA_API_KEY": (None, None, True, "券商", "paper 模式必填；local 模式与 Secret 一起选填，用于日线核对和备用"),
-    "ALPACA_API_SECRET": (None, None, True, "券商", "paper 模式必填；local 模式与 Key 一起选填，用于日线核对和备用"),
+    "ALPACA_API_KEY": (None, None, True, "券商", "paper 模式必填；local 模式与 Secret 一起选填，用于日线备用和行情只读对照"),
+    "ALPACA_API_SECRET": (None, None, True, "券商", "paper 模式必填；local 模式与 Key 一起选填，用于日线备用和行情只读对照"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "仅 paper 模式读取，默认 true；设为 false 会拒绝启动"),
     "LUMIWEALTH_API_KEY": (None, None, True, "券商", "可选：BotSpot／云端报告，本地交易不需要"),
     "SCHWAB_ACCOUNT_NUMBER": (None, None, True, "Schwab", "AI 使用的 Schwab 账户号码（建议单独开一个账户）"),
@@ -192,7 +192,7 @@ ACCOUNT_COMMANDS = frozenset({"local", "paper", "report", "audit-ledger", "stop"
                               "adjust-reserve", "acceptance", "approvals", "approve", "reject", "monitor",
                               "notify-test", "status", "decisions", "rehearse", "prefetch", "datadesk", "prune",
                               "weekly", "experiments", "settle-position", "subscribe", "redeem", "capital",
-                              "deposit", "withdraw", "economics", "evidence", "quotes", "strategy-lab"})
+                              "deposit", "withdraw", "economics", "evidence", "quotes", "strategy-lab", "sources"})
 EARLIER_DEFAULT = Path("artifacts/autonomous-fund")
 
 

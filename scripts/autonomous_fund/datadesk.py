@@ -646,6 +646,22 @@ class DataDesk:
             while not stop.wait(HEARTBEAT_SECONDS):
                 self.heartbeat()
         threading.Thread(target=beat, name="desk-heartbeat", daemon=True).start()
+        from .settings import alpaca_keys
+        keys = alpaca_keys(self.environ)
+        if self.mode == "local" and all(keys):
+            from .history import AlpacaDailyHistory
+            from .market_observation import SourceObserver
+            from .risk import Limits
+
+            # Keep observation independent of the bulk desk jobs and the
+            # trading process, including when the desk is yielding to Yahoo.
+            alpaca = AlpacaDailyHistory(*keys, get=self._gets["alpaca"])
+            symbols = {self.quant.stress_benchmark}
+            sweep = self.config.get("cash_sweep") or {}
+            if sweep.get("enabled") and sweep.get("symbol"):
+                symbols.add(sweep["symbol"])
+            observer = SourceObserver(self.run_dir, alpaca, symbols, Limits(**self.config["limits"]), self.clock)
+            threading.Thread(target=observer.serve, args=(stop,), name="desk-source-observer", daemon=True).start()
         while not stop.is_set():
             self.tick()
             now = self.clock()

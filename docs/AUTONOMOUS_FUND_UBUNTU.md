@@ -32,6 +32,7 @@
 | `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、数据员各类数据的更新时间、账户、待审批、周报状态、日内交易次数、最近通知）；`logs` 三个服务的实时日志，`errors` 最近 24 小时内最后 80 条警告／错误记录（保留完整 traceback），`report` 账户报告，`approvals` 待审批；`decisions [YYYY-MM-DD]` 按纽约日期核对每次复核、订单、成交及调仓通知；`weekly` 打印本周到目前为止的周报（不发送）；`experiments` 实验登记表（生效、影子观察、未通过、退役及状态变化）；`prune` 预览可清理的旧资讯、追踪文件和导出归档（`--apply` 执行，每日备份后也会自动执行） |
 | `bash scripts/fund-capital.sh` | **加钱／取钱（申购／赎回）**：`subscribe 10000` 加 1 万美元，`redeem 5000` 取 5000 美元，`cancel <编号>` 取消等待中的请求，不带参数查看份额、单位净值和等待中的请求。本地虚拟账户和 Alpaca 模拟盘使用同一套命令。基金在交易时段按单位净值确认，申赎金额不计入收益。详见 `AUTONOMOUS_PAPER_FUND.md` 的“申购与赎回” |
 | `bash scripts/fund-logs.sh economics` | **只读经济对照**：新方案与维持旧目标的 1／5／20 日价格方案、估算交易摩擦、已准确关联的决策链费用和非重叠样本数；另列期初贝塔对照，保留固定基准。不新增模型调用或下载。缺少证据显示未知，不是实际成交收益或触发当日日内盈亏；周报也会显示截止时点的全历史评估。详见 `AUTONOMOUS_PAPER_FUND.md` 的“新旧目标的经济对照” |
+| `bash scripts/fund-logs.sh sources [YYYY-MM-DD]` | **只读行情双源观察**。按纽约交易日汇总 Alpaca IEX、Yahoo 的有效样本、限流、价差和公司行动留证。local 模式复用现有 Alpaca 行情凭据，在数据员服务内自动采样。盘中决策和模拟撮合仍走既有行情路径 |
 | `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止三个服务；`--disable` 同时取消开机自启 |
 
 第一次运行 `fund-start.sh` 时如果还没有 `.env`，脚本会从模板创建一份并提示填写 Key 后再运行。
@@ -82,6 +83,7 @@ bash scripts/fund-rehearse.sh
 |---|---|---|
 | 资讯 | Yahoo 个股新闻、SEC 8-K 公告、美联储发布、自定义 RSS，以及 AI 设定的 `news_watch` 搜索词，写进账本的资讯表；跟踪的标的包括持仓、最新目标和价格提醒 | 开盘时每 `FUND_NEWS_POLL_SECONDS`（默认 5 分钟），休市时每 20 分钟 |
 | 盘中行情 | 可交易标的、大盘基准、持仓和价格告警的已完成一分钟行情、覆盖率及有效样本的涨跌家数 | 开盘时按 `FUND_DESK_INTRADAY_SECONDS`（默认 5 分钟）及标的数量安排整轮更新，必要时先补查关键标的 |
+| 盘中双源观察 | Alpaca IEX 报价与分钟线，配对已有 Yahoo 观测，并独立收集公司行动证据 | 约每分钟采样，从开盘持续到收盘后 5 分钟。查看 `fund-logs.sh sources` |
 | 盘前行情 | 每个可交易标的和 SPY/QQQ/IWM/DIA 的盘前成交：最新价、相对昨收的涨跌、盘前成交量、领涨领跌 | 交易日美东 04:00 到开盘，每 15 分钟 |
 | 全球市场 | 标普、纳指、罗素股指期货，VIX，10 年期美债收益率，美元指数，欧元、日元，原油、黄金，日经、恒生、欧洲斯托克 50 | 工作日休市时每 15 分钟、盘中每 30 分钟、周末每 4 小时 |
 | 经济日历 | 未来三周主要经济数据排期（FRED，需要 `FRED_API_KEY`），FOMC 决议排期来自美联储。零售销售和工业产出另核对发布机关的当日结果 | 排期每 6 小时，两项支持的结果到时检查，待确认时约每 5 分钟重试 |
@@ -210,7 +212,7 @@ Telegram、外部数据与运行参数、券商”分节，所有可调项都有
 | `FUND_AUTOMATION_MODE` | `full`（默认）：独立 AI 风控审批例外买入；`semi`：人工审批；修改后重启并在 `status` 核对加载模式 |
 | `FUND_APPROVAL_MODEL` | 独立审批模型，默认 `deepseek/deepseek-flash`；可自行更换支持的 `提供方/模型ID`，不影响经理模型；重启后生效 |
 | `FUND_SEC_USER_AGENT` | 可选；资讯监控读取 SEC 8-K 公告所需的联系人声明（姓名＋邮箱） |
-| `ALPACA_API_KEY`、`ALPACA_API_SECRET` | paper 必填专用模拟账户凭证；local 选填一整对，用于日线核对及备用行情 |
+| `ALPACA_API_KEY`、`ALPACA_API_SECRET` | paper 必填专用模拟账户凭证；local 选填一整对，用于备用日线、日线核对和盘中双源只读观察 |
 | `ALPACA_IS_PAPER=true` | 仅 paper 读取，默认 true；设为 false 会拒绝启动 |
 | `FUND_CAPITAL_USD` 等约束 | 授权资金、仓位、回撤、单日亏损、禁买名单、文字约束、审批额度与外部参数，见模板各节 |
 

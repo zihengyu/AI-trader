@@ -261,6 +261,8 @@ class YahooRealtimeData(DataSource):
         self.tape, self.live_seconds = tape, live_seconds
         self._quote_kinds = {"live": 0, "completed_bar": 0}
         self._quote_observations = OrderedDict()
+        self._minute_observations = OrderedDict()
+        self._action_observations = OrderedDict()
         self._chart_trades = OrderedDict()
         self._closing_quotes = OrderedDict()
 
@@ -271,6 +273,8 @@ class YahooRealtimeData(DataSource):
                                else "chart_last_trade_with_completed_bar_fallback"),
                       "quotes_by_kind": dict(self._quote_kinds),
                       "quotes_by_symbol": {s: dict(row) for s, row in self._quote_observations.items()},
+                      "completed_minutes": dict(self._minute_observations),
+                      "corporate_actions": dict(self._action_observations),
                       "source_failures": [{**row, "retry_in_seconds": max(0, round(self._failures[key][1] - time.monotonic(), 1))}
                                           for key, row in self._source_errors.items() if key in self._failures]}
             if self._last_rejected_bar is not None:
@@ -483,7 +487,22 @@ class YahooRealtimeData(DataSource):
         return Bars(frame.tail(length).copy(), self.SOURCE, asset)
 
     def execution_bars(self, asset, *, required_through=None):
-        return self._history(asset, "1m", "5d", required_through=required_through)
+        frame = self._history(asset, "1m", "5d", required_through=required_through)
+        if not frame.empty:
+            self._remember_minute(asset, frame.index[-1], frame.iloc[-1])
+        return frame
+
+    def _remember_minute(self, asset, start, bar):
+        observation = {"start": start.isoformat(), "checked_at": self.get_datetime().isoformat(),
+                       **{field: float(bar[field]) for field in ("open", "high", "low", "close", "volume")}}
+        self._retain_observation(self._minute_observations, asset.symbol, observation)
+
+    def _retain_observation(self, observations, symbol, row):
+        with self._request_lock:
+            observations[symbol] = row
+            observations.move_to_end(symbol)
+            while len(observations) > 60:
+                observations.popitem(last=False)
 
     def get_closing_quote(self, asset, closed_at):
         """A completed session's unadjusted close, from its final minute or its daily bar.
@@ -509,6 +528,7 @@ class YahooRealtimeData(DataSource):
             exact = minute[minute.index + timedelta(minutes=1) == closed_at]
             if not exact.empty:
                 row, start, kind = exact.iloc[-1], exact.index[-1], "completed_minute_close"
+                self._remember_minute(asset, start, row)
         except MarketDataUnavailable:
             pass  # A real daily close can remain available during minute backoff.
         if row is None:
@@ -551,7 +571,14 @@ class YahooRealtimeData(DataSource):
     def corporate_actions(self, asset, since=None):
         period = "max" if since and instant(since) < self.get_datetime() - timedelta(days=150) else "6mo"
         self._history(asset, "1d", period)
-        return list(self._actions.get((asset.symbol, period), []))
+        actions = list(self._actions.get((asset.symbol, period), []))
+        checked_at = self.get_datetime()
+        cutoff = (checked_at.date() - timedelta(days=35)).isoformat()
+        self._retain_observation(self._action_observations, asset.symbol, {
+            "checked_at": checked_at.isoformat(),
+            "actions": [row for row in actions if row["date"] >= cutoff],
+        })
+        return actions
 
     def history_actions(self, asset, length):
         """Actions from the same Yahoo series used by a daily research-history request."""
@@ -636,7 +663,7 @@ class YahooRealtimeData(DataSource):
         """Bounded per-symbol source clocks: totals cannot explain a missing stream symbol."""
         now = self.get_datetime()
         stamp = quote.raw_data["original_response"].timestamp
-        detail = {"price_kind": quote.raw_data["price_kind"], "source_as_of": stamp.isoformat(),
+        detail = {"price": quote.price, "price_kind": quote.raw_data["price_kind"], "source_as_of": stamp.isoformat(),
                   "checked_at": now.isoformat(), "age_seconds": (now - stamp).total_seconds(),
                   "stream_as_of": None, "chart_as_of": None}
         tick = self.tape.tick(self._symbol(asset)) if self.tape is not None else None
@@ -654,11 +681,7 @@ class YahooRealtimeData(DataSource):
                 detail.update(chart_as_of=chart_stamp.isoformat(), chart_age_seconds=(now - chart_stamp).total_seconds())
             except (ValueError, TypeError, OverflowError):
                 pass  # Never serialize an invalid provider field or guess its timestamp.
-        with self._request_lock:
-            self._quote_observations[asset.symbol] = detail
-            self._quote_observations.move_to_end(asset.symbol)
-            while len(self._quote_observations) > 60:
-                self._quote_observations.popitem(last=False)
+        self._retain_observation(self._quote_observations, asset.symbol, detail)
         # Keep this read's source clocks with the quote, not just in the latest
         # global snapshot (which another consumer may replace before rejection).
         quote.raw_data["source_clocks"] = {"stream_enabled": self.tape is not None, **{
