@@ -2,7 +2,7 @@
 
 Synthetic usage records, synthetic seeded histories and neutral symbols only; no network, no model.
 """
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -156,6 +156,26 @@ def test_the_status_line_states_the_break_even_in_plain_words():
                       "unpriced_calls": 1})
     assert "一年约 $504" in line and "占净值 5.04%" in line and "跑赢基准" in line and "1 次调用没有单价" in line
     assert "无法估算" in cost_line({"calls": 2, "window_days": 30, "days_with_calls": 0})
+
+
+def test_costs_distinguish_weekend_calls_from_completed_exchange_sessions():
+    from scripts.autonomous_fund.status import cost_line
+
+    # July 3 was an early close, July 4 was a holiday and July 6 was Sunday.
+    start = datetime(2025, 7, 3, 15, tzinfo=timezone.utc)
+    sunday = datetime(2025, 7, 6, 19, tzinfo=timezone.utc)
+    rows = [{"at": start, "kind": "agent", "body": {"cost_usd": 4.0}},
+            {"at": sunday, "kind": "agent", "body": {"cost_usd": 2.0}},
+            {"at": sunday, "kind": "agent", "body": {"cost_usd": None}}]
+    summary = cost_summary(rows, equity=10_000, now=sunday, observed_from=start)
+    assert summary["days_with_calls"] == 2 and summary["average_per_day_usd"] == 3.0
+    assert summary["window_usd"] == 6.0 and summary["unpriced_calls"] == 1
+    assert summary["completed_trading_sessions"] == 1 and summary["average_per_trading_session_usd"] == 6.0
+    assert summary["annual_trading_session_pace_usd"] == 1512
+    assert "2 个有已定价调用的自然日" in cost_line(summary) and "1 个已完成交易会话" in cost_line(summary)
+    only_weekend = cost_summary(rows[1:], now=sunday, observed_from=sunday)
+    assert only_weekend["completed_trading_sessions"] == 0 and only_weekend["annual_trading_session_pace_usd"] is None
+    assert "尚无已完成交易会话" in cost_line(only_weekend)
 
 
 # ----- Beta and style exposure limits ---------------------------------------------------------------------

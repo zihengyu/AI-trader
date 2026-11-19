@@ -4,7 +4,6 @@ The fund's asynchronous fills are not reproduced. This explicit scenario funds
 risk trades before parking idle cash, charges both legs and preserves real cash.
 It never sends an order or constructs a broker connection.
 """
-import copy
 from dataclasses import replace
 from decimal import ROUND_CEILING
 
@@ -30,7 +29,7 @@ def step(book, day, desired, prices, actions, *, policy, now, session_index):
     sweep = CashSweep(symbol, number(settings["keep_cash"]), number(settings["band"]), settings["min_idle_sessions"])
     fee, slip = number(book.policy["fee_rate"]), number(book.policy["slippage"])
     mark = number(prices[symbol])
-    previous = copy.deepcopy(vars(book))
+    previous = book._save_step_state()
     try:
         held, average = book.positions.pop(symbol, 0), book.averages.pop(symbol, mark)
         for action in actions:
@@ -85,8 +84,7 @@ def step(book, day, desired, prices, actions, *, policy, now, session_index):
                          position_average_prices={s: str(v) for s, v in book.averages.items()},
                          cash_management_scenario="fund_risk_then_park_next_open_v1")
     except Exception:
-        vars(book).clear()
-        vars(book).update(previous)
+        book._restore_step_state(previous)
         raise
 
 

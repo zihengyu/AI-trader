@@ -61,14 +61,20 @@ jobs:
             requirements_agent_evals.txt
       - name: Install dependencies
         run: python -m pip install -e . pytest-mock -c requirements_agent_evals.txt
+      - name: Verify Linux fund report commands
+        if: runner.os == 'Linux'
+        run: python -m pytest -q tests/test_autonomous_fund_call_accounting.py
       - name: Run deterministic fund regressions
         run: >-
           python -m pytest -q -m "not apitest and not downloader"
           tests/test_autonomous_fund_approval_recovery.py
           tests/test_autonomous_fund_closed_ledger.py
+          tests/test_autonomous_fund_comparison_books.py
+          tests/test_autonomous_fund_costs_exposures.py
           tests/test_autonomous_fund_datadesk.py
           tests/test_autonomous_fund_execution_continuity.py
           tests/test_autonomous_fund_execution_quality.py
           tests/test_autonomous_fund_quant.py
+          tests/test_autonomous_fund_reporting_freshness.py
           tests/test_autonomous_fund_strategy_lab.py
           tests/test_autonomous_fund_strategy_lab_integrity.py

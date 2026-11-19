@@ -13,6 +13,7 @@ import re
 import stat
 import statistics
 import sys
+from collections import defaultdict
 from importlib.metadata import version as package_version
 from functools import lru_cache
 from datetime import date, timedelta
@@ -23,7 +24,8 @@ from pathlib import Path
 from .comparison import Book, project
 from .risk import RiskError, instant, number
 from .strategy_definition import daily_sample_requirements, proposal_body
-from .strategy_program import StrategyRuleError, history_requirements, parameter_values, targets, validate_program
+from .strategy_program import (HistoryIndex, StrategyRuleError, compile_targets, parameter_values, strategy_inputs,
+                               targets, validate_program)
 
 
 COVERAGE_FIELDS = ("raw_prices", "corporate_actions_complete", "point_in_time_membership",
@@ -307,6 +309,8 @@ def check_snapshot_as_of(data, now, max_rows=None):
 
 
 class ResearchBook(Book):
+    CHECKPOINT_AMOUNTS = ("peak", "fees", "friction", "turnover", "model_cost")
+
     def __init__(self, capital, policy):
         self.receivables = []
         super().__init__(capital, policy)
@@ -316,12 +320,43 @@ class ResearchBook(Book):
             (number(r["amount"]) for r in self.receivables), number(0))
 
 
-def replay(proposal, data, policy, days, *, initial_capital, static_weight=None, initial_signal=False):
+    def checkpoint(self, binding, held_since, signals, as_of):
+        state = {"binding": binding, "last": digest(self.last), "held_since": held_since,
+                 "signals": signals, "as_of": as_of, "orders": self.orders,
+                 "last_risk_trade": getattr(self, "_last_risk_trade", None),
+                 "amounts": {key: str(getattr(self, key)) for key in self.CHECKPOINT_AMOUNTS}}
+        return {**state, "checksum": digest(state)}
+
+    def resume(self, saved, binding, days):
+        state = dict(saved["checkpoint"])
+        series = saved["series"]
+        if (not series or len(series) > len(days) or [row["day"] for row in series] != list(days[:len(series)])
+                or state.pop("checksum") != digest(state) or state["binding"] != binding
+                or state["last"] != digest(series[-1])):
+            raise RiskError("Replay checkpoint does not match its frozen prefix")
+        self.last = copy.deepcopy(series[-1])
+        self.series = list(series)
+        self.observations, self.orders = len(series), state["orders"]
+        self.cash = number(self.last["cash"])
+        self.positions = dict(self.last["positions"])
+        self.averages = {symbol: number(value) for symbol, value in self.last["position_average_prices"].items()}
+        self.receivables = copy.deepcopy(self.last["receivables"])
+        self.paused = self.last["risk_increase_paused"]
+        for key in self.CHECKPOINT_AMOUNTS:
+            setattr(self, key, number(state["amounts"][key]))
+        if state["last_risk_trade"] is not None:
+            self._last_risk_trade = state["last_risk_trade"]
+        return dict(state["held_since"]), dict(state["signals"]), state["as_of"]
+
+
+def replay(proposal, data, policy, days, *, initial_capital, static_weight=None, initial_signal=False,
+           resume=None, save_checkpoint=False):
     bars = data["bars"]
-    histories = {**bars, **data.get("features", {})}
+    histories = HistoryIndex({**bars, **data.get("features", {})})
     by_day = {s: {r["day"]: r for r in rows} for s, rows in bars.items()}
     benchmark = proposal["validation"]["benchmark"]
     all_days = [row["day"] for row in bars[benchmark]]
+    indexes = {day: index for index, day in enumerate(all_days)}
     if not (initial_signal and not days) and (
             not days or list(days) != [day for day, _, _ in _daily_sessions(days[0], days[-1])]):
         raise RiskError("Strategy replay has missing exchange sessions")
@@ -343,12 +378,26 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         owned_policy["groups"] = []
     cash_symbol = policy.get("cash_symbol") if proposal["implementation"]["adapter"] == "daily_cash_rules_v1" else None
     book, held_since = ResearchBook(initial_capital, owned_policy), {}
+    program = proposal["implementation"]
+    compiled = compile_targets(program) if static_weight is None else None
     signals, previous_close, previous_day = {}, None, None
     nav = number(initial_capital)
+    binding = digest([proposal, owned_policy, str(initial_capital), static_weight]) if save_checkpoint or resume else None
+    if resume is not None:
+        try:
+            held_since, signals, previous_close = book.resume(resume, binding, days)
+            if instant(previous_close) != instant(by_day[benchmark][book.last["day"]]["at"]):
+                raise RiskError("Replay checkpoint close does not match the exchange session")
+            nav = number(book.last["equity"])
+        except (KeyError, TypeError, ValueError, ArithmeticError):
+            # An old or unusable checkpoint is optional. Replay the immutable
+            # inputs and let the controller verify their archived prefix again.
+            book, held_since = ResearchBook(initial_capital, owned_policy), {}
+            signals, previous_close = {}, None
     # Warm-up only forms the initial signal. No trades, no model use and no
     # evaluation-period balance is borrowed from another split.
     prior = all_days if initial_signal else [day for day in all_days if day < days[0]]
-    if prior:
+    if prior and not book.series:
         previous_day = prior[-1]
         common = [by_day[s][previous_day] for s in proposal["instruments"] if previous_day in by_day[s]]
         if initial_signal and len(common) != len(set(proposal["instruments"])):
@@ -356,9 +405,13 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         if common:
             previous_close = max(r["at"] for r in common)
             signals = ({benchmark: static_weight} if static_weight is not None else targets(
-                proposal["implementation"], histories, previous_close, session_index=all_days.index(previous_day),
-                book=book, held_since=held_since))
-    for day in days:
+                program, histories, previous_close, session_index=indexes[previous_day],
+                book=book, held_since=held_since, compiled=compiled))
+    actions_by_day = defaultdict(list)
+    for action in data.get("actions", []):
+        actions_by_day[action["ex_date"]].append(action)
+    resumed_sessions = len(book.series)
+    for day in days[resumed_sessions:]:
         required = set(proposal["instruments"]) | {benchmark} | set(book.positions) | ({cash_symbol} if cash_symbol else set())
         if any(day not in by_day.get(s, {}) for s in required):
             raise RiskError("A strategy split has missing sessions or instruments")
@@ -371,9 +424,7 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         book.cash += sum((number(r["amount"]) for r in paid), number(0))
         book.receivables = [r for r in book.receivables if r["pay_date"] > day]
         actions = []
-        for action in data.get("actions", []):
-            if action["ex_date"] != day:
-                continue
+        for action in actions_by_day[day]:
             if instant(action["available_at"]) > open_at:
                 raise RiskError("Corporate action was not available at the simulated ex-date")
             symbol, ratio = action["symbol"], number(action.get("split", 1))
@@ -399,13 +450,13 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         if cash_symbol:
             from .strategy_cash import step
             step(book, day, desired, opened, actions, policy=owned_policy,
-                 now=open_at, session_index=all_days.index(day))
+                 now=open_at, session_index=indexes[day])
         else:
             book.step(day, desired, opened, actions)
         if book.error:
             raise RiskError(book.error["reason"])
         for symbol in set(book.positions) - before:
-            held_since[symbol] = all_days.index(day)
+            held_since[symbol] = indexes[day]
         held_since = {s: value for s, value in held_since.items() if s in book.positions}
         book.charge(daily_overhead)
         # Execution occurred at the open, valuation at the completed close.
@@ -419,8 +470,8 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         previous_close = max(by_day[s][day]["at"] for s in required)
         previous_day = day
         signals = ({benchmark: static_weight} if static_weight is not None else targets(
-            proposal["implementation"], histories, previous_close, session_index=all_days.index(day),
-            book=book, held_since=held_since))
+            program, histories, previous_close, session_index=indexes[day],
+            book=book, held_since=held_since, compiled=compiled))
     available = nav - sum((number(r["amount"]) for r in book.receivables), number(0))
     desired = {s: number(w) * available / nav for s, w in signals.items()}
     if cash_symbol:
@@ -429,11 +480,15 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
     # Allocating half a sleeve validated at 10% must authorize at most 5% of
     # fund capital. The raw program may request 100%; it is not the tested cap.
     next_targets = {} if book.paused else project(desired, owned_policy)
-    return {"series": book.series, "summary": book.summary(), "next_targets": next_targets,
+    result = {"series": book.series, "summary": book.summary(), "next_targets": next_targets,
             "next_signal_as_of": previous_close,
             "raw_next_targets": signals,
             "cost_usd": str(book.model_cost), "risk_paused": book.paused,
             "implementation": "next_open_whole_share_v1"}
+    if save_checkpoint and book.series:
+        result["checkpoint"] = book.checkpoint(binding, held_since, signals, previous_close)
+        result["resumed_sessions"] = resumed_sessions
+    return result
 
 
 def replay_strategy_reference(reference, data, policy, days, **options):
@@ -561,24 +616,25 @@ def _historical_arm_gap(proposal, data, policy, locked_sessions):
     if policy.get("shared_data_cost_usd_per_session", "0") is None:
         return {"status": "needs_data", "passed": False, "reason": "The account's shared data cost is unknown"}
     plan = proposal["validation"]
-    symbols = set(proposal["instruments"]) | {plan["benchmark"]}
+    cash = None
     if proposal["implementation"]["adapter"] == "daily_cash_rules_v1":
         if not policy.get("cash_symbol") or not (policy.get("cash_management") or {}).get("enabled"):
             return {"status": "needs_data", "passed": False, "reason": "Cash-management policy unavailable"}
-        symbols.add(policy["cash_symbol"])
+        cash = policy["cash_symbol"]
+    try:
+        inputs = strategy_inputs(proposal, cash)
+    except StrategyRuleError as exc:
+        return {"status": "needs_formalization", "passed": False, "reason": str(exc)}
+    symbols = inputs.prices
     if symbols - data["bars"].keys():
         return {"status": "needs_data", "passed": False, "reason": "Missing required instrument history",
                 "missing_symbols": sorted(symbols - data["bars"].keys())}
     bars = data["bars"]
     histories = {**bars, **data.get("features", {})}
-    missing = sorted(symbol for symbol in proposal.get("data_symbols", ()) if not histories.get(symbol))
+    missing = sorted(symbol for symbol in inputs.declared if not histories.get(symbol))
     if missing:
         return {"status": "needs_data", "passed": False, "reason": "A declared data series is unavailable",
                 "missing_symbols": missing}
-    try:
-        requirements, uses_index = history_requirements(proposal["implementation"])
-    except StrategyRuleError as exc:
-        return {"status": "needs_formalization", "passed": False, "reason": str(exc)}
     benchmark = plan["benchmark"]
     days = [row["day"] for row in bars[benchmark]]
     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
@@ -598,10 +654,10 @@ def _historical_arm_gap(proposal, data, policy, locked_sessions):
     # The preceding close forms the initial signal. An absolute session index
     # also depends on all earlier benchmark sessions in the supplied history.
     depths = dict.fromkeys([*proposal["instruments"], benchmark], 1) if prior else {}
-    if prior and uses_index:
+    if prior and inputs.uses_session_index:
         depths[benchmark] = None
     first_observation = {}
-    for (symbol, column), depth in requirements.items():
+    for (symbol, column), depth in inputs.fields.items():
         rows = _historical_feature_rows(histories.get(symbol, ()), initial_close, final_close, depth)
         if not rows or any(type(value) not in {int, float} or not math.isfinite(value)
                            for value in (row.get(column) for row in rows)):

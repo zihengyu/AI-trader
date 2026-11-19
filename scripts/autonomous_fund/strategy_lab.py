@@ -21,9 +21,9 @@ from .journal import encode
 from .research_budget import ResearchBudget, ResearchBudgetSettings
 from .risk import RiskError, instant, number, trading_day
 from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, daily_sample_requirements, proposal_body
-from .strategy_program import validate_program
-from .strategy_evidence import (load_frozen_dataset, load_reference, merge_forward_input, reference_signal_matches,
-                                reference_signal_ready)
+from .strategy_program import strategy_inputs, validate_program
+from .strategy_evidence import (can_resume_forward, load_frozen_dataset, load_reference, merge_forward_input,
+                                reference_signal_matches, reference_signal_ready)
 from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, historical_input_gap, implementation_hash,
                                   planned_sessions, snapshot_limitations, source_artifact_gaps)
 
@@ -94,6 +94,7 @@ class StrategyLab:
         key, version = body["strategy_id"], body["version"]
         fingerprint, policy_hash = digest(body), digest(self.policy)
         feasibility_error = None
+        requirements = None
         try:
             state = "needs_formalization" if body["implementation"] is None else validate_program(
                 body["implementation"], body["instruments"])
@@ -133,7 +134,8 @@ class StrategyLab:
                 raise RiskError("A changed strategy must identify its revision type")
             if state == "candidate":
                 try:
-                    load_reference(db, body, policy_hash, now)
+                    reference = load_reference(db, body, policy_hash, now)
+                    requirements = strategy_inputs(body, self.policy.get("cash_symbol"), reference).describe()
                 except RiskError as exc:
                     state, feasibility_error = "needs_formalization", str(exc)[:500]
             db.execute("INSERT INTO fund_strategy_versions VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -141,7 +143,8 @@ class StrategyLab:
                         encode(self.policy), policy_hash, state, "open"))
             self._event(db, key, version, now, "registered", {"state": state, "digest": fingerprint,
                                                             "feasibility_error": feasibility_error,
-                                                            "source_call_id": source_call_id})
+                                                            "source_call_id": source_call_id,
+                                                            **({"inputs": requirements} if requirements else {})})
         self.sync_registry(now)
         return key, version
 
@@ -352,7 +355,7 @@ class StrategyLab:
             return {**dict(row), "lease": lease, "reservation": reservation}
 
     def _forward_input(self, db, row, dataset):
-        records = db.execute("SELECT body FROM fund_strategy_forward WHERE id=? AND version=? ORDER BY day",
+        records = db.execute("SELECT body,dataset FROM fund_strategy_forward WHERE id=? AND version=? ORDER BY day",
                              (row["id"], row["version"])).fetchall()
         passed = db.execute("SELECT e.at,e.body FROM fund_strategy_events e WHERE id=? AND version=? AND kind='historical_pass' "
                             "ORDER BY sequence LIMIT 1", (row["id"], row["version"])).fetchone()
@@ -367,8 +370,27 @@ class StrategyLab:
         receipts = [json.loads(r[0]) for r in records]
         # Use the saved prefix and incoming snapshot, including legacy full prefixes.
         base = receipts[-1]["frozen_dataset_hash"] if receipts else historical[0]
-        seed = merge_forward_input(load_frozen_dataset(db, base), dataset)
-        return seed, passed[0], receipts, json.loads(passed[1])["forward_plan"], base
+        seed = load_frozen_dataset(db, base)
+        previous, resume = {}, None
+        if receipts:
+            saved = db.execute("SELECT r.body FROM fund_strategy_results r JOIN fund_strategy_jobs j ON j.id=r.job_id "
+                               "WHERE j.strategy_id=? AND j.version=? AND j.kind='forward' AND j.dataset=?",
+                               (row["id"], row["version"], records[-1][1])).fetchone()
+            try:
+                previous = json.loads(saved[0]) if saved else {}
+                if not isinstance(previous, dict):
+                    previous = {}
+                if previous.get("replay_checkpoint_base") == base and previous.get("series") == [r["receipt"] for r in receipts]:
+                    checkpoint = previous["replay_checkpoints"]["strategy"]
+                    if can_resume_forward(seed, dataset, receipts[-1]["receipt"]["day"], checkpoint["as_of"]):
+                        resume = {arm: {"checkpoint": checkpoint, "series": previous[series]}
+                                  for arm, series in (("strategy", "series"), ("passive", "reference_series"),
+                                                      ("control", "strategy_reference_series"))
+                                  if (checkpoint := previous["replay_checkpoints"].get(arm)) is not None}
+            except (KeyError, TypeError, ValueError):
+                resume = None  # Unusable auxiliary state does not erase existing receipts.
+        return (merge_forward_input(seed, dataset), passed[0], receipts, json.loads(passed[1])["forward_plan"],
+                base, previous.get("reference_series"), resume)
 
     @staticmethod
     def _save_next_signal(db, row, job, result, last_bar, finished, dataset, *, reference=None):
@@ -445,6 +467,7 @@ class StrategyLab:
             holdout = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                  (row["id"], row["version"])).fetchone()
             forward_at, prior, forward_plan, input_issue, forward_base = None, [], None, None, None
+            passive_prefix, resume = None, None
             proposal = json.loads(row["proposal"])
             identity = proposal["validation"].get("reference_strategy")
             reference, reference_issue = None, None
@@ -454,7 +477,7 @@ class StrategyLab:
                 reference_issue = str(exc)[:500]
             if job["kind"] == "forward" and qualified_input:
                 try:
-                    data, forward_at, prior, forward_plan, forward_base = self._forward_input(db, row, data)
+                    data, forward_at, prior, forward_plan, forward_base, passive_prefix, resume = self._forward_input(db, row, data)
                 except RiskError as exc:
                     input_issue = str(exc)
                 except (KeyError, TypeError, ValueError):
@@ -469,6 +492,8 @@ class StrategyLab:
                    "timeout_seconds": self.settings.job_timeout_seconds}
         if reference is not None:
             payload["reference"] = reference
+        if resume:
+            payload["replay_resume"] = resume
         try:
             if reference_issue:
                 result = {"status": "needs_formalization", "passed": False, "reason": reference_issue}
@@ -501,12 +526,21 @@ class StrategyLab:
             link = encode({"forward_base": forward_base, "forward_source": job["dataset"]})
             extra_data = len(link.encode()) if frozen and not db.execute(
                 "SELECT 1 FROM fund_strategy_datasets WHERE digest=?", (frozen,)).fetchone() else 0
-            if used + extra_data + len(encode(result).encode()) > self.settings.max_artifact_bytes:
+            if frozen and result.get("replay_checkpoints"):
+                result["replay_checkpoint_base"] = frozen
+            remaining = self.settings.max_artifact_bytes - used - extra_data
+            result_size = len(encode(result).encode())
+            if result_size > remaining and result.pop("replay_checkpoints", None):
+                result.pop("replay_checkpoint_base", None)
+                result_size = len(encode(result).encode())
+            if result_size > remaining:
                 result = {"status": "worker_error", "passed": False, "error": "ArtifactBudgetExceeded"}
             if job["kind"] == "forward" and result.get("series"):
                 series = result["series"]
                 controls = result.get("strategy_reference_series") or []
-                if (series[:len(prior)] != [item["receipt"] for item in prior] or identity is not None and (
+                if (series[:len(prior)] != [item["receipt"] for item in prior]
+                    or passive_prefix is not None and (result.get("reference_series") or [])[:len(prior)] != passive_prefix
+                    or identity is not None and (
                     [item["day"] for item in controls] != [item["day"] for item in series]
                     or controls[:len(prior)] != [item.get("strategy_reference_receipt") for item in prior]
                 )):
@@ -648,7 +682,7 @@ class StrategyLab:
                 candidates.append({"id": row["id"], "version": row["version"], "digest": row["digest"],
                                    "state": state, "task_state": task_state,
                                    "policy_current": row["policy_hash"] == digest(self.policy),
-                                   **({"proposal": proposal} if index < detail_limit or strategy_id else
+                                   **({"proposal": proposal, "inputs": registration.get("inputs")} if index < detail_limit or strategy_id else
                                       {"name": proposal["name"], "hypothesis": proposal["hypothesis"][:500]}),
                                    "last_task": task, "source_call_id": registration.get("source_call_id"),
                                    "feasibility_error": registration.get("feasibility_error"),
@@ -707,7 +741,10 @@ def run_worker(payload, timeout):
     worker = Path(__file__).with_name("strategy_worker.py")
     env = {key: os.environ[key] for key in ("SYSTEMROOT", "WINDIR", "LANG") if key in os.environ}
     env.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1")
-    completed = subprocess.run([sys.executable, "-I", str(worker)], input=encode(payload).encode("utf-8"),
+    encoded = encode(payload).encode("utf-8")
+    if len(encoded) > 32_000_000 and "replay_resume" in payload:
+        encoded = encode({key: value for key, value in payload.items() if key != "replay_resume"}).encode("utf-8")
+    completed = subprocess.run([sys.executable, "-I", str(worker)], input=encoded,
                                capture_output=True, timeout=timeout, env=env, close_fds=True,
                                cwd=worker.parent)
     if completed.returncode or len(completed.stdout) > 32_000_000:

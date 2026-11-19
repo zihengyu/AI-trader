@@ -205,8 +205,14 @@ returns. Such inputs can yield research diagnostics but cannot pass admission.
 The data desk reads executable open candidates and fills requested daily history
 for their instruments, benchmarks, cash sleeve and known supplemental market
 series. It reuses sufficiently deep, current daily caches and downloads missing
-series in small off-hours batches using its existing market-data source. The
-extra history is cached separately from the runner's risk inputs. Short history,
+series in small off-hours batches using its existing market-data source.
+Registration, preflight and history planning derive dependencies from the same
+rules for both executable arms. Automatic requests include the scored window,
+the preceding close and statically known lookbacks or lags. Runtime-dependent
+lookbacks stay visible in the input manifest. The desk reports fields its
+provider does not supply and per-study history row limits. Features with their
+own publication times can still be supplied with a reviewed snapshot.
+The extra history is cached separately from the runner's risk inputs. Short history,
 unavailable series and provider failures remain visible to the researcher and
 under `fund-logs.sh strategy-lab`. The desk retries missing completed bars and
 prioritizes trading during a provider cooldown. The lab builds a snapshot for
@@ -222,7 +228,13 @@ saved before the next exchange open and match the signal actually used in the
 simulated fill. Later historical corrections cannot rewrite a recorded input or
 signal. Forward snapshots reference the previous frozen input and the incoming
 immutable source, and their reconstructed content is checked against the same
-digest used in evidence receipts. Legacy full snapshots remain readable. An
+digest used in evidence receipts. Each replay compiles its rules once and indexes
+observations by publication cutoff while preserving observation order. Forward
+updates restore book state from a checkpoint bound to the accepted input and
+replay new sessions. Missing or invalid checkpoints and inputs that could affect
+prior sessions fall back to a full replay. The controller checks the candidate,
+passive benchmark and optional executable comparison against previously accepted
+receipts before saving new observations. Legacy full snapshots remain readable. An
 imported batch can provide replay results, with each session labeled
 as prospective or replayed. Replayed sessions do not qualify. A missed signal
 remains a gap for that version. A new revalidation version earns its own

@@ -33,6 +33,24 @@ def reference_signal_matches(signal, receipt, reference):
             and signal["raw_targets"] == receipt.get("raw_signal"))
 
 
+def can_resume_forward(seed, incoming, day, close):
+    """An appended observation must not change any completed leg or its closing signal."""
+    for symbol, rows in incoming["bars"].items():
+        known = seed["bars"].get(symbol) or []
+        last = known[-1]["day"] if known else ""
+        if any(last < row["day"] <= day for row in rows):
+            return False
+    close = instant(close)
+    for symbol, rows in incoming.get("features", {}).items():
+        known = seed.get("features", {}).get(symbol) or []
+        last = instant(known[-1]["at"]) if known else None
+        if any((last is None or instant(row["at"]) > last) and instant(row["at"]) <= close
+               and instant(row["available_at"]) <= close for row in rows):
+            return False
+    existing = {digest(action) for action in seed.get("actions", [])}
+    return not any(action["ex_date"] <= day and digest(action) not in existing for action in incoming.get("actions", []))
+
+
 def merge_forward_input(seed, incoming):
     """Append new observations to an owned copy of the frozen replay history."""
     for symbol, values in incoming["bars"].items():

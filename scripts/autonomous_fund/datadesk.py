@@ -933,7 +933,7 @@ class DataDesk:
 
     def _job_strategy_history(self, now):
         from .session_calendar import completed_daily_cutoff
-        from .strategy_lab_runtime import history_requests, research_history_store
+        from .strategy_lab_runtime import history_request_plan, research_history_store
         from .strategy_validation import _daily_sessions
 
         path = self.run_dir / "state.sqlite3"
@@ -943,9 +943,10 @@ class DataDesk:
         # overseas indices with their own publication clocks out of this cache.
         available_symbols = self.universe.keys() | set(self.stocks) | set(GAUGES)
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            requests, unsupported = history_requests(db, available_symbols)
-        result = {"requested": len(requests), "fetched": 0, "pending": 0, "missing_source": sorted(unsupported),
-                  "short_history": {}}
+            plan = history_request_plan(db, available_symbols)
+        requests = plan["requests"]
+        result = {"requested": len(requests), "fetched": 0, "pending": 0, "missing_source": sorted(plan["unsupported"]),
+                  "short_history": {}, "missing_fields": plan["unsupported_fields"], "capacity": plan["capacity"]}
         if not requests:
             return result
 

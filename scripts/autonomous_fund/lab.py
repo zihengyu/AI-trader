@@ -129,6 +129,7 @@ def queue_forward_notice(db, now, opened):
 def check_data(root, data, key, version, now, *, artifacts_dir=None):
     from .strategy_lab import has_source_artifact_receipt
     from .strategy_evidence import load_reference
+    from .strategy_program import strategy_inputs
     from .strategy_validation import check_snapshot_as_of, historical_input_gap, snapshot_limitations, source_artifact_gaps
 
     path = Path(root) / "state.sqlite3"
@@ -151,19 +152,19 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
             reference = load_reference(db, proposal, row[3], row[4])
         except RiskError as exc:
             gap = {"status": "needs_formalization", "reason": str(exc)[:500]}
-    arms = (proposal,) if reference is None else (proposal, reference)
-    required = {symbol for arm in arms for symbol in arm["instruments"]} | {proposal["validation"]["benchmark"]}
-    if policy.get("cash_symbol"):
-        required.add(policy["cash_symbol"])
-    features = {symbol for arm in arms for symbol in arm.get("data_symbols", ())}
+    try:
+        inputs = strategy_inputs(proposal, policy.get("cash_symbol"), reference)
+    except RiskError as exc:
+        gap = gap or {"status": "needs_formalization", "reason": str(exc)[:500]}
+        inputs = None
     gaps = (snapshot_limitations(data, require_receipts=True) if artifacts_dir is None
             else source_artifact_gaps(data, artifacts_dir))
     required_artifacts = policy.get("research_execution", {}).get("require_source_artifacts", False)
     matched = artifacts_dir is not None and not gaps
     if required_artifacts and not recorded and artifacts_dir is None:
         gaps.append("source_artifacts_unchecked")
-    missing = sorted((required - data["bars"].keys()) |
-                     (features - data["bars"].keys() - data.get("features", {}).keys()))
+    missing = (sorted((inputs.prices - data["bars"].keys()) |
+                      (inputs.symbols - data["bars"].keys() - data.get("features", {}).keys())) if inputs else [])
     if not gap and proposal.get("implementation") and row[2] in {"candidate", "needs_data", "awaiting_new_holdout"}:
         gap = historical_input_gap(proposal, data, policy, locked_sessions=json.loads(locked[0]) if locked else None,
                                    reference=reference)
@@ -172,6 +173,7 @@ def check_data(root, data, key, version, now, *, artifacts_dir=None):
             "source_artifacts_required": required_artifacts, "source_artifacts_recorded": recorded,
             "source_artifacts_matched_this_check": matched,
             "benchmark_sessions_in_snapshot": len(data["bars"].get(proposal["validation"]["benchmark"], ())),
+            "inputs": inputs.describe() if inputs else None,
             "input_gap": gap, "ready_for_validation_input": not gaps and not missing and not gap}
 
 
@@ -388,6 +390,10 @@ def report(root):
             lines.append(f"数据员自动补数追踪 {coverage['requested']} 个日线序列，待补 {coverage['pending']} 个。")
             if coverage.get("missing_source"):
                 lines.append("缺少适用行情或特征来源：" + json.dumps(coverage["missing_source"], ensure_ascii=False))
+            if coverage.get("missing_fields"):
+                lines.append("自动数据源不提供的字段：" + json.dumps(coverage["missing_fields"], ensure_ascii=False))
+            if coverage.get("capacity"):
+                lines.append("历史快照行数上限不足：" + json.dumps(coverage["capacity"], ensure_ascii=False))
             if coverage.get("short_history"):
                 lines.append("历史长度不足：" + json.dumps(coverage["short_history"], ensure_ascii=False))
             if coverage.get("failed"):

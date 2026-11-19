@@ -10,10 +10,12 @@ from .risk import RiskError, instant, trading_day
 from .session_calendar import completed_daily_cutoff, regular_session_open
 from .strategy_lab import has_source_artifact_receipt, load_snapshot
 from .strategy_evidence import load_reference
+from .strategy_program import strategy_inputs
 from .strategy_validation import digest, snapshot_limitations
 
 
 HISTORICAL_STATES = ("candidate", "needs_data", "awaiting_new_holdout")
+DAILY_FIELDS = {"open", "high", "low", "close", "volume"}
 
 
 def research_cycle(journal, now, lab, mode):
@@ -74,12 +76,24 @@ def _research_progress(db, policy_hash, now):
 
 
 def history_symbols(proposal, cash_symbol, reference=None):
-    symbols = set(proposal["instruments"] + proposal.get("data_symbols", []) + [proposal["validation"]["benchmark"]])
-    if reference is not None:
-        symbols.update(reference["instruments"] + reference.get("data_symbols", []))
-    if cash_symbol:
-        symbols.add(cash_symbol)
-    return symbols
+    return strategy_inputs(proposal, cash_symbol, reference).symbols
+
+
+def _requested_depths(proposal, inputs):
+    plan = proposal["validation"]
+    sessions = sum(plan[key] for key in ("train_sessions", "validation_sessions", "final_sessions"))
+    depths = dict.fromkeys(inputs.symbols, sessions + 1)  # The preceding close forms the initial signal.
+    for (symbol, _), depth in inputs.known_depths.items():
+        depths[symbol] = max(depths[symbol], sessions + depth)
+    return depths
+
+
+def _bounded_depths(depths, budget):
+    bounded = {}
+    for index, symbol in enumerate(sorted(depths, key=lambda key: (depths[key], key))):
+        bounded[symbol] = min(depths[symbol], budget // (len(depths) - index))
+        budget -= bounded[symbol]
+    return bounded
 
 
 def research_history_store(root):
@@ -89,14 +103,20 @@ def research_history_store(root):
 
 
 def history_requests(db, universe):
+    plan = history_request_plan(db, universe)
+    return plan["requests"], plan["unsupported"]
+
+
+def history_request_plan(db, universe):
     """Read the frozen versions the running lab can actually schedule."""
+    result = {"requests": {}, "unsupported": set(), "unsupported_fields": {}, "capacity": {}}
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='fund_strategy_versions'").fetchone():
-        return {}, set()
+        return result
     saved = db.execute("SELECT value FROM meta WHERE key='strategy_lab_policy'").fetchone()
     policy = json.loads(saved[0]) if saved else {}
     if not policy.get("enabled"):
-        return {}, set()
-    requests, unsupported = {}, set()
+        return result
+    requests, unsupported = result["requests"], result["unsupported"]
     for body, frozen, created_at in db.execute(
             "SELECT proposal,policy,created_at FROM fund_strategy_versions WHERE policy_hash=? AND task_state='open' "
             "AND state IN (?,?,?)", (policy["policy_hash"], *HISTORICAL_STATES)):
@@ -104,23 +124,37 @@ def history_requests(db, universe):
         cash = frozen.get("cash_symbol")
         try:
             reference = load_reference(db, proposal, policy["policy_hash"], created_at)
+            inputs = strategy_inputs(proposal, cash, reference)
         except RiskError:
             continue  # The scheduler exposes the invalid reference receipt.
-        symbols = history_symbols(proposal, cash, reference)
-        plan = proposal["validation"]
-        requested = sum(plan[key] for key in ("train_sessions", "validation_sessions", "final_sessions"))
-        depth = min(requested, policy["max_history_rows"] // len(symbols))
-        for symbol in symbols:
-            if symbol not in universe | {cash} or any(char in symbol for char in ("/", "\\", "\x00")):
-                unsupported.add(symbol)
-            elif depth:
+        raw_fields = {symbol for symbol, field in inputs.fields if field in DAILY_FIELDS}
+        custom_fields = {symbol for symbol, field in inputs.fields if field not in DAILY_FIELDS}
+        daily = inputs.prices | raw_fields | (inputs.declared - custom_fields)
+        supported = {symbol for symbol in daily if symbol in universe | {cash}
+                     and not any(char in symbol for char in ("/", "\\", "\x00"))}
+        unsupported.update(inputs.symbols - supported)
+        for symbol, field in inputs.fields:
+            if symbol not in supported or field not in DAILY_FIELDS:
+                result["unsupported_fields"].setdefault(symbol, set()).add(field)
+        depths = _requested_depths(proposal, inputs)
+        wanted = {symbol: depths[symbol] for symbol in supported}
+        bounded = _bounded_depths(wanted, policy["max_history_rows"])
+        short = {symbol: {"requested": wanted[symbol], "allocated": depth}
+                 for symbol, depth in sorted(bounded.items()) if depth < wanted[symbol]}
+        if short:
+            key = f"{proposal['strategy_id']} / {proposal['version']}"
+            result["capacity"][key] = {"row_limit": policy["max_history_rows"], "symbols": short}
+        for symbol, depth in bounded.items():
+            if depth:
                 requests[symbol] = max(requests.get(symbol, 0), depth)
-    return requests, unsupported - requests.keys()
+    result["unsupported"] = unsupported - requests.keys()
+    result["unsupported_fields"] = {symbol: sorted(fields) for symbol, fields in sorted(result["unsupported_fields"].items())}
+    return result
 
 
-def _cache_symbols(strategy, rows):
+def _cache_depths(strategy, rows):
     cash = strategy.strategy_lab.policy.get("cash_symbol")
-    requested = set()
+    requested = {}
     for row in rows:
         if row["task_state"] == "open" and row["state"] in HISTORICAL_STATES:
             proposal, reference = json.loads(row["proposal"]), None
@@ -130,18 +164,25 @@ def _cache_symbols(strategy, rows):
                         reference = load_reference(db, proposal, row["policy_hash"], row["created_at"])
                     except RiskError:
                         continue
-            requested.update(history_symbols(proposal, cash, reference))
+            try:
+                depths = _requested_depths(proposal, strategy_inputs(proposal, cash, reference))
+            except RiskError:
+                continue
+            for symbol, depth in depths.items():
+                requested[symbol] = max(requested.get(symbol, 0), depth)
     # A model-supplied feature name is never a path to arbitrary local data.
-    return tuple(sorted(symbol for symbol in requested if symbol
-                        and not any(char in symbol for char in ("/", "\\", "\x00"))))
+    return {symbol: requested[symbol] for symbol in sorted(requested) if symbol
+            and not any(char in symbol for char in ("/", "\\", "\x00"))}
 
 
-def cached_snapshot(strategy, now, *, symbols=None):
+def cached_snapshot(strategy, now, *, symbols=None, depths=None):
     """The existing daily cache is exploratory and carries no original provider receipts."""
     lab, store = getattr(strategy, "strategy_lab", None), getattr(strategy, "daily_store", None)
     if lab is None or store is None:
         return None
-    symbols = _cache_symbols(strategy, lab.rows()) if symbols is None else symbols
+    if symbols is None:
+        depths = _cache_depths(strategy, lab.rows())
+        symbols = depths
     raw_bars = {}
     day = trading_day(now)
     research = research_history_store(lab.journal.root)
@@ -159,9 +200,6 @@ def cached_snapshot(strategy, now, *, symbols=None):
     schedule = mcal.get_calendar("NYSE").schedule(start_date=min(days), end_date=max(days))
     bounds = {str(day.date()): (row.market_open, row.market_close) for day, row in schedule.iterrows()}
     bars = {}
-    per_symbol = lab.settings.max_history_rows // len(raw_bars)
-    if not per_symbol:
-        return None
     for symbol, values in raw_bars.items():
         rows = []
         for raw in values:
@@ -176,7 +214,14 @@ def cached_snapshot(strategy, now, *, symbols=None):
                          "available_at": close_at.isoformat(), "open": opened, "high": high, "low": low,
                          "close": close, "volume": volume, "availability_estimated": True})
         if rows:
-            bars[symbol] = rows[-per_symbol:]
+            bars[symbol] = rows
+    budget = lab.settings.max_history_rows
+    required = {symbol: min(len(rows), (depths or {}).get(symbol, len(rows))) for symbol, rows in bars.items()}
+    allocated = _bounded_depths(required, budget)
+    extra = _bounded_depths({symbol: len(rows) - allocated[symbol] for symbol, rows in bars.items()},
+                            budget - sum(allocated.values()))
+    bars = {symbol: rows[-length:] for symbol, rows in bars.items()
+            if (length := allocated[symbol] + extra[symbol])}
     if not bars:
         return None
     return {"bars": bars, "actions": [],
@@ -261,13 +306,13 @@ def prepare_inputs(strategy, now):
     groups = {}
     for row in rows:
         if row["policy_hash"] == policy:
-            symbols = _cache_symbols(strategy, (row,))
-            if symbols:
-                groups.setdefault(symbols, []).append((row["id"], row["version"]))
+            depths = tuple(_cache_depths(strategy, (row,)).items())
+            if depths:
+                groups.setdefault(depths, []).append((row["id"], row["version"]))
 
     day = trading_day(now)
     research = research_history_store(lab.journal.root)
-    symbols = sorted({symbol for group in groups for symbol in group})
+    symbols = sorted({symbol for group in groups for symbol, _ in group})
     cache = tuple((symbol, store.version(day, "bars/" + symbol), research.version(day, "bars/" + symbol))
                   for symbol in symbols)
     receipt = day, completed_daily_cutoff(now), groups, cache
@@ -277,8 +322,9 @@ def prepare_inputs(strategy, now):
     previous = lab.journal.get_meta("strategy_lab_cache_content", {})
     previous = previous if isinstance(previous, dict) else {}  # Older ledgers stored the pooled snapshot digest.
     saved = {}
-    for symbols, identities in groups.items():
-        data = cached_snapshot(strategy, now, symbols=symbols)
+    for group, identities in groups.items():
+        depths = dict(group)
+        data = cached_snapshot(strategy, now, symbols=depths, depths=depths)
         if data is None:
             continue
         content = digest([digest(data), policy])

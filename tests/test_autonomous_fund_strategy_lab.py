@@ -113,6 +113,31 @@ def register_comparison(engine, candidate, control, now):
     return candidate["validation"]["reference_strategy"]
 
 
+def test_derived_dependencies_drive_both_arms_history_and_report_capacity(tmp_path):
+    from scripts.autonomous_fund.lab import check_data
+    from scripts.autonomous_fund.strategy_lab_runtime import history_request_plan
+
+    engine, candidate, control = lab(tmp_path, max_history_rows=500), proposal(), proposal("different-inputs")
+    candidate["implementation"]["rules"][0]["entry"] = ('ret("AUX", 30) > 0 and '
+                                                          'field("AUX", "close", session_index) > 0')
+    control["implementation"]["rules"][0]["entry"] = 'field("EVENTS", "surprise") > 0 and field("FX", "close") > 0'
+    register_comparison(engine, candidate, control, NOW)
+    engine.update_task({"strategy_id": control["strategy_id"], "version": "v1", "action": "pause",
+                        "findings": "Used as a fixed reference", "next_step": "Keep this version"}, NOW)
+    engine.submit(candidate, NOW)
+    with engine.journal.connection() as db:
+        plan = history_request_plan(db, {"ALFA", "BASE", "AUX", "EVENTS", "FX"})
+    assert sum(plan["requests"].values()) == 500
+    assert set(plan["requests"]) == {"ALFA", "BASE", "AUX", "FX"}
+    assert plan["unsupported"] == {"EVENTS"} and plan["unsupported_fields"] == {"EVENTS": ["surprise"]}
+    assert plan["capacity"][f"{candidate['strategy_id']} / v1"]["symbols"]["AUX"]["requested"] == 171
+    check = check_data(tmp_path, dataset(140), candidate["strategy_id"], "v1", NOW)
+    assert check["symbols_missing_from_this_snapshot"] == ["AUX", "EVENTS", "FX"]
+    saved = engine.context(NOW, strategy_id=candidate["strategy_id"])["candidates"][0]
+    assert saved["inputs"] == check["inputs"]
+    assert {"symbol": "AUX", "field": "close", "observations": None, "known_observations": 31} in saved["inputs"]["fields"]
+
+
 @pytest.mark.parametrize("issue", ["wrong_digest", "other_policy", "unsupported_adapter", "longer_horizon"])
 def test_executable_comparison_requires_a_frozen_compatible_reference(tmp_path, issue):
     engine = lab(tmp_path)
@@ -160,7 +185,8 @@ def test_executable_reference_uses_shared_history_and_binds_both_forward_signals
     key = candidate["strategy_id"]
     with engine.journal.connection() as db:
         requests, unsupported = history_requests(db, {"ALFA", "BASE", "BETA", "EVENTS"})
-    assert set(requests) == {"ALFA", "BASE", "BETA", "EVENTS"} and not unsupported
+    # The daily bar provider cannot supply the declared event-value column.
+    assert set(requests) == {"ALFA", "BASE", "BETA"} and unsupported == {"EVENTS"}
     missing = attest({**data, "bars": {k: v for k, v in data["bars"].items() if k != "BETA"}})
     check = check_data(tmp_path, missing, key, "v1", formed)
     assert check["symbols_missing_from_this_snapshot"] == ["BETA"]
@@ -811,9 +837,9 @@ def test_data_desk_automatically_fills_candidate_history_without_writing_trading
 
     engine = lab(tmp_path)
     research = proposal()
-    research["implementation"]["rules"][0]["entry"] = 'field("ALFA", "close") > 0'
+    research["implementation"]["rules"][0]["entry"] = 'ret("ALFA", 5) > 0'
     engine.submit(research, NOW)
-    session_dates = mcal.get_calendar("NYSE").schedule(start_date="2025-01-02", end_date=NOW.date()).index[-140:]
+    session_dates = mcal.get_calendar("NYSE").schedule(start_date="2025-01-02", end_date=NOW.date()).index[-146:]
     closes = [100 + i / 10 for i in range(len(session_dates))]
     frame = pd.DataFrame({"open": closes, "high": closes, "low": closes, "close": closes,
                           "volume": 10000}, index=session_dates)
@@ -829,12 +855,12 @@ def test_data_desk_automatically_fills_candidate_history_without_writing_trading
                     clock=lambda: NOW, sleep=lambda _: None, environ={})
     day = NOW.date().isoformat()
     baseline = [(stamp.date(), close, 10000, close, close, close) for stamp, close in zip(session_dates, closes)]
-    desk.store.save_bars(day, "BASE", 140, baseline, cutoff=NOW.date() + timedelta(days=1))
+    desk.store.save_bars(day, "BASE", 141, baseline[-141:], cutoff=NOW.date() + timedelta(days=1))
     desk.store.save_bars(day, "ALFA", 40, baseline[-40:], cutoff=NOW.date() + timedelta(days=1))
     original = desk.store.get(day, "bars/ALFA")
     assert desk.enabled("strategy_history", NOW)
     result = desk.run_job("strategy_history")
-    assert calls == [("ALFA", 140, "day")]
+    assert calls == [("ALFA", 146, "day")]  # Five-session return needs six rows before the scored window.
     assert result["fetched"] == 1 and result["pending"] == 0 and result["missing_source"] == []
     assert desk.store.get(day, "bars/ALFA") == original
     assert desk._job_strategy_history(NOW)["fetched"] == 0  # A repeat consumes no provider call.
@@ -1243,6 +1269,77 @@ def test_cash_adapter_counts_total_return_without_spending_dividends_early():
     assert float(before["equity"]) == pytest.approx(float(ex["equity"]))
     assert float(ex["equity"]) == pytest.approx(float(paid["equity"]))
     assert float(paid["cash"]) > float(ex["cash"])
+
+
+@pytest.mark.parametrize("cash_adapter", [False, True])
+def test_checkpoint_resumes_exact_cash_positions_and_receivables(cash_adapter, monkeypatch):
+    from scripts.autonomous_fund import strategy_program
+
+    data, configured, candidate = cash_dataset() if cash_adapter else (dataset(12), policy(), proposal())
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    candidate["implementation"]["rules"][0].update(entry="True", exit="False", weight="0.5")
+    data["actions"] = [{"symbol": "ALFA", "ex_date": days[3], "pay_date": days[7], "dividend": .2,
+                        "available_at": data["bars"]["ALFA"][1]["at"]}]
+    parse_calls = []
+    original = strategy_program.parse
+
+    def counted_parse(*args, **kwargs):
+        parse_calls.append(args[0])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(strategy_program, "parse", counted_parse)
+    options = {"initial_capital": "10000", "save_checkpoint": True}
+    prefix = replay(candidate, data, configured, days[1:5], **options)
+    assert prefix["series"][-1]["receivables"] and len(parse_calls) == 3
+    saved = json.loads(json.dumps({"series": prefix["series"], "checkpoint": prefix["checkpoint"]}, default=str))
+    resumed = replay(candidate, data, configured, days[1:], resume=saved, **options)
+    full = replay(candidate, data, configured, days[1:], **options)
+    assert resumed.pop("resumed_sessions") == 4 and full.pop("resumed_sessions") == 0
+    assert resumed == full
+    saved["checkpoint"]["amounts"]["fees"] = "999"
+    restored = replay(candidate, data, configured, days[1:], resume=saved, **options)
+    assert restored.pop("resumed_sessions") == 0 and restored == full
+
+
+def test_observation_index_preserves_order_and_publication_cutoffs():
+    from scripts.autonomous_fund.strategy_program import HistoryIndex
+
+    rows = [{"at": (NOW + timedelta(days=offset)).isoformat(), "available_at": (NOW + timedelta(days=release)).isoformat(),
+             "value": value} for offset, release, value in [(0, 2, 10), (1, 1, 20), (2, 2, 30)]]
+    rows[-1]["feature_available_at"] = {"value": (NOW + timedelta(days=3)).isoformat()}
+    history = HistoryIndex({"AUX": rows})
+    after = Evaluator(history, NOW + timedelta(days=2), {})
+    assert after.observations("AUX", "value", 2, lag=1) == [10, 20]
+    with pytest.raises(Warmup, match="not-yet-published"):
+        after.observations("AUX", "value", 1)
+    assert Evaluator(history, NOW + timedelta(days=1), {}).observations("AUX", "value", 1) == [20]
+
+
+def test_forward_resumes_after_restart_and_rejects_a_rewritten_passive_prefix(tmp_path):
+    engine, candidate, initial = lab(tmp_path), proposal(), dataset()
+    formed = instant(initial["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    engine.submit(candidate, formed)
+    assert engine.schedule(initial, formed) and engine.run_one(formed)["passed"]
+
+    def append(current, count, *, actions=()):
+        data = dataset(count)
+        observed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+        incoming = attest({**data, "bars": {symbol: rows[-1:] for symbol, rows in data["bars"].items()},
+                           "actions": list(actions)})
+        assert current.schedule(incoming, observed)
+        return current.run_one(observed)
+
+    assert append(engine, 171)["resumed_sessions"] == 0
+    engine = lab(tmp_path)
+    latest = append(engine, 172)
+    assert latest["resumed_sessions"] == 1 and latest["prospective_sessions"] == 2
+    bars = dataset(173)["bars"]["BASE"]
+    late = {"symbol": "BASE", "ex_date": bars[-2]["day"], "pay_date": bars[-1]["day"],
+            "dividend": .25, "available_at": bars[-3]["at"]}
+    result = append(engine, 173, actions=[late])
+    assert result["status"] == "needs_data" and "history changed" in result["reason"]
+    with engine.journal.connection() as db:
+        assert db.execute("SELECT count(*) FROM fund_strategy_forward").fetchone()[0] == 2
 
 
 def test_cash_adapter_validates_with_an_independent_passive_reference():

@@ -119,6 +119,7 @@ def test_verified_sleeve_cap_reaches_manager_acceptance_and_order_authority(tmp_
     # The same sleeve tested prospectively is the only one authorized here.
     observed, result = forward_one_session_at_a_time(engine, history(210), 170, monkeypatch)
     assert result["passed"]
+    assert result["resumed_sessions"] == 39
     now = observed + timedelta(minutes=10)
     entry, = library(journal, now)
     assert float(entry["next_targets"]["ALFA"]) == pytest.approx(.1)

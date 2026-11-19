@@ -22,7 +22,11 @@ def main():
             resource.setrlimit(resource.RLIMIT_AS, (2_000_000_000, 2_000_000_000))
     except ImportError:
         pass  # Parent still imposes wall-clock/input/output bounds on Windows.
-    sys.stdout.write(json.dumps(evaluate(payload), allow_nan=False, default=str))
+    result = evaluate(payload)
+    output = json.dumps(result, allow_nan=False, default=str)
+    if len(output.encode("utf-8")) > 32_000_000 and result.pop("replay_checkpoints", None):
+        output = json.dumps(result, allow_nan=False, default=str)
+    sys.stdout.write(output)
 
 
 def evaluate(payload):
@@ -68,13 +72,15 @@ def evaluate(payload):
             if not days:
                 result = {"status": "awaiting_forward", "passed": False}
             else:
-                args = dict(initial_capital=payload["initial_capital"])
-                actual = replay(proposal, data, paired_policy, days, **args)
+                args = dict(initial_capital=payload["initial_capital"], save_checkpoint=True)
+                resume = payload.get("replay_resume") or {}
+                actual = replay(proposal, data, paired_policy, days, resume=resume.get("strategy"), **args)
                 baseline = replay(proposal, data, policy, days,
-                                  static_weight=plan["benchmark_weight"], **args)
+                                  static_weight=plan["benchmark_weight"], resume=resume.get("passive"), **args)
                 a, b = metrics(actual["series"], payload["initial_capital"]), metrics(baseline["series"], payload["initial_capital"])
                 test = test_excess(a, b, plan, payload["trials"])
-                control = (replay_strategy_reference(paired_reference, data, paired_policy, days, **args)
+                control = (replay_strategy_reference(paired_reference, data, paired_policy, days,
+                                                     resume=resume.get("control"), **args)
                            if paired_reference is not None else None)
                 if control:
                     control_metrics = metrics(control["series"], payload["initial_capital"])
@@ -120,6 +126,11 @@ def evaluate(payload):
                 if control:
                     result["strategy_reference_series"] = control["series"]
                     result["next_strategy_reference_signal"] = {**next_signal(control), "identity": identity}
+                arms = {"strategy": actual, "passive": baseline}
+                if control:
+                    arms["control"] = control
+                result["replay_checkpoints"] = {name: arm["checkpoint"] for name, arm in arms.items()}
+                result["resumed_sessions"] = min(arm["resumed_sessions"] for arm in arms.values())
     except StrategyRuleError as exc:
         result = {"status": "needs_formalization", "passed": False, "reason": str(exc)[:500]}
     except Exception as exc:

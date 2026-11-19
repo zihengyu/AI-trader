@@ -108,12 +108,25 @@ class Book:
     def value(self, prices):
         return self.cash + sum((q * prices[s] for s, q in self.positions.items()), ZERO)
 
+    def _save_step_state(self):
+        # Attempts append to the histories. Copy only the mutable working book.
+        state = {key: deepcopy(value) for key, value in vars(self).items() if key not in {"policy", "series", "overlays"}}
+        return state, len(self.series), len(self.overlays)
+
+    def _restore_step_state(self, saved):
+        state, observations, overlays = saved
+        series, marks, policy = self.series, self.overlays, self.policy
+        del series[observations:]
+        del marks[overlays:]
+        vars(self).clear()
+        vars(self).update(state, policy=policy, series=series, overlays=marks)
+
     def step(self, day, desired, prices, actions=(), risk=None):
         if self.error:
             return
         # A missing action receipt or cash shortfall must not leave half a virtual
         # rebalance in the evidence. Real trading state is never touched here.
-        previous = {key: deepcopy(value) for key, value in vars(self).items() if key != "policy"}
+        previous = self._save_step_state()
         try:
             desired = project(desired, self.policy)
             required = set(self.positions) | {s for s, w in desired.items() if w > 0}
@@ -199,7 +212,7 @@ class Book:
             self.series.append({**self.last, "net_economic_equity":
                 str(self.value(marks) - self.model_cost) if not self.cost_unknown else None})
         except (RiskError, KeyError, TypeError, ValueError, ArithmeticError) as exc:
-            self.__dict__.update(previous)
+            self._restore_step_state(previous)
             self.error = {"day": day, "reason": str(exc) if isinstance(exc, RiskError) else "missing_or_invalid_comparison_input"}
 
     def summary(self):

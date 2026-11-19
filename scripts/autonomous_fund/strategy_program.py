@@ -8,6 +8,8 @@ import ast
 import math
 import operator
 import statistics
+from bisect import insort
+from dataclasses import dataclass
 
 from .risk import RiskError, instant
 
@@ -128,10 +130,9 @@ def _rule_expressions(rule, parameters):
             raise StrategyRuleError(f"{rule['symbol']}.{field}: {exc}") from exc
 
 
-def history_requirements(program):
-    """Return the observation depths and whether the rules use an absolute session index."""
+def _history_requirements(program):
     parameters = parameter_values(program)
-    depths, session_index = {}, False
+    depths, known, session_index = {}, {}, False
     for rule in program["rules"]:
         for _, expression in _rule_expressions(rule, parameters):
             for node in ast.walk(expression):
@@ -141,7 +142,58 @@ def history_requirements(program):
                     key, depth = _history_call(node, parameters)
                     previous = depths.get(key, 0)
                     depths[key] = None if previous is None or depth is None else max(previous, depth)
+                    if depth is not None:
+                        known[key] = max(known.get(key, 0), depth)
+    return depths, known, session_index
+
+
+def history_requirements(program):
+    """Return the observation depths and whether the rules use an absolute session index."""
+    depths, _, session_index = _history_requirements(program)
     return depths, session_index
+
+
+@dataclass
+class StrategyInputs:
+    prices: set[str]
+    declared: set[str]
+    fields: dict[tuple[str, str], int | None]
+    known_depths: dict[tuple[str, str], int]
+    uses_session_index: bool
+
+    @property
+    def symbols(self):
+        return self.prices | self.declared | {symbol for symbol, _ in self.fields}
+
+    def describe(self):
+        return {"prices": sorted(self.prices), "declared": sorted(self.declared),
+                "fields": [{"symbol": symbol, "field": column, "observations": depth,
+                            "known_observations": self.known_depths.get((symbol, column), 0)}
+                           for (symbol, column), depth in sorted(self.fields.items())],
+                "uses_session_index": self.uses_session_index}
+
+
+def strategy_inputs(proposal, cash_symbol=None, reference=None):
+    """Derive input dependencies without changing the frozen proposal text."""
+    prices = {proposal["validation"]["benchmark"]}
+    if cash_symbol:
+        prices.add(cash_symbol)
+    result = StrategyInputs(prices, set(), {}, {}, False)
+    for arm in (proposal, reference):
+        if arm is None:
+            continue
+        result.prices.update(arm["instruments"])
+        result.declared.update(arm.get("data_symbols", ()))
+        if arm.get("implementation") is None:
+            continue
+        fields, known, uses_index = _history_requirements(arm["implementation"])
+        result.uses_session_index |= uses_index
+        for key, depth in fields.items():
+            previous = result.fields.get(key, 0)
+            result.fields[key] = None if previous is None or depth is None else max(previous, depth)
+        for key, depth in known.items():
+            result.known_depths[key] = max(result.known_depths.get(key, 0), depth)
+    return result
 
 
 def validate_program(program, instruments):
@@ -185,9 +237,49 @@ def parameter_values(program):
     return result
 
 
+class _ObservationIndex:
+    def __init__(self, rows):
+        self.rows = rows
+        # Eligibility is independent of the original ordering used by lookbacks.
+        self.releases = sorted((max(instant(row["at"]), instant(row["available_at"])), index)
+                               for index, row in enumerate(rows))
+        self.visible = []
+        self.cursor = 0
+        self.cutoff = None
+
+    def window(self, cutoff, count, lag):
+        if self.cutoff is not None and cutoff < self.cutoff:
+            self.visible.clear()
+            self.cursor = 0
+        self.cutoff = cutoff
+        while self.cursor < len(self.releases) and self.releases[self.cursor][0] <= cutoff:
+            _, index = self.releases[self.cursor]
+            if not self.visible or self.visible[-1] < index:
+                self.visible.append(index)
+            else:
+                insort(self.visible, index)
+            self.cursor += 1
+        if len(self.visible) < count + lag:
+            return ()
+        stop = len(self.visible) - lag
+        return tuple(self.rows[index] for index in self.visible[stop - count:stop])
+
+
+class HistoryIndex:
+    def __init__(self, histories):
+        self.histories = histories
+        self.indexes = {}
+
+    def window(self, symbol, cutoff, count=1, lag=0):
+        if symbol not in self.indexes:
+            self.indexes[symbol] = _ObservationIndex(self.histories.get(symbol, ()))
+        return self.indexes[symbol].window(cutoff, count, lag)
+
+
 class Evaluator:
     def __init__(self, histories, now, names):
-        self.histories, self.now, self.names = histories, instant(now) if now is not None else None, names
+        self.history = histories if isinstance(histories, HistoryIndex) else HistoryIndex(histories)
+        self.now, self.names = instant(now) if now is not None else None, names
 
     def observations(self, symbol, column, count, lag=0):
         if type(symbol) is not str or type(column) is not str:
@@ -195,18 +287,17 @@ class Evaluator:
         if type(count) is not int or type(lag) is not int or not 1 <= count <= HISTORY_LIMIT or not 0 <= lag <= HISTORY_LIMIT:
             raise StrategyRuleError("Strategy history windows must be bounded nonnegative integers")
         # No fill-forward: a missing point-in-time value stays missing.
-        rows = [r for r in self.histories.get(symbol, ()) if instant(r["available_at"]) <= self.now
-                and instant(r["at"]) <= self.now]
-        if len(rows) < count + lag:
+        selected = self.history.window(symbol, self.now, count, lag)
+        if not selected:
             raise Warmup("Insufficient point-in-time strategy observations")
-        selected = rows[len(rows) - count - lag:len(rows) - lag if lag else None]
         result = []
         for row in selected:
             value = row.get(column)
             # Optional external features carry their own publication time; a
             # current financial statement may not be backdated into a price bar.
-            stamp = (row.get("feature_available_at") or {}).get(column, row["available_at"])
-            if instant(stamp) > self.now or type(value) not in {float, int} or not math.isfinite(value):
+            publications = row.get("feature_available_at") or {}
+            if (column in publications and instant(publications[column]) > self.now or type(value) not in {float, int}
+                    or not math.isfinite(value)):
                 raise Warmup("Missing or not-yet-published strategy feature")
             result.append(float(value))
         return result
@@ -285,20 +376,25 @@ class Evaluator:
         return value
 
 
-def targets(program, histories, now, *, session_index, book, held_since):
-    result = {}
+def compile_targets(program):
     parameters = parameter_values(program)
-    compiled = [(rule, dict(_rule_expressions(rule, parameters))) for rule in program["rules"]]
-    for rule, expressions in compiled:
+    return parameters, [(rule, dict(_rule_expressions(rule, parameters))) for rule in program["rules"]]
+
+
+def targets(program, histories, now, *, session_index, book, held_since, compiled=None):
+    result = {}
+    parameters, rules = compile_targets(program) if compiled is None else compiled
+    indexed = histories if isinstance(histories, HistoryIndex) else HistoryIndex(histories)
+    now = instant(now)
+    for rule, expressions in rules:
         symbol = rule["symbol"]
         held = book.positions.get(symbol, 0)
-        rows = [r for r in histories.get(symbol, ()) if instant(r["at"]) <= instant(now)
-                and instant(r["available_at"]) <= instant(now)]
+        rows = indexed.window(symbol, now) if held else ()
         mark = rows[-1]["close"] if rows else 0
         names = {**parameters, "holding_sessions": max(0, session_index - held_since.get(symbol, session_index)),
                  "position_weight": float(held * mark) / float(book.last["equity"]) if held and book.last else 0,
                  "entry_price": float(book.averages.get(symbol, 0)), "session_index": session_index}
-        evaluator = Evaluator(histories, now, names)
+        evaluator = Evaluator(indexed, now, names)
         try:
             field = "exit" if held else "entry"
             condition_met = evaluator.boolean(expressions[field])

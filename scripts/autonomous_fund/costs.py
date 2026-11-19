@@ -160,18 +160,17 @@ def unpriced_text(reasons):
     return "、".join(f"{label} {reasons[key]}" for key, label in UNPRICED_LABELS.items() if reasons.get(key))
 
 
-def cost_summary(rows, equity=None, now=None, prices=None, days=30):
+def cost_summary(rows, equity=None, now=None, prices=None, days=30, *, observed_from=None):
     """Recent model cost per day and role, its annual pace and the break-even excess return.
 
     rows: journal events (dicts with at, kind, body); `agent` rows are model calls.
     Scripted test calls and answers served from LumiBot's own cache cost nothing.
-    The pace is the mean over the trading days with model calls in the window,
-    times 252; break_even_excess_return is that pace as a fraction of equity: the
-    AI must beat its benchmark by at least this much a year to cover its models.
+    Keep the legacy priced-call-date pace for report readers. The trading-session
+    pace allocates all priced calls, including weekends, across completed NYSE sessions.
     """
     zone = ZoneInfo("America/New_York")
     calls = [r for r in rows if r["kind"] == "agent" and not scripted(r["body"]) and not r["body"].get("cache_hit")]
-    now = instant(now) if now is not None else (instant(calls[-1]["at"]) if calls else None)
+    now = instant(now) if now is not None else max((instant(row["at"]) for row in calls), default=None)
     start = (now - timedelta(days=days)) if now is not None else None
     # Counts, unknown-price notices and token totals must describe the same window as costs.
     calls = [row for row in calls if start is None or start <= instant(row["at"]) <= now]
@@ -206,13 +205,29 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
             continue
         by_day[day] = by_day.get(day, 0.0) + cost
         by_role[role] = by_role.get(role, 0.0) + cost
-    per_day = sum(by_day.values()) / len(by_day) if by_day else None
+    total = sum(by_day.values())
+    per_day = total / len(by_day) if by_day else None
     annual = per_day * TRADING_DAYS if per_day is not None else None
     equity = float(equity) if equity else None
+    sessions = 0
+    if start is not None:
+        from .scorecard import _exchange_sessions
+        from .session_calendar import _session_close, completed_daily_cutoff
+
+        if observed_from is not None:
+            observed_start = min((instant(row["at"]) for row in calls), default=instant(observed_from))
+            start = max(start, min(instant(observed_from), observed_start))
+        first = start.astimezone(zone).date()
+        close = _session_close(first)
+        if close is not None and close < start:
+            first += timedelta(days=1)
+        sessions = len(_exchange_sessions(first.isoformat(), completed_daily_cutoff(now).isoformat()))
+    per_session = total / sessions if sessions and by_day else None
+    session_pace = per_session * TRADING_DAYS if per_session is not None else None
     return {
         "window_days": days, "calls": len(calls), "unpriced_calls": unpriced, "unpriced_by_reason": reasons, "tokens": tokens,
         "today_usd": round(by_day.get(today, 0.0), 4) if today else None,
-        "window_usd": round(sum(by_day.values()), 4), "days_with_calls": len(by_day),
+        "window_usd": round(total, 4), "days_with_calls": len(by_day),
         "by_day_usd": {d: round(v, 4) for d, v in sorted(by_day.items())},
         "by_role_usd": {r: round(v, 4) for r, v in sorted(by_role.items())},
         "today_by_purpose": {key: {**item, "known_usd": round(item["known_usd"], 4)}
@@ -222,6 +237,11 @@ def cost_summary(rows, equity=None, now=None, prices=None, days=30):
         "average_per_day_usd": round(per_day, 4) if per_day is not None else None,
         "annual_pace_usd": round(annual, 2) if annual is not None else None,
         "break_even_excess_return": round(annual / equity, 5) if annual is not None and equity else None,
+        "completed_trading_sessions": sessions,
+        "average_per_trading_session_usd": round(per_session, 4) if per_session is not None else None,
+        "annual_trading_session_pace_usd": round(session_pace, 2) if session_pace is not None else None,
+        "trading_session_break_even_excess_return": round(session_pace / equity, 5)
+        if session_pace is not None and equity else None,
         "complete": unpriced == 0 and bool(by_day),
         "note": "Estimate from the operator's rates, not a provider bill. Unpriced calls are not counted as free: "
                 "set model_prices_per_million / FUND_MODEL_PRICES_JSON for every model in use.",

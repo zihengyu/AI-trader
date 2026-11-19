@@ -265,9 +265,18 @@ def cost_line(costs):
             text += "；核对模型费率 FUND_MODEL_PRICES_JSON 和提供方用量"
         return text
     text = (f"模型费用（估算）：今天 ${costs['today_usd']:.2f}；近 {costs['window_days']} 天 ${costs['window_usd']:.2f}"
-            f"（{costs['days_with_calls']} 个交易日，日均 ${costs['average_per_day_usd']:.2f}）；按此速度一年约 "
-            f"${costs['annual_pace_usd']:.0f}，占净值 {fraction_text(costs['break_even_excess_return'])}"
-            "——AI 每年至少要跑赢基准这么多才能打平模型费用")
+            f"（{costs['days_with_calls']} 个有已定价调用的自然日，日均 ${costs['average_per_day_usd']:.2f}）")
+    if costs.get("average_per_trading_session_usd") is not None:
+        text += (f"。按 {costs['completed_trading_sessions']} 个已完成交易会话摊销，每会话 "
+                 f"${costs['average_per_trading_session_usd']:.2f}；按此速度一年约 "
+                 f"${costs['annual_trading_session_pace_usd']:.0f}，"
+                 f"占净值 {fraction_text(costs['trading_session_break_even_excess_return'])}"
+                 "——按这个费用节奏估算 AI 需要跑赢基准的幅度")
+    elif "completed_trading_sessions" not in costs:
+        text += (f"。按调用日节奏估算一年约 ${costs['annual_pace_usd']:.0f}，"
+                 f"占净值 {fraction_text(costs['break_even_excess_return'])}，用于估算 AI 跑赢基准的打平幅度")
+    else:
+        text += "。观察窗口内尚无已完成交易会话，暂无法摊销"
     if costs.get("unpriced_calls"):
         text += f"（另有 {costs['unpriced_calls']} 次调用没有单价或完整用量，未计入"
         text += f"：{detail}）" if detail else "）"
