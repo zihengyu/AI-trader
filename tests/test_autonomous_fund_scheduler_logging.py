@@ -8,14 +8,16 @@ import pytest
 from scripts.autonomous_fund.runtime_logging import SchedulerLogger, configure_scheduler_logging
 
 
-def test_native_scheduler_continues_after_an_overlapping_job_log_fails(monkeypatch, capsys):
+def test_native_scheduler_reports_overlap_without_calling_the_failing_filter(monkeypatch, capsys):
     from apscheduler.events import EVENT_JOB_MAX_INSTANCES
     from lumibot.strategies.strategy_executor import StrategyExecutor
 
     class FailedDependencyFilter(logging.Filter):
         def filter(self, record):
+            received.append(record)
             raise KeyError("litellm")
 
+    received = []
     logger = logging.getLogger("apscheduler.scheduler")
     monkeypatch.setattr(logger, "filters", [FailedDependencyFilter()])
     monkeypatch.setattr(logger, "level", logging.WARNING)
@@ -41,14 +43,17 @@ def test_native_scheduler_continues_after_an_overlapping_job_log_fails(monkeypat
     try:
         scheduler.start()
         assert started.wait(3)
-        assert skipped.wait(3)  # The warning's exception did not end _process_jobs.
+        assert skipped.wait(3)  # The native scheduler still publishes an overlap event.
         assert scheduler._thread.is_alive()
         release.set()
         assert continued.wait(3)  # A real later iteration is scheduled, not just a heartbeat.
     finally:
         release.set()
         scheduler.shutdown(wait=True)
-    assert "scheduler_logging_error: KeyError" in capsys.readouterr().err
+    output = capsys.readouterr().err
+    assert "FUND scheduler_overlap:" in output
+    assert "synthetic-iteration" not in output and "scheduler_logging_error" not in output
+    assert not received
 
 
 def test_actual_sdk_redaction_failure_withholds_sensitive_record(monkeypatch, capsys):

@@ -297,15 +297,18 @@ sudo -u "<service-user>" bash scripts/run_autonomous_fund.sh resume --run-dir ar
 合并日志只取最后几百行，否则真正的异常可能被报告挤出。
 
 AI 研究超过调度间隔时，`MaxInstancesReachedError` 表示上一轮仍在执行，本应跳过重叠任务。
-已修复的一条实际停机路径是：记录这条警告时，LiteLLM 日志过滤器发生 `KeyError: 'litellm'`，
-异常逃出并终止调度线程，随后监控判定迭代停止。应用现在保留正常日志过滤；过滤器异常时只输出
-`scheduler_logging_error` 和异常类型、隐藏原始记录，并继续调度；不增加并发迭代，不吞掉模型或交易异常。
-该提示同时保留安全的异常位置、原因链和 OS 错误码，便于定位依赖过滤器故障；不会打印原始日志内容、输入值或局部变量。
+记录这条警告时，LiteLLM 日志过滤器曾在惰性导入时抛出 `KeyError`。现在普通重叠只在原始日志中
+记录固定的 `scheduler_overlap`，调度器仍发布原生重叠事件。其他日志按原有过滤器处理。过滤器
+异常时记录 `scheduler_logging_error`、异常类型、安全位置、原因链和 OS 错误码。原始记录、
+输入值和局部变量会被隐藏，调度继续运行。
 `fund-logs.sh errors` 会将结构化回答校验的字段位置及缩进详情保留在同一条异常记录中，避免只看到
 `1 validation error` 而丢失原因。自定义异常名不以 `Error`／`Exception` 结尾或没有消息时，也保留最后的原因行及异常链；
 仅在同一进程的 traceback 内识别这类终行，普通成功日志不因此进入异常摘要。
 AI 调用原生 `notify_user` 使用本账户的持久化队列，队列接受不等于 Telegram 已送达。
 监控收到正常停止／重启的 SIGINT 时也会正常退出，不再把 `KeyboardInterrupt` 当成崩溃堆栈输出。
+数据员收到停止信号后会结束可中断的取数等待，跳过下一项任务和后续分批请求，并在退出时标记
+数据员已停止。已缓存数据会保留，未完成的批次不会更新成功时间。正在进行的单次外部请求仍需返回
+或达到它自己的超时。
 
 宏观摘要的 `macro.enabled` 只控制应用预计算的 FRED 市场摘要，
 不会关闭或替换 LumiBot 原生 FRED 研究工具；直接调用这些工具仍需显式配置 `FRED_API_KEY`。

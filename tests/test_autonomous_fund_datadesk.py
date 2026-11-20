@@ -100,6 +100,31 @@ def test_a_job_with_nothing_to_do_yet_is_neither_a_success_nor_an_error(tmp_path
     assert job["note"].startswith("no account journal yet") and not job.get("error") and not job.get("ok_at")
 
 
+def test_shutdown_interrupts_the_current_batch_and_skips_the_remaining_jobs(tmp_path):
+    from threading import Event
+
+    stop = Event()
+    desk = DataDesk(tmp_path, config(), "local", clock=lambda: NOW, environ={})
+    observed = []
+    desk.due = lambda now: ["intraday", "news"]
+
+    def fetch(symbol):
+        observed.append(symbol)
+        stop.set()
+        return object()
+
+    desk._job_intraday = lambda now: desk._requests(["ALFA", "BRAVO"], fetch)
+    desk._job_news = lambda now: observed.append("news")
+    desk.serve(stop)
+
+    status = DeskStatus(tmp_path)
+    state = status.read()
+    assert observed == ["ALFA"]
+    assert state["stopped_at"] == NOW.isoformat() and state["running"] is None
+    assert state["jobs"]["intraday"]["error"] is None and "ok_at" not in state["jobs"]["intraday"]
+    assert not status.alive(NOW)
+
+
 def test_bars_and_snapshot_fill_the_store_once_and_the_snapshot_is_rewritten_only_on_change(tmp_path):
     from tests.test_autonomous_fund_prefetch import frame
     fetched = []

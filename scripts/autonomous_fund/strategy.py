@@ -1083,7 +1083,7 @@ class AutonomousFund(Strategy):
             for index, probe_model in enumerate(sorted(probed), 1):
                 name = f"model_probe_{index}"
                 self.agents.create(name=name, model=probe_model, output_schema=ModelProbe,
-                                   **{**common, "tools": None, "allow_network": False},
+                                   **{**common, "tools": [], "include_builtin_tools": False, "allow_network": False},
                                    run_timeout_seconds=run_timeouts["critic"], system_prompt=PROBE_PROMPT)
                 self.probe_agents[name] = probe_model
         self.log_message(f"Models: researcher={self.agent_models['researcher']}; manager={self.agent_models['manager']}"

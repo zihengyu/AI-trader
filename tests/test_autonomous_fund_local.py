@@ -443,6 +443,35 @@ def test_manager_timeout_reaches_both_schemas_and_watchdog_budget(tmp_path, monk
         broker._close_connection()
 
 
+def test_live_fund_model_probes_do_not_inherit_builtin_tools(tmp_path, monkeypatch):
+    from lumibot.components.agents import manager
+    from lumibot.components.agents.schemas import AgentRunResult
+    from scripts.autonomous_fund.strategy import AutonomousFund, account_digest
+
+    monkeypatch.setenv("LUMIBOT_CACHE_FOLDER", str(tmp_path / "cache"))
+    monkeypatch.setenv("IS_BACKTESTING", "false")
+    monkeypatch.setattr(manager, "_botspot_research_server_from_environment", lambda: (None, None))
+    clock = Clock()
+    source = YahooRealtimeData(now=clock, fetch=clock.fetch)
+    journal = Journal(tmp_path, account_digest("local", "local-virtual-account"))
+    broker = LocalPaperBroker(source, journal, Limits(), connect_stream=False)
+    strategy = AutonomousFund(broker=broker, name="SyntheticProbeTools", parameters={
+        "config": {"model": "deepseek/synthetic", "limits": {}, "universe": {"ALFA": "stock"}},
+        "run_dir": str(tmp_path), "mode": "local", "account_binding": "local-virtual-account", "live_data": False})
+    try:
+        strategy._executor._initialize()
+        assert strategy.probe_agents
+        for name in strategy.probe_agents:
+            probe = strategy.agents[name]
+            assert not probe._ensure_bound_tools()
+            result = AgentRunResult(summary="{}", model=probe.default_model, events=[])
+            assert not any(warning["kind"] == "no_tool_calls" for warning in probe._derive_warnings(result, {}))
+        for role in ("researcher", "manager"):
+            assert "duckdb_query" in {tool.name for tool in strategy.agents[role]._ensure_bound_tools()}
+    finally:
+        broker._close_connection()
+
+
 def test_local_mode_runs_through_native_strategy_executor_with_scripted_model(tmp_path, monkeypatch):
     from lumibot.traders import Trader
     from scripts.autonomous_fund.run import ScriptedRuntime

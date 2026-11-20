@@ -234,6 +234,8 @@ class DeskStatus:
 
     def alive(self, now=None, state=None):
         state = state if state is not None else self.read()
+        if state and state.get("stopped_at"):
+            return False
         age = self._age((state or {}).get("heartbeat_at"), now or datetime.now(timezone.utc))
         return age is not None and 0 <= age <= ALIVE_SECONDS
 
@@ -470,6 +472,8 @@ def fomc_meetings(html, today, days=CALENDAR_DAYS):
 
 
 class DataDesk:
+    _stop: threading.Event | None = None  # Set by the service. Standalone jobs use normal pacing.
+
     def __init__(self, run_dir, config, mode, *, source=None, environ=None, clock=None, news_get=None,
                  news_yahoo=None, macro_get=None, earnings_get=None, earnings_yahoo=None, sec_get=None,
                  chart=None, calendar_get=None, alpaca_get=None, short_volume_get=None, index_history_get=None,
@@ -593,6 +597,8 @@ class DataDesk:
         """Run every due job once; returns {job: outcome}. One failing job never stops the others."""
         ran = {}
         for name in self.due(now or self.clock()):
+            if self._stop is not None and self._stop.is_set():
+                break
             ran[name] = self.run_job(name)
         return ran
 
@@ -603,6 +609,7 @@ class DataDesk:
         self.heartbeat()
         job = self.state["jobs"].setdefault(name, {})
         try:
+            self._check_stopping()
             outcome = getattr(self, f"_job_{name}")(now)
             failures = 0
             coverage = (outcome or {}).get("coverage") if name == "intraday" else None
@@ -642,6 +649,10 @@ class DataDesk:
 
     def serve(self, stop):
         """Run until `stop` is set; the heartbeat thread keeps the status fresh during long jobs."""
+        self._stop = stop
+        with self._lock:
+            self.state.pop("stopped_at", None)
+
         def beat():
             while not stop.wait(HEARTBEAT_SECONDS):
                 self.heartbeat()
@@ -664,10 +675,14 @@ class DataDesk:
             threading.Thread(target=observer.serve, args=(stop,), name="desk-source-observer", daemon=True).start()
         while not stop.is_set():
             self.tick()
+            if stop.is_set():
+                break
             now = self.clock()
             upcoming = [t for n, t in self.next_run.items() if n != "intraday" and self.enabled(n, now)]
             pause = min([(t - now).total_seconds() for t in upcoming] + [30])  # Also notices the open.
             stop.wait(max(1.0, pause))
+        with self._lock:
+            self.state["stopped_at"] = self.clock().isoformat()
         self.heartbeat()
 
     # ----- jobs -----------------------------------------------------------------------
@@ -680,14 +695,21 @@ class DataDesk:
 
     def _yield_to_trading(self, now):
         """Leave Yahoo to the trading process while its own Yahoo requests are failing."""
+        self._check_stopping()
         until = yahoo_paused_until(self.run_dir, now)
         if until is not None:
             raise Idle(f"Yahoo is failing for the trading process; the desk waits until {until.isoformat()}", retry_at=until)
 
+    def _check_stopping(self):
+        if self._stop is not None and self._stop.is_set():
+            raise Idle("data desk shutdown requested")
+
     def _requests(self, symbols, fetch):
         """Paced reads; three consecutive source failures stop the round."""
         frames, failures = {}, 0
+        pause = self._stop.wait if self._stop is not None else self._sleep
         for index, symbol in enumerate(symbols):
+            self._check_stopping()
             if failures >= MAX_FAILURES_IN_A_ROW:
                 frames[symbol] = RiskError("skipped: Yahoo failed three times in a row this round")
                 continue
@@ -699,7 +721,7 @@ class DataDesk:
             except Exception as exc:
                 frames[symbol], failures = exc, failures + 1
             if index < len(symbols) - 1:
-                self._sleep(YAHOO_PAUSE_SECONDS)
+                pause(YAHOO_PAUSE_SECONDS)
         return frames
 
     def _chart(self, symbol, period, interval, prepost):
@@ -717,6 +739,7 @@ class DataDesk:
 
     def _previous_close(self, symbol, day):
         """(date, close) of the last completed session: the store first, then one daily read per day."""
+        self._check_stopping()
         from .bar_quality import apply, cached_verdict
         rows = self.store.bars(day, symbol, 1)
         if rows:
