@@ -468,8 +468,8 @@ def strategy_research_lines(research, lab=None, *, registration=None):
     registered = {tuple(item) for item in (registration or {}).get("registered", [])}
     if registration is not None:
         lines.append(f"本轮确认登记 {len(registered)} 条策略提案。")
-        if not proposals and research.get("research_direction"):
-            lines.append("本轮提交了研究方向，完整策略申请为 0 条。验证队列按已登记的策略版本运行。")
+        if not proposals and tasks:
+            lines.append("研究任务更新只记录进展。待形式化的策略需提交可执行修订，才会重新检查回测资格。")
     for proposal in proposals[:4]:
         identity = proposal["strategy_id"], proposal["version"]
         if registration is not None and identity not in registered:
@@ -482,15 +482,17 @@ def strategy_research_lines(research, lab=None, *, registration=None):
         lines.append(f"- {label}：{error['strategy_id']} / {error['version']} · {error['error']}")
     failed_tasks = {(error["strategy_id"], error["version"]) for error in (registration or {}).get("errors", [])
                     if error["action"] == "task"}
-    for task in tasks[:8]:
+    for task in tasks:
         if (task["strategy_id"], task["version"]) in failed_tasks:
             continue
         lines.append(f"- 持续研究：{task['strategy_id']} / {task['version']} · {task['action']}")
-        lines.append("  下一步：" + task["next_step"][:200])
+        lines.append("  下一步：" + task["next_step"])
     if candidates:
         lines.append("研究输入时的实验进度：")
         for row in candidates[:8]:
             lines.append(f"- {row['id']} / {row['version']}：{labels.get(row['state'], row['state'])}")
+            if blocker := row.get("backtest_blocker"):
+                lines.append("  回测阻塞：" + blocker)
     budget = (registration.get("budget") if registration is not None else lab.get("budget")) or {}
     if budget.get("monthly_limit_usd") is not None:
         lines.append(f"研究资源本月占用 ${budget.get('monthly_committed_usd', 0):.2f} / "
@@ -795,8 +797,10 @@ def readable(kind, details, sequence=None, *, now=None):
             phase = "休市期间 · 策略验证跟进"
         lines = [f"📊 盘前研究 · {phase}（开盘 {_when(details.get('session_open'))}）", "", details.get("summary") or ""]
         evidence = details.get("evidence") or []
-        if evidence:
-            lines += ["", f"证据 {details.get('evidence_count', len(evidence))} 条："]
+        count = details.get("evidence_count", len(evidence))
+        if evidence or count:
+            preview = f"（本通知展示 {len(evidence)} 条）" if count > len(evidence) else ""
+            lines += ["", f"证据 {count} 条{preview}："]
             lines += [f"• {e.get('source')}（{_when(e.get('available_at') or e.get('observed_at'))}）" for e in evidence]
         ideas = details.get("ideas")
         if ideas:
@@ -804,7 +808,7 @@ def readable(kind, details, sequence=None, *, now=None):
             label = "已登记为预测，之后按收盘价打分" if count is None else f"本轮新登记预测 {count} 条"
             lines += ["", f"投资想法 {len(ideas)} 条（{label}）："]
             lines += [f"• {i.get('symbol')} {DIRECTIONS.get(i.get('direction'), i.get('direction'))}，"
-                      f"{i.get('horizon_sessions')} 个交易日，把握 {_percent(i.get('confidence'))}：{(i.get('thesis') or '')[:120]}"
+                      f"{i.get('horizon_sessions')} 个交易日，把握 {_percent(i.get('confidence'))}：{i.get('thesis') or ''}"
                       for i in ideas]
         elif "ideas" in details:
             lines += ["", "投资想法：今天没有足够把握的机会（允许为空）。"]

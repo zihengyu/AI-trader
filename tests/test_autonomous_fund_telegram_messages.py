@@ -25,6 +25,36 @@ def test_completed_premarket_research_is_announced_with_its_summary(tmp_path):
     assert research["session_open"] == "2026-11-02T14:30:00+00:00" and research["evidence_count"] == 1
 
 
+def test_premarket_attachment_preserves_every_source_and_the_end_of_the_thesis(tmp_path):
+    from .test_autonomous_fund_premarket import harness
+
+    strategy, _ = harness(tmp_path / "runner")
+    original = strategy.agents["researcher"].run
+    thesis = "支持依据和限制。" * 20 + "最后一条限定条件。"
+
+    def research(**kwargs):
+        result = original(**kwargs)
+        body = result.parsed.model_dump()
+        body["summary"] += "详细研究摘要。" * 560
+        source = body["evidence"][0]
+        body["evidence"] = [{**source, "source": f"Research source {i:02} " + "完整数据说明。" * 24}
+                            for i in range(1, 20)]
+        body["ideas"] = [{"symbol": "ALFA", "direction": "outperform", "confidence": 0.6,
+                          "horizon_sessions": 5, "thesis": thesis, "edge_source": "Synthetic evidence",
+                          "invalidation": "No relative return", "evidence_refs": [19]}]
+        result.parsed = type(result.parsed).model_validate(body)
+        result.summary = result.parsed.model_dump_json()
+        return result
+
+    strategy.agents["researcher"].run = research
+    strategy.before_market_opens()
+    [notice] = notices(strategy.journal, "premarket_research")
+    bot = delivered(tmp_path / "monitor", "premarket_research", notice)
+    [(_, _, document)] = bot.documents
+    assert "证据 19 条" in document and document.count("Research source ") == 19
+    assert "Research source 19" in document and thesis in document
+
+
 def live_open(tmp_path, stopped):
     from .test_autonomous_fund_stability import live
     strategy = live(tmp_path)
@@ -85,6 +115,8 @@ def test_premarket_research_reads_as_a_message_not_json(tmp_path):
                       "observed_at": "2026-11-02T13:00:00+00:00"}]})
     [text] = bot.messages
     assert text.startswith("📊 盘前研究") and "科技股财报季前景偏强" in text and "Synthetic filing" in text
+    # Older outbox records may carry only a preview of the saved evidence.
+    assert "证据 2 条（本通知展示 1 条）" in text
     assert "{" not in text and "开盘前" in text
 
 

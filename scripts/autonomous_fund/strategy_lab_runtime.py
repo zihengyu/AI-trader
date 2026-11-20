@@ -18,6 +18,30 @@ HISTORICAL_STATES = ("candidate", "needs_data", "awaiting_new_holdout")
 DAILY_FIELDS = {"open", "high", "low", "close", "volume"}
 
 
+def research_lab_context(lab, now, **selection):
+    """Expose saved formalization blockers without changing validation or version identity."""
+    context = lab.context(now, **selection)
+    for candidate in context["candidates"]:
+        state = candidate["state"]
+        if state not in {"needs_formalization", "needs_adapter"}:
+            continue
+        validation = candidate.get("validation") or {}
+        reason = validation.get("reason") or candidate.get("feasibility_error")
+        proposal = candidate.get("proposal")
+        if not reason and proposal is not None:
+            program = proposal.get("implementation")
+            if state == "needs_adapter" and program:
+                reason = f"Execution adapter {program['adapter']} is not supported by the daily verifier."
+            elif program is None:
+                reason = "The saved version has no executable implementation."
+            elif not program.get("rules"):
+                reason = "The saved implementation has no executable position rules."
+        candidate["backtest_blocker"] = reason or (
+            "Inspect this exact saved version for the implementation or verification gap."
+        )
+    return context
+
+
 def research_cycle(journal, now, lab, mode):
     """Read the prior close and unreviewed validation milestones for scheduled research."""
     now = instant(now)

@@ -196,7 +196,14 @@ RESEARCHER_PROMPT = (
     "Stale or suspect values are labeled; never treat them as current. "
     "Work within a bounded budget: use at most about 20 tool calls, prefer the supplied context and data "
     "over repeated searches, and return the best supported summary with disclosed gaps rather than running out "
-    "of time; an unfinished run returns nothing."
+    "of time; an unfinished run returns nothing. "
+    "For an open Strategy Lab task that needs formalization, inspect the saved version and its backtest_blocker. "
+    "If a saved successor already addresses the blocker, follow up on that version. "
+    "When the mechanism fits the existing adapters and you can specify testable rules, submit a child version "
+    "in strategy_proposals with the parent_version, executable rules and a feasible validation plan. "
+    "A continue task saves progress only. If a revision is not ready, record the exact missing input, rule, "
+    "or unsupported operation and how to resolve it. Check the documented adapter capabilities before claiming "
+    "an adapter is missing. Empty proposals remain valid and old versions stay frozen."
 ) + SQL_RESEARCH_PROMPT + RESEARCH_GUIDANCE
 CRITIC_PROMPT = (
     "You are the devil's advocate for a long-only paper portfolio's research. Argue the strongest honest case "
@@ -1537,7 +1544,8 @@ class AutonomousFund(Strategy):
         if lab is None:
             return None
         try:
-            return lab.context(now, detail_limit=4 if research else 0)
+            from .strategy_lab_runtime import research_lab_context
+            return research_lab_context(lab, now, detail_limit=4 if research else 0)
         except Exception as exc:
             return {"status": "unavailable", "error": type(exc).__name__, "admitted_library": [],
                     "authority": "No strategy permission inferred; existing mandate and execution guards still apply."}
@@ -1547,7 +1555,8 @@ class AutonomousFund(Strategy):
         lab = getattr(self, "strategy_lab", None)
         if lab is None:
             return {"status": "disabled"}
-        return lab.context(self.get_datetime(), strategy_id=strategy_id or None, version=version or None)
+        from .strategy_lab_runtime import research_lab_context
+        return research_lab_context(lab, self.get_datetime(), strategy_id=strategy_id or None, version=version or None)
 
     def _record_strategy_research(self, research, now):
         lab = getattr(self, "strategy_lab", None)
@@ -1689,7 +1698,7 @@ class AutonomousFund(Strategy):
                 "registered_idea_count": len(packet["idea_ids"]),
                 "strategy_research": strategy_research_lines(research, context.get("strategy_lab"), registration=registration),
                 "evidence": [{k: e.get(k) for k in ("source", "available_at", "observed_at")}
-                             for e in research["evidence"][:8]]})
+                             for e in research["evidence"]]})
             self.log_message("Pre-market research saved. Portfolio decisions and orders wait for the regular session.")
         except ResearchBudgetExhausted:
             pass  # The reservation gate already recorded the budget notice.

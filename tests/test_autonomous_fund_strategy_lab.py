@@ -1726,6 +1726,38 @@ def test_research_reporting_uses_saved_evidence_and_accepts_no_new_idea():
     assert "新策略提案" in text and "验证未通过" in text and "不等于策略准入" in text
 
 
+def test_draft_followup_keeps_the_blocker_visible_until_an_executable_revision(tmp_path):
+    from scripts.autonomous_fund.notifications import strategy_research_lines
+    from scripts.autonomous_fund.strategy_lab_runtime import research_lab_context
+
+    engine = lab(tmp_path)
+    original = proposal()
+    draft = {**original, "implementation": None}
+    engine.submit(draft, NOW)
+    next_step = "列出决策时点、数据窗口、进入退出及仓位规则。" * 12 + "明确独立样本要求。"
+    followup = {"strategy_id": draft["strategy_id"], "version": draft["version"],
+                "action": "continue", "findings": "Draft is still missing executable rules", "next_step": next_step}
+    engine.update_task(followup, NOW)
+    snapshot = dataset()
+    assert engine.schedule(snapshot, NOW) == []
+    context = research_lab_context(engine, NOW)
+    [saved] = context["candidates"]
+    assert saved["state"] == "needs_formalization" and "implementation" in saved["backtest_blocker"]
+    notice = "\n".join(strategy_research_lines({"research_direction": "Finish the draft",
+                                               "research_tasks": [followup]}, context,
+                                              registration={"registered": [], "errors": []}))
+    assert "本轮确认登记 0 条策略提案" in notice and "回测阻塞" in notice
+    assert saved["backtest_blocker"] in notice and next_step in notice
+
+    later = NOW + timedelta(minutes=1)
+    revised = {**original, "version": "v2", "parent_version": draft["version"], "change_type": "revision"}
+    engine.submit(revised, later)
+    assert len(engine.schedule(snapshot, later)) == 1
+    with engine.journal.connection() as db:
+        assert [tuple(row) for row in db.execute("SELECT version,kind FROM fund_strategy_jobs")] == [("v2", "historical")]
+    assert engine.context(NOW)["candidates"][0]["state"] == "needs_formalization"
+
+
 def test_researcher_handoff_registers_a_strategy_without_a_manager_or_order_call(tmp_path):
     from scripts.autonomous_fund.strategy import Research
     from tests.test_autonomous_fund_premarket import harness

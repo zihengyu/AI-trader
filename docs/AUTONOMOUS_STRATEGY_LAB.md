@@ -85,6 +85,15 @@ across restarts and through the read-only `strategy_research` tool. Default agen
 context includes a bounded set of detailed proposals; older versions are
 retrievable without including every artifact in every paid prompt.
 
+The research context and notifications show saved backtest blockers for versions
+awaiting formalization or an adapter. A `continue` update records progress
+against the existing version. If the existing adapters can express the strategy,
+the Researcher can submit a revision with the saved parent, executable position
+rules and feasible validation windows. Follow an existing revision if it already
+addresses the gap. If the revision is still blocked, record the specific missing
+input, rule or operation. A submitted revision goes through the same independent
+validation as any other candidate.
+
 ## Executable daily research
 
 An implementation contains independent position rules with Boolean `entry` and
@@ -579,6 +588,11 @@ python -m scripts.autonomous_fund.lab check-data --run-dir artifacts/fund-local 
 The check shows missing symbols, receipt gaps and benchmark session coverage.
 Lab status shows the recorded feasibility reason for proposals awaiting
 formalization or an adapter, including the case where no rules were submitted.
+New premarket notifications include every saved evidence entry and the complete
+idea thesis and research task next step. Long Telegram notifications arrive as
+text attachments. Older notices that stored only a preview show the saved total
+and the number of entries displayed. The latest complete research is exported to
+`premarket_research.json` in the account run directory.
 Daily incremental snapshots can omit data that was already frozen in the book.
 Lab status shows the next opening deadline, current versions awaiting timestamped
 signals, queued forward jobs and the remaining daily job slots. Versions that
