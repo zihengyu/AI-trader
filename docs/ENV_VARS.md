@@ -48,7 +48,8 @@ This page documents environment variables used by LumiBot, with an emphasis on *
 - Implemented in `scripts/autonomous_fund/settings.py`; the template/registry consistency is enforced by `tests/test_autonomous_fund_settings.py`.
 
 ### Schwab variables in the autonomous paper fund
-- `SCHWAB_ACCOUNT_NUMBER`, `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`, `SCHWAB_BACKEND_CALLBACK_URL`, `SCHWAB_TOKEN`, `SCHWAB_TOKEN_PATH` keep the native LumiBot Schwab meanings (see `docsrc/brokers.schwab.rst`). The application uses them only for the read-only `schwab-check`, whose broker instance has every order method disabled; there is no live execution entry. Without `SCHWAB_APP_KEY` the native default app and its BotSpot OAuth callback are used; without `SCHWAB_APP_SECRET` the refresh token must be renewed by browser login about weekly.
+- `SCHWAB_ACCOUNT_NUMBER`, `SCHWAB_APP_KEY`, `SCHWAB_APP_SECRET`, `SCHWAB_BACKEND_CALLBACK_URL`, `SCHWAB_TOKEN`, and `SCHWAB_TOKEN_PATH` keep the native LumiBot Schwab meanings (see `docsrc/brokers.schwab.rst`). The local data desk uses the app key, app secret and an existing authorized token file for market data only. `schwab-check` is an independent account check with order methods disabled. There is no live execution entry.
+- `TWELVE_DATA_API_KEY` optionally enables the local data desk's regular-session minute-bar research reference. It is sampled with a single symbol per round and does not support execution quotes.
 - With `FUND_ALLOW_EXTERNAL_HOLDINGS=true`, all positions present at the first mandate start (including money-market funds) become the operator's frozen holdings, and operator-held symbols are removed from the AI's tradable universe.
 
 ### `FUND_SEC_USER_AGENT`

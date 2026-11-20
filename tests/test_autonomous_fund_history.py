@@ -2,7 +2,7 @@
 
 A fake HTTP client and synthetic bars only; no network or credentials.
 """
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pandas as pd
@@ -48,6 +48,29 @@ def test_no_bars_is_an_error_not_an_empty_history():
         history.bars("ALFA", 10, date(2026, 11, 2))
     with pytest.raises(RiskError):
         AlpacaDailyHistory("", "s")
+
+
+def test_basic_sip_waits_for_the_completed_session_without_sticky_iex():
+    now = datetime(2026, 11, 27, 18, 5, tzinfo=timezone.utc)  # NYSE half day closes at 18:00Z.
+    attempts = []
+
+    def get(url, *, params, **kwargs):
+        attempts.append((url, params["feed"], datetime.fromisoformat(params["end"])))
+        if "/ALFA/" in url and params["feed"] == "sip":
+            return response([], status=403)
+        return response([bar("2026-11-27", 110)])
+
+    history = AlpacaDailyHistory("key", "secret", get=get, clock=lambda: now)
+    cutoff = date(2026, 11, 28)
+    with pytest.raises(RiskError, match="SIP delay window"):
+        history.bars("ALFA", 10, cutoff)
+    assert not attempts
+    now += timedelta(minutes=15)
+    history.bars("ALFA", 10, cutoff)
+    assert history.feed == "iex"
+    assert history.bars("BETA", 10, cutoff)[0][0] == date(2026, 11, 27)
+    assert history.feed == "sip" and [feed for _, feed, _ in attempts] == ["sip", "iex", "sip"]
+    assert all(end == now - timedelta(minutes=16) for _, _, end in attempts)
 
 
 def test_strategy_uses_the_fallback_only_when_yahoo_fails_and_records_it(tmp_path):

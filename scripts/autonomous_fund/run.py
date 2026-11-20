@@ -485,9 +485,11 @@ def main(argv=None):
     if args.mode == "sources":
         from .market_observation import observation_lines
         from .settings import alpaca_keys
+        from .schwab import market_credentials
 
         try:
-            lines = observation_lines(args.run_dir, args.session_date, configured=all(alpaca_keys(os.environ)))
+            lines = observation_lines(args.run_dir, args.session_date, configured=(all(alpaca_keys(os.environ)) or
+                all(market_credentials(os.environ)) or bool(os.environ.get("TWELVE_DATA_API_KEY", "").strip())))
         except ValueError:
             parser.error("sources --session-date requires a valid New York date YYYY-MM-DD")
         print("\n".join(lines))

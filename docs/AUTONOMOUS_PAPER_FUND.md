@@ -109,7 +109,8 @@ Python 模块同样可跨平台运行：`python -m scripts.autonomous_fund.run -
 | 外部 | `FUND_SHADOW_AB`、`FUND_FACTOR_LAB` | 影子 A/B 验证 AI 的复盘学习；因子实验室（AI 提出因子、代码客观检验） |
 | Alpaca | `ALPACA_API_KEY`、`ALPACA_API_SECRET` | paper 必填 Paper 凭证；local 选填一整对，用于日线核对及备用行情 |
 | 模拟标识 | `ALPACA_IS_PAPER` | 仅 paper 读取，默认 `true` |
-| Schwab | `SCHWAB_ACCOUNT_NUMBER`、`SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL`、`SCHWAB_TOKEN`、`SCHWAB_TOKEN_PATH` | 仅用于只读体检 `schwab-check`（见“Schwab 实盘准备”） |
+| Schwab | `SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET`、`SCHWAB_TOKEN_PATH` 等 | `local` 数据员可用这三项采样只读行情；`schwab-check` 是独立账户体检 |
+| Twelve Data | `TWELVE_DATA_API_KEY` | 可选。为 `local` 盘中研究提供轮换采样的已完成分钟线 |
 
 投资范围的新增、行业分组和其余细节参数仍在 `config.json` 中修改（新增证券需要审阅分类）。
 查看最终生效的配置及每项来源（密钥只显示已设置／缺失）：

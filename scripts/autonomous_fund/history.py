@@ -10,7 +10,7 @@ dividends and splits from its own feed. The consolidated (SIP) feed is asked
 first; an account without it falls back to IEX bars, and the source is recorded.
 """
 import math
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from .risk import RiskError, instant, number
@@ -68,12 +68,13 @@ def _spin_off(action):
 class AlpacaDailyHistory:
     adjustment = PRICE_ADJUSTMENT
 
-    def __init__(self, key, secret, get=None):
+    def __init__(self, key, secret, get=None, *, clock=None):
         import requests
         if not key or not secret:
             raise RiskError("Alpaca history needs ALPACA_API_KEY and ALPACA_API_SECRET")
         self.headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": secret}
         self.get = get or requests.get
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.feed = "sip"
 
     def iex_snapshots(self, symbols):
@@ -126,16 +127,30 @@ class AlpacaDailyHistory:
 
     def bars(self, symbol, length, today):
         """[(date, close, volume, open, high, low)] for completed sessions before `today`, oldest first."""
+        from .session_calendar import _session_close, completed_daily_cutoff
+
         today = today if isinstance(today, date) else date.fromisoformat(str(today)[:10])
-        params = {"timeframe": "1Day", "adjustment": self.adjustment, "limit": 10000, "feed": self.feed,
+        # A post-close caller can request through the next calendar day, but Basic SIP
+        # rejects a recent/future `end`. Never cache a partial session under that cutoff.
+        now = instant(self.clock())
+        if today > now.astimezone(ZONE).date() + timedelta(days=1):
+            raise NoDailyBars("The requested daily cutoff is in the future")
+        safe_end = now - timedelta(minutes=16)
+        day, mature = today - timedelta(days=1), completed_daily_cutoff(safe_end)
+        while day >= mature:
+            if _session_close(day) is not None:
+                raise NoDailyBars("The requested daily cutoff is still inside the SIP delay window")
+            day -= timedelta(days=1)
+        end = min(datetime.combine(today, time.min, ZONE), safe_end)
+        params = {"timeframe": "1Day", "adjustment": self.adjustment, "limit": 10000, "feed": "sip",
                   "start": (today - timedelta(days=int(length * 1.5) + 10)).isoformat(),
-                  # Include the whole last eligible session, rather than stopping at UTC midnight.
-                  "end": datetime.combine(today, time.min, ZONE).isoformat()}
+                  "end": end.isoformat()}
         try:
             raw = self._pages(symbol, params)
         except PermissionError:
-            self.feed = params["feed"] = "iex"  # This account has no consolidated feed.
+            params["feed"] = "iex"  # A refusal for one request does not downgrade later requests.
             raw = self._pages(symbol, params)
+        self.feed = params["feed"]
         rows = []
         for bar in raw:
             # Source timestamps must identify a real instant. Interpreting a

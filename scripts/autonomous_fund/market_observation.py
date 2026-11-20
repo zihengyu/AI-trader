@@ -7,6 +7,7 @@ from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from .datastore import DailyStore
 from .risk import MarketDataUnavailable, ObservedPrice, instant, number, trading_day
 from .session_calendar import _session_bounds
 from .status import RUNNER_FRESH_SECONDS, _read
@@ -16,6 +17,7 @@ LOG = logging.getLogger(__name__)
 INTERVAL_SECONDS = 60
 PHASES = ("opening", "intraday", "closing", "after_close")
 PHASE_NAMES = dict(zip(PHASES, ("开盘", "盘中", "收盘前", "收盘后")))
+REFERENCE_DATASET = "source_reference"
 
 
 def _folder(root):
@@ -147,6 +149,63 @@ def _yahoo_row(market, symbol, clock, opened, closed, limits):
     return {"quote": quote_row, "minute": minute_row}
 
 
+def _broker_midpoint(quote, now, opened, closed, limits):
+    """Both sides need their own clock. Quote.timestamp may be receipt time."""
+    if quote is None or quote.bid_time is None or quote.ask_time is None:
+        return {"status": "missing"}
+    try:
+        bid, ask = number(quote.bid), number(quote.ask)
+        bid_at, ask_at = instant(quote.bid_time), instant(quote.ask_time)
+    except (TypeError, ValueError, OverflowError):
+        return {"status": "invalid"}
+    if not 0 < bid <= ask:
+        return {"status": "invalid"}
+    if max(bid_at, ask_at) > now:
+        return {"status": "future"}
+    if max(bid_at, ask_at) > closed:
+        return {"status": "outside_session"}
+    row = _quote((bid + ask) / 2, min(bid_at, ask_at), now, opened, closed, limits,
+                 kind="bid_ask_midpoint", received_at=now)
+    return {**row, "bid": str(bid), "ask": str(ask), "bid_as_of": bid_at.isoformat(), "ask_as_of": ask_at.isoformat()}
+
+
+def research_reference(store, now, limits):
+    """Read the latest independently observed mark, checking its age again at use."""
+    if store is None:
+        return None
+    now = instant(now)
+    day = trading_day(now)
+    opened, closed = _session_bounds(day)
+    if opened is None or not opened <= now < closed:
+        return None
+    saved = store.get(day, REFERENCE_DATASET)
+    if not isinstance(saved, dict) or not isinstance(saved.get("symbols"), dict):
+        return None
+    try:
+        if not opened <= instant(saved.get("as_of")) <= now:
+            return None
+    except (TypeError, ValueError):
+        return None
+    quotes = {}
+    for symbol, readings in saved["symbols"].items():
+        if not isinstance(readings, dict):
+            continue
+        for source in ("schwab", "twelve_data"):
+            row = readings.get(source)
+            if not isinstance(row, dict) or row.get("status") != "valid":
+                continue
+            try:
+                stamp, received = instant(row.get("source_as_of")), instant(row.get("received_at"))
+            except (TypeError, ValueError):
+                continue
+            age = (now - stamp).total_seconds()
+            if opened <= stamp <= received <= now and age <= limits.quote_max_seconds:
+                quotes[symbol] = {**row, "source": source, "age_seconds": age}
+                break
+    return {"as_of": saved["as_of"], "symbols": quotes, "requests": saved.get("requests", {}),
+            "usage": "Research reference only. A Twelve Data close is a completed candle, not a bid, ask or last trade."}
+
+
 def _differences(alpaca, yahoo):
     a, y = alpaca["trade"], yahoo["quote"]
     result = {}
@@ -166,14 +225,18 @@ def _failure(exc):
 
 
 class SourceObserver:
-    def __init__(self, root, alpaca, references, limits, clock):
+    def __init__(self, root, alpaca, references, limits, clock, *, schwab=None, twelve_data=None):
         self.root, self.alpaca, self.references, self.limits, self.clock = Path(root), alpaca, references, limits, clock
+        self.schwab, self.twelve_data = schwab, twelve_data
+        self.store = DailyStore(self.root / "cache" / "daily")
         self._action_slot = None
-        self._next_request = None
+        self._next_request = {}
+        self._twelve_index = 0
 
-    def _request(self, fetch, now):
-        if self._next_request is not None and now < self._next_request:
-            return None, {"status": "rate_limit_cooldown", "retry_at": self._next_request.isoformat()}
+    def _request(self, fetch, now, *, source="alpaca"):
+        retry_at = self._next_request.get(source)
+        if retry_at is not None and now < retry_at:
+            return None, {"status": "rate_limit_cooldown", "retry_at": retry_at.isoformat()}
         try:
             return fetch(), {"status": "ok"}
         except Exception as exc:
@@ -187,7 +250,7 @@ class SourceObserver:
                                    at + timedelta(seconds=int(headers.get("Retry-After", 0))))
                 except (OSError, TypeError, ValueError, OverflowError):
                     pass
-                self._next_request = retry_at
+                self._next_request[source] = retry_at
                 error["retry_at"] = retry_at.isoformat()
             return None, error
 
@@ -202,7 +265,8 @@ class SourceObserver:
         if not symbols:
             return None
 
-        snapshots, request = self._request(lambda: self.alpaca.iex_snapshots(symbols), now)
+        snapshots, request = (self._request(lambda: self.alpaca.iex_snapshots(symbols), now) if self.alpaca else
+                              (None, {"status": "not_configured"}))
         observed = instant(self.clock())
         beat = _read(self.root / "status.json") or {}
         try:
@@ -226,7 +290,7 @@ class SourceObserver:
                   "feed": "iex", "alpaca_request": request, "yahoo_runner_fresh": runner_fresh,
                   "yahoo_failures": yahoo_failures, "symbols": records}
 
-        if phase == "after_close":
+        if self.alpaca and phase == "after_close":
             pending = [symbol for symbol in symbols if records[symbol]["alpaca"]["minute"]["status"] != "valid"]
             if pending:
                 minutes, status = self._request(lambda: self.alpaca.iex_final_minutes(pending, closed), observed)
@@ -239,8 +303,11 @@ class SourceObserver:
         for readings in records.values():
             readings["differences"] = _differences(readings["alpaca"], readings["yahoo"])
 
+        if phase != "after_close" and (self.schwab or self.twelve_data):
+            self._independent_references(record, symbols, opened, closed)
+
         slot = day, phase, now.hour, tuple(symbols)
-        if slot != self._action_slot:
+        if self.alpaca and slot != self._action_slot:
             end = date.fromisoformat(day)
             start = end - timedelta(days=35)
             actions, status = self._request(lambda: self.alpaca.corporate_actions(symbols, start, end), instant(self.clock()))
@@ -256,6 +323,50 @@ class SourceObserver:
         with (folder / f"{day}.jsonl").open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, ensure_ascii=False, allow_nan=False, separators=(",", ":")) + "\n")
         return record
+
+    def _independent_references(self, record, symbols, opened, closed):
+        requests, readings = {}, {symbol: {} for symbol in symbols}
+        if self.schwab:
+            quotes, requests["schwab"] = self._request(lambda: self.schwab.quotes(symbols), instant(self.clock()),
+                                                       source="schwab")
+            checked_at = instant(self.clock())
+            for symbol in symbols:
+                mark = ({"status": requests["schwab"]["status"]} if quotes is None else
+                        _broker_midpoint(quotes.get(symbol), checked_at, opened, closed, self.limits))
+                records = record["symbols"][symbol]
+                readings[symbol]["schwab"] = records["schwab"] = mark
+                iex = records["alpaca"]["quote"]
+                if mark["status"] == iex["status"] == "valid":
+                    skew = (instant(mark["source_as_of"]) - instant(iex["source_as_of"])).total_seconds()
+                    records["differences"]["schwab_iex_midpoint_skew_seconds"] = skew
+                    if abs(skew) <= 5:
+                        records["differences"]["schwab_iex_midpoint_bps"] = float(
+                            (number(mark["price"]) / number(iex["price"]) - 1) * 10000)
+        if self.twelve_data:
+            # One symbol per round keeps a regular session inside the Basic plan's daily quota.
+            missing = [symbol for symbol in symbols if readings[symbol].get("schwab", {}).get("status") != "valid"]
+            pool = missing or symbols
+            symbol = pool[self._twelve_index % len(pool)]
+            self._twelve_index += 1
+            bars, requests["twelve_data"] = self._request(lambda: self.twelve_data.minutes(symbol),
+                                                           instant(self.clock()), source="twelve_data")
+            checked_at = instant(self.clock())
+            mark = {"status": requests["twelve_data"]["status"] if bars is None else "missing"}
+            for bar in bars or []:
+                minute = _minute(bar, checked_at, opened, closed, self.limits)
+                if minute["status"] == "forming_or_future":
+                    continue
+                mark = {"status": minute["status"]}
+                if "close" in minute:
+                    mark.update(kind="completed_minute_close", price=minute["close"], source_as_of=minute["end"],
+                                received_at=checked_at.isoformat(), age_seconds=minute["age_seconds"])
+                    if minute["status"] == "valid" and number(minute["volume"]) <= 0:
+                        mark["status"] = "zero_volume"
+                break
+            readings[symbol]["twelve_data"] = record["symbols"][symbol]["twelve_data"] = mark
+        record["reference_requests"] = requests
+        self.store.put(record["session"], REFERENCE_DATASET, {"as_of": instant(self.clock()).isoformat(),
+                       "requests": requests, "symbols": {symbol: items for symbol, items in readings.items() if items}})
 
     def serve(self, stop):
         while not stop.is_set():
@@ -273,7 +384,8 @@ def observation_lines(root, selected_day=None, *, configured=False):
     sessions, totals, deltas, limits = defaultdict(set), defaultdict(Counter), defaultdict(list), Counter()
     during_yahoo_minute_errors = defaultdict(Counter)
     actions, invalid, rows = {}, 0, 0
-    output = ["行情双源观察（只读）｜Alpaca IEX 与 Yahoo 本地运行观测"]
+    output = ["行情来源观察（只读）｜Yahoo、Alpaca IEX 与已配置的独立参考"]
+    reference_requests = defaultdict(Counter)
     for path in sorted(folder.glob(f"{selected_day or '????-??-??'}.jsonl")):
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -288,12 +400,17 @@ def observation_lines(root, selected_day=None, *, configured=False):
                         for feed in ("alpaca", "yahoo"):
                             for kind in ("quote", "minute"):
                                 totals[symbol, phase, feed, kind][feeds[feed][kind]["status"]] += 1
+                        for feed, kind in (("schwab", "quote"), ("twelve_data", "minute")):
+                            if feed in feeds:
+                                totals[symbol, phase, feed, kind][feeds[feed]["status"]] += 1
                         if symbol in failed_minutes:
                             for kind in ("quote", "minute"):
                                 during_yahoo_minute_errors[symbol, phase, kind][feeds["alpaca"][kind]["status"]] += 1
                         for kind, difference in feeds["differences"].items():
                             deltas[symbol, phase, kind].append(difference)
                     sessions[session].add(phase)
+                    for feed, request in record.get("reference_requests", {}).items():
+                        reference_requests[feed][request["status"]] += 1
                     if record["alpaca_request"]["status"] == "rate_limited":
                         limits["alpaca"] += 1
                     if record.get("alpaca_closing_request", {}).get("status") == "rate_limited":
@@ -316,7 +433,7 @@ def observation_lines(root, selected_day=None, *, configured=False):
                 except (KeyError, TypeError, ValueError):
                     invalid += 1
     if not rows:
-        output.append("暂无观测。" if configured else "暂无观测，未检测到完整的 Alpaca 行情凭据。")
+        output.append("暂无观测。" if configured else "暂无观测，未检测到完整的行情对照凭据。")
         return output
     full = sum(set(PHASES[:3]) <= stages for stages in sessions.values())
     output.append(f"已记录 {len(sessions)} 个纽约交易日、{rows} 轮。有开盘、盘中、收盘前样本的交易日 {full} 个。")
@@ -325,6 +442,8 @@ def observation_lines(root, selected_day=None, *, configured=False):
                   f"Yahoo 有限流证据 {limits['yahoo']} 轮。")
     if invalid:
         output.append(f"有 {invalid} 条记录无法读取。")
+    for provider, counts in sorted(reference_requests.items()):
+        output.append(f"  {provider} 请求 " + "，".join(f"{state} {count}" for state, count in sorted(counts.items())))
     for (symbol, phase, feed, kind), counts in sorted(totals.items()):
         n = sum(counts.values())
         output.append(f"  {symbol} {PHASE_NAMES[phase]} {feed} {'报价' if kind == 'quote' else '分钟线'} "
@@ -333,7 +452,13 @@ def observation_lines(root, selected_day=None, *, configured=False):
         output.append(f"  {symbol} {PHASE_NAMES[phase]} Yahoo 分钟线报错期间，"
                       f"Alpaca {'报价' if kind == 'quote' else '分钟线'}有效 {counts['valid']}/{sum(counts.values())}")
     for (symbol, phase, kind), values in sorted(deltas.items()):
-        if kind == "last_trade_skew_seconds":
+        if kind == "schwab_iex_midpoint_skew_seconds":
+            output.append(f"  {symbol} {PHASE_NAMES[phase]} 买卖中点源时间差（Schwab 减 Alpaca IEX）"
+                          f" {min(values):+.1f} 至 {max(values):+.1f} 秒，配对 {len(values)} 次")
+        elif kind == "schwab_iex_midpoint_bps":
+            output.append(f"  {symbol} {PHASE_NAMES[phase]} 买卖中点差（Schwab／Alpaca IEX，源时间差 ≤ 5 秒）"
+                          f" {min(values):+.2f} 至 {max(values):+.2f} 基点，配对 {len(values)} 次")
+        elif kind == "last_trade_skew_seconds":
             output.append(f"  {symbol} {PHASE_NAMES[phase]} 最新成交源时间差（Alpaca 减 Yahoo）"
                           f" {min(values):+.1f} 至 {max(values):+.1f} 秒，配对 {len(values)} 次")
         elif kind.endswith("_bps"):

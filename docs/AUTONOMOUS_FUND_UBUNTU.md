@@ -13,7 +13,7 @@
 应用继续复用 LumiBot 原生框架，入口在 `scripts/autonomous_fund/`。默认研究用 DeepSeek Flash，
 投资决策和复盘用 DeepSeek V4 Pro；只有结构化目标组合能进入独立 Python 风控。
 `local` 是真实公开市场行情＋本地虚拟账户；`paper` 才是 Alpaca Paper 券商账户。
-两者都没有真实资金入口。Schwab 仍只准备说明，不能通过 `.env` 启用。
+两者都没有真实资金入口。`local` 可以给数据员配置 Schwab 只读行情。
 
 以下命令中的 `<repo>`、`<service-user>` 必须替换成自己的 Linux 目录和已有的专用非 root 用户。
 示例使用 Ubuntu 24.04 的 Python 3.12；实际 Linux 依赖安装、systemd 启停、重启及网络验收须在目标主机完成。
@@ -32,7 +32,7 @@
 | `bash scripts/fund-logs.sh` | 维护：默认显示运行概况（服务、交易／停止原因、监控、数据员各类数据的更新时间、账户、待审批、周报状态、日内交易次数、最近通知）；`logs` 三个服务的实时日志，`errors` 最近 24 小时内最后 80 条警告／错误记录（保留完整 traceback），`report` 账户报告，`approvals` 待审批；`decisions [YYYY-MM-DD]` 按纽约日期核对每次复核、订单、成交及调仓通知；`weekly` 打印本周到目前为止的周报（不发送）；`experiments` 实验登记表（生效、影子观察、未通过、退役及状态变化）；`prune` 预览可清理的旧资讯、追踪文件和导出归档（`--apply` 执行，每日备份后也会自动执行） |
 | `bash scripts/fund-capital.sh` | **加钱／取钱（申购／赎回）**：`subscribe 10000` 加 1 万美元，`redeem 5000` 取 5000 美元，`cancel <编号>` 取消等待中的请求，不带参数查看份额、单位净值和等待中的请求。本地虚拟账户和 Alpaca 模拟盘使用同一套命令。基金在交易时段按单位净值确认，申赎金额不计入收益。详见 `AUTONOMOUS_PAPER_FUND.md` 的“申购与赎回” |
 | `bash scripts/fund-logs.sh economics` | **只读经济对照**：新方案与维持旧目标的 1／5／20 日价格方案、估算交易摩擦、已准确关联的决策链费用和非重叠样本数；另列期初贝塔对照，保留固定基准。不新增模型调用或下载。缺少证据显示未知，不是实际成交收益或触发当日日内盈亏；周报也会显示截止时点的全历史评估。详见 `AUTONOMOUS_PAPER_FUND.md` 的“新旧目标的经济对照” |
-| `bash scripts/fund-logs.sh sources [YYYY-MM-DD]` | **只读行情双源观察**。按纽约交易日汇总 Alpaca IEX、Yahoo 的有效样本、限流、价差和公司行动留证。local 模式复用现有 Alpaca 行情凭据，在数据员服务内自动采样。盘中决策和模拟撮合仍走既有行情路径 |
+| `bash scripts/fund-logs.sh sources [YYYY-MM-DD]` | **只读行情观察**。按纽约交易日汇总 Yahoo、Alpaca IEX 和已配置的 Schwab / Twelve Data 的有效样本、请求状态、可比价差及公司行动留证 |
 | `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止三个服务；`--disable` 同时取消开机自启 |
 
 第一次运行 `fund-start.sh` 时如果还没有 `.env`，脚本会从模板创建一份并提示填写 Key 后再运行。
@@ -83,7 +83,7 @@ bash scripts/fund-rehearse.sh
 |---|---|---|
 | 资讯 | Yahoo 个股新闻、SEC 8-K 公告、美联储发布、自定义 RSS，以及 AI 设定的 `news_watch` 搜索词，写进账本的资讯表；跟踪的标的包括持仓、最新目标和价格提醒 | 开盘时每 `FUND_NEWS_POLL_SECONDS`（默认 5 分钟），休市时每 20 分钟 |
 | 盘中行情 | 可交易标的、大盘基准、持仓和价格告警的已完成一分钟行情、覆盖率及有效样本的涨跌家数 | 开盘时按 `FUND_DESK_INTRADAY_SECONDS`（默认 5 分钟）及标的数量安排整轮更新，必要时先补查关键标的 |
-| 盘中双源观察 | Alpaca IEX 报价与分钟线，配对已有 Yahoo 观测，并独立收集公司行动证据 | 约每分钟采样，从开盘持续到收盘后 5 分钟。查看 `fund-logs.sh sources` |
+| 盘中多源观察 | Alpaca IEX 报价和分钟线、Yahoo 运行观测、Schwab 买卖盘中点和可选的 Twelve Data 已完成分钟线 | 约每分钟采样。Schwab/Twelve Data 仅在常规盘中采样，Alpaca 收盘样本持续到收盘后 5 分钟。查看 `fund-logs.sh sources` |
 | 盘前行情 | 每个可交易标的和 SPY/QQQ/IWM/DIA 的盘前成交：最新价、相对昨收的涨跌、盘前成交量、领涨领跌 | 交易日美东 04:00 到开盘，每 15 分钟 |
 | 全球市场 | 标普、纳指、罗素股指期货，VIX，10 年期美债收益率，美元指数，欧元、日元，原油、黄金，日经、恒生、欧洲斯托克 50 | 工作日休市时每 15 分钟、盘中每 30 分钟、周末每 4 小时 |
 | 经济日历 | 未来三周主要经济数据排期（FRED，需要 `FRED_API_KEY`），FOMC 决议排期来自美联储。零售销售和工业产出另核对发布机关的当日结果 | 排期每 6 小时，两项支持的结果到时检查，待确认时约每 5 分钟重试 |
@@ -189,7 +189,20 @@ paper 会检查必需的 Paper 账户凭证。local 只填一项 Alpaca 凭证�
 有分歧的交易日剔除，严重不一致的证券当天停用，收盘后发一条“日线数据交叉核对”通知（见 `docs/AUTONOMOUS_FUND_DATA_SOURCES.md`）。
 备用及对照日线统一请求拆股与分拆复权，排除现金分红复权；旧判定自动重算，不需清缓存。
 公司行动核对覆盖请求及缓存历史，分拆派股比例单列为证据，不自动改账。通知中的历史价差不是当日跌幅，待核对也不等于错账。
-**建议 local 模式也配上免费的 Alpaca Paper Key**，这是目前唯一的免费数据核对手段。
+**建议 local 模式也配上 Alpaca Paper Key**，盘中按 IEX 单市场核验，日线优先请求历史 SIP。刚收盘的 SIP 日线留出 16 分钟，之后只请求已经可读的日期范围；若请求被拒绝而使用 IEX，会记录实际来源。
+
+嘉信只读行情使用 `SCHWAB_APP_KEY`、`SCHWAB_APP_SECRET` 和已授权的
+`SCHWAB_TOKEN_PATH`。在开发者门户添加 **Market Data Production**；只取行情时
+订单限额填 `0`，本地 OAuth 可用 `https://127.0.0.1:8182`，授权使用同一个回调地址。
+用 `schwab-py` 的授权流程生成令牌，令牌文件应由数据员服务用户私有持有并允许续期，
+不要与其他会刷新令牌的进程共用同一个文件。无浏览器服务器可以使用该 SDK 的手动授权方式。
+`SCHWAB_ACCOUNT_NUMBER` 仅用于单独的账户体检。
+
+`TWELVE_DATA_API_KEY` 可选。数据员每轮采样一只跟踪标的的已完成分钟线，优先轮采缺少合格 Schwab 报价的标的。
+研究员可用 `desk_latest("source_reference")` 查看最新研究参考价。同一标的优先使用
+时间合格的 Schwab 买卖中点；该轮有合格的 Twelve Data 分钟线时可补该标的的缺口。
+两者均按源时间判定新鲜度。备用分钟收盘价没有买卖盘含义，模拟撮合仍按原有成交数据验证。
+`fund-logs.sh sources` 显示配对时钟和中点差，适合在调整运行行情路径前核对样本质量。
 
 `prepare` 只生成 `artifacts/fund-systemd/` 中的交易、监控、数据员三个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`

@@ -1537,6 +1537,13 @@ variables (``SCHWAB_ACCOUNT_NUMBER``, ``SCHWAB_APP_KEY``, ``SCHWAB_APP_SECRET``,
 settled cash, margin, holdings, open orders and the capital-sleeve preview; the
 application has no live execution entry.
 
+The ``local`` data desk optionally reads Schwab quotes with ``SCHWAB_APP_KEY``,
+``SCHWAB_APP_SECRET``, and an authorized ``SCHWAB_TOKEN_PATH``. There is no
+account-number requirement for market data. ``TWELVE_DATA_API_KEY`` optionally
+adds a Twelve Data completed-minute research reference. It samples one symbol
+per round during the regular US equity session. These references are visible
+through ``desk_latest("source_reference")`` and do not drive simulated fills.
+
 Operators may approve plan requests by replying ``同意`` or ``拒绝`` in Telegram
 (to the alert, with its six-character code, or as plain text when exactly one
 request is pending). Only the configured chat counts; a private chat's owner is

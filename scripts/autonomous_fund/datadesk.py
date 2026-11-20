@@ -658,20 +658,26 @@ class DataDesk:
                 self.heartbeat()
         threading.Thread(target=beat, name="desk-heartbeat", daemon=True).start()
         from .settings import alpaca_keys
+        from .schwab import SchwabMarketQuotes, market_credentials
         keys = alpaca_keys(self.environ)
-        if self.mode == "local" and all(keys):
+        schwab = market_credentials(self.environ)
+        twelve_key = str(self.environ.get("TWELVE_DATA_API_KEY") or "").strip()
+        if self.mode == "local" and (all(keys) or all(schwab) or twelve_key):
             from .history import AlpacaDailyHistory
             from .market_observation import SourceObserver
             from .risk import Limits
+            from .twelve_data import TwelveDataMinutes
 
             # Keep observation independent of the bulk desk jobs and the
             # trading process, including when the desk is yielding to Yahoo.
-            alpaca = AlpacaDailyHistory(*keys, get=self._gets["alpaca"])
+            alpaca = AlpacaDailyHistory(*keys, get=self._gets["alpaca"]) if all(keys) else None
             symbols = {self.quant.stress_benchmark}
             sweep = self.config.get("cash_sweep") or {}
             if sweep.get("enabled") and sweep.get("symbol"):
                 symbols.add(sweep["symbol"])
-            observer = SourceObserver(self.run_dir, alpaca, symbols, Limits(**self.config["limits"]), self.clock)
+            observer = SourceObserver(self.run_dir, alpaca, symbols, Limits(**self.config["limits"]), self.clock,
+                                      schwab=SchwabMarketQuotes(*schwab) if all(schwab) else None,
+                                      twelve_data=TwelveDataMinutes(twelve_key) if twelve_key else None)
             threading.Thread(target=observer.serve, args=(stop,), name="desk-source-observer", daemon=True).start()
         while not stop.is_set():
             self.tick()

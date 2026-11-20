@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -17,6 +18,8 @@ from scripts.autonomous_fund.market_data import YahooRealtimeData
 from scripts.autonomous_fund.market_observation import SourceObserver, observation_lines
 from scripts.autonomous_fund.risk import Limits, MarketDataUnavailable
 from scripts.autonomous_fund.strategy import configuration
+from scripts.autonomous_fund.schwab import SchwabMarketQuotes
+from scripts.autonomous_fund.twelve_data import TwelveDataMinutes
 
 
 NOW = datetime(2026, 11, 19, 14, 32, 5, tzinfo=timezone.utc)
@@ -145,6 +148,78 @@ def test_actual_early_close_never_uses_after_hours_minutes_or_quotes(tmp_path):
     assert record["symbols"]["BETA"]["alpaca"]["minute"]["status"] == "missing"
 
 
+def test_independent_quotes_reach_read_only_desk_reference_with_freshness_and_fallback(tmp_path, monkeypatch):
+    from scripts.autonomous_fund.strategy import AutonomousFund
+
+    def epoch(stamp):
+        return int(stamp.timestamp() * 1000)
+
+    def quotes(symbols):
+        assert symbols == ["ALFA", "BETA", "GAMMA"]
+        rows = {symbol: {"symbol": symbol, "quote": {"bidPrice": 100, "askPrice": 100.1,
+                "bidTime": epoch(NOW - timedelta(seconds=2)), "askTime": epoch(NOW - timedelta(seconds=1))}}
+                for symbol in symbols}
+        rows["ALFA"]["quote"]["bidTime"] = epoch(NOW - timedelta(seconds=80))
+        rows["GAMMA"]["quote"]["askTime"] = epoch(NOW + timedelta(seconds=1))
+        return SimpleNamespace(status_code=200, json=lambda: rows)
+
+    token = tmp_path / "synthetic-token"
+    token.touch()
+    client = SimpleNamespace(get_quotes=quotes, set_timeout=lambda timeout: None)
+    monkeypatch.setattr("schwab.auth.client_from_token_file", lambda *_: client)
+
+    def twelve_get(url, *, params, headers, timeout, allow_redirects):
+        assert params["symbol"] == "ALFA" and params["timezone"] == "UTC" and params["outputsize"] == 2
+        assert headers == {"Authorization": "apikey synthetic-twelve"} and not allow_redirects
+        values = [{"datetime": f"2026-11-19 14:{minute}:00", "open": "99", "high": "102", "low": "98",
+                   "close": close, "volume": "700"} for minute, close in [("32", "101"), ("31", "100")]]
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: {
+            "meta": {"symbol": "ALFA", "interval": "1min", "currency": "USD"}, "values": values})
+
+    responses = AlpacaResponses({SNAPSHOTS_URL: {s: snapshot(NOW) for s in ("ALFA", "BETA", "GAMMA")},
+                                 ACTIONS_URL: {"corporate_actions": {}}})
+    reader = SourceObserver(tmp_path, AlpacaDailyHistory("synthetic-key", "synthetic-secret", get=responses),
+                            ("ALFA", "BETA", "GAMMA"), Limits(), lambda: NOW,
+                            schwab=SchwabMarketQuotes("key", "secret", token),
+                            twelve_data=TwelveDataMinutes("synthetic-twelve", get=twelve_get))
+    record = reader.poll(NOW)
+    assert record["symbols"]["ALFA"]["schwab"]["status"] == "stale"
+    assert record["symbols"]["GAMMA"]["schwab"]["status"] == "future"
+    assert record["symbols"]["BETA"]["differences"]["schwab_iex_midpoint_bps"] == 0
+    strategy = object.__new__(AutonomousFund)
+    strategy.mode, strategy.daily_store, strategy.limits = "local", reader.store, reader.limits
+    strategy.get_datetime = lambda: NOW
+    marks = strategy.desk_latest("source_reference")["data"]["symbols"]
+    assert marks["ALFA"]["source"] == "twelve_data" and marks["ALFA"]["price"] == "100"
+    assert "bid" not in marks["ALFA"] and "GAMMA" not in marks
+    assert marks["BETA"]["source"] == "schwab" and marks["BETA"]["bid"] == "100"
+    strategy.get_datetime = lambda: NOW + timedelta(seconds=61)
+    assert strategy.desk_latest("source_reference")["data"]["symbols"] == {}
+    strategy.mode = "backtest"
+    assert strategy.desk_latest("source_reference")["data"] is None
+
+
+def test_twelve_quota_error_does_not_delay_the_other_sources(tmp_path):
+    response = Response()
+    response.status_code = 200
+    response._content = b'{"status":"error","code":429,"message":"private response"}'
+    calls, now = [], NOW
+
+    def get(*args, **kwargs):
+        calls.append(1)
+        return response
+
+    alpaca = AlpacaResponses({SNAPSHOTS_URL: {"ALFA": snapshot(NOW)}, ACTIONS_URL: {"corporate_actions": {}}})
+    reader = SourceObserver(tmp_path, AlpacaDailyHistory("synthetic-key", "synthetic-secret", get=alpaca),
+                            ("ALFA",), Limits(), lambda: now, twelve_data=TwelveDataMinutes("key", get=get))
+    assert reader.poll(now)["reference_requests"]["twelve_data"]["status"] == "rate_limited"
+    now += timedelta(seconds=30)
+    record = reader.poll(now)
+    assert record["reference_requests"]["twelve_data"]["status"] == "rate_limit_cooldown"
+    assert record["symbols"]["ALFA"]["alpaca"]["quote"]["status"] == "valid" and len(calls) == 1
+    assert "private response" not in json.dumps(record)
+
+
 def test_freshness_and_market_phase_are_independent_of_other_symbols(tmp_path):
     at = NOW + timedelta(minutes=30)
     responses = AlpacaResponses({
@@ -183,12 +258,18 @@ def test_alpaca_429_honors_retry_headers_without_repeating_actions(tmp_path):
     assert [url for url, _ in responses.calls] == [SNAPSHOTS_URL, SNAPSHOTS_URL, ACTIONS_URL]
 
 
-def test_data_desk_starts_read_only_observer_even_when_other_jobs_wait(tmp_path, monkeypatch):
+@pytest.mark.parametrize("source", ["alpaca", "schwab", "twelve_data"])
+def test_data_desk_starts_read_only_observer_even_when_other_jobs_wait(tmp_path, monkeypatch, source):
     stop = Event()
     responses = AlpacaResponses({SNAPSHOTS_URL: {}, ACTIONS_URL: {"corporate_actions": {}}})
     config = configuration(Path("scripts/autonomous_fund/config.json"), environ={})
-    desk = DataDesk(tmp_path, config, "local", environ={"ALPACA_API_KEY": "synthetic-key",
-                    "ALPACA_API_SECRET": "synthetic-secret"}, clock=lambda: NOW, alpaca_get=responses)
+    credentials = {"alpaca": {"ALPACA_API_KEY": "synthetic-key", "ALPACA_API_SECRET": "synthetic-secret"},
+                   "schwab": {"SCHWAB_APP_KEY": "test-key", "SCHWAB_APP_SECRET": "test-secret",
+                              "SCHWAB_TOKEN_PATH": str(tmp_path / "unused-token")},
+                   "twelve_data": {"TWELVE_DATA_API_KEY": "test-key"}}
+    monkeypatch.setattr(SchwabMarketQuotes, "quotes", lambda *_: {})
+    monkeypatch.setattr(TwelveDataMinutes, "minutes", lambda *_: [])
+    desk = DataDesk(tmp_path, config, "local", environ=credentials[source], clock=lambda: NOW, alpaca_get=responses)
     called = Event()
 
     def sample_once(self, stop_event):
@@ -203,5 +284,6 @@ def test_data_desk_starts_read_only_observer_even_when_other_jobs_wait(tmp_path,
     monkeypatch.setattr(desk, "tick", skip_jobs)
     desk.serve(stop)
     assert called.is_set()
-    assert "1 个纽约交易日" in "\n".join(observation_lines(tmp_path))
+    report = "\n".join(observation_lines(tmp_path))
+    assert "1 个纽约交易日" in report and source in report
     assert not (tmp_path / "state.sqlite3").exists()

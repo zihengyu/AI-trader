@@ -4507,7 +4507,8 @@ class AutonomousFund(Strategy):
                 10-year yield, dollar, EUR, JPY, crude, gold, Tokyo, Hong Kong, Europe), calendar
                 (scheduled US releases such as CPI, jobs, GDP, FOMC), snapshot (daily returns,
                 volatility, beta, trend, liquidity), macro (FRED regime), earnings (upcoming dates
-                and caps), news (recent headlines, filings, releases) or status (dataset freshness)
+                and caps), news (recent headlines, filings, releases), source_reference (fresh independent
+                intraday research marks) or status (dataset freshness)
         """
         return self._desk_section(str(section).strip().lower(), self.get_datetime())
 
@@ -4517,6 +4518,7 @@ class AutonomousFund(Strategy):
                    "calendar": lambda: self._economic_calendar(now),
                    "macro": lambda: self._macro_context(now), "earnings": lambda: self._earnings_caps(now),
                    "news": lambda: self._news_context(None, now),
+                   "source_reference": lambda: self._source_reference(now),
                    "status": lambda: self.desk_status.summary(now) if getattr(self, "desk_status", None) else None}
         if section not in readers:
             return {"error": f"unknown section {section!r}", "sections": sorted(readers)}
@@ -4528,7 +4530,8 @@ class AutonomousFund(Strategy):
                  "calendar": "no release calendar yet: it needs FRED_API_KEY and refreshes every six hours",
                  "news": "the news watch is not running in this process (news.enabled is false, or a rehearsal)",
                  "macro": "FRED macro context is disabled (macro.enabled is false)",
-                 "status": "this run has no data desk (historical runs never read live data)"}
+                 "status": "this run has no data desk (historical runs never read live data)",
+                 "source_reference": "no current-session independent market observations"}
         try:
             data = readers[section]()
             answer = {"section": section, "read_at": instant(now).isoformat(), "data": data}
@@ -4570,6 +4573,12 @@ class AutonomousFund(Strategy):
     def _premarket(self, now):
         return self._desk_read(now, "premarket", 60)
 
+    def _source_reference(self, now):
+        if getattr(self, "mode", None) != "local":
+            return None
+        from .market_observation import research_reference
+        return research_reference(getattr(self, "daily_store", None), now, self.limits)
+
     def _global_markets(self, now):
         return self._desk_read(now, "global_markets", 90)
 
@@ -4600,12 +4609,14 @@ class AutonomousFund(Strategy):
         opened = instant(session["next_open"]) if session.get("open") and session.get("next_open") else None
         # The pre-market view matters before the open and for the first hour of the session (gaps).
         early = not session.get("open") or opened is None or instant(now) - opened <= timedelta(hours=1)
+        reference = self._source_reference(now) if session.get("open") else None
         return {"desk": status.summary(now), "intraday": self._intraday(now),
+                **({"source_reference": reference} if reference else {}),
                 "premarket": self._premarket(now) if early else None,
                 "global_markets": self._global_markets(now), "economic_calendar": self._economic_calendar(now),
                 "news_since_last_decision": new,
                 "tool": "desk_latest(section) returns the newest intraday, premarket, global, calendar, snapshot, "
-                        "macro, earnings, news or status at the moment you call it"}
+                        "macro, earnings, news, source_reference or status at the moment you call it"}
 
     def _market_snapshot(self, now):
         """Returns, volatility, beta, trend and liquidity per tradable symbol, once per trading day.

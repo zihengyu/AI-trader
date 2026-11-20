@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- The Autonomous Fund data desk can qualify Schwab stock and ETF quotes against Alpaca IEX and use current completed Twelve Data minutes as an independent research reference. Both are optional and read-only.
 - Strategy Lab daily validation can predeclare an after-close decision cutoff for timestamped publications. Historical replay, queued workers and the forward audit use the same exchange-relative clock before next-open execution.
 - Strategy Lab daily research adapters can predeclare a portfolio-wide rebalance band. In-band replay retains shares subject to explicit exits and hard risk limits. Forward signals and resumable receipts retain the rebalance decision and its reference target.
 - Strategy Lab can freeze a registered executable version as a paired comparator in daily validation. Both arms share input and execution assumptions, and forward qualification needs timely signals from both arms as well as the existing passive hurdle.
@@ -32,6 +33,7 @@ Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 - The optional autonomous paper fund supports `FUND_AUTOMATION_MODE=full|semi`, defaulting to full. Full mode assigns exception purchase requests to a separate read-only risk reviewer; semi keeps operator approvals. `FUND_APPROVAL_MODEL` independently selects any supported reviewer model, defaulting to DeepSeek Flash without following manager-model overrides. Exact request/digest/account/policy/expiry binding, persisted bounded retries, ordinary model/cost budgets and next-iteration quantitative checks remain mandatory. Missing or invalid answers never grant authority. Status reports the loaded mode, and selected decision views show each order's automatic, AI, operator or system authority without inventing legacy evidence.
 
 ### Fixed
+- Autonomous Fund historical SIP queries request a mature end time after the exchange close and keep a per-request IEX fallback from downgrading later daily requests.
 - Autonomous Fund premarket notices preserve all evidence entries, full idea theses and full research task next steps. Strategy Lab research reports explain what prevents a saved draft from entering a backtest and how to submit an executable revision.
 - Autonomous-fund event screening preserves pending triggers when a required manager review is due or the trigger batch changes during inference. News batching respects the existing review schedule, and status distinguishes confirmed skips from ambiguous legacy dismissals.
 - Fund diagnostics distinguish tool failures that remain unresolved from earlier successful retries, and show the active event-screen calibration window and evidence status. Data desk stops now take effect between requests in macro, calendar, news, earnings, SEC and cross-check batches.

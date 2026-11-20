@@ -171,6 +171,7 @@ SETTINGS = {
     "ALPACA_API_KEY": (None, None, True, "券商", "paper 模式必填；local 模式与 Secret 一起选填，用于日线备用和行情只读对照"),
     "ALPACA_API_SECRET": (None, None, True, "券商", "paper 模式必填；local 模式与 Key 一起选填，用于日线备用和行情只读对照"),
     "ALPACA_IS_PAPER": (None, None, False, "券商", "仅 paper 模式读取，默认 true；设为 false 会拒绝启动"),
+    "TWELVE_DATA_API_KEY": (None, None, True, "外部", "可选：本地模拟账户的 Twelve Data 盘中分钟线研究备用源"),
     "LUMIWEALTH_API_KEY": (None, None, True, "券商", "可选：BotSpot／云端报告，本地交易不需要"),
     "SCHWAB_ACCOUNT_NUMBER": (None, None, True, "Schwab", "AI 使用的 Schwab 账户号码（建议单独开一个账户）"),
     "SCHWAB_APP_KEY": (None, None, True, "Schwab", "你自己的 Schwab 开发者应用 App Key（不填则用 LumiBot 默认应用）"),

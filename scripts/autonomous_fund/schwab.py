@@ -18,6 +18,38 @@ from .risk import RiskError, number
 ORDER_METHODS = ("submit_order", "submit_orders", "_submit_order", "_submit_orders", "cancel_order",
                  "cancel_orders", "_cancel_order", "modify_order", "_modify_order", "cancel_open_orders")
 
+MARKET_CREDENTIALS = ("SCHWAB_APP_KEY", "SCHWAB_APP_SECRET", "SCHWAB_TOKEN_PATH")
+
+
+def market_credentials(environ):
+    return tuple(str(environ.get(name) or "").strip() for name in MARKET_CREDENTIALS)
+
+
+class SchwabMarketQuotes:
+    """Use the native market-data adapter with an already authorized token file."""
+
+    def __init__(self, key, secret, token_path):
+        self._key, self._secret = key, secret
+        self._path = Path(token_path).expanduser()
+        self._source = None
+        self._revision = None
+
+    def quotes(self, symbols):
+        from lumibot.entities import Asset
+
+        stat = self._path.stat()
+        revision = (stat.st_ino, stat.st_mtime_ns)
+        if self._source is None or self._revision != revision:
+            from schwab.auth import client_from_token_file
+            from lumibot.data_sources.schwab_data import SchwabData
+
+            client = client_from_token_file(str(self._path), self._key, self._secret)
+            client.set_timeout(5.0)
+            self._source = SchwabData(client=client)
+            self._revision = revision
+        assets = [Asset(symbol, asset_type="stock") for symbol in symbols]
+        return {asset.symbol: quote for asset, quote in self._source.get_quotes(assets).items()}
+
 
 def read_only(broker):
     """Make order methods on THIS broker instance raise; account reads are unaffected."""
