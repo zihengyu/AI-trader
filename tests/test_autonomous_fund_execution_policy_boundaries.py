@@ -422,3 +422,20 @@ def test_triage_status_uses_current_profile_and_explains_provisional_enforcement
     with strategy.journal.connection() as db:
         text = triage_line(db, NOW)
     assert "生效中" in text and "95% 上限高于校准阈值" in text
+
+
+def test_triage_status_separates_confirmed_skips_from_legacy_dismissals(tmp_path):
+    from scripts.autonomous_fund.status import triage_line
+
+    strategy, _ = fund(tmp_path, "enforce", [])
+    strategy.journal.event(NOW - timedelta(days=1), "event_triage", {"action": "dismissed"})
+    strategy.journal.event(NOW, "event_triage", {"action": "dismissed"})
+    strategy.journal.event(NOW, "event_triage", {"action": "dismissed", "manager_review_skipped": True})
+    for _ in range(400):
+        strategy.journal.event(NOW, "event_triage", {"action": "scheduled"})
+    strategy.journal.event(NOW + timedelta(minutes=1), "event_triage", {"action": "dismissed"})
+    with strategy.journal.connection() as db:
+        text = triage_line(db, NOW)
+    assert "今天判断 402 次" in text
+    assert "确认跳过基金经理复核 1 次" in text
+    assert "另有 1 次缺少是否跳过的记录" in text

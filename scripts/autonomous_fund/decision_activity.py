@@ -30,7 +30,8 @@ KINDS = ("decision_validated", "decision_accepted", "decision_backoff", "review_
 WAKES = {"news": "资讯", "price_move": "价格异动", "price_alert": "价格提醒", "market_stress": "市场压力",
          "stop_loss": "止损", "take_profit": "止盈", "capital_flow": "申购/赎回", "entry": "入场价"}
 TRIAGE = {"dismissed": "快速模型判断不需要（未叫基金经理）", "audit": "快速模型判断不需要，抽查仍叫了基金经理",
-          "escalated": "快速模型判断需要", "shadow": "快速模型影子判断", "deadline": "已到必复核时间"}
+          "escalated": "快速模型判断需要", "shadow": "快速模型影子判断", "deadline": "已到必复核时间",
+          "scheduled": "例行复核需要基金经理", "superseded": "筛选期间事件有变化，交基金经理复核"}
 LABELS = {"initial": "首次记录", "portfolio": "调整目标组合", "levels": "调整交易价位",
           "minor": "小幅调整权重（不足 1 个百分点）", "maintain": "维持目标组合"}
 DELIVERY = {"sent": "已送达", "pending": "待发送", "retry": "等待重试", "sending": "发送中",
@@ -296,7 +297,11 @@ def lines(data, timeline=False, *, event_sequence=None):
                     label = {"audit": "抽查结果", "shadow": "对照结果"}.get(screen.get("action"), "复核结果")
                     note = f"（{label}：基金经理{'改了' if changed else '没改'}组合"
                     note += "，算漏判）" if screen.get("miss") else "）"
-                result.append(f"  事件判断：{TRIAGE.get(screen.get('action'), screen.get('action'))}{note}"
+                action = screen.get("action")
+                description = TRIAGE.get(action, action)
+                if action == "dismissed" and screen.get("manager_review_skipped") is not True:
+                    description = "快速模型判断不需要（是否跳过复核缺少记录）"
+                result.append(f"  事件判断：{description}{note}"
                               + (f"｜{str(verdict.get('reason'))[:80]}" if verdict.get("reason") else ""))
             original = str(item["decision"].get("rationale") or "")
             rationale = " ".join(original.split())

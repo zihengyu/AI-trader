@@ -112,13 +112,19 @@ def triage_line(db, now):
     if type(window) is not int or not 10 <= window <= 500:
         window = 40
     pairs = (meta.get("triage_pairs") or [])[-window:]
-    zone = ZoneInfo("America/New_York")
-    today = instant(now).astimezone(zone).date().isoformat()
+    now = instant(now).astimezone(ZoneInfo("America/New_York"))
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     actions = {}
-    for at, body in db.execute("SELECT at,body FROM events WHERE kind='event_triage' ORDER BY sequence DESC LIMIT 400"):
-        if instant(at).astimezone(zone).date().isoformat() == today:
-            action = json.loads(body).get("action")
+    confirmed_skips = 0
+    for at, body in db.execute(
+        "SELECT at,body FROM events WHERE kind='event_triage' AND julianday(at) BETWEEN julianday(?) AND julianday(?)",
+        (start.isoformat(), now.isoformat()),
+    ):
+        if start <= instant(at) <= now:
+            record = json.loads(body)
+            action = record.get("action")
             actions[action] = actions.get(action, 0) + 1
+            confirmed_skips += action == "dismissed" and record.get("manager_review_skipped") is True
     if not pairs and not actions and not meta.get("triage_enforcing"):
         return None
     misses = sum(bool(p) for p in pairs)
@@ -137,9 +143,14 @@ def triage_line(db, now):
                 state += f"（当前校准样本 {len(pairs)}/{window}，样本不足）"
             elif type(limit) in (int, float) and bound > limit:
                 state += "（当前漏判率的 95% 上限高于校准阈值）"
-    return (f"盘中事件判断：{state}；最近 {len(pairs)} 次“不需要”里漏判 {misses} 次"
-            f"（95% 上限 {bound * 100:.1f}%）；今天判断 {sum(actions.values())} 次"
-            + (f"，其中未叫基金经理 {actions.get('dismissed', 0)} 次" if enforcing else ""))
+    text = (f"盘中事件判断：{state}；最近 {len(pairs)} 次“不需要”里漏判 {misses} 次"
+            f"（95% 上限 {bound * 100:.1f}%）；今天判断 {sum(actions.values())} 次")
+    dismissed = actions.get("dismissed", 0)
+    if enforcing or dismissed:
+        text += f"，确认跳过基金经理复核 {confirmed_skips} 次"
+    if dismissed > confirmed_skips:
+        text += f"，另有 {dismissed - confirmed_skips} 次缺少是否跳过的记录"
+    return text
 
 
 def _age(at, now):

@@ -17,7 +17,7 @@ from tests.test_autonomous_fund_quant import NOW, account, harness
 from tests.test_autonomous_fund_triage import NEWS, fund, verdict
 
 
-@pytest.mark.parametrize("action", ["dismissed", "audit", "escalated", "shadow", "deadline"])
+@pytest.mark.parametrize("action", ["dismissed", "audit", "escalated", "shadow", "deadline", "scheduled"])
 def test_triage_outcomes_link_to_the_actual_recorded_call(tmp_path, action):
     strategy, _ = fund(tmp_path, "shadow" if action == "shadow" else "enforce", [])
     strategy.scripted = False
@@ -33,6 +33,8 @@ def test_triage_outcomes_link_to_the_actual_recorded_call(tmp_path, action):
     def run(**kwargs):
         if action == "deadline":
             strategy.get_datetime = lambda: NOW + timedelta(hours=2)
+        elif action == "scheduled":
+            strategy.get_datetime = lambda: NOW + timedelta(minutes=41)
         return SimpleNamespace(parsed=verdict(action == "escalated"), usage={"input_tokens": 100, "output_tokens": 20},
                                model=strategy.triage_model, cache_hit=False, summary="Synthetic screen", parse_error=None)
 
@@ -44,9 +46,13 @@ def test_triage_outcomes_link_to_the_actual_recorded_call(tmp_path, action):
     screen, = [r["body"] for r in events if r["kind"] == "event_triage"]
     assert outcome["call_id"] == screen["call_id"] == call["call_id"]
     assert outcome["triage_id"] == screen["id"] and outcome["action"] == screen["action"] == action
-    assert outcome["valid"] is (action != "deadline")  # A mandatory review ignores the late verdict.
+    used = action not in {"deadline", "scheduled"}
+    assert outcome["valid"] is used  # A required review ignores the late verdict.
+    if action == "scheduled":
+        assert strategy._triggers == [NEWS] and strategy._pending_triage is None
+        assert strategy.journal.get_meta("triage_dismissal_count") is None
     value = call_value.from_events([(r["at"], r["kind"], r["body"]) for r in events])["by_purpose"]["triage"]
-    assert value["used"] == int(action != "deadline") and value["outcome_unknown"] == 0
+    assert value["used"] == int(used) and value["outcome_unknown"] == 0
 
 
 def test_a_saved_identity_probe_records_adoption_without_claiming_a_trade(tmp_path):
@@ -83,6 +89,21 @@ def test_timeline_describes_manager_change_separately_from_miss_rate(tmp_path, a
     assert ("算漏判" in text) is (changed and action != "escalated")
     if action == "escalated":
         assert "抽查结果" not in text
+
+
+@pytest.mark.parametrize(("record", "label"), [
+    ({"action": "dismissed"}, "是否跳过复核缺少记录"),
+    ({"action": "dismissed", "manager_review_skipped": True}, "未叫基金经理"),
+    ({"action": "scheduled"}, "例行复核需要基金经理"),
+    ({"action": "superseded"}, "筛选期间事件有变化，交基金经理复核"),
+])
+def test_timeline_uses_recorded_evidence_for_screening_actions(tmp_path, record, label):
+    book = Journal(tmp_path, "synthetic-screen-timeline")
+    plan(book, 0)
+    book.event(OPEN + timedelta(minutes=5), "event_triage", {"id": "screen-1", **record})
+    plan(book, 1)
+    text = "\n".join(lines(activity(tmp_path, "2026-11-02", now=ACTIVITY_NOW), timeline=True))
+    assert label in text
 
 
 def test_a_legacy_escalation_without_manager_result_is_not_labeled_no_change(tmp_path):

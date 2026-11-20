@@ -108,6 +108,7 @@ def test_an_enforced_dismissal_skips_the_manager_returns_to_its_schedule_and_bat
     assert strategy._triage_gate(account(), NOW) is True
     assert strategy._triggers == [] and strategy.next_review == scheduled
     assert events(strategy, "event_triage")[-1]["action"] == "dismissed"
+    assert events(strategy, "event_triage")[-1]["manager_review_skipped"] is True
     later = NOW + timedelta(minutes=5)
     strategy._triggers = [{**NEWS, "at": str(later)}]
     assert strategy._triage_gate(account(), later) is True and len(calls) == 1  # Within the floor: batched.
@@ -128,7 +129,8 @@ def test_an_enforced_escalation_tells_the_manager_why_and_is_scored_but_not_coun
 
 def test_every_fifth_enforced_dismissal_is_audited_by_running_the_manager(tmp_path):
     strategy, _ = fund(tmp_path, "enforce", [verdict(False)] * 5)
-    strategy.journal.set_meta("scheduled_review_at", (NOW + timedelta(hours=1)).isoformat())
+    # All five screens precede the regular review. Its own deadline is tested separately.
+    strategy.journal.set_meta("scheduled_review_at", (NOW + timedelta(minutes=90)).isoformat())
     actions = []
     for i in range(5):
         at = NOW + timedelta(minutes=16 * i)
@@ -138,6 +140,65 @@ def test_every_fifth_enforced_dismissal_is_audited_by_running_the_manager(tmp_pa
         actions.append((events(strategy, "event_triage")[-1]["action"], skipped))
     assert actions == [("dismissed", True)] * 4 + [("audit", False)]
     assert strategy._pending_triage["action"] == "audit"
+
+
+def test_a_due_regular_review_with_incomplete_allocation_bypasses_the_screen(tmp_path):
+    strategy, calls = fund(tmp_path, "enforce", [])
+    strategy.journal.set_meta("scheduled_review_at", NOW.isoformat())
+    strategy._triggers = [NEWS]
+    assert strategy._triage_gate(account(), NOW) is False
+    assert calls == [] and strategy._triggers == [NEWS]
+    assert events(strategy, "event_triage") == []
+
+
+def test_batched_news_cannot_postpone_a_regular_review(tmp_path):
+    strategy, calls = fund(tmp_path, "enforce", [])
+    scheduled = NOW + timedelta(minutes=1)
+    strategy.journal.set_meta("scheduled_review_at", scheduled.isoformat())
+    strategy.journal.set_meta("triage_last_at", (NOW - timedelta(minutes=2)).isoformat())
+    strategy._triggers = [NEWS]
+    assert strategy._triage_gate(account(), NOW) is True
+    assert strategy.next_review == scheduled
+    assert strategy._triage_gate(account(), scheduled) is False
+    assert calls == [] and strategy._triggers == [NEWS]
+
+
+def test_validated_dismissal_can_still_skip_a_quiet_regular_review(tmp_path):
+    from tests.test_autonomous_fund_ai_requests import quiet_strategy
+
+    strategy, held = quiet_strategy(tmp_path)
+    now = NOW + timedelta(minutes=30)
+    strategy.triage, strategy.triage_model = TriageSettings(mode="enforce"), "fixture/screen"
+    strategy.last_decision = decision([("ALFA", .05)])
+    strategy.get_datetime = lambda: now
+    strategy.journal.set_meta("scheduled_review_at", now.isoformat())
+    strategy._triggers = [NEWS]
+    strategy._agent_call = lambda *args, **kwargs: verdict(False)
+    strategy._record_agent = lambda name, result, **kwargs: result
+    assert strategy._triage_gate(held, now) is True
+    assert strategy._triggers == []
+    [screen] = events(strategy, "event_triage")
+    assert screen["action"] == "dismissed" and screen["manager_review_skipped"] is True
+    assert events(strategy, "review_skipped")
+
+
+def test_a_new_price_alert_supersedes_the_in_flight_screen(tmp_path):
+    strategy, calls = fund(tmp_path, "enforce", [verdict(False)])
+    strategy.journal.set_meta("scheduled_review_at", (NOW + timedelta(minutes=30)).isoformat())
+    strategy._triggers = [NEWS]
+    original = strategy.agents["triage"].run
+
+    def run(**kwargs):
+        strategy._request_review(NOW, "price_alert", {"symbol": "ALFA"})
+        return original(**kwargs)
+
+    strategy.agents["triage"].run = run
+    assert strategy._triage_gate(account(), NOW) is False and len(calls) == 1
+    assert [item["reason"] for item in strategy._triggers] == ["news", "price_alert"]
+    [screen] = events(strategy, "event_triage")
+    assert screen["action"] == "superseded" and strategy._pending_triage is None
+    [outcome] = events(strategy, "agent_outcome")
+    assert outcome["valid"] is False and outcome["reason"] == "trigger_batch_changed"
 
 
 def test_auto_from_the_shadow_enforces_after_a_clean_window_and_rolls_back_when_misses_rise(tmp_path):

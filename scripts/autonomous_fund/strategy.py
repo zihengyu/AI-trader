@@ -2504,7 +2504,7 @@ class AutonomousFund(Strategy):
                 self._warm_optional(now)
                 return
             before = self.last_decision
-            self._decide(account, now, paused)
+            self._decide(account, self.get_datetime(), paused)
             self._score_triage(before)
         except Exception as exc:
             from .execution import ApprovalPending
@@ -3004,38 +3004,44 @@ class AutonomousFund(Strategy):
         packet = getattr(self, "premarket_research", None)
         return packet.get("completed_at") if isinstance(packet, dict) else None
 
-    def _quiet_review(self, account, now, paused=False):
-        """True when a scheduled review has nothing new for the manager: the model call is skipped.
+    def _quiet_review_plan(self, account, now, paused):
+        """Check account readiness for a quiet review independently of soft triggers.
 
-        All must hold: skipping is enabled; no watcher trigger (alert, large move,
-        market stress, news match) is waiting; purchases are not paused; the last
+        Skipping must be enabled and purchases must not be paused. The last
         model decision was made this trading day less than max_quiet_minutes ago;
         its allocation completed and the holdings are exactly what it left (no stop,
         take-profit or other fill since); and the saved research is the one it saw.
-        Levels and alerts stay armed meanwhile, and the next check is one review
-        floor later. Anything else calls the manager as before.
         """
         budget = getattr(self, "model_budget", None) or ModelBudget()
-        if not budget.skip_quiet_reviews or paused or getattr(self, "_triggers", None):
-            return False
+        if not budget.skip_quiet_reviews or paused:
+            return None
         last = self.journal.get_meta("last_model_decision") or {}
         done = self.journal.get_meta("allocation_complete") or {}
         try:
             made = instant(last["at"])
         except (KeyError, TypeError, ValueError):
-            return False
+            return None
+        deadline = made + timedelta(minutes=budget.max_quiet_minutes)
         latest = self.execution.latest(now)
-        if (last.get("day") != trading_day(now) or now - made >= timedelta(minutes=budget.max_quiet_minutes)
+        if (last.get("day") != trading_day(now) or not made <= now < deadline
                 or latest is None or latest["state"] != "complete" or done.get("decision_id") != latest["id"]
                 or done.get("positions") != self._holdings_key(account)
                 or last.get("research") != self._research_key()):
+            return None
+        return {"reason": "nothing changed since the last decision", "decision_id": latest["id"],
+                "decided_at": last["at"],
+                "next_check": min(now + timedelta(minutes=budget.min_review_minutes), deadline).isoformat(),
+                "manager_due_by": deadline.isoformat()}
+
+    def _quiet_review(self, account, now, paused=False):
+        """Skip a scheduled review only when nothing is waiting for the manager."""
+        if getattr(self, "_triggers", None):
             return False
-        self.next_review = min(now + timedelta(minutes=budget.min_review_minutes),
-                               made + timedelta(minutes=budget.max_quiet_minutes))
-        self.journal.event(now, "review_skipped", {
-            "reason": "nothing changed since the last decision", "decision_id": latest["id"],
-            "decided_at": last["at"], "next_check": self.next_review.isoformat(),
-            "manager_due_by": (made + timedelta(minutes=budget.max_quiet_minutes)).isoformat()})
+        plan = self._quiet_review_plan(account, now, paused)
+        if plan is None:
+            return False
+        self.journal.event(now, "review_skipped", plan)
+        self.next_review = instant(plan["next_check"])
         return True
 
     def _triage_enforcing(self):
@@ -3081,8 +3087,12 @@ class AutonomousFund(Strategy):
             return False  # Invalid scheduling evidence cannot suppress the manager.
         if previous is not None and previous > now:
             return False
+        if enforcing and scheduled is not None and scheduled <= now and self._quiet_review_plan(account, now, paused) is None:
+            return False  # A scheduled review already needs the manager regardless of the soft batch.
         if enforcing and previous is not None and now - previous < floor:
-            self.next_review = min(previous + floor, deadline)
+            if scheduled is not None and scheduled <= now:
+                return False
+            self.next_review = min(previous + floor, deadline, scheduled or deadline)
             return True
         if self._cost_exhausted(now, "triage"):
             return False
@@ -3101,8 +3111,8 @@ class AutonomousFund(Strategy):
             self.journal.event(now, "triage_unavailable",
                                {"error": str(exc) if isinstance(exc, RiskError) else type(exc).__name__})
             return False
-        # Inference can cross the mandatory review deadline. A dismissal cannot
-        # defer that review, and the event batch stays available to the manager.
+        # Inference can cross a deadline or outlive the trigger batch it saw.
+        # A stale verdict must leave the pending triggers available to the manager.
         now = self.get_datetime()
         self.journal.set_meta("triage_last_at", now.isoformat())
         record = {"id": uuid4().hex[:12], "at": now.isoformat(), "verdict": verdict, "triggers": len(triggers),
@@ -3111,10 +3121,19 @@ class AutonomousFund(Strategy):
         call = getattr(self, "_current_call", None) or {}
         if call.get("role") == "triage":
             record["call_id"] = call["call_id"]
+        unused = None
+        quiet_plan = None
         if now >= deadline:
-            record["action"] = "deadline"
+            record["action"], unused = "deadline", "mandatory_review_due"
+        elif triggers != (getattr(self, "_triggers", None) or []):
+            record["action"], unused = "superseded", "trigger_batch_changed"
+        elif enforcing and (scheduled is None or scheduled <= now):
+            quiet_plan = self._quiet_review_plan(account, now, paused)
+            if scheduled is not None and quiet_plan is None:
+                record["action"], unused = "scheduled", "scheduled_review_due"
+        if unused:
             self.journal.event(now, "event_triage", record)
-            self._call_outcome(valid=False, triage_id=record["id"], action=record["action"], reason="mandatory_review_due")
+            self._call_outcome(valid=False, triage_id=record["id"], action=record["action"], reason=unused)
             return False
         if verdict["escalate"]:
             record["action"] = "escalated" if enforcing else "shadow"
@@ -3125,19 +3144,27 @@ class AutonomousFund(Strategy):
             record["action"] = "shadow"
         else:
             count = int(self.journal.get_meta("triage_dismissal_count", 0) or 0) + 1
-            self.journal.set_meta("triage_dismissal_count", count)
-            settings = self.triage
-            record["action"] = "audit" if count % settings.audit_every == 0 else "dismissed"
+            audit = count % settings.audit_every == 0
+            if audit or quiet_plan is not None or (scheduled is not None and scheduled > now):
+                record["action"] = "audit" if audit else "dismissed"
+                self.journal.set_meta("triage_dismissal_count", count)
+            else:
+                record["action"] = "scheduled"
+        if record["action"] == "dismissed":
+            record["manager_review_skipped"] = True
+            if quiet_plan is not None:
+                self.journal.event(now, "review_skipped", quiet_plan)
         self.journal.event(now, "event_triage", record)
+        if record["action"] == "scheduled":
+            self._call_outcome(valid=False, triage_id=record["id"], action=record["action"], reason="scheduled_review_due")
+            return False
         self._call_outcome(triage_id=record["id"], action=record["action"])
         if record["action"] != "dismissed":
             self._pending_triage = record  # Scored once the manager has answered.
             return False
+        self.next_review = instant(quiet_plan["next_check"]) if quiet_plan is not None else min(scheduled, deadline)
         self._triggers = []
-        if scheduled and scheduled > now:
-            self.next_review = min(scheduled, deadline)
-            return True
-        return self._quiet_review(account, now, paused)  # Its own schedule is due: quiet, or the manager runs.
+        return True
 
     def _score_triage(self, before):
         """After a manager call that followed a screening: did the manager change the targets?"""
