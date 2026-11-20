@@ -2,7 +2,7 @@
 
 Open strategy proposals, reproducible research, independent simulation and bounded paper-library admission for the optional autonomous fund.
 
-Last Updated: 2026-11-19
+Last Updated: 2026-11-20
 Status: Daily strategy research and paper qualification; research-only defaults
 Audience: Fund operators, researchers and contributors
 
@@ -109,6 +109,25 @@ at the following session open with explicit fees/slippage and whole shares; the
 book is valued at the close. Missing observations are never filled forward. A
 missing input while holding cannot silently create a sale. Each test split and
 each candidate has independent capital, cash, positions and trade receipts.
+
+Both daily adapters accept an optional `implementation.portfolio_rebalance_band`
+expressed as a fraction of total portfolio value. With `0.05`, the difference
+between the new total risk target and the last executed discretionary target must
+reach five percentage points to rebalance. The comparison uses caps-projected
+targets before the cash reserve, receivables and whole-share sizing. The first
+entry can execute at any positive target. Inside the band the book keeps its
+share quantities through price changes. Explicit exits, opening exposure caps
+and the drawdown lock still apply. Cash parking runs independently.
+
+Only a discretionary risk trade updates the reference weight. Mandatory sales
+inside the band leave it in place while any risk position survives. An empty
+risk sleeve resets it. Each closing signal archives the proposed weight,
+reference weight and hold or rebalance decision. The corresponding session
+receipt stores the decision and the resulting reference used at the next close.
+Forward evidence must match the archived decision, and replay checkpoints retain
+the reference. During a hold the next allocatable caps come from the virtual
+book's retained closing exposure. The passive benchmark follows its own
+allocation rule. Omit the field for daily rebalancing.
 
 Daily-adapter `open_at` and `at` must match the actual NYSE session open and
 close, including half days and daylight-saving changes. Publication delays belong

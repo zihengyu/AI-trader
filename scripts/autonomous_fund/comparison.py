@@ -121,7 +121,19 @@ class Book:
         vars(self).clear()
         vars(self).update(state, policy=policy, series=series, overlays=marks)
 
-    def step(self, day, desired, prices, actions=(), risk=None):
+    def _retained_positions(self, desired, marks, before, budget):
+        held = {s: q for s, q in self.positions.items() if s in desired}
+        weights = {s: q * marks[s] / before for s, q in held.items()}
+        if len(held) == len(self.positions) and project(weights, self.policy) == weights:
+            return held
+        # Exits and cap trims still trade. Reserve their friction before checking
+        # the surviving positions against the caps.
+        weights = {s: q * marks[s] / budget for s, q in held.items()}
+        capped = project({s: min(w, ONE) for s, w in weights.items()}, self.policy)
+        return {s: held[s] if w == weights[s] else int((budget * w / marks[s]).to_integral_value(rounding=ROUND_FLOOR))
+                for s, w in capped.items()}
+
+    def step(self, day, desired, prices, actions=(), risk=None, *, hold_positions=False):
         if self.error:
             return
         # A missing action receipt or cash shortfall must not leave half a virtual
@@ -169,7 +181,11 @@ class Book:
             # Worst-case two-sided turnover reserves friction before sizing. This
             # prevents fees from pushing rounded positions above post-fee caps.
             budget = before * (ONE - 2 * (fee + slip + fee * slip))
-            planned = {s: int((budget * w / marks[s]).to_integral_value(rounding=ROUND_FLOOR)) for s, w in desired.items()}
+            if hold_positions and not self.paused and risk is None:
+                planned = self._retained_positions(desired, marks, before, budget)
+            else:
+                planned = {s: int((budget * w / marks[s]).to_integral_value(rounding=ROUND_FLOOR))
+                           for s, w in desired.items()}
             if self.paused:
                 planned = {s: min(q, self.positions.get(s, 0)) for s, q in planned.items()}
             for symbol in planned:

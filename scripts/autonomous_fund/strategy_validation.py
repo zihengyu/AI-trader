@@ -349,6 +349,18 @@ class ResearchBook(Book):
         return dict(state["held_since"]), dict(state["signals"]), state["as_of"]
 
 
+def _portfolio_rebalance(signals, policy, anchor, band):
+    if band is None:
+        return None
+    target = sum(project(signals, policy).values(), number(0))
+    hold = False
+    if anchor is not None:
+        change = abs(target - number(anchor))
+        # Evaluated weights are floats. Allow roundoff at the exact threshold.
+        hold = change < band and not math.isclose(change, band, rel_tol=1e-12)
+    return {"action": "hold" if hold else "rebalance", "reference_weight": anchor, "target_weight": str(target)}
+
+
 def replay(proposal, data, policy, days, *, initial_capital, static_weight=None, initial_signal=False,
            resume=None, save_checkpoint=False):
     bars = data["bars"]
@@ -380,7 +392,10 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
     book, held_since = ResearchBook(initial_capital, owned_policy), {}
     program = proposal["implementation"]
     compiled = compile_targets(program) if static_weight is None else None
+    band = program.get("portfolio_rebalance_band") if static_weight is None else None
+    band = number(band) if band is not None else None
     signals, previous_close, previous_day = {}, None, None
+    rebalance_anchor = None
     nav = number(initial_capital)
     binding = digest([proposal, owned_policy, str(initial_capital), static_weight]) if save_checkpoint or resume else None
     if resume is not None:
@@ -389,6 +404,7 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
             if instant(previous_close) != instant(by_day[benchmark][book.last["day"]]["at"]):
                 raise RiskError("Replay checkpoint close does not match the exchange session")
             nav = number(book.last["equity"])
+            rebalance_anchor = book.last.get("rebalance_anchor")
         except (KeyError, TypeError, ValueError, ArithmeticError):
             # An old or unusable checkpoint is optional. Replay the immutable
             # inputs and let the controller verify their archived prefix again.
@@ -447,14 +463,25 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         equity = book.value(opened)
         available = equity - sum((number(r["amount"]) for r in book.receivables), number(0))
         desired = {s: number(w) * available / equity for s, w in signals.items()}
+        rebalance = _portfolio_rebalance(signals, owned_policy, rebalance_anchor, band)
+        hold_positions = rebalance is not None and rebalance["action"] == "hold"
         if cash_symbol:
             from .strategy_cash import step
             step(book, day, desired, opened, actions, policy=owned_policy,
-                 now=open_at, session_index=indexes[day])
+                 now=open_at, session_index=indexes[day], hold_positions=hold_positions)
         else:
-            book.step(day, desired, opened, actions)
+            book.step(day, desired, opened, actions, hold_positions=hold_positions)
         if book.error:
             raise RiskError(book.error["reason"])
+        if rebalance is not None:
+            # Only an executed discretionary risk rebalance moves the anchor.
+            # Cash parking and mandatory sales inside the band cannot make a
+            # skipped target the baseline for the next signal.
+            if not any(s != cash_symbol for s in book.positions):
+                rebalance_anchor = None
+            elif not hold_positions and not book.paused and any(t["symbol"] != cash_symbol for t in book.last["trades"]):
+                rebalance_anchor = rebalance["target_weight"]
+            book.last.update(portfolio_rebalance=rebalance, rebalance_anchor=rebalance_anchor)
         for symbol in set(book.positions) - before:
             held_since[symbol] = indexes[day]
         held_since = {s: value for s, value in held_since.items() if s in book.positions}
@@ -474,7 +501,13 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
             book=book, held_since=held_since, compiled=compiled))
     available = nav - sum((number(r["amount"]) for r in book.receivables), number(0))
     desired = {s: number(w) * available / nav for s, w in signals.items()}
-    if cash_symbol:
+    next_rebalance = _portfolio_rebalance(signals, owned_policy, rebalance_anchor, band)
+    if next_rebalance is not None and next_rebalance["action"] == "hold":
+        # Held exposure sets the next capacity, subject to the same caps.
+        # Explicit exits carry zero capacity.
+        desired = {s: q * number(book.last["position_prices"][s]) / nav
+                   for s, q in book.positions.items() if desired.get(s, 0) > 0}
+    elif cash_symbol:
         from .strategy_cash import risk_targets
         desired = risk_targets(desired, owned_policy)
     # Allocating half a sleeve validated at 10% must authorize at most 5% of
@@ -485,6 +518,8 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
             "raw_next_targets": signals,
             "cost_usd": str(book.model_cost), "risk_paused": book.paused,
             "implementation": "next_open_whole_share_v1"}
+    if next_rebalance is not None:
+        result["next_portfolio_rebalance"] = next_rebalance
     if save_checkpoint and book.series:
         result["checkpoint"] = book.checkpoint(binding, held_since, signals, previous_close)
         result["resumed_sessions"] = resumed_sessions

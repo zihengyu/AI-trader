@@ -8,7 +8,7 @@ from itertools import takewhile
 from .costs import scripted, unpriced_reason
 from .risk import RiskError, instant, number, trading_day
 from .strategy_competition import _risk_matched
-from .strategy_evidence import reference_signal_matches, reference_signal_ready
+from .strategy_evidence import reference_signal_matches, reference_signal_ready, signal_matches_receipt
 from .strategy_validation import _daily_sessions, metrics
 
 
@@ -107,7 +107,7 @@ def _session_state(opened, closed, cutoff, signal_ok, recorded_forward, forward_
         if forward_body.get("evidence") == "replay":
             return "replayed"
         if (forward_body.get("evidence") != "prospective" or not signal_ok
-                or receipt["raw_signal"] != signal["raw_targets"]
+                or not signal_matches_receipt(signal, receipt)
                 or instant(receipt["signal_as_of"]) != instant(signal["as_of"])):
             return "inconsistent_evidence"
         if pair is None:

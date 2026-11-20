@@ -28,9 +28,14 @@ def reference_signal_ready(signal, reference, as_of):
             and isinstance(signal.get("raw_targets"), dict))
 
 
+def signal_matches_receipt(signal, receipt):
+    return (signal["raw_targets"] == receipt.get("raw_signal")
+            and signal.get("portfolio_rebalance") == receipt.get("portfolio_rebalance"))
+
+
 def reference_signal_matches(signal, receipt, reference):
     return (reference_signal_ready(signal, reference, receipt.get("signal_as_of"))
-            and signal["raw_targets"] == receipt.get("raw_signal"))
+            and signal_matches_receipt(signal, receipt))
 
 
 def can_resume_forward(seed, incoming, day, close):

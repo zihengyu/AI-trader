@@ -141,8 +141,11 @@ def evaluate(payload):
 
 
 def next_signal(simulation):
-    return {"as_of": simulation["next_signal_as_of"], "raw_targets": simulation["raw_next_targets"],
-            "targets": simulation["next_targets"]}
+    signal = {"as_of": simulation["next_signal_as_of"], "raw_targets": simulation["raw_next_targets"],
+              "targets": simulation["next_targets"]}
+    if "next_portfolio_rebalance" in simulation:
+        signal["portfolio_rebalance"] = simulation["next_portfolio_rebalance"]
+    return signal
 
 
 if __name__ == "__main__":

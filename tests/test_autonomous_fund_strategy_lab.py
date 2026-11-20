@@ -1301,6 +1301,128 @@ def test_checkpoint_resumes_exact_cash_positions_and_receivables(cash_adapter, m
     assert restored.pop("resumed_sessions") == 0 and restored == full
 
 
+@pytest.mark.parametrize("cash_adapter", [False, True])
+def test_portfolio_band_uses_executed_total_and_resumes_after_a_hold(cash_adapter):
+    from scripts.autonomous_fund.strategy_worker import next_signal
+
+    data, configured, candidate = cash_dataset() if cash_adapter else (dataset(12), policy(), proposal())
+    data["bars"]["BRAVO"] = copy.deepcopy(data["bars"]["ALFA"])
+    configured["universe"]["BRAVO"] = "stock"
+    candidate["instruments"].append("BRAVO")
+    program = candidate["implementation"]
+    program["portfolio_rebalance_band"] = .05
+    program["rules"] = [{"symbol": symbol, "entry": "True", "exit": "False",
+                         "weight": 'field("BASE", "exposure") / 2'} for symbol in candidate["instruments"]]
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    exposures = [.04, .40, .37, .35, .36, .33, .32]
+    for index, row in enumerate(data["bars"]["BASE"]):
+        row["exposure"] = exposures[min(index, len(exposures) - 1)]
+    options = {"initial_capital": "10000", "save_checkpoint": True}
+    full = replay(candidate, data, configured, days[1:], **options)
+    first, second, within, boundary = full["series"][:4]
+    assert {"ALFA", "BRAVO"} <= first["positions"].keys()  # First entry is below the band.
+    assert within["portfolio_rebalance"] == {"action": "hold", "reference_weight": "0.4", "target_weight": "0.370"}
+    assert all(within["positions"][s] == second["positions"][s] for s in candidate["instruments"])
+    assert not any(t["symbol"] in candidate["instruments"] for t in within["trades"])
+    assert boundary["portfolio_rebalance"]["action"] == "rebalance"
+    assert float(boundary["rebalance_anchor"]) == pytest.approx(.35)
+    assert {t["symbol"] for t in boundary["trades"] if t["side"] == "sell"} >= set(candidate["instruments"])
+
+    after_second = replay(candidate, data, configured, days[1:3], **options)
+    signal = next_signal(after_second)
+    assert signal["portfolio_rebalance"] == within["portfolio_rebalance"]
+    assert float(signal["targets"]["ALFA"]) == pytest.approx(
+        second["positions"]["ALFA"] * float(second["position_prices"]["ALFA"]) / float(second["equity"]))
+    prefix = replay(candidate, data, configured, days[1:4], **options)
+    saved = json.loads(json.dumps(prefix, default=str))
+    resumed = replay(candidate, data, configured, days[1:], resume=saved, **options)
+    assert resumed.pop("resumed_sessions") == 3
+    assert full.pop("resumed_sessions") == 0
+    assert resumed == full
+
+    passive = replay(candidate, data, configured, days[1:], initial_capital="10000", static_weight=.4)
+    assert all("portfolio_rebalance" not in row for row in passive["series"])
+
+
+def test_portfolio_band_allows_explicit_exit_and_trims_opening_cap_drift():
+    data, configured, candidate = dataset(8), policy(), proposal()
+    data["bars"]["BRAVO"] = copy.deepcopy(data["bars"]["ALFA"])
+    configured["universe"]["BRAVO"] = "stock"
+    configured["limits"]["max_position"] = ".4"
+    candidate["instruments"].append("BRAVO")
+    candidate["implementation"].update(portfolio_rebalance_band=.05, rules=[
+        {"symbol": "ALFA", "entry": "True", "exit": "False", "weight": "0.38"},
+        {"symbol": "BRAVO", "entry": "session_index == 0", "exit": "True", "weight": "0.02"},
+    ])
+    data["bars"]["ALFA"][3].update(open=200., close=200., high=200., low=200.)
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    result = replay(candidate, data, configured, days[1:4], initial_capital="10000")
+    initial, exit_day, capped = result["series"]
+    assert exit_day["portfolio_rebalance"]["action"] == capped["portfolio_rebalance"]["action"] == "hold"
+    assert [(t["symbol"], t["side"]) for t in exit_day["trades"]] == [("BRAVO", "sell")]
+    assert exit_day["positions"]["ALFA"] == initial["positions"]["ALFA"]
+    assert [(t["symbol"], t["side"]) for t in capped["trades"]] == [("ALFA", "sell")]
+    assert capped["positions"]["ALFA"] * 200 / float(capped["equity"]) <= .4
+    assert capped["rebalance_anchor"] == initial["rebalance_anchor"]
+
+
+def test_portfolio_band_still_checks_opening_drawdown_while_holding():
+    data, configured, candidate = dataset(8), policy(), proposal()
+    configured["limits"]["drawdown"] = ".08"
+    candidate["implementation"]["portfolio_rebalance_band"] = .05
+    candidate["implementation"]["rules"][0].update(entry="True", exit="False", weight=".4")
+    data["bars"]["ALFA"][2].update(open=60., close=60., high=60., low=60.)
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    result = replay(candidate, data, configured, days[1:3], initial_capital="10000")
+    last = result["series"][-1]
+    assert last["portfolio_rebalance"]["action"] == "hold"
+    assert last["risk_increase_paused"] and result["next_targets"] == {}
+    assert not any(t["side"] == "buy" for t in last["trades"])
+
+
+def test_portfolio_band_preserves_unset_proposal_digest():
+    from scripts.autonomous_fund.strategy_definition import proposal_body
+
+    legacy = proposal_body(proposal())
+    assert "portfolio_rebalance_band" not in legacy["implementation"]
+    candidate = copy.deepcopy(legacy)
+    candidate["implementation"]["portfolio_rebalance_band"] = None
+    assert proposal_body(candidate) == legacy
+    candidate["implementation"]["portfolio_rebalance_band"] = .05
+    assert digest(proposal_body(candidate)) != digest(legacy)
+    candidate["implementation"]["portfolio_rebalance_band"] = 1.1
+    with pytest.raises(ValueError, match="portfolio_rebalance_band"):
+        proposal_body(candidate)
+
+
+def test_portfolio_band_persists_preopen_signal_and_requires_the_same_decision(tmp_path):
+    engine, candidate, initial = lab(tmp_path), proposal(), dataset()
+    candidate["implementation"]["portfolio_rebalance_band"] = .05
+    formed = instant(initial["bars"]["BASE"][-1]["at"]) + timedelta(hours=1)
+    engine.submit(candidate, formed)
+    assert engine.schedule(initial, formed) and engine.run_one(formed)["passed"]
+
+    updated = dataset(171)
+    next_bar = updated["bars"]["BASE"][-1]
+    observed = instant(next_bar["at"]) + timedelta(hours=1)
+    incoming = attest({**updated, "bars": {symbol: rows[-1:] for symbol, rows in updated["bars"].items()}})
+    assert engine.schedule(incoming, observed)
+    result = engine.run_one(observed)
+    assert result["prospective_sessions"] == 1
+    day = next_bar["day"]
+    with engine.journal.connection() as db:
+        version = db.execute("SELECT * FROM fund_strategy_versions").fetchone()
+        at, body = db.execute("SELECT at,body FROM fund_strategy_signals WHERE day=?", (day,)).fetchone()
+        signal = json.loads(body)
+        assert instant(at) < instant(next_bar["open_at"])
+        assert signal["portfolio_rebalance"] == result["series"][0]["portfolio_rebalance"]
+        assert result["next_signal"]["portfolio_rebalance"]["action"] == "hold"
+        # The same raw weights with a different band decision cannot qualify.
+        signal["portfolio_rebalance"]["action"] = "hold"
+        db.execute("UPDATE fund_strategy_signals SET body=? WHERE day=?", (json.dumps(signal), day))
+        assert engine._forward_evidence(db, version, result["series"], [next_bar]) == set()
+
+
 def test_observation_index_preserves_order_and_publication_cutoffs():
     from scripts.autonomous_fund.strategy_program import HistoryIndex
 

@@ -21,7 +21,7 @@ def risk_targets(desired, policy):
     return {s: number(w) * scale for s, w in desired.items()}
 
 
-def step(book, day, desired, prices, actions, *, policy, now, session_index):
+def step(book, day, desired, prices, actions, *, policy, now, session_index, hold_positions=False):
     settings = policy.get("cash_management") or {}
     symbol = policy.get("cash_symbol")
     if not settings.get("enabled") or settings.get("symbol") != symbol:
@@ -43,7 +43,7 @@ def step(book, day, desired, prices, actions, *, policy, now, session_index):
         # cash view does. Additional friction is reserved before risk sizing.
         book.cash += held * mark
         book.step(day, risk_targets(desired, policy), prices,
-                  [a for a in actions if a["symbol"] != symbol])
+                  [a for a in actions if a["symbol"] != symbol], hold_positions=hold_positions)
         if book.error:
             raise RiskError(book.error["reason"])
         risk_trades = list(book.last["trades"])

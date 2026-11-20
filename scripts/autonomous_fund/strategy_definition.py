@@ -30,6 +30,7 @@ class StrategyProgram(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     adapter: str = Field(default="daily_rules_v1", min_length=1, max_length=80)
     rules: list[PositionRule] = Field(default_factory=list, max_length=40)
+    portfolio_rebalance_band: float | None = Field(default=None, gt=0, le=1, allow_inf_nan=False)
     # Strict provider schemas require named object properties. An array keeps
     # arbitrary parameter names without an open additionalProperties dictionary.
     parameters: list[StrategyParameter] = Field(default_factory=list, max_length=20)
@@ -120,6 +121,9 @@ def proposal_body(proposal):
     if body["validation"]["reference_strategy"] is None:
         # Preserve the digest of previously registered passive-only proposals.
         del body["validation"]["reference_strategy"]
+    if body["implementation"] is not None and body["implementation"]["portfolio_rebalance_band"] is None:
+        # Omitting the optional band preserves existing executable version identities.
+        del body["implementation"]["portfolio_rebalance_band"]
     return body
 
 
@@ -200,6 +204,9 @@ RESEARCH_GUIDANCE = (
     "min_independent_observations in both validation and final windows. Base revisions on identified evidence gaps "
     "and declare a fresh evaluation before drawing a new conclusion. "
     "For executable daily_rules_v1 use rules with symbol, entry/exit Boolean expressions and weight expression. "
+    "Both daily adapters accept an optional implementation.portfolio_rebalance_band as a weight fraction. "
+    "For example, 0.05 requires a five-percentage-point change from the last executed portfolio target "
+    "for a discretionary rebalance. In the band the book retains shares, subject to exits and risk limits. "
     "Expressions support field(symbol,column,lag), mean(symbol,column,window), ret(symbol,window), "
     "stdev(symbol,column,window), min/max/abs, arithmetic, comparisons, and/or/not, and the names "
     "holding_sessions, position_weight, entry_price, session_index. Historical observations are completed "

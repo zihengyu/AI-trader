@@ -23,7 +23,7 @@ from .risk import RiskError, instant, number, trading_day
 from .strategy_definition import ResearchTaskUpdate, StrategyLabSettings, daily_sample_requirements, proposal_body
 from .strategy_program import strategy_inputs, validate_program
 from .strategy_evidence import (can_resume_forward, load_frozen_dataset, load_reference, merge_forward_input,
-                                reference_signal_matches, reference_signal_ready)
+                                reference_signal_matches, reference_signal_ready, signal_matches_receipt)
 from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, historical_input_gap, implementation_hash,
                                   planned_sessions, snapshot_limitations, source_artifact_gaps)
 
@@ -426,7 +426,7 @@ class StrategyLab:
             opened = opens[day]
             if (instant(signal["as_of"]) == instant(session["signal_as_of"]) <= recorded < opened
                     and instant(signal["open_at"]) == opened
-                    and signal["raw_targets"] == session["raw_signal"]
+                    and signal_matches_receipt(signal, session)
                     and (reference is None or reference_signal_matches(signal.get("strategy_reference") or {},
                                                                        controls.get(day, {}), reference))
                     and signal["proposal_digest"] == row["digest"] and signal["policy_hash"] == row["policy_hash"]):
