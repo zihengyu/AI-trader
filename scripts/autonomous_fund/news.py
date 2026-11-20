@@ -258,23 +258,29 @@ class NewsWatch:
             self._ciks = {row["ticker"].upper().replace("-", "."): int(row["cik_str"]) for row in body.values()}
         return self._ciks
 
-    def collect(self):
+    def collect(self, *, before_fetch=None):
         with self._lock:
             symbols, held, queries = set(self._symbols), set(self._held), set(self._queries)
         queries |= set(self.settings.queries)
         batches = []  # (key, items)
+
+        def guarded(key, fetch):
+            if before_fetch is not None:
+                before_fetch()
+            return self._guard(key, fetch)
+
         # skip_sources: left out of this poll, for example Yahoo while the trading process needs it.
         sources = set(self.settings.sources) - set(getattr(self, "skip_sources", ()) or ())
         if "yahoo" in sources:
             for symbol in sorted(symbols):
-                batches.append((f"yahoo:{symbol}", self._guard(f"yahoo:{symbol}", lambda s=symbol: yahoo_items(s, self.yahoo))))
+                batches.append((f"yahoo:{symbol}", guarded(f"yahoo:{symbol}", lambda s=symbol: yahoo_items(s, self.yahoo))))
         if "google" in sources:
             for query in sorted(queries):
                 url = GOOGLE_URL.format(query=quote_plus(query))
-                batches.append((f"google:{query}", self._guard(f"google:{query}", lambda u=url, q=query: parse_feed(
+                batches.append((f"google:{query}", guarded(f"google:{query}", lambda u=url, q=query: parse_feed(
                     self._text(u), "google_news", "query", (), q))))
         if "fed" in sources:
-            batches.append(("fed", self._guard("fed", lambda: parse_feed(self._text(FED_URL), "federal_reserve", "macro"))))
+            batches.append(("fed", guarded("fed", lambda: parse_feed(self._text(FED_URL), "federal_reserve", "macro"))))
         agent = self.environ.get("FUND_SEC_USER_AGENT", "").strip()
         if "sec" in sources and agent:  # SEC fair access requires a declared contact.
             for symbol in sorted(held):
@@ -284,16 +290,16 @@ class NewsWatch:
                         return []  # ETFs and unknown tickers have no company filings.
                     return parse_feed(self._text(SEC_FILINGS.format(cik=cik), {"User-Agent": agent}),
                                       "sec_edgar", "filing", [s])
-                batches.append((f"sec:{symbol}", self._guard(f"sec:{symbol}", filings)))
+                batches.append((f"sec:{symbol}", guarded(f"sec:{symbol}", filings)))
         for name, url in self.settings.rss_feeds:
-            batches.append((f"rss:{name}", self._guard(f"rss:{name}", lambda u=url, n=name: parse_feed(
+            batches.append((f"rss:{name}", guarded(f"rss:{name}", lambda u=url, n=name: parse_feed(
                 self._text(u), f"rss:{n}", "headline"))))
         return batches, held
 
-    def poll_once(self):
+    def poll_once(self, *, before_fetch=None):
         # Stored times are UTC: string comparison and ordering stay correct across DST.
         now = instant(self.clock()).astimezone(timezone.utc)
-        batches, held = self.collect()
+        batches, held = self.collect(before_fetch=before_fetch)
         fresh_since = now - timedelta(hours=24)
         warm_before = set(self._seen_keys)
         with self.journal.connection() as db:

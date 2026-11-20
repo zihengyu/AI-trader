@@ -56,7 +56,7 @@ def _publication(html, date_prefix, summary_prefix):
     return published, summary
 
 
-def release_status(releases, now, get, clock, prior=()):
+def release_status(releases, now, get, clock, prior=(), *, before_fetch=None):
     now = instant(now)
     today = now.astimezone(ZONE).date()
     prior = {(row["date"], row["release"]): row for row in prior}
@@ -78,6 +78,8 @@ def release_status(releases, now, get, clock, prior=()):
         elif now < scheduled:
             retry = min(retry, max(1, int((scheduled - now).total_seconds())))
         elif day == today:
+            if before_fetch is not None:
+                before_fetch()
             try:
                 response = get(url, timeout=8, headers={"User-Agent": "LumiBot-AutonomousFund/1.0"})
                 response.raise_for_status()

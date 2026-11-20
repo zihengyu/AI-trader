@@ -130,7 +130,8 @@ def tool_diagnostics(result):
     if calls is None or results is None:
         return None
     failed = []
-    failed_names, later_successes = set(), set()
+    later_successes = set()
+    pending_failures = {}
     for event in results:
         name = _tool_label(getattr(event, 'tool_name', None))
         payload = getattr(event, 'payload', None)
@@ -145,14 +146,16 @@ def tool_diagnostics(result):
             if type(error.get('retryable')) is bool:
                 entry['retryable'] = error['retryable']
             failed.append(entry)
-            if name:
-                failed_names.add(name)
-        elif name in failed_names and payload.get('ok') is not False and not payload.get('error'):
+            pending_failures[name] = pending_failures.get(name, 0) + 1
+        elif name is not None and name in pending_failures and payload.get('ok') is not False and not payload.get('error'):
             later_successes.add(name)
+            pending_failures.pop(name, None)
     no_tools = any(isinstance(warning, dict) and warning.get('kind') == 'no_tool_calls'
                    for warning in (getattr(result, 'warnings', None) or ()))
     return {'tool_calls': len(calls), 'tool_results': len(results), 'failed_results': len(failed),
             'failures': failed[:10], 'tools_with_later_success': sorted(later_successes)[:10],
+            'unresolved_failed_results': sum(pending_failures.values()),
+            'tools_with_unresolved_failures': sorted(name for name in pending_failures if name)[:10],
             'no_tool_calls_warning': no_tools}
 
 

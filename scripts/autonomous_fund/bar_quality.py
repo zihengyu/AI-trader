@@ -121,13 +121,15 @@ def check(store, day, symbol, rows, cutoff, reference):
     return verdict
 
 
-def check_store(store, day, symbols, length, reference):
+def check_store(store, day, symbols, length, reference, *, before_fetch=None):
     """Data desk / prefetch: check every stored symbol for the day. Returns counts by status."""
     counts, failed = {}, None
     for symbol in symbols:
         rows = store.bars(day, symbol, length)
         if not rows:
             continue
+        if before_fetch is not None:
+            before_fetch()
         try:
             verdict = check(store, day, symbol, rows, day, reference)
         except Exception as exc:  # The service is down: stop asking for the rest of this pass.

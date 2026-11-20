@@ -125,6 +125,61 @@ def test_shutdown_interrupts_the_current_batch_and_skips_the_remaining_jobs(tmp_
     assert not status.alive(NOW)
 
 
+@pytest.mark.parametrize("job", ["earnings", "macro", "calendar", "news"])
+def test_shutdown_stops_a_separate_source_batch_without_marking_it_fresh(tmp_path, job):
+    from threading import Event
+
+    stop = Event()
+    calls = []
+
+    def fred_get(url, *, params, **kwargs):
+        calls.append(params["id"])
+        stop.set()
+        return SimpleNamespace(text="DATE,value\n2026-11-02,1.5\n", raise_for_status=lambda: None)
+
+    def earnings_fetch(symbol, day):
+        calls.append(symbol)
+        stop.set()
+        return "synthetic", ["2026-11-04"], None
+
+    def calendar_get(url, *, params, **kwargs):
+        calls.append(params["offset"])
+        stop.set()
+        return SimpleNamespace(json=lambda: {"release_dates": [{}] * 1000}, raise_for_status=lambda: None)
+
+    def news_get(url, **kwargs):
+        calls.append(url)
+        stop.set()
+        feed = "<rss><channel /></rss>"
+        return SimpleNamespace(text=feed, content=feed.encode(), raise_for_status=lambda: None)
+
+    settings = config(universe={"ALFA": "stock", "BRAVO": "stock"}, quant_risk={},
+                      news={"sources": ["google"], "queries": ["synthetic one", "synthetic two"]})
+    environ = {"FRED_API_KEY": "fixture-key"} if job == "calendar" else {}
+    desk = DataDesk(tmp_path, settings, "local", clock=lambda: NOW, environ=environ, macro_get=fred_get,
+                    calendar_get=calendar_get, news_get=news_get)
+    if job == "news":
+        Journal(tmp_path, "synthetic-shutdown-news")
+    desk._calendar = SimpleNamespace(source=lambda: "synthetic", fetch=earnings_fetch)
+    desk.due = lambda now: [job]
+    old = {"ALFA": {"source": "previous", "dates": ["2026-11-02"], "error": None}}
+    desk.store.put(DAY, "earnings", old)
+    desk.serve(stop)
+
+    assert len(calls) == 1
+    state = desk.status.read()
+    assert state["stopped_at"] == NOW.isoformat()
+    assert state["jobs"][job]["error"] is None and "ok_at" not in state["jobs"][job]
+    if job == "earnings":
+        assert desk.store.get(DAY, "earnings") == old
+    elif job == "macro":
+        assert desk.store.get(DAY, f"fred_{calls[0]}") == [["2026-11-02", 1.5]]
+    elif job == "calendar":
+        assert calls == [0] and desk.store.get(DAY, "econ_calendar") is None
+    else:
+        assert desk._news.stats["polls"] == 0
+
+
 def test_bars_and_snapshot_fill_the_store_once_and_the_snapshot_is_rewritten_only_on_change(tmp_path):
     from tests.test_autonomous_fund_prefetch import frame
     fetched = []

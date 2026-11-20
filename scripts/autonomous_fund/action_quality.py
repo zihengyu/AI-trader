@@ -83,7 +83,7 @@ def blocked(verdicts):
     return {symbol for symbol, row in (verdicts or {}).items() if row["status"] == "unreliable"}
 
 
-def refresh(store, day, symbols, length, source, reference):
+def refresh(store, day, symbols, length, source, reference, *, before_fetch=None):
     """Data desk/prefetch job. Cache comparable verdicts; retry missing sources on the next pass."""
     primary = getattr(source, "history_actions", None)
     if primary is None:
@@ -106,6 +106,8 @@ def refresh(store, day, symbols, length, source, reference):
     pending = sorted(set(symbols) - saved.keys())
     failure = None
     if pending:
+        if before_fetch is not None:
+            before_fetch()
         try:
             external = reference.corporate_actions(pending, start, end)
         except Exception as exc:
@@ -114,6 +116,8 @@ def refresh(store, day, symbols, length, source, reference):
                 saved[symbol] = previous.get(symbol) or {"status": "unavailable", "error": failure}
         else:
             for symbol in pending:
+                if before_fetch is not None:
+                    before_fetch()
                 try:
                     saved[symbol] = compare(primary(Asset(symbol, asset_type="stock"), length),
                                             external[symbol], start, end)

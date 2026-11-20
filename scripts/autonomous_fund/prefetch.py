@@ -44,7 +44,7 @@ def fetch_bars(store, day, symbols, length, data, *, before_fetch=None):
     return bars
 
 
-def refresh_earnings(store, day, calendar, stocks, refresh=False):
+def refresh_earnings(store, day, calendar, stocks, refresh=False, *, before_fetch=None):
     """Earnings dates per stock into the store; refresh=True fetches every stock again.
 
     A failed fetch never replaces dates fetched earlier: the earlier answer is kept.
@@ -54,6 +54,8 @@ def refresh_earnings(store, day, calendar, stocks, refresh=False):
     for symbol in stocks:
         if symbol in saved and not saved[symbol].get("error") and not refresh:
             continue
+        if before_fetch is not None:
+            before_fetch()
         source_name, dates, error = calendar.fetch(symbol, today)
         if error and symbol in saved and not saved[symbol].get("error"):
             continue

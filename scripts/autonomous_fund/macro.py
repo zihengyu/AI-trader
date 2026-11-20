@@ -132,11 +132,13 @@ class MacroWatch:
         self._raw = {}  # series -> (fetched_on, observations)
         self._versions = {}  # series -> store version last read (the data desk refreshes during the day)
 
-    def refresh(self, as_of_day):
+    def refresh(self, as_of_day, *, before_fetch=None):
         """Fetch every series now and store it (the data desk's job): {series: "ok" or the error}."""
         today = date.fromisoformat(str(as_of_day)[:10])
         result = {}
         for name in SERIES:
+            if before_fetch is not None:
+                before_fetch()
             try:
                 observations = self._fetch(name, today)
                 self._raw[name] = (today, observations)

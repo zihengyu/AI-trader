@@ -770,7 +770,7 @@ class DataDesk:
         # Yahoo headlines wait while trading needs Yahoo; the Fed, SEC, Google News and RSS continue.
         self._news.skip_sources = {"yahoo"} if yahoo_paused_until(self.run_dir, now) else set()
         before = dict(self._news.stats)
-        self._news.poll_once()
+        self._news.poll_once(before_fetch=self._check_stopping)
         return {"stored": self._news.stats["stored"] - before["stored"],
                 "material": self._news.stats["material"] - before["material"],
                 "sources_with_errors": sorted(self._news.stats["errors"])}
@@ -872,6 +872,7 @@ class DataDesk:
                                        schedule_as_of=stamp, prior=releases)
         rows = []
         for page in range(5):  # Hundreds of releases a week: page through the window, at most 5000 rows.
+            self._check_stopping()
             response = get(FRED_RELEASE_DATES, timeout=20, params={
                 "api_key": key, "file_type": "json", "realtime_start": today.isoformat(),
                 "realtime_end": (today + timedelta(days=CALENDAR_DAYS)).isoformat(),
@@ -884,6 +885,7 @@ class DataDesk:
                 break
         major, other = major_releases(rows, today)
         unavailable = None
+        self._check_stopping()
         try:  # FOMC decision days from the Fed itself; a failure is disclosed, never guessed.
             page = get(FOMC_CALENDAR, timeout=20, headers={"User-Agent": "LumiBot-AutonomousFund/1.0"})
             page.raise_for_status()
@@ -896,7 +898,7 @@ class DataDesk:
 
     def _save_calendar(self, now, get, releases, other, unavailable, *, schedule_as_of, prior):
         from .macro_releases import release_status
-        releases, retry = release_status(releases, now, get, self.clock, prior)
+        releases, retry = release_status(releases, now, get, self.clock, prior, before_fetch=self._check_stopping)
         self.store.put(trading_day(now), "econ_calendar", {
             "as_of": instant(now).isoformat(), "schedule_as_of": schedule_as_of,
             "window_days": CALENDAR_DAYS, "releases": releases,
@@ -914,7 +916,7 @@ class DataDesk:
         from .macro import MacroWatch
         if self._macro is None:
             self._macro = MacroWatch(self.macro_settings, environ=self.environ, get=self._gets["macro"], store=self.store)
-        result = self._macro.refresh(trading_day(now))
+        result = self._macro.refresh(trading_day(now), before_fetch=self._check_stopping)
         if all(value != "ok" for value in result.values()):
             raise RiskError("every FRED series failed: " + ", ".join(sorted(set(result.values())))[:150])
         return result
@@ -928,7 +930,8 @@ class DataDesk:
         if self._calendar.source() == "yahoo":
             self._yield_to_trading(now)
         stocks = sorted(s for s, kind in self.universe.items() if kind == "stock")
-        result = refresh_earnings(self.store, trading_day(now), self._calendar, stocks, refresh=True)
+        result = refresh_earnings(self.store, trading_day(now), self._calendar, stocks, refresh=True,
+                                  before_fetch=self._check_stopping)
         if stocks and len(result["failed"]) == len(stocks):  # Nothing usable: an error, not a fresh calendar.
             raise RiskError(f"the earnings calendar failed for all {len(stocks)} stocks")
         return result
@@ -946,8 +949,10 @@ class DataDesk:
             from .action_quality import refresh
             from .bar_quality import check_store
             # Cross-checked here, off the trading process; it reuses these verdicts.
-            result["corporate_actions"] = refresh(self.store, day, symbols, self.length, source, reference)
-            result["quality"] = check_store(self.store, day, symbols, self.length, reference)
+            result["corporate_actions"] = refresh(self.store, day, symbols, self.length, source, reference,
+                                                  before_fetch=self._check_stopping)
+            result["quality"] = check_store(self.store, day, symbols, self.length, reference,
+                                            before_fetch=self._check_stopping)
         self.store.prune(trading_day(now))
         if result["failed"] and not result["fetched"] and not result["already_stored"]:
             first = sorted(result["failed"].items())[0]
@@ -1055,8 +1060,13 @@ class DataDesk:
     def _job_sec(self, now):
         import pandas as pd
         from .fundamentals import SecFundamentals
+
+        def may_download():
+            self._check_stopping()
+            return True
+
         sec = SecFundamentals(self.run_dir / "cache" / "sec", self.environ["FUND_SEC_USER_AGENT"], get=self._gets["sec"])
-        sec.panels(set(self.stocks), pd.bdate_range(end=trading_day(now), periods=5))
+        sec.panels(set(self.stocks), pd.bdate_range(end=trading_day(now), periods=5), may_download=may_download)
         return {"companies": len(self.stocks), "errors": dict(list(sec.errors.items())[:20])}
 
     def _job_short_volume(self, now):

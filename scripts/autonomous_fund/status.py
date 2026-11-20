@@ -100,10 +100,15 @@ def triage_line(db, now):
     from zoneinfo import ZoneInfo
     from .triage import upper_bound
     meta = {key: json.loads(value) for key, value in db.execute(
-        "SELECT key,value FROM meta WHERE key IN ('triage_enforcing','triage_pairs')")}
-    scored = db.execute("SELECT body FROM events WHERE kind='triage_scored' AND json_valid(body) "
-                        "AND json_type(body,'$.stats')='object' ORDER BY sequence DESC LIMIT 1").fetchone()
-    window = (json.loads(scored[0]).get("stats") or {}).get("window", 40) if scored else 40
+        "SELECT key,value FROM meta WHERE key IN ('triage_enforcing','triage_pairs','triage_profile')")}
+    profile = meta.get("triage_profile")
+    policy = profile.get("policy") if isinstance(profile, dict) else None
+    if not isinstance(policy, dict):
+        # Older journals have no bound policy. Use the window their scorer recorded.
+        scored = db.execute("SELECT body FROM events WHERE kind='triage_scored' AND json_valid(body) "
+                            "AND json_type(body,'$.stats')='object' ORDER BY sequence DESC LIMIT 1").fetchone()
+        policy = json.loads(scored[0])["stats"] if scored else {}
+    window = policy.get("window", 40)
     if type(window) is not int or not 10 <= window <= 500:
         window = 40
     pairs = (meta.get("triage_pairs") or [])[-window:]
@@ -114,13 +119,27 @@ def triage_line(db, now):
         if instant(at).astimezone(zone).date().isoformat() == today:
             action = json.loads(body).get("action")
             actions[action] = actions.get(action, 0) + 1
-    if not pairs and not actions:
+    if not pairs and not actions and not meta.get("triage_enforcing"):
         return None
     misses = sum(bool(p) for p in pairs)
-    state = "生效中" if meta.get("triage_enforcing") else "影子观察（基金经理照常被叫，只打分）"
+    bound = upper_bound(misses, len(pairs))
+    enforcing = meta.get("triage_enforcing")
+    mode, limit = policy.get("mode"), policy.get("max_miss_rate")
+    state = "影子观察（基金经理照常被叫，只打分）"
+    if mode == "off":
+        state = "已关闭"
+    elif enforcing:
+        state = "生效中"
+        if mode == "enforce":
+            state = "按配置固定生效"
+        elif mode == "auto":
+            if len(pairs) < window:
+                state += f"（当前校准样本 {len(pairs)}/{window}，样本不足）"
+            elif type(limit) in (int, float) and bound > limit:
+                state += "（当前漏判率的 95% 上限高于校准阈值）"
     return (f"盘中事件判断：{state}；最近 {len(pairs)} 次“不需要”里漏判 {misses} 次"
-            f"（95% 上限 {upper_bound(misses, len(pairs)) * 100:.1f}%）；今天判断 {sum(actions.values())} 次"
-            + (f"，其中未叫基金经理 {actions.get('dismissed', 0)} 次" if meta.get("triage_enforcing") else ""))
+            f"（95% 上限 {bound * 100:.1f}%）；今天判断 {sum(actions.values())} 次"
+            + (f"，其中未叫基金经理 {actions.get('dismissed', 0)} 次" if enforcing else ""))
 
 
 def _age(at, now):

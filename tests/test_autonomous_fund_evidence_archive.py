@@ -85,6 +85,8 @@ def test_application_tool_diagnostics_link_errors_and_no_tool_warning_to_the_exa
     assert details['failed_results'] == 1
     assert details['failures'] == [{'tool': 'duckdb_query', 'error_type': 'BinderException', 'retryable': False}]
     assert details['tools_with_later_success'] == ['duckdb_query']
+    assert details['unresolved_failed_results'] == 0
+    assert details['tools_with_unresolved_failures'] == []
     assert second['tool_diagnostics']['no_tool_calls_warning'] is True
     assert load_call(tmp_path, first['id'])['result']['tool_diagnostics'] == details
     assert load_call(tmp_path, second['id'])['result']['tool_diagnostics']['tool_calls'] == 0
@@ -92,6 +94,24 @@ def test_application_tool_diagnostics_link_errors_and_no_tool_warning_to_the_exa
     assert len(records) == 2 and first['id'] in records[0] and 'shadow' in records[0]
     assert second['id'] in records[1] and 'postmarket_review' in records[1]
     assert 'PRIVATE_' not in ''.join(records) and 'PRIVATE_' not in json.dumps([first, second])
+
+
+def test_a_second_failure_after_success_remains_unresolved():
+    from lumibot.components.agents.schemas import AgentRunResult, AgentTraceEvent
+    from scripts.autonomous_fund.evidence import tool_diagnostics
+
+    def result(name, ok):
+        payload = {"rows": []} if ok else {"tool_error": True, "error": {"type": "BinderException"}}
+        return AgentTraceEvent(kind="tool_result", tool_name=name, payload=payload)
+
+    events = [result("query", False), result("query", True), result("query", False),
+              result("catalog", False), result("catalog", False), result("catalog", True),
+              result("lookup", True), result(None, False)]
+    stats = tool_diagnostics(AgentRunResult("answer", "fixture/model", events))
+    assert stats["failed_results"] == 5
+    assert stats["tools_with_later_success"] == ["catalog", "query"]
+    assert stats["unresolved_failed_results"] == 2
+    assert stats["tools_with_unresolved_failures"] == ["query"]
 
 
 def test_failed_call_keeps_its_input_and_unknown_usage_without_inventing_a_result(tmp_path):

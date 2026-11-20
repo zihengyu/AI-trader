@@ -2,6 +2,8 @@
 from datetime import date, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 from scripts.autonomous_fund.action_quality import KEY, compare, refresh
 from scripts.autonomous_fund.datastore import DailyStore
 from scripts.autonomous_fund.history import AlpacaDailyHistory
@@ -44,6 +46,29 @@ def test_corporate_actions_compare_on_same_share_basis_and_keep_unconfirmed_sepa
     verdict = compare(left, worse, start, end)
     assert verdict["status"] == "unreliable"
     assert verdict["discrepancies"][0]["yahoo_ex_date_basis"] == "0.40"
+
+
+def test_cancelled_crosscheck_leaves_the_prior_snapshot_intact(tmp_path):
+    from scripts.autonomous_fund.datadesk import Idle
+
+    store, day = DailyStore(tmp_path), "2026-11-03"
+    previous = {"ALFA": {"status": "unreliable"}, "BRAVO": {"status": "unreliable"}}
+    store.put(day, KEY, previous)
+    calls = []
+
+    def primary(asset, length):
+        calls.append(asset.symbol)
+        return []
+
+    def check_stopping():
+        if calls:
+            raise Idle("stopping")
+
+    source = SimpleNamespace(history_actions=primary)
+    reference = SimpleNamespace(corporate_actions=lambda symbols, start, end: dict.fromkeys(symbols, []))
+    with pytest.raises(Idle):
+        refresh(store, day, ["ALFA", "BRAVO"], 30, source, reference, before_fetch=check_stopping)
+    assert calls == ["ALFA"] and store.get(day, KEY) == previous
 
 
 def test_published_corporate_mismatch_invalidates_cached_research_and_notifies(tmp_path):

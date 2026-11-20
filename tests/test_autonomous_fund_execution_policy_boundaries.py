@@ -399,3 +399,26 @@ def test_triage_status_uses_the_actual_scoring_window(tmp_path, window):
     with strategy.journal.connection() as db:
         text = triage_line(db, NOW)
     assert f"最近 {window} 次" in text and f"漏判 {sum(pairs[-window:])} 次" in text
+
+
+def test_triage_status_uses_current_profile_and_explains_provisional_enforcement(tmp_path):
+    from scripts.autonomous_fund.status import triage_line
+    from scripts.autonomous_fund.triage import TriageSettings, bind_profile
+
+    strategy, _ = fund(tmp_path, "shadow", [])
+    strategy.journal.event(NOW, "triage_scored", {"stats": {"window": 10}})
+    bind_profile(strategy.journal, TriageSettings(window=40), "fixture/triage", "current", NOW)
+    strategy.journal.set_meta("triage_pairs", [False])
+    with strategy.journal.connection() as db:
+        text = triage_line(db, NOW)
+    assert "生效中" in text and "1/40，样本不足" in text and "95.0%" in text
+
+    strategy.journal.set_meta("triage_pairs", [False] * 40)
+    with strategy.journal.connection() as db:
+        text = triage_line(db, NOW)
+    assert "最近 40 次" in text and "样本不足" not in text
+
+    strategy.journal.set_meta("triage_pairs", [True] * 4 + [False] * 36)
+    with strategy.journal.connection() as db:
+        text = triage_line(db, NOW)
+    assert "生效中" in text and "95% 上限高于校准阈值" in text
