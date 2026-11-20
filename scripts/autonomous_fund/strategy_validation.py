@@ -214,6 +214,11 @@ def following_session(day):
     return session, opened
 
 
+def signal_cutoff(close, plan):
+    minutes = plan.get("signal_delay_minutes", 0)
+    return (instant(close) + timedelta(minutes=minutes)).isoformat() if minutes else close
+
+
 def planned_sessions(days, count=None):
     expected = [day for day, _, _ in _daily_sessions(days[0], days[-1])]
     return expected if count is None else expected[-count:]
@@ -366,7 +371,8 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
     bars = data["bars"]
     histories = HistoryIndex({**bars, **data.get("features", {})})
     by_day = {s: {r["day"]: r for r in rows} for s, rows in bars.items()}
-    benchmark = proposal["validation"]["benchmark"]
+    plan = proposal["validation"]
+    benchmark = plan["benchmark"]
     all_days = [row["day"] for row in bars[benchmark]]
     indexes = {day: index for index, day in enumerate(all_days)}
     if not (initial_signal and not days) and (
@@ -401,8 +407,8 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
     if resume is not None:
         try:
             held_since, signals, previous_close = book.resume(resume, binding, days)
-            if instant(previous_close) != instant(by_day[benchmark][book.last["day"]]["at"]):
-                raise RiskError("Replay checkpoint close does not match the exchange session")
+            if instant(previous_close) != instant(signal_cutoff(by_day[benchmark][book.last["day"]]["at"], plan)):
+                raise RiskError("Replay checkpoint signal does not match the session cutoff")
             nav = number(book.last["equity"])
             rebalance_anchor = book.last.get("rebalance_anchor")
         except (KeyError, TypeError, ValueError, ArithmeticError):
@@ -419,7 +425,7 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
         if initial_signal and len(common) != len(set(proposal["instruments"])):
             raise RiskError("Initial forward signal is missing the latest close")
         if common:
-            previous_close = max(r["at"] for r in common)
+            previous_close = signal_cutoff(max(r["at"] for r in common), plan)
             signals = ({benchmark: static_weight} if static_weight is not None else targets(
                 program, histories, previous_close, session_index=indexes[previous_day],
                 book=book, held_since=held_since, compiled=compiled))
@@ -494,8 +500,15 @@ def replay(proposal, data, policy, days, *, initial_capital, static_weight=None,
                          net_economic_equity=str(nav - book.model_cost), signal_as_of=previous_close,
                          raw_signal=signals)
         book.series[-1] = copy.deepcopy(book.last)
-        previous_close = max(by_day[s][day]["at"] for s in required)
-        previous_day = day
+        previous_close = signal_cutoff(max(by_day[s][day]["at"] for s in required), plan)
+        if static_weight is None:
+            # The rule interpreter can read book equity and position weights,
+            # so the same publication cutoff applies to their held marks.
+            for symbol in book.positions:
+                mark = by_day[symbol][day]
+                published = (mark.get("feature_available_at") or {}).get("close", mark["available_at"])
+                if max(instant(mark["available_at"]), instant(published)) > instant(previous_close):
+                    raise RiskError(f"Held closing mark unavailable at the strategy signal cutoff: {symbol}")
         signals = ({benchmark: static_weight} if static_weight is not None else targets(
             program, histories, previous_close, session_index=indexes[day],
             book=book, held_since=held_since, compiled=compiled))
@@ -684,8 +697,8 @@ def _historical_arm_gap(proposal, data, policy, locked_sessions):
         return {"status": "needs_data", "passed": False, "reason": "Benchmark history has missing exchange sessions"}
 
     prior = _daily_sessions(min(days[0], expected[0]), expected[0])[:-1]
-    initial_close = prior[-1][2] if prior else sessions[0][2]
-    final_close = sessions[-1][2]
+    initial_close = instant(signal_cutoff(prior[-1][2] if prior else sessions[0][2], plan))
+    final_close = instant(signal_cutoff(sessions[-1][2], plan))
     # The preceding close forms the initial signal. An absolute session index
     # also depends on all earlier benchmark sessions in the supplied history.
     depths = dict.fromkeys([*proposal["instruments"], benchmark], 1) if prior else {}

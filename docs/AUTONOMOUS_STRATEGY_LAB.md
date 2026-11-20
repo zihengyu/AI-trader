@@ -104,11 +104,23 @@ training a new ML model, intraday limit/stop simulation and unsupported executio
 mechanisms require a separately reviewed adapter. They are not silently replaced
 with a daily approximation and marked validated.
 
-Signals use observations available at a completed session close. Orders execute
-at the following session open with explicit fees/slippage and whole shares; the
-book is valued at the close. Missing observations are never filled forward. A
-missing input while holding cannot silently create a sale. Each test split and
-each candidate has independent capital, cash, positions and trade receipts.
+Signals use observations available by the session's decision cutoff. The
+default cutoff is the exchange close. Set `validation.signal_delay_minutes`
+to a positive value up to 720 to include publications made after that close.
+The offset starts at the scheduled NYSE close, including half days. Executable
+arms use the candidate's cutoff for their paired test. Historical preflight,
+the worker and the forward audit use that same clock. Workers wait for it
+without spending a validation slot early. An updated eligible snapshot may
+replace a delayed historical job while it is still waiting for the cutoff.
+The locked session grid stays fixed, and each job remains bound to its input.
+
+Orders execute at the following session open with explicit fees/slippage and
+whole shares. The book is valued at the close. Position state used by a signal
+requires the held closing marks to have been published by its cutoff. A rule
+that requires a same-session feature must verify its observation session using
+the dated source evidence. A missing input while holding cannot silently create
+a sale. Each test split and candidate has independent capital, cash, positions
+and trade receipts.
 
 Both daily adapters accept an optional `implementation.portfolio_rebalance_band`
 expressed as a fraction of total portfolio value. With `0.05`, the difference
@@ -199,8 +211,10 @@ The preceding close, indicator lookbacks and absolute benchmark session indexes
 retain the history they require. An older gap outside that scope does not move
 or invalidate the selected window.
 Missing requirements remain visible in `strategy-lab` and the research context.
-The first eligible validation freezes the exact benchmark sessions and input
-snapshot digest for the version. The queued validation retains that snapshot.
+The first eligible validation freezes the exact benchmark sessions and records
+the input snapshot digest. Each queued job binds its own input snapshot. A
+snapshot received while a delayed job is waiting can replace its queued job
+without moving the frozen sessions.
 If the worker later diagnoses missing data, a new attested snapshot can repair
 those same sessions. Adding later prices never moves the splits. New variants need a final
 window disjoint from already reserved windows. Exploratory training, validation

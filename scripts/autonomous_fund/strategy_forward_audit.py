@@ -9,7 +9,7 @@ from .costs import scripted, unpriced_reason
 from .risk import RiskError, instant, number, trading_day
 from .strategy_competition import _risk_matched
 from .strategy_evidence import reference_signal_matches, reference_signal_ready, signal_matches_receipt
-from .strategy_validation import _daily_sessions, metrics
+from .strategy_validation import _daily_sessions, metrics, signal_cutoff
 
 
 def _window(frozen, required):
@@ -77,8 +77,8 @@ def _originating_call(db, key, version, cutoff):
     return {"call_id": call, "status": "call_receipt_unavailable"}
 
 
-def _signal_valid(at, body, opened, previous_close, proposal_digest, policy_hash):
-    return (at is not None and previous_close <= at < opened and instant(body["as_of"]) == previous_close
+def _signal_valid(at, body, opened, expected_cutoff, proposal_digest, policy_hash):
+    return (at is not None and expected_cutoff <= at < opened and instant(body["as_of"]) == expected_cutoff
             and instant(body["open_at"]) == opened and body.get("proposal_digest") == proposal_digest
             and body.get("policy_hash") == policy_hash and isinstance(body.get("raw_targets"), dict))
 
@@ -190,6 +190,7 @@ def audit_forward(db, key, version, cutoff):
         "AND julianday(at)<=julianday(?)", args) if instant(at) <= cutoff}
     rows = []
     for day, opened, closed, previous_close in window:
+        expected_cutoff = instant(signal_cutoff(previous_close, plan))
         signal_at, raw_signal, job, signal_dataset, signal_source, signal_result = signals.get(day, (None,) * 6)
         recorded, raw_observation, input_dataset = observations.get(day, (None, None, None))
         try:
@@ -198,12 +199,12 @@ def audit_forward(db, key, version, cutoff):
             signal_source_status = _source_status(db, signal_source, signal_at, requires_artifacts)
             observation_source_status = _source_status(db, input_dataset, recorded, requires_artifacts)
             source_states = {"artifact_bytes_matched", "snapshot_recorded"}
-            signal_ok = (_signal_valid(signal_at, signal, opened, previous_close, row[3], row[4])
+            signal_ok = (_signal_valid(signal_at, signal, opened, expected_cutoff, row[3], row[4])
                          and signal_source_status in source_states and signal_result is not None
                          and instant(signal_result) <= signal_at
                          and _source_status(db, signal_dataset, signal_at, False) == "snapshot_recorded")
             if signal_ok and strategy_reference is not None:
-                signal_ok = reference_signal_ready(signal.get("strategy_reference"), strategy_reference, previous_close)
+                signal_ok = reference_signal_ready(signal.get("strategy_reference"), strategy_reference, expected_cutoff)
             status = _session_state(opened, closed, cutoff, signal_ok, recorded, observation,
                                     paired.get(day), result_at, signal, strategy_reference)
             if status == "prospective" and observation_source_status not in source_states:
@@ -217,6 +218,8 @@ def audit_forward(db, key, version, cutoff):
                      "signal_source_status": signal_source_status,
                      "observation_at": recorded.isoformat() if recorded else None,
                      "observation_source_dataset": input_dataset, "observation_source_status": observation_source_status})
+        if plan.get("signal_delay_minutes"):
+            rows[-1]["signal_cutoff"] = expected_cutoff.isoformat()
         if opened > cutoff:
             break
 

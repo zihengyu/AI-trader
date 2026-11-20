@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- Strategy Lab daily validation can predeclare an after-close decision cutoff for timestamped publications. Historical replay, queued workers and the forward audit use the same exchange-relative clock before next-open execution.
 - Strategy Lab daily research adapters can predeclare a portfolio-wide rebalance band. In-band replay retains shares subject to explicit exits and hard risk limits. Forward signals and resumable receipts retain the rebalance decision and its reference target.
 - Strategy Lab can freeze a registered executable version as a paired comparator in daily validation. Both arms share input and execution assumptions, and forward qualification needs timely signals from both arms as well as the existing passive hurdle.
 - The Autonomous Fund regression workflow tests Strategy Lab, ledger, risk, approvals and execution recovery on Windows and Linux. Strategy Lab status surfaces the reason a proposal is awaiting formalization or a validation adapter.

@@ -159,7 +159,8 @@ def test_executable_comparison_requires_a_frozen_compatible_reference(tmp_path, 
 
 
 @pytest.mark.parametrize("paired_receipt", [True, False])
-def test_executable_reference_uses_shared_history_and_binds_both_forward_signals(tmp_path, paired_receipt):
+@pytest.mark.parametrize("signal_delay", [0, 30])
+def test_executable_reference_uses_shared_history_and_binds_both_forward_signals(tmp_path, paired_receipt, signal_delay):
     from scripts.autonomous_fund.lab import check_data, forward_audit, forward_readiness
     from scripts.autonomous_fund.strategy_lab_runtime import history_requests
 
@@ -167,6 +168,7 @@ def test_executable_reference_uses_shared_history_and_binds_both_forward_signals
     configured["universe"]["BETA"] = "unlevered_etf"
     engine = StrategyLab(Journal(tmp_path, "synthetic-comparison"), configured)
     candidate, control = proposal(), proposal("reference-alternative")
+    candidate["validation"]["signal_delay_minutes"] = signal_delay
     control["instruments"], control["data_symbols"] = ["BETA"], ["EVENTS"]
     control["implementation"]["rules"][0].update(symbol="BETA", entry='field("EVENTS", "value") > 0',
                                                    exit="False", weight="0.25")
@@ -204,6 +206,8 @@ def test_executable_reference_uses_shared_history_and_binds_both_forward_signals
         day, body = db.execute("SELECT day,body FROM fund_strategy_signals WHERE id=?", (key,)).fetchone()
         signal = json.loads(body)
         assert signal["strategy_reference"]["identity"] == identity
+        expected = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(minutes=signal_delay)
+        assert instant(signal["as_of"]) == instant(signal["strategy_reference"]["as_of"]) == expected
         if not paired_receipt:
             signal.pop("strategy_reference")
             db.execute("UPDATE fund_strategy_signals SET body=? WHERE id=? AND day=?", (json.dumps(signal), key, day))
@@ -1421,6 +1425,85 @@ def test_portfolio_band_persists_preopen_signal_and_requires_the_same_decision(t
         signal["portfolio_rebalance"]["action"] = "hold"
         db.execute("UPDATE fund_strategy_signals SET body=? WHERE day=?", (json.dumps(signal), day))
         assert engine._forward_evidence(db, version, result["series"], [next_bar]) == set()
+
+
+def test_delayed_signal_uses_half_day_close_and_filters_late_publications():
+    from scripts.autonomous_fund.strategy_definition import proposal_body
+
+    data, candidate = dataset(5, start="2025-11-26"), proposal()
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    close = instant(data["bars"]["BASE"][1]["at"])
+    assert close.astimezone(ZONE).hour == 13
+    candidate["implementation"]["rules"][0].update(entry='field("LATE", "value") > 0', exit="False")
+    feature = {"at": close.isoformat(), "available_at": close.isoformat(), "value": 1,
+               "feature_available_at": {"value": (close + timedelta(minutes=15)).isoformat()}}
+    data["features"] = {"LATE": [feature]}
+    legacy_definition = proposal_body(candidate)
+    candidate["validation"]["signal_delay_minutes"] = 0
+    assert proposal_body(candidate) == legacy_definition
+    legacy = replay(candidate, data, policy(), days[2:3], initial_capital="10000")
+    assert legacy["series"][0]["positions"] == {}
+
+    candidate["validation"]["signal_delay_minutes"] = 30
+    delayed = replay(candidate, data, policy(), days[2:3], initial_capital="10000")
+    first = delayed["series"][0]
+    assert instant(first["signal_as_of"]) == close + timedelta(minutes=30)
+    assert first["positions"]["ALFA"] > 0
+    assert instant(first["signal_as_of"]) < instant(data["bars"]["BASE"][2]["open_at"])
+
+    feature["feature_available_at"]["value"] = (close + timedelta(minutes=31)).isoformat()
+    late = replay(candidate, data, policy(), days[2:3], initial_capital="10000")
+    assert late["series"][0]["positions"] == {}
+
+
+def test_unpublished_held_mark_cannot_enter_the_signal_through_book_state():
+    data, candidate = dataset(5), proposal()
+    candidate["validation"]["signal_delay_minutes"] = 30
+    bar = data["bars"]["ALFA"][1]
+    bar["available_at"] = (instant(bar["at"]) + timedelta(minutes=31)).isoformat()
+    days = [row["day"] for row in data["bars"]["BASE"]]
+    with pytest.raises(RiskError, match="Held closing mark unavailable at the strategy signal cutoff"):
+        replay(candidate, data, policy(), days[1:2], initial_capital="10000")
+
+
+def test_delayed_signal_waits_for_cutoff_and_keeps_prospective_receipts(tmp_path):
+    from scripts.autonomous_fund.lab import forward_audit
+
+    def with_releases(data):
+        data["features"] = {"RELEASE": [{"at": row["at"], "value": 1,
+                                        "available_at": (instant(row["at"]) + timedelta(minutes=15)).isoformat()}
+                                       for row in data["bars"]["BASE"]]}
+        return attest(data)
+
+    engine, candidate, initial = lab(tmp_path), proposal(), with_releases(dataset())
+    candidate["validation"]["signal_delay_minutes"] = 30
+    candidate["implementation"]["rules"][0]["entry"] = 'field("RELEASE", "value") > 0'
+    close = instant(initial["bars"]["BASE"][-1]["at"])
+    cutoff = close + timedelta(minutes=30)
+    early = copy.deepcopy(initial)
+    early["features"]["RELEASE"].pop()
+    engine.submit(candidate, close)
+    early_job, = engine.schedule(attest(early), close + timedelta(minutes=5))
+    ready_job, = engine.schedule(initial, close + timedelta(minutes=15))
+    assert ready_job != early_job and engine.run_one(cutoff - timedelta(seconds=1)) is None
+    assert engine.run_one(cutoff)["passed"]
+    with engine.journal.connection() as db:
+        recorded, body = db.execute("SELECT at,body FROM fund_strategy_signals").fetchone()
+        assert instant(recorded) >= cutoff
+        assert instant(json.loads(body)["as_of"]) == cutoff
+
+    for count in (171, 172):
+        data = with_releases(dataset(count))
+        observed = instant(data["bars"]["BASE"][-1]["at"]) + timedelta(minutes=31)
+        incoming = attest({**data, "bars": {symbol: rows[-1:] for symbol, rows in data["bars"].items()},
+                           "features": {"RELEASE": data["features"]["RELEASE"][-1:]}})
+        assert engine.schedule(incoming, observed)
+        result = engine.run_one(observed)
+        assert result["prospective_sessions"] == count - 170
+        assert result["resumed_sessions"] == count - 171
+    audit = forward_audit(tmp_path, candidate["strategy_id"], "v1", observed + timedelta(minutes=1))
+    assert [row["status"] for row in audit["sessions"][:2]] == ["prospective", "prospective"]
+    assert instant(audit["sessions"][0]["signal_cutoff"]) == cutoff
 
 
 def test_observation_index_preserves_order_and_publication_cutoffs():

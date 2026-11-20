@@ -58,6 +58,7 @@ class ValidationPlan(BaseModel):
     benchmark: str = Field(min_length=1, max_length=24)
     benchmark_weight: float = Field(default=1.0, gt=0, le=1, allow_inf_nan=False)
     reference_strategy: StrategyReference | None = None
+    signal_delay_minutes: int = Field(default=0, ge=0, le=720)
     holding_sessions: int = Field(ge=1, le=252)
     train_sessions: int = Field(default=180, ge=40, le=5000)
     validation_sessions: int = Field(default=60, ge=20, le=10000)
@@ -121,6 +122,8 @@ def proposal_body(proposal):
     if body["validation"]["reference_strategy"] is None:
         # Preserve the digest of previously registered passive-only proposals.
         del body["validation"]["reference_strategy"]
+    if body["validation"]["signal_delay_minutes"] == 0:
+        del body["validation"]["signal_delay_minutes"]
     if body["implementation"] is not None and body["implementation"]["portfolio_rebalance_band"] is None:
         # Omitting the optional band preserves existing executable version identities.
         del body["implementation"]["portfolio_rebalance_band"]
@@ -207,6 +210,9 @@ RESEARCH_GUIDANCE = (
     "Both daily adapters accept an optional implementation.portfolio_rebalance_band as a weight fraction. "
     "For example, 0.05 requires a five-percentage-point change from the last executed portfolio target "
     "for a discretionary rebalance. In the band the book retains shares, subject to exits and risk limits. "
+    "validation.signal_delay_minutes optionally sets a shared decision cutoff 1–720 minutes after the "
+    "actual session close for both executable arms. Use it for data available after close and before the next open. "
+    "Supply original publication times and check the feature session explicitly if the rule needs a same-session value. "
     "Expressions support field(symbol,column,lag), mean(symbol,column,window), ret(symbol,window), "
     "stdev(symbol,column,window), min/max/abs, arithmetic, comparisons, and/or/not, and the names "
     "holding_sessions, position_weight, entry_price, session_index. Historical observations are completed "

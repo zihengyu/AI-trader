@@ -25,7 +25,7 @@ from .strategy_program import strategy_inputs, validate_program
 from .strategy_evidence import (can_resume_forward, load_frozen_dataset, load_reference, merge_forward_input,
                                 reference_signal_matches, reference_signal_ready, signal_matches_receipt)
 from .strategy_validation import (check_dataset, check_snapshot_as_of, digest, following_session, historical_input_gap, implementation_hash,
-                                  planned_sessions, snapshot_limitations, source_artifact_gaps)
+                                  planned_sessions, signal_cutoff, snapshot_limitations, source_artifact_gaps)
 
 
 def has_source_artifact_receipt(db, fingerprint, now):
@@ -207,6 +207,7 @@ class StrategyLab:
                     # a strategy under a different account risk configuration.
                     continue
                 body = json.loads(row["proposal"])
+                plan = body["validation"]
                 if row["state"] not in {"candidate", "needs_data", "awaiting_new_holdout", "shadow", "paper_active"}:
                     continue
                 try:
@@ -216,7 +217,6 @@ class StrategyLab:
                     continue
                 if row["state"] in {"candidate", "needs_data", "awaiting_new_holdout"}:
                     kind = "exploratory"
-                    plan = body["validation"]
                     total = plan["train_sessions"] + plan["validation_sessions"] + plan["final_sessions"]
                     lock = db.execute("SELECT sessions FROM fund_strategy_holdouts WHERE id=? AND version=?",
                                       (row["id"], row["version"])).fetchone()
@@ -227,8 +227,10 @@ class StrategyLab:
                         if not complete:
                             continue
                         if db.execute("SELECT 1 FROM fund_strategy_jobs WHERE strategy_id=? AND version=? "
-                                      "AND kind='historical' AND state IN ('queued','running')",
-                                      (row["id"], row["version"])).fetchone():
+                                      "AND kind='historical' AND (state='running' OR (state='queued' "
+                                      "AND (?=0 OR julianday(at)<julianday(?))))",
+                                      (row["id"], row["version"], plan.get("signal_delay_minutes", 0),
+                                       instant(now).isoformat())).fetchone():
                             continue
                     # A shared provider snapshot need not contain every strategy.
                     # A scoped cache snapshot, however, is specifically for this version.
@@ -273,8 +275,12 @@ class StrategyLab:
                 else:
                     continue
                 key = uuid4().hex
+                close = data["bars"][plan["benchmark"]][-1]["at"]
+                # A snapshot can be queued on receipt. The normal claim path
+                # waits for the frozen clock, even if the inbox file never changes.
+                ready_at = max(instant(now), instant(signal_cutoff(close, plan)))
                 result = db.execute("INSERT OR IGNORE INTO fund_strategy_jobs VALUES(?,?,?,?,?,?,?,NULL,NULL,NULL)",
-                                    (key, row["id"], row["version"], instant(now).isoformat(), kind, fingerprint, "queued"))
+                                    (key, row["id"], row["version"], ready_at.isoformat(), kind, fingerprint, "queued"))
                 if result.rowcount:
                     db.execute("UPDATE fund_strategy_jobs SET state='superseded' WHERE strategy_id=? AND version=? "
                                "AND kind=? AND state='queued' AND id!=?",
@@ -395,14 +401,15 @@ class StrategyLab:
     @staticmethod
     def _save_next_signal(db, row, job, result, last_bar, finished, dataset, *, reference=None):
         signal = result.get("next_signal")
-        if not signal or not signal["as_of"] or instant(signal["as_of"]) != instant(last_bar["at"]):
+        cutoff = instant(signal_cutoff(last_bar["at"], json.loads(row["proposal"])["validation"]))
+        if not signal or not signal["as_of"] or instant(signal["as_of"]) != cutoff:
             return
         day, opened = following_session(last_bar["day"])
-        if not instant(last_bar["available_at"]) <= finished < opened:
+        if not max(instant(last_bar["available_at"]), cutoff) <= finished < opened:
             return
         if reference is not None:
             control = result.get("next_strategy_reference_signal")
-            if not reference_signal_ready(control, reference, last_bar["at"]):
+            if not reference_signal_ready(control, reference, cutoff):
                 return
             signal = {**signal, "strategy_reference": control}
         db.execute("INSERT OR IGNORE INTO fund_strategy_signals VALUES(?,?,?,?,?,?,?)",
