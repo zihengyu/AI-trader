@@ -78,7 +78,10 @@ def test_observations_map_each_experiment_to_one_state():
                       "predictions:research_ideas": "shadow", "predictions:review": "shadow"}
     fundamentals = next(item for item in entries if item["id"] == "factor:f3")
     assert "SEC point-in-time fundamentals" in fundamentals["dependencies"]
-    assert next(item for item in entries if item["id"] == "factor:f1")["evidence"]["walk_forward_agreeing"] == 3
+    legacy = next(item for item in entries if item["id"] == "factor:f1")["evidence"]
+    assert legacy["walk_forward_agreeing"] == 3
+    assert legacy["qualification"]["predictive"]["status"] == "legacy_unclassified"
+    assert legacy["qualification"]["economic_alpha"]["status"] == "economic_evidence_insufficient"
     assert next(item for item in entries if item["id"] == "learning:baseline")["evidence"]["t_stat"] == -2.3
 
 

@@ -115,6 +115,38 @@ def test_registry_counts_each_distinct_expression_once_and_caps_a_review(tmp_pat
     assert retest[0]["trials"] == trials  # Its evidence bar is the one it was first tried under.
 
 
+def test_long_horizon_preflight_skips_formal_statistics_and_reports_warmup(tmp_path, monkeypatch):
+    from scripts.autonomous_fund import factors
+
+    def no_formal_statistics(*args, **kwargs):
+        pytest.fail("An infeasible proposal ran formal statistics")
+
+    monkeypatch.setattr(factors, "summarize", no_formal_statistics)
+    lab = FactorLab(Journal(tmp_path, "synthetic-preflight"), FactorSettings(negative_control_runs=0))
+    close, volume = panel(days=504)
+    candidate = proposal("rank(ts_mean(ret(60), 10))", horizon=20)
+    [result] = lab.test([candidate], NOW, "2026-11-02", close, volume)
+    preflight = result["preflight"]
+    assert result["status"] == "insufficient_data" and result["formal_test_run"] is False
+    assert result["horizon_sessions"] == 20 and preflight["feature_warmup_sessions"] == 69
+    assert preflight["status"] == "needs_more_sessions" and preflight["minimum_history_sessions"] == 630
+    assert preflight["history_sessions_shortfall"] == 126 and preflight["independent_observations"] == 21
+    saved = lab.rows()
+    [repeat] = lab.test([candidate], NOW, "2026-11-03", close, volume)
+    assert repeat["repeat"] and not repeat["formal_test_run"] and lab.rows() == saved
+    context = lab.context(NOW, close, volume)
+    assert context["data_capacity"]["minimum_sessions_before_warmup"]["20"] == 561
+    assert context["recently_rejected"][0]["preflight"] == preflight
+
+
+def test_missing_cross_section_pairs_are_reported_before_significance():
+    close, volume = panel(names=4)
+    result = evaluate("rank(ret(60))", 5, close, volume, SETTINGS, trials=1)
+    assert result["preflight"]["status"] == "data_quality_insufficient"
+    assert result["preflight"]["maximum_names_on_one_date"] == 4
+    assert not result["formal_test_run"] and result["qualification"]["predictive"]["status"] == "insufficient_data"
+
+
 def confirm(lab):
     """Mark historically validated factors as confirmed, as an agreeing live record would."""
     with lab.journal.connection() as db:
@@ -167,6 +199,7 @@ def test_factor_settings_are_validated(section, message):
 # ----- Integration: the review proposes, the code tests, decisions see the evidence ----------
 
 def test_review_factor_proposals_are_tested_and_reach_the_next_decision(tmp_path):
+    from scripts.autonomous_fund.notifications import daily_document
     from scripts.autonomous_fund.review import PostmarketReview
     from scripts.autonomous_fund.strategy import AutonomousFund
     from .test_autonomous_fund_review import answer, events, review_harness
@@ -189,18 +222,29 @@ def test_review_factor_proposals_are_tested_and_reach_the_next_decision(tmp_path
     strategy.after_market_closes()
     tested = events(strategy, "factor_tests")[0]
     assert tested["results"][0]["status"] == "validated" and tested["session_date"] == "2026-11-02"
+    assert tested["results"][0]["formal_test_run"] is True
+    assert tested["results"][0]["qualification"]["predictive"]["status"] == "passed"
     context = strategy._factor_context(NOW)
     assert context["provisional"][0]["name"] == "中期动量"  # Awaiting its live record.
+    assert context["provisional"][0]["qualification"]["economic_alpha"]["status"] == "economic_evidence_insufficient"
+    [review] = strategy.journal.events(("postmarket_review",))
+    _, report = daily_document(tmp_path, review["sequence"])
+    assert "预测检验 通过" in report and "经济 Alpha 证据不足" in report
     assert AutonomousFund._arm_context({"factor_lab": context}, "baseline")["factor_lab"] is None  # Control arm.
     assert AutonomousFund._arm_context({"factor_lab": context}, "memo")["factor_lab"] is context
 
 
-def test_factor_lab_failures_never_break_the_review(tmp_path):
+@pytest.mark.parametrize("missing_history", [False, True])
+def test_factor_lab_failures_never_break_the_review(tmp_path, missing_history):
     from scripts.autonomous_fund.review import PostmarketReview
     from .test_autonomous_fund_review import answer, events, review_harness
     strategy, _ = review_harness(tmp_path)
     strategy.factor_lab = FactorLab(strategy.journal, SETTINGS)
-    strategy._factor_panel = lambda now: (_ for _ in ()).throw(ConnectionError("history down"))
+    def factor_panel(now):
+        if not missing_history:
+            raise ConnectionError("history down")
+        return None
+    strategy._factor_panel = factor_panel
     original = strategy.agents["manager"].run
 
     def manager(**kwargs):
@@ -211,6 +255,10 @@ def test_factor_lab_failures_never_break_the_review(tmp_path):
     strategy.agents["manager"].run = manager
     strategy.after_market_closes()
     assert events(strategy, "postmarket_review") and events(strategy, "factor_lab_unavailable")
+    if missing_history:
+        [result] = events(strategy, "factor_tests")[0]["results"]
+        assert result["preflight"]["status"] == "missing_history" and not result["formal_test_run"]
+        assert strategy.factor_lab.trials() == 0
 
 
 def test_factor_lab_command_runs_on_recorded_market_data(tmp_path, capsys):

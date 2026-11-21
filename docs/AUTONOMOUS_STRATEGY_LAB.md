@@ -2,7 +2,7 @@
 
 Open strategy proposals, reproducible research, independent simulation and bounded paper-library admission for the optional autonomous fund.
 
-Last Updated: 2026-11-20
+Last Updated: 2026-11-21
 Status: Daily strategy research and paper qualification; research-only defaults
 Audience: Fund operators, researchers and contributors
 
@@ -41,6 +41,13 @@ budgets, and a failed research response leaves its validation updates pending.
 | Research economics | `costs.py`, `call_value.py` | Atomic resource reservations linked to existing paid-call receipts; daily/monthly/project bounds |
 | Trade authority | `execution.py`, local broker | Optional admitted-strategy checks at decision acceptance, purchase submission and local acceptance/fill |
 | Existing experiments | `learning.py`, `construction.py` | Unchanged; they do not become evidence that a new strategy passed |
+
+Factor proposals have a separate preflight and evidence breakdown in the existing
+Factor Lab. Historical predictive IC and a theoretical long-short net spread do
+not establish constrained implementation or independent economic alpha. A factor
+that motivates a full strategy still needs a registered executable specification,
+an admitted historical snapshot and a frozen forward comparison. See the
+[factor evaluation contract](AUTONOMOUS_PAPER_FUND.md#因子实验室ai-挖掘因子代码客观检验).
 
 New implementation files are under `scripts/autonomous_fund/`. Shared LumiBot
 agent tools, research SQL fallback, provider adapters and example strategies are

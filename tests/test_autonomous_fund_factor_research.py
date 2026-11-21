@@ -155,16 +155,28 @@ def test_factors_validated_on_a_mixed_cross_section_retire_on_upgrade(tmp_path):
     assert lab.trials() == 1  # It still raises the evidence bar.
 
 
-def test_a_spread_that_does_not_survive_costs_is_rejected():
+def test_theoretical_spread_and_prediction_do_not_qualify_economic_alpha(monkeypatch):
+    from scripts.autonomous_fund import factors
+
     close, volume = panel(seed=1)
     cheap = evaluate("rank(ret(60))", 5, close, volume, SETTINGS, trials=1)
     assert cheap["status"] == "validated" and cheap["net_spread"] > 0
     assert set(cheap["decay"]) == {"1", "5", "20"} and 0 < cheap["rank_autocorrelation"] <= 1
     expected = cheap["in_sample"]["mean_spread"] - 4 * cheap["quintile_turnover"] * SETTINGS.cost_bps / 10_000
     assert cheap["net_spread"] == pytest.approx(expected, abs=1e-5)
+    # Hold the statistical observations fixed and vary only the measured turnover.
+    monkeypatch.setattr(factors, "quintile_turnover", lambda *_: 1.0)
     costly = evaluate("rank(ret(60))", 5, close, volume, FactorSettings(cost_bps=100.0), trials=1)
-    if cheap["in_sample"]["mean_spread"] < 4 * cheap["quintile_turnover"] * 0.01:
-        assert costly["status"] == "rejected" and "costs" in costly["reason"]
+    assert costly["status"] == "rejected" and costly["net_spread"] < 0
+    monkeypatch.setattr(factors, "quintile_turnover", lambda *_: None)
+    missing = evaluate("rank(ret(60))", 5, close, volume, SETTINGS, trials=1)
+    assert missing["status"] == "validated" and missing["net_spread"] is None
+    for outcome, spread in ((cheap, "positive"), (costly, "nonpositive"), (missing, "insufficient_evidence")):
+        evidence = outcome["qualification"]
+        assert evidence["predictive"]["status"] == "passed"
+        assert evidence["theoretical_long_short"]["status"] == spread
+        assert evidence["tradable"]["status"] == "insufficient_evidence"
+        assert evidence["economic_alpha"]["status"] == "economic_evidence_insufficient"
 
 
 def test_a_near_copy_of_a_validated_factor_is_redundant(tmp_path):

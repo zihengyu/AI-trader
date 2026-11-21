@@ -28,8 +28,8 @@ Evidence standard, so that "mining" does not become overfitting:
 - the proposing models' knowledge cutoffs (operator-supplied) split off the
   clean out-of-sample record, dates the models cannot have memorized; without
   a known cutoff every historical test is flagged as possibly memorized;
-- the top-minus-bottom quintile spread must survive trading costs (turnover of
-  the quintiles x cost_bps) in the factor's direction;
+- a measured in-sample quintile spread must survive the assumed costs on its
+  turnover; a missing spread remains missing evidence;
 - a candidate whose ranks are highly correlated with an already validated
   factor in the same cross-section is `redundant`, not a new discovery;
 - after validation, the IC on dates after the validation day is tracked as the
@@ -250,8 +250,7 @@ def _eval(node, data, member):
 
 def daily_ic(factor, close, horizon, min_names):
     """Per-date cross-sectional rank IC against the close-to-close return over `horizon` sessions."""
-    forward = close.shift(-horizon) / close - 1
-    both = factor.notna() & forward.notna()
+    forward, both = _paired_returns(factor, close, horizon)
     f, r = factor.where(both), forward.where(both)
     count = both.sum(axis=1)
     fr, rr = f.rank(axis=1), r.rank(axis=1)
@@ -271,8 +270,7 @@ def daily_ic_within(factor, close, horizon, min_names, sectors):
     sector (names without a sector form one group); a factor that only separates sectors
     scores about zero here. Names alone in their sector carry no within-sector information.
     """
-    forward = close.shift(-horizon) / close - 1
-    both = factor.notna() & forward.notna()
+    forward, both = _paired_returns(factor, close, horizon)
     fr, rr = factor.where(both).rank(axis=1), forward.where(both).rank(axis=1)
     labels = [sectors.get(column, "unassigned") for column in close.columns]
 
@@ -288,6 +286,12 @@ def daily_ic_within(factor, close, horizon, min_names, sectors):
     count = informative.sum(axis=1)
     frame = pd.DataFrame({"ic": ic, "spread": np.nan, "names": count})
     return frame[(count >= min_names) & ic.notna()]
+
+
+def _paired_returns(factor, close, horizon):
+    end = close.shift(-horizon)
+    forward = end / close - 1
+    return forward, np.isfinite(factor) & np.isfinite(forward) & close.gt(0) & end.gt(0)
 
 
 def summarize(rows):
@@ -348,9 +352,17 @@ def rank_similarity(left, right, dates):
 
 
 WINDOW_MIN_OBSERVATIONS = 3  # A walk-forward test window with fewer observations cannot agree.
+WINDOW_EMBARGO_OBSERVATIONS = 1
 
 
-def walk_forward(sampled, windows, direction, embargo=1):
+def _walk_forward_slices(count, windows, embargo):
+    size = count // (windows + 1)
+    for k in range(1, windows + 1):
+        start = k * size
+        yield max(0, start - embargo), slice(start, (k + 1) * size if k < windows else count)
+
+
+def walk_forward(sampled, windows, direction, embargo=WINDOW_EMBARGO_OBSERVATIONS):
     """Consecutive forward test windows over the non-overlapping sampled ICs.
 
     The sampled series is cut into `windows` + 1 equal blocks; the first only
@@ -360,10 +372,9 @@ def walk_forward(sampled, windows, direction, embargo=1):
     A window agrees when it has enough observations and both its mean IC and its
     training mean IC have the overall direction's sign.
     """
-    size, results = len(sampled) // (windows + 1), []
-    for k in range(1, windows + 1):
-        start, end = k * size, (k + 1) * size if k < windows else len(sampled)
-        train, test = sampled.iloc[:max(0, start - embargo)], sampled.iloc[start:end]
+    results = []
+    for k, (train_end, window) in enumerate(_walk_forward_slices(len(sampled), windows, embargo), 1):
+        train, test = sampled.iloc[:train_end], sampled.iloc[window]
         summary = summarize(test)
         trained = float(train["ic"].mean()) if len(train) else None
         agrees = bool(summary["n"] >= WINDOW_MIN_OBSERVATIONS and summary["mean_ic"] is not None and
@@ -484,24 +495,134 @@ class FactorSettings:
         return cls(**section)
 
 
+def _factor_warmup(node):
+    if isinstance(node, ast.BinOp):
+        return max(_factor_warmup(node.left), _factor_warmup(node.right))
+    if isinstance(node, ast.UnaryOp):
+        return _factor_warmup(node.operand)
+    if not isinstance(node, ast.Call):
+        return 0
+    name = node.func.id
+    if name in {"ret", "vol"}:
+        return node.args[0].value
+    warmup = _factor_warmup(node.args[0])
+    if name in {"delay", "delta"}:
+        return warmup + node.args[1].value
+    if name.startswith("ts_"):
+        return warmup + node.args[1].value - 1
+    return warmup
+
+
+def _sample_counts(count, settings):
+    inside = int(round(count * (1 - settings.holdout_fraction)))
+    windows = sum(train_end > 0 and window.stop - window.start >= WINDOW_MIN_OBSERVATIONS
+                  for train_end, window in _walk_forward_slices(count, settings.walk_forward_windows,
+                                                               WINDOW_EMBARGO_OBSERVATIONS))
+    return inside, count - inside, windows
+
+
+def _enough_samples(inside, holdout, windows, settings):
+    return (inside >= settings.min_observations and holdout >= settings.min_holdout_observations
+            and windows >= settings.min_window_agreement)
+
+
+def _minimum_samples(settings, *, at_least=0):
+    count = max(at_least, settings.min_observations + settings.min_holdout_observations)
+    while not _enough_samples(*_sample_counts(count, settings), settings):
+        count += 1
+    return count
+
+
+def _factor_preflight(factor, close, horizon, warmup, rows, sampled, settings):
+    inside, holdout, windows = _sample_counts(len(sampled), settings)
+    required = _minimum_samples(settings)
+    ready = _enough_samples(inside, holdout, windows, settings)
+    next_feasible = len(sampled) if ready else _minimum_samples(settings, at_least=len(sampled))
+    min_sessions = warmup + required * horizon + 1  # Feature warmup, independent return windows and final close.
+    _, pairs = _paired_returns(factor, close, horizon)
+    pairs = pairs.iloc[warmup:-horizon]
+    max_names = int(pairs.sum(axis=1).max()) if len(pairs) else 0
+    if len(close) == 0:
+        status = "missing_history"
+    elif ready:
+        status = "ready"
+    elif len(close) < min_sessions:
+        status = "needs_more_sessions"
+    elif max_names < settings.min_names or not len(rows):
+        status = "data_quality_insufficient"
+    else:
+        status = "exploratory_only"
+    return {"status": status, "horizon_sessions": horizon, "history_sessions": len(close),
+            "history_first_session": str(close.index[0].date()) if len(close) else None,
+            "history_last_session": str(close.index[-1].date()) if len(close) else None,
+            "history_sessions_with_valid_prices": int((np.isfinite(close) & close.gt(0)).any(axis=1).sum()),
+            "feature_warmup_sessions": warmup, "minimum_history_sessions": min_sessions,
+            "history_sessions_shortfall": max(0, min_sessions - len(close)),
+            "eligible_signal_dates": len(rows), "independent_observations": len(sampled),
+            "minimum_independent_observations": required,
+            "independent_observations_shortfall": next_feasible - len(sampled),
+            "in_sample_observations": inside, "minimum_in_sample_observations": settings.min_observations,
+            "holdout_observations": holdout, "minimum_holdout_observations": settings.min_holdout_observations,
+            "eligible_walk_forward_windows": windows, "walk_forward_windows": settings.walk_forward_windows,
+            "minimum_agreeing_windows": settings.min_window_agreement,
+            "embargo_sessions": horizon, "minimum_names": settings.min_names,
+            "symbols_with_pairs": int(pairs.any(axis=0).sum()), "maximum_names_on_one_date": max_names,
+            "unavailable_pair_fraction": round(1 - float(pairs.to_numpy().mean()), 4) if pairs.size else None}
+
+
+def factor_qualification(evidence):
+    """Keep historical registry state distinct from the evidence available to support each claim."""
+    return evidence.get("qualification") or {
+        "predictive": {"status": "legacy_unclassified"},
+        "tradable": {"status": "insufficient_evidence", "reason": "requires_constrained_long_only_replay"},
+        "economic_alpha": {"status": "economic_evidence_insufficient",
+                           "reason": "requires_independent_benchmark_relative_net_returns"},
+        "theoretical_long_short": {"status": "legacy_unclassified", "net_spread": evidence.get("net_spread")},
+    }
+
+
+def _qualification(predictive, net, settings):
+    result = factor_qualification({})
+    result["predictive"] = {"status": predictive}
+    result["theoretical_long_short"] = {
+        "status": "insufficient_evidence" if net is None else "positive" if net > 0 else "nonpositive",
+        "sample": "in_sample", "net_spread": net, "cost_bps_per_side": settings.cost_bps,
+    }
+    return result
+
+
 def evaluate(expression, horizon, close, volume, settings, trials, extra=None, cutoff=None, sectors=None):
     """In-sample, holdout and walk-forward evidence with a verdict. close/volume end at the last completed session."""
     if type(horizon) is not int or not 1 <= horizon <= 20:
         raise RiskError("Factor horizon must be 1..20 sessions")
     return evaluate_factor(compute(expression, close, volume, extra), horizon, close, settings, trials, cutoff,
-                           sectors=sectors)
+                           sectors=sectors, warmup=_factor_warmup(parse(expression)))
 
 
-def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, sectors=None):
+def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, sectors=None, *, warmup=0):
     """The evidence standard applied to a computed factor panel (also used by the negative control).
 
     With `sectors` ({symbol: sector}) the within-sector IC on the same dates is reported as
     `sector_neutral`. It is evidence, not a criterion: a sector-rotation factor can be real,
     but the AI should know it is a sector bet rather than stock selection.
     """
+    if type(horizon) is not int or not 1 <= horizon <= 20:
+        raise RiskError("Factor horizon must be 1..20 sessions")
     rows = daily_ic(factor, close, horizon, settings.min_names)
     sampled = rows.iloc[::horizon]  # Non-overlapping forward windows: honest t-statistics.
-    split = int(round(len(sampled) * (1 - settings.holdout_fraction)))
+    preflight = _factor_preflight(factor, close, horizon, warmup, rows, sampled, settings)
+    split = preflight["in_sample_observations"]
+    if preflight["status"] != "ready":
+        return {"status": "insufficient_data", "direction": None, "trials": trials, "formal_test_run": False,
+                "preflight": preflight, "qualification": _qualification("insufficient_data", None, settings),
+                "in_sample": {"n": split, "mean_ic": None, "t": None, "hit_rate": None, "mean_spread": None},
+                "holdout": {"n": preflight["holdout_observations"], "mean_ic": None, "t": None,
+                            "hit_rate": None, "mean_spread": None},
+                "reason": (f"{preflight['status']}: {len(sampled)}/{preflight['minimum_independent_observations']} "
+                           f"independent observations, {split}/{settings.min_observations} in-sample, "
+                           f"{preflight['holdout_observations']}/{settings.min_holdout_observations} holdout, "
+                           f"{preflight['eligible_walk_forward_windows']}/{settings.min_window_agreement} "
+                           f"usable walk-forward windows, needs {settings.min_names} names per date")}
     inside, holdout = sampled.iloc[:split], sampled.iloc[split:]
     neutral = None
     if sectors:
@@ -511,15 +632,12 @@ def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, secto
                    "meaning": "rank IC after removing each sector's mean rank, on the same dates; near zero means "
                               "the factor mostly separates sectors (a sector bet), not stocks within them"}
     result = {"in_sample": summarize(inside), "holdout": summarize(holdout), "trials": trials,
+              "preflight": preflight, "formal_test_run": True,
               **({"sector_neutral": neutral} if neutral else {}),
               "critical_t": critical_t(trials, settings.significance), "knowledge": knowledge(sampled, cutoff),
               "first_date": str(sampled.index[0].date()) if len(sampled) else None,
               "last_date": str(sampled.index[-1].date()) if len(sampled) else None}
     ins, out = result["in_sample"], result["holdout"]
-    if ins["n"] < settings.min_observations or out["n"] < settings.min_holdout_observations:
-        return {**result, "status": "insufficient_data", "direction": None,
-                "reason": f"needs {settings.min_observations} in-sample and {settings.min_holdout_observations} "
-                          f"holdout observations with at least {settings.min_names} names"}
     direction = 1 if ins["mean_ic"] > 0 else -1
     # Reported with every verdict, all from the in-sample part so the holdout stays untouched.
     decay = {}
@@ -540,7 +658,8 @@ def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, secto
     result.update(decay=decay, rank_autocorrelation=rank_autocorrelation(factor, dates),
                   in_sample_last_date=str(inside.index[-1].date()) if len(inside) else None,
                   quintile_turnover=round(turnover, 3) if turnover is not None else None,
-                  net_spread=round(net, 5) if net is not None else None)
+                  net_spread=round(net, 5) if net is not None else None,
+                  qualification=_qualification("failed", net, settings))
     if ins["t"] is None or abs(ins["t"]) < result["critical_t"]:
         return {**result, "status": "rejected", "direction": direction,
                 "reason": f"in-sample |t| below the trials-adjusted bar {result['critical_t']}"}
@@ -551,6 +670,7 @@ def evaluate_factor(factor, horizon, close, settings, trials, cutoff=None, secto
         return {**result, "status": "rejected", "direction": direction,
                 "reason": f"only {agreeing} of {len(windows)} walk-forward windows agree with the direction; "
                           f"{settings.min_window_agreement} required"}
+    result["qualification"]["predictive"]["status"] = "passed"
     if net is not None and net <= 0:
         return {**result, "status": "rejected", "direction": direction,
                 "reason": f"the quintile spread does not survive {settings.cost_bps:g} bps per side on its turnover"}
@@ -701,12 +821,15 @@ class FactorLab:
                 existing = db.execute("SELECT * FROM fund_factors WHERE id=?", (key,)).fetchone()
             if existing and existing["status"] != "insufficient_data":
                 results.append({"name": existing["name"], "expression": expression, "status": existing["status"],
-                                "reason": "already tested: " + (existing["reason"] or ""), "repeat": True})
+                                "reason": "already tested: " + (existing["reason"] or ""), "repeat": True,
+                                "formal_test_run": False, "qualification": factor_qualification(json.loads(existing["evidence"]))})
                 continue
             data = (panels or {}).get(universe)
             if data is None:  # No history for this cross-section today: not a trial, retried later.
                 results.append({"name": name, "expression": expression, "universe": universe,
-                                "status": "unavailable", "reason": f"no {universe} history available"})
+                                "status": "unavailable", "reason": f"no {universe} history available",
+                                "formal_test_run": False, "preflight": {"status": "missing_history"},
+                                "qualification": _qualification("insufficient_data", None, self.settings)})
                 continue
             trials = self.trials() + (0 if existing else 1)
             try:
@@ -720,6 +843,11 @@ class FactorLab:
             if outcome["status"] == "invalid":
                 results.append({"name": name, "expression": expression, "universe": universe, **outcome})
                 continue
+            item = {"name": name, "expression": expression, "horizon_sessions": horizon, "universe": universe, **outcome}
+            if (existing and outcome["status"] == "insufficient_data"
+                    and json.loads(existing["evidence"]).get("preflight") == outcome["preflight"]):
+                results.append({**item, "repeat": True})
+                continue  # Recurring data gaps have no new formal result or registry revision.
             with self.journal.connection() as db:
                 db.execute("""INSERT OR REPLACE INTO fund_factors (id, expression, horizon, name, hypothesis,
                     proposed_at, session_date, status, direction, evidence, validated_at, retired_at, reason, universe)
@@ -727,8 +855,7 @@ class FactorLab:
                     key, expression, horizon, name, proposal.get("hypothesis", ""), str(now), session_date,
                     outcome["status"], outcome["direction"], json.dumps(outcome, default=str),
                     session_date if outcome["status"] == "validated" else None, None, outcome["reason"], universe))
-            results.append({"name": name, "expression": expression, "horizon_sessions": horizon,
-                            "universe": universe, **outcome})
+            results.append(item)
         if results:
             self.journal.event(now, "factor_tests", {"session_date": session_date, "results": results})
         return results
@@ -817,7 +944,15 @@ class FactorLab:
         confirmed_rows = [r for r in active if r.get("confirmed_at")]
         provisional = [r for r in active if not r.get("confirmed_at")]
         tried = self.rows()
-        control = self._negative_control(now, as_panels(close, volume, extra) if close is not None else None)
+        panels = as_panels(close, volume, extra)
+        control = self._negative_control(now, panels)
+        required = _minimum_samples(self.settings)
+        recent = []
+        for row in [r for r in tried if r["status"] in {"rejected", "insufficient_data", "retired", "redundant"}][-10:]:
+            evidence = json.loads(row["evidence"])
+            recent.append({"name": row["name"], "expression": row["expression"], "horizon_sessions": row["horizon"],
+                           "status": row["status"], "reason": row["reason"], "universe": row["universe"],
+                           "preflight": evidence.get("preflight"), "qualification": factor_qualification(evidence)})
         return {
             "grammar": GRAMMAR,
             "evidence_standard": (
@@ -827,8 +962,11 @@ class FactorLab:
                 "Direction -1 means low factor values were favored. walk_forward_agreeing windows (each trained "
                 "only on earlier dates, with a horizon embargo) must show the direction too. memory_risk says whether "
                 "the history predates the proposing model's knowledge cutoff (unknown_cutoff: it may be memorized; "
-                "the live record is always clean). The quintile spread must survive costs on its "
-                "turnover, and a factor that mostly re-ranks like a validated one is redundant. Each factor names its "
+                "post-validation dates are new). A measured in-sample theoretical quintile spread must survive "
+                "assumed costs on its turnover. A factor that mostly re-ranks like a validated one is redundant. "
+                "qualification separates predictive tests, the theoretical spread, constrained tradability, and "
+                "economic alpha. Economic alpha requires separate independent benchmark-relative net evidence. "
+                "data_capacity gives a lower bound before expression warmup and missing data. Each factor names its "
                 "cross-section (stocks incl. the research universe, or etfs); favored lists only tradable names. "
                 "validated lists factors whose live record after validation agreed for at least "
                 "live_min_observations observations; provisional lists factors that passed the historical tests "
@@ -840,25 +978,16 @@ class FactorLab:
             "live_min_observations": self.settings.live_min_observations,
             "survivorship": SURVIVORSHIP_NOTE,
             "trials": len(tried), "next_critical_t": critical_t(len(tried) + 1, self.settings.significance),
-            "validated": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
-                           "universe": r.get("universe") or "stocks",
-                           "direction": r["direction"], "validated_on": r["validated_at"],
-                           "in_sample": json.loads(r["evidence"])["in_sample"],
-                           "holdout": json.loads(r["evidence"])["holdout"], "live": r["live"],
-                           **_evidence_flags(json.loads(r["evidence"]))}
-                          for r in confirmed_rows[:self.settings.max_active]],
-            "provisional": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
-                             "universe": r.get("universe") or "stocks", "direction": r["direction"],
-                             "validated_on": r["validated_at"], "in_sample": json.loads(r["evidence"])["in_sample"],
-                             "holdout": json.loads(r["evidence"])["holdout"],
-                             "live": {k: (r["live"] or {}).get(k) for k in ("n", "mean_ic", "t", "unavailable", "crowding")},
-                             **_evidence_flags(json.loads(r["evidence"]))}
+            "data_capacity": {"loaded_sessions": {name: len((panels or {})[name]["close"]) if name in (panels or {})
+                                                   else 0 for name in UNIVERSES},
+                              "minimum_independent_observations": required, "minimum_names": self.settings.min_names,
+                              "minimum_sessions_before_warmup": {str(h): required * h + 1 for h in range(1, 21)}},
+            "validated": [_context_result(r, r["live"]) for r in confirmed_rows[:self.settings.max_active]],
+            "provisional": [_context_result(r, {k: (r["live"] or {}).get(k)
+                                                for k in ("n", "mean_ic", "t", "unavailable", "crowding")})
                             for r in provisional[:self.settings.max_active]],
             "negative_control": control,
-            "recently_rejected": [{"name": r["name"], "expression": r["expression"], "horizon_sessions": r["horizon"],
-                                   "status": r["status"], "reason": r["reason"]}
-                                  for r in tried if r["status"] in {"rejected", "insufficient_data", "retired",
-                                                                    "redundant"}][-10:],
+            "recently_rejected": recent,
         }
 
 
@@ -873,6 +1002,14 @@ def confirmed(live, direction, settings):
     """The live record after validation agrees: enough observations and the validated direction."""
     return (live.get("n", 0) >= settings.live_min_observations and live.get("mean_ic") is not None
             and direction is not None and live["mean_ic"] * direction > 0)
+
+
+def _context_result(row, live):
+    evidence = json.loads(row["evidence"])
+    return {"name": row["name"], "expression": row["expression"], "horizon_sessions": row["horizon"],
+            "universe": row.get("universe") or "stocks", "direction": row["direction"],
+            "validated_on": row["validated_at"], "in_sample": evidence["in_sample"], "holdout": evidence["holdout"],
+            "live": live, "qualification": factor_qualification(evidence), **_evidence_flags(evidence)}
 
 
 def _evidence_flags(evidence):

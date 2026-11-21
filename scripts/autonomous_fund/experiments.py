@@ -133,7 +133,7 @@ def observations(*, factors=(), learning=None, construction=None, scorecards=Non
     previous = previous or (lambda experiment_id: None)
     entries = []
     for row in factors:
-        from .factors import FUNDAMENTAL_FIELDS, parse
+        from .factors import FUNDAMENTAL_FIELDS, factor_qualification, parse
         try:
             names = {node.id for node in ast.walk(parse(row["expression"])) if isinstance(node, ast.Name)}
         except Exception:  # An invalid expression is registered too, without its data.
@@ -156,7 +156,8 @@ def observations(*, factors=(), learning=None, construction=None, scorecards=Non
                        and not row.get("confirmed_at") else
                        "live record confirmed" if row["status"] == "validated" else row.get("reason") or row["status"]),
             "evidence": {**{key: evidence[key] for key in ("status", "direction", "in_sample", "holdout", "critical_t",
-                                                         "net_spread") if key in evidence},
+                                                         "net_spread", "preflight", "formal_test_run") if key in evidence},
+                         "qualification": factor_qualification(evidence),
                          **({"walk_forward_agreeing": walk.get("agreeing"), "walk_forward_required": walk.get("required")}
                             if walk else {})}})
     if learning and learning.get("enabled"):

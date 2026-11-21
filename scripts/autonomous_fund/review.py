@@ -601,13 +601,13 @@ def review_after_close(strategy):
                     "（symbol、direction=up/down/outperform/underperform、horizon_sessions 1-20、benchmark、"
                     "hypothesis_ref 指向对应调整），之后会被自动打分。"
                     "在 mandate_compliance 中逐条核对当日决策是否遵守 operator_mandate 的约束，如有偏离必须说明。"
-                    "阅读 factor_lab：已验证因子的样本内、样本外和验证后的实盘记录，以及被拒绝或退役的因子。"
+                    "阅读 factor_lab 的样本内外结果、登记之后的 IC，以及被拒绝或退役的因子。"
                     "结合拥挤度代理的日期和覆盖数说明风险，只在数据足够时引用。"
                     "可在 factor_proposals 中按 factor_lab.grammar 提出最多 5 个新的因子表达式（name、expression、"
                     "horizon_sessions 1-20、hypothesis、universe=stocks 或 etfs），优先基于复盘中发现的选股或择时规律；"
-                    "代码会在所选横截面（个股含研究股票池，或 ETF）里用无前视的历史数据做 rank IC 检验，"
-                    "要求扣除换手成本后多空收益仍为正、且与已验证因子不高度相关，每多试一个表达式门槛都会提高，"
-                    "结果在下一次决策和复盘中提供。"
+                    "先查看 factor_lab.data_capacity 和上次预检查的样本缺口，保留机制要求的预测期限。"
+                    "代码会在指定横截面做 rank IC 检验。用 qualification 分别说明预测证据、样本内理论多空收益、"
+                    "可执行多头组合和经济 Alpha。确认同一表达式的结果时复用已保存证据。"
                     "不要重复已检验的表达式，也不要为了通过检验而反复微调参数。"
                     "返回 session_date=指定交易日以及本次 context.as_of；不要返回订单或 targets。")
     manager_prompt += CASH_MANAGEMENT_GUIDANCE
@@ -690,16 +690,15 @@ def review_after_close(strategy):
         try:
             from .factors import as_panels
             panels = as_panels(strategy._factor_panel(now))
-            if not panels:
-                raise RiskError("Factor history unavailable")
-            testable = [p for p in review["factor_proposals"] if (p.get("universe") or "stocks") in panels]
-            if len(testable) < len(review["factor_proposals"]):
+            unavailable = [p["name"] for p in review["factor_proposals"]
+                           if (p.get("universe") or "stocks") not in (panels or {})]
+            if unavailable:
                 strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {
                     "session_date": day, "error": "no history for the cross-section of some proposals",
-                    "skipped": [p["name"] for p in review["factor_proposals"] if p not in testable]})
-            if testable:
-                lab.test(testable, strategy.get_datetime(), day, panels, models=tuple(packet["models"].values()),
-                         sectors=strategy._sectors() if hasattr(strategy, "_sectors") else None)
+                    "skipped": unavailable})
+            lab.test(review["factor_proposals"], strategy.get_datetime(), day, panels,
+                     models=tuple(packet["models"].values()),
+                     sectors=strategy._sectors() if panels and hasattr(strategy, "_sectors") else None)
             strategy._factor_context_cache = None  # The next context includes these results.
         except Exception as exc:  # Evidence tooling must never cost the saved review.
             strategy.journal.event(strategy.get_datetime(), "factor_lab_unavailable", {

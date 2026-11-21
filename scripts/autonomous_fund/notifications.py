@@ -99,7 +99,10 @@ def _cost_text(costs):
     return cost_line(costs) or "模型费用：没有可估算的调用（设置 FUND_MODEL_PRICES_JSON 后显示）"
 
 
-FACTOR_STATUS = {"validated": "历史检验通过（待样本外确认）", "rejected": "未通过", "insufficient_data": "数据不足", "invalid": "表达式无效"}
+FACTOR_STATUS = {"validated": "历史检验通过（待样本外确认）", "rejected": "未通过", "insufficient_data": "数据不足",
+                 "unavailable": "历史缺失", "invalid": "表达式无效"}
+PREDICTIVE_STATUS = {"passed": "通过", "failed": "未通过", "insufficient_data": "样本不足",
+                     "legacy_unclassified": "历史记录未单独分类"}
 HEALTH_KINDS = {"blocked", "bookkeeping_error", "watchdog_stop", "watchdog_recovered", "auto_resumed",
                 "auto_resume_blocked", "auto_resume_exhausted", "bot_crash", "server_supervision_stop",
                 "postmarket_review_error", "premarket_research_error", "model_budget_exhausted",
@@ -662,6 +665,8 @@ def daily_report(root, sequence):
         lines += ["本交易日没有记分卡（本轮未保存完整结果；不能据此判断没有可打分样本）。", ""]
     lines += ["## 因子挖掘（AI 提出，代码客观检验）", ""]
     results = [result for kind, body in related if kind == "factor_tests" for result in body.get("results", [])]
+    if results:
+        from .factors import factor_qualification
     for result in results:
         sample, holdout = result.get("in_sample") or {}, result.get("holdout") or {}
         within = ((result.get("sector_neutral") or {}).get("in_sample") or {}).get("t")
@@ -670,6 +675,16 @@ def daily_report(root, sequence):
                      f"样本外 t={holdout.get('t')}"
                      + (f"，行业内 t={within}（接近 0 说明主要是押行业，不是行业内选股）" if result.get("sector_neutral") else "")
                      + f"；{result.get('reason', '')}")
+        if preflight := result.get("preflight"):
+            if result.get("formal_test_run") is False and not result.get("repeat") and "history_sessions" in preflight:
+                lines.append(f"  - 预检查 {preflight['history_sessions']}/{preflight['minimum_history_sessions']} 个历史交易日，"
+                             f"{preflight['independent_observations']}/{preflight['minimum_independent_observations']} 个独立观察，"
+                             "未运行正式显著性检验。")
+        qualification = factor_qualification(result)
+        prediction = PREDICTIVE_STATUS.get(qualification["predictive"]["status"], "未知")
+        spread = qualification["theoretical_long_short"].get("net_spread")
+        lines.append(f"  - 预测检验 {prediction}。理论多空净收益差 {_percent(spread)}。"
+                     "可执行多头组合与经济 Alpha 证据不足。")
     if results:
         from .universe import survivorship_text
         lines.append(f"- 注意：{survivorship_text(root)}")
@@ -1575,6 +1590,13 @@ def weekly_document(root, sequence):
     if tests:
         counts = Counter(FACTOR_STATUS.get(r.get("status"), r.get("status")) for r in tests)
         lines.append("- 本周检验：" + "、".join(f"{k} {v}" for k, v in sorted(counts.items())))
+        measured = [r for r in tests if r.get("formal_test_run") is True]
+        blocked = sum(r.get("formal_test_run") is False and r.get("status") in {"insufficient_data", "unavailable"}
+                      and not r.get("repeat") for r in tests)
+        predictive = sum((r.get("qualification", {}).get("predictive") or {}).get("status") == "passed" for r in measured)
+        if measured or blocked:
+            lines.append(f"- 有分层记录的正式检验 {len(measured)} 次，预测通过 {predictive} 次，预检查阻塞 {blocked} 次。"
+                         "可执行多头组合和经济 Alpha 需独立验证。")
         lines += [f"  - 历史检验通过（待样本外确认）：{r.get('name')} `{r.get('expression')}`"
                   for r in tests if r.get("status") == "validated"]
     else:
