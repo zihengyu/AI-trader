@@ -1,5 +1,7 @@
 """Shared-account attribution and the read-only Schwab check (synthetic accounts, no network)."""
 import json
+from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +11,40 @@ from scripts.autonomous_fund.holdings import split_holdings
 from scripts.autonomous_fund.risk import RiskError, number
 
 UNIVERSE = {"AAPL", "MSFT", "SPY"}
+
+
+@pytest.mark.parametrize("outcome", ["complete", "interrupted", "missing_refresh_token"])
+def test_manual_oauth_preserves_old_token_until_a_valid_replacement(tmp_path, outcome):
+    from scripts.autonomous_fund.schwab_auth import authorize_market_token
+
+    target = tmp_path / "market-token.json"
+    previous = {"creation_timestamp": 1, "token": {"refresh_token": "synthetic-previous"}}
+    target.write_text(json.dumps(previous), encoding="utf-8")
+    environ = {"SCHWAB_TOKEN_PATH": str(target), "SCHWAB_APP_KEY": "synthetic-key",
+               "SCHWAB_APP_SECRET": "synthetic-secret", "SCHWAB_BACKEND_CALLBACK_URL": "https://127.0.0.1:8182"}
+    issued = int(datetime.now(timezone.utc).timestamp())
+
+    def authorize(key, secret, callback, token_path):
+        assert (key, secret, callback) == ("synthetic-key", "synthetic-secret", "https://127.0.0.1:8182")
+        staged = Path(token_path)
+        assert staged != target and staged.parent.parent == tmp_path
+        assert json.loads(target.read_text(encoding="utf-8")) == previous
+        token = {"access_token": "synthetic-access"}
+        if outcome != "missing_refresh_token":
+            token["refresh_token"] = "synthetic-next"
+        staged.write_text(json.dumps({"creation_timestamp": issued, "token": token}), encoding="utf-8")
+        if outcome == "interrupted":
+            raise KeyboardInterrupt
+
+    if outcome == "complete":
+        assert authorize_market_token(environ, authorize=authorize) == target.resolve()
+        assert json.loads(target.read_text(encoding="utf-8"))["token"]["refresh_token"] == "synthetic-next"
+    else:
+        error = KeyboardInterrupt if outcome == "interrupted" else RiskError
+        with pytest.raises(error):
+            authorize_market_token(environ, authorize=authorize)
+        assert json.loads(target.read_text(encoding="utf-8")) == previous
+    assert not list(tmp_path.glob(".schwab-auth-*"))
 
 
 def position(symbol, quantity, kind="stock", value=None):

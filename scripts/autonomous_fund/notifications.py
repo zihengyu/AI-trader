@@ -2,6 +2,8 @@
 import json
 import sqlite3
 from collections import Counter
+from datetime import datetime, timezone
+from math import ceil
 from zoneinfo import ZoneInfo
 
 from .execution import operator_connection
@@ -971,6 +973,21 @@ def readable(kind, details, sequence=None, *, now=None):
     elif kind == "data_desk_stale" and isinstance(details, dict):
         text = (f"ℹ️ 数据员已 {details.get('heartbeat_minutes_ago')} 分钟没有更新：交易进程改为自己拉取行情、资讯和宏观数据，"
                 "交易不受影响。查看：bash scripts/fund-logs.sh errors；重启：bash scripts/fund-restart.sh -y")
+    elif kind == "schwab_token_expiry" and isinstance(details, dict):
+        expires = instant(details["expires_at"])
+        minutes_left = ceil((expires - instant(now or datetime.now(timezone.utc))).total_seconds() / 60)
+        hours, minutes = divmod(max(0, minutes_left), 60)
+        remaining = f"{hours} 小时 {minutes} 分钟" if hours else f"{minutes} 分钟"
+        title = "🚨 紧急 · 嘉信行情授权即将到期" if details["urgency"] == "urgent" else "⏰ 嘉信行情授权续期提醒"
+        if minutes_left <= 0:
+            title = "🚨 嘉信行情授权已到预计到期时间"
+        text = (f"{title}\n预计到期 {_when(expires)}\n剩余约 {remaining}\n\n"
+                "1. SSH 登录服务器，进入 AI-trader 目录。\n"
+                "2. 运行 bash scripts/fund-schwab-auth.sh。\n"
+                "3. 用浏览器打开脚本打印的嘉信链接，登录并授权。\n"
+                "4. 把跳转后的完整网址贴回 SSH 的 Redirect URL>，按 Enter。\n"
+                "若回调到 127.0.0.1 显示连接失败，仍可复制地址栏。\n"
+                "看到「嘉信行情令牌已更新」即完成。")
     elif kind == "decision_drought" and isinstance(details, dict):
         last = details.get("last_decision_at")
         text = (f"⚠️ 交易时段已经 {details.get('minutes_without_decision')} 分钟没有有效的投资决策"

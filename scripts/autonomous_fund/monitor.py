@@ -14,6 +14,7 @@ import requests
 from .execution import EXECUTION_REVISION, approval_code, operator_connection, resolve_approval
 from .journal import NOTIFICATION_KIND, encode, notification_body
 from .risk import RiskError, instant, trading_day
+from .schwab import market_credentials, market_token_expiry
 
 
 DECISION_GRACE_MINUTES = 90  # After the open, the first valid decision is expected within this.
@@ -23,6 +24,8 @@ EXECUTION_MONITOR_MAX_AGE_SECONDS = 45
 POLL_SECONDS = 10
 NOTIFICATION_BUDGET_SECONDS = 20  # One in-flight ten-second request may finish after this budget.
 MESSAGE_BUILD_ATTEMPTS = 3  # Then a short notice goes out in place of a report that cannot be built.
+SCHWAB_REMINDER_WINDOW = timedelta(hours=24)
+SCHWAB_URGENT_WINDOW = timedelta(hours=3)
 
 
 def _disclose_build_failure(kind, sequence):
@@ -133,8 +136,10 @@ class Telegram:
 
 
 class Monitor:
-    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900, resume_policy=None):
+    def __init__(self, root, transport=None, *, heartbeat_seconds=180, agent_seconds=900, resume_policy=None,
+                 schwab_token_path=None):
         self.root, self.transport = Path(root), transport
+        self.schwab_token_path = Path(schwab_token_path) if schwab_token_path else None
         self.clock = time.monotonic
         self._observer = uuid4().hex
         self._commands_first = False
@@ -364,6 +369,7 @@ class Monitor:
                     "session_date": packet["session_date"]}})))
             self._queue_weekly(db, reviews, now)
             self._queue_fill_updates(db, now)
+            self._queue_schwab_token_notice(db, now)
             if state == "healthy":
                 self._queue_lab_deadline(db, now)
             # Drop stale first-start alerts; retain recent requests and failures.
@@ -406,7 +412,7 @@ class Monitor:
                         break
                 stale = (body.get("kind") not in {"postmarket_report", "weekly_report"} and
                          now - notice_at > timedelta(hours=1))
-                obsolete = self._approval_notice_error(db, body, now) if notice_at <= now else None
+                obsolete = self._pending_notice_error(db, body, now) if notice_at <= now else None
                 db.execute("INSERT INTO fund_deliveries VALUES(?,?,?,?,?,NULL)",
                            (row["sequence"], "suppressed" if duplicate or stale or obsolete else "pending", 0,
                             max(now, notice_at).isoformat(), obsolete))
@@ -655,8 +661,40 @@ class Monitor:
         db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
             "kind": "data_desk_stale", "details": {"heartbeat_minutes_ago": round(age / 60)}})))
 
-    def _approval_notice_error(self, db, body, now):
-        """Pending action notices must still name live authority; resolutions remain history."""
+    def _queue_schwab_token_notice(self, db, now):
+        if self.schwab_token_path is None:
+            return
+        expires = market_token_expiry(self.schwab_token_path, now)
+        if expires is None or expires - now > SCHWAB_REMINDER_WINDOW:
+            return
+        urgency = "urgent" if expires - now <= SCHWAB_URGENT_WINDOW else "day"
+        expires_at = expires.isoformat()
+        # Token identity uses the original authorization timestamp, which is preserved across access refreshes.
+        key = f"schwab_token_notice:{expires_at}:{urgency}"
+        queued = db.execute("INSERT OR IGNORE INTO fund_monitor_meta VALUES(?,?)", (key, now.isoformat()))
+        if queued.rowcount:
+            db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", encode({
+                "kind": "schwab_token_expiry", "details": {"expires_at": expires_at, "urgency": urgency}})))
+
+    def _pending_notice_error(self, db, body, now):
+        """Suppress pending notices whose named approval or token has been superseded."""
+        if body.get("kind") == "schwab_token_expiry":
+            if self.schwab_token_path is None:
+                return "schwab_market_token_not_configured"
+            details = body.get("details")
+            try:
+                expires = instant(details["expires_at"])
+                urgency = details["urgency"]
+            except (KeyError, TypeError, ValueError):
+                return "schwab_token_notice_invalid"
+            if urgency not in ("day", "urgent"):
+                return "schwab_token_notice_invalid"
+            current = market_token_expiry(self.schwab_token_path, now)
+            if current is not None and current != expires:
+                return "schwab_market_token_replaced"
+            if urgency == "day" and expires - now <= SCHWAB_URGENT_WINDOW:
+                return "schwab_token_urgent_window"
+            return None
         if body.get("kind") not in {"approval_required", "ai_approval_pending"}:
             return None
         details = body.get("details")
@@ -731,7 +769,7 @@ class Monitor:
                 if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
                     raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
                 claimed_at = datetime.now(timezone.utc) if realtime else now
-                obsolete = self._approval_notice_error(db, body, claimed_at)
+                obsolete = self._pending_notice_error(db, body, claimed_at)
                 if obsolete:
                     db.execute("UPDATE fund_deliveries SET state='suppressed',last_error=? "
                         "WHERE sequence=? AND state IN ('pending','retry','sending') AND next_at=?",
@@ -769,7 +807,7 @@ class Monitor:
                 if not selected or selected[0] != hashlib.sha256(str(self.transport.chat_id).encode()).hexdigest():
                     raise RiskError("Monitor recipient changed; stop and restart the selected monitor")
                 sending_at = datetime.now(timezone.utc) if realtime else now
-                obsolete = self._approval_notice_error(db, body, sending_at)
+                obsolete = self._pending_notice_error(db, body, sending_at)
                 if obsolete:
                     db.execute("UPDATE fund_deliveries SET state='suppressed',last_error=? "
                         "WHERE sequence=? AND state='sending' AND next_at=?", (obsolete, row["sequence"], lease_until))
@@ -1128,13 +1166,16 @@ def send_test(root):
 
 def run_monitor(args):
     from filelock import FileLock
+    from .settings import configured_mode
     from .stops import ResumePolicy
     from .strategy import configuration
     policy = ResumePolicy.from_config(configuration(args.config).get("service"))
     transport = None if args.console_only else Telegram()
+    credentials = market_credentials(os.environ)
+    token_path = credentials[2] if (configured_mode(os.environ) or "local") == "local" and all(credentials) else None
     with FileLock(str(args.run_dir / "monitor.lock"), timeout=0):
         monitor = Monitor(args.run_dir, transport, heartbeat_seconds=args.heartbeat_seconds, agent_seconds=args.agent_seconds,
-                          resume_policy=policy)
+                          resume_policy=policy, schwab_token_path=token_path)
         while True:
             status = monitor.poll()
             if args.once:

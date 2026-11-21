@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- The Autonomous Fund queues Telegram reminders 24 and 3 hours before an estimated Schwab market-data token expiry. `fund-schwab-auth.sh` runs interactive OAuth and publishes a replacement token after successful authorization.
 - The Autonomous Fund data desk can qualify Schwab stock and ETF quotes against Alpaca IEX and use current completed Twelve Data minutes as an independent research reference. Both are optional and read-only.
 - Strategy Lab daily validation can predeclare an after-close decision cutoff for timestamped publications. Historical replay, queued workers and the forward audit use the same exchange-relative clock before next-open execution.
 - Strategy Lab daily research adapters can predeclare a portfolio-wide rebalance band. In-band replay retains shares subject to explicit exits and hard risk limits. Forward signals and resumable receipts retain the rebalance decision and its reference target.

@@ -10,8 +10,10 @@ modifies an order, and this application still has no live execution entry.
 """
 import json
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from filelock import FileLock
 
 from .risk import RiskError, number
 
@@ -19,10 +21,33 @@ ORDER_METHODS = ("submit_order", "submit_orders", "_submit_order", "_submit_orde
                  "cancel_orders", "_cancel_order", "modify_order", "_modify_order", "cancel_open_orders")
 
 MARKET_CREDENTIALS = ("SCHWAB_APP_KEY", "SCHWAB_APP_SECRET", "SCHWAB_TOKEN_PATH")
+MARKET_TOKEN_LIFETIME = timedelta(days=7)
 
 
 def market_credentials(environ):
     return tuple(str(environ.get(name) or "").strip() for name in MARKET_CREDENTIALS)
+
+
+def market_token_expiry(path, now):
+    """Estimate the retail refresh-token deadline from schwab-py's original authorization time."""
+    try:
+        path = path.expanduser()
+        if not path.is_file():
+            return None
+        with path.open(encoding="utf-8") as handle:
+            document = json.load(handle)
+        issued, token = document["creation_timestamp"], document["token"]
+        refresh_token = token.get("refresh_token") if isinstance(token, dict) else None
+        if type(issued) not in (int, float) or issued <= 0 or not isinstance(refresh_token, str) or not refresh_token:
+            return None
+        issued_at = datetime.fromtimestamp(issued, timezone.utc)
+        return issued_at + MARKET_TOKEN_LIFETIME if issued_at <= now else None
+    except (KeyError, OSError, OverflowError, RuntimeError, TypeError, ValueError):
+        return None  # An invalid path or a partial SDK write should not interrupt monitoring.
+
+
+def market_token_lock(path):
+    return FileLock(str(path) + ".lock", timeout=10)
 
 
 class SchwabMarketQuotes:
@@ -37,18 +62,22 @@ class SchwabMarketQuotes:
     def quotes(self, symbols):
         from lumibot.entities import Asset
 
-        stat = self._path.stat()
-        revision = (stat.st_ino, stat.st_mtime_ns)
-        if self._source is None or self._revision != revision:
-            from schwab.auth import client_from_token_file
-            from lumibot.data_sources.schwab_data import SchwabData
+        path = self._path.resolve()
+        with market_token_lock(path):
+            stat = path.stat()
+            revision = (path, stat.st_ino, stat.st_mtime_ns)
+            if self._source is None or self._revision != revision:
+                from schwab.auth import client_from_token_file
+                from lumibot.data_sources.schwab_data import SchwabData
 
-            client = client_from_token_file(str(self._path), self._key, self._secret)
-            client.set_timeout(5.0)
-            self._source = SchwabData(client=client)
-            self._revision = revision
-        assets = [Asset(symbol, asset_type="stock") for symbol in symbols]
-        return {asset.symbol: quote for asset, quote in self._source.get_quotes(assets).items()}
+                client = client_from_token_file(str(path), self._key, self._secret)
+                client.set_timeout(5.0)
+                self._source = SchwabData(client=client)
+                self._revision = revision
+            assets = [Asset(symbol, asset_type="stock") for symbol in symbols]
+            # The SDK can write a refreshed access token during this request. Serialize that
+            # write with the authorization script's final replacement of the token file.
+            return {asset.symbol: quote for asset, quote in self._source.get_quotes(assets).items()}
 
 
 def read_only(broker):

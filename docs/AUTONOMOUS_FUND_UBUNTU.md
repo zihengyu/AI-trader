@@ -33,6 +33,7 @@
 | `bash scripts/fund-capital.sh` | **加钱／取钱（申购／赎回）**：`subscribe 10000` 加 1 万美元，`redeem 5000` 取 5000 美元，`cancel <编号>` 取消等待中的请求，不带参数查看份额、单位净值和等待中的请求。本地虚拟账户和 Alpaca 模拟盘使用同一套命令。基金在交易时段按单位净值确认，申赎金额不计入收益。详见 `AUTONOMOUS_PAPER_FUND.md` 的“申购与赎回” |
 | `bash scripts/fund-logs.sh economics` | **只读经济对照**：新方案与维持旧目标的 1／5／20 日价格方案、估算交易摩擦、已准确关联的决策链费用和非重叠样本数；另列期初贝塔对照，保留固定基准。不新增模型调用或下载。缺少证据显示未知，不是实际成交收益或触发当日日内盈亏；周报也会显示截止时点的全历史评估。详见 `AUTONOMOUS_PAPER_FUND.md` 的“新旧目标的经济对照” |
 | `bash scripts/fund-logs.sh sources [YYYY-MM-DD]` | **只读行情观察**。按纽约交易日汇总 Yahoo、Alpaca IEX 和已配置的 Schwab / Twelve Data 的有效样本、请求状态、可比价差及公司行动留证 |
+| `bash scripts/fund-schwab-auth.sh` | **嘉信行情授权或续期**。使用现有 `.env`，在浏览器登录授权并把回调网址粘贴回 SSH 终端 |
 | `bash scripts/fund-stop.sh` | 手动关停：先停止交易（人工停止，不会自动恢复，交易进程撤销本应用的挂单，默认等 60 秒；`--now` 不等），再停止三个服务；`--disable` 同时取消开机自启 |
 
 第一次运行 `fund-start.sh` 时如果还没有 `.env`，脚本会从模板创建一份并提示填写 Key 后再运行。
@@ -197,6 +198,16 @@ paper 会检查必需的 Paper 账户凭证。local 只填一项 Alpaca 凭证�
 用 `schwab-py` 的授权流程生成令牌，令牌文件应由数据员服务用户私有持有并允许续期，
 不要与其他会刷新令牌的进程共用同一个文件。无浏览器服务器可以使用该 SDK 的手动授权方式。
 `SCHWAB_ACCOUNT_NUMBER` 仅用于单独的账户体检。
+
+首次授权或续期时，在 SSH 终端运行 `bash scripts/fund-schwab-auth.sh`。脚本读取现有的 `SCHWAB_APP_KEY`、
+`SCHWAB_APP_SECRET`、`SCHWAB_BACKEND_CALLBACK_URL` 和 `SCHWAB_TOKEN_PATH`，使用数据员服务用户保存令牌。
+令牌目录须允许数据员用户写入，以便保存和替换令牌。用自己电脑的浏览器打开脚本打印的嘉信链接，登录后确认授权。
+把浏览器跳转后的完整地址立即贴回 SSH 的 `Redirect URL>` 提示处。回调为 `127.0.0.1` 时，页面显示连接被拒绝也可以复制地址栏。
+脚本显示「嘉信行情令牌已更新」后，数据员会在下次查报价时使用新令牌。授权失败或中断时保留现有令牌文件，可直接重试。
+
+独立监控根据令牌文件记录的初次签发时间估算 7 天有效期。预计到期前 24 小时发 Telegram 提醒，
+届时仍未换新会在预计到期前 3 小时发紧急提醒。通知显示剩余时长、预计到期时间和续授权步骤。
+提醒跨重启去重，休市也会检查。成功换新后，监控按新签发时间计算下一轮提醒。
 
 `TWELVE_DATA_API_KEY` 可选。数据员每轮采样一只跟踪标的的已完成分钟线，优先轮采缺少合格 Schwab 报价的标的。
 研究员可用 `desk_latest("source_reference")` 查看最新研究参考价。同一标的优先使用

@@ -1,5 +1,6 @@
 """Telegram HTTP doubles and independent watchdog failures; no messages sent."""
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,99 @@ class FakeTelegram:
     def send(self, text):
         self.messages.append(text)
         return self.outcomes.pop(0) if self.outcomes else {"ok": True, "message_id": len(self.messages)}
+
+
+def write_schwab_token(path, issued, *, access="synthetic-private-access"):
+    path.write_text(encode({"creation_timestamp": int(issued.timestamp()), "token": {
+        "access_token": access, "refresh_token": "synthetic-private-refresh"}}), encoding="utf-8")
+
+
+def test_schwab_reminds_at_24_and_3_hours_per_authorization_across_restarts(tmp_path):
+    journal, transport = setup(tmp_path), FakeTelegram()
+    path = tmp_path / "schwab.json"
+    issued = NOW - timedelta(days=6)
+    write_schwab_token(path, issued)
+    monitor = Monitor(tmp_path, transport, schwab_token_path=path)
+    heartbeat(tmp_path, NOW - timedelta(seconds=1))
+    monitor.poll(NOW - timedelta(seconds=1))
+    assert not transport.messages
+    monitor.poll(NOW)
+    assert len(transport.messages) == 1
+    assert "剩余约 24 小时 0 分钟" in transport.messages[0]
+    assert "bash scripts/fund-schwab-auth.sh" in transport.messages[0] and "Redirect URL>" in transport.messages[0]
+
+    # An access-token refresh rewrites the file but preserves the original authorization timestamp.
+    write_schwab_token(path, issued, access="synthetic-rewritten-access")
+    restarted = Monitor(tmp_path, transport, schwab_token_path=path)
+    at = NOW + timedelta(hours=21)
+    heartbeat(tmp_path, at - timedelta(seconds=1))
+    restarted.poll(at - timedelta(seconds=1))
+    assert len(transport.messages) == 1
+    restarted.poll(at)
+    restarted.poll(at + timedelta(seconds=1))
+    assert len(transport.messages) == 2 and "紧急" in transport.messages[1]
+    assert "剩余约 3 小时 0 分钟" in transport.messages[1]
+    notices = [row["body"] for row in journal.all_events()
+               if row["kind"] == "notification" and row["body"].get("kind") == "schwab_token_expiry"]
+    assert [row["details"]["urgency"] for row in notices] == ["day", "urgent"]
+    assert "synthetic-private" not in encode(notices) + "".join(transport.messages)
+    assert str(path) not in encode(notices) + "".join(transport.messages)
+
+
+def test_schwab_renewal_suppresses_pending_notice_and_restarts_the_countdown(tmp_path):
+    setup(tmp_path)
+    transport = FakeTelegram([{"ok": False, "error": "network", "retry_after": 60}])
+    path = tmp_path / "schwab.json"
+    write_schwab_token(path, NOW - timedelta(days=6))
+    monitor = Monitor(tmp_path, transport, schwab_token_path=path)
+    monitor.poll(NOW)
+    assert len(transport.messages) == 1
+
+    new_issue = NOW + timedelta(seconds=10)
+    write_schwab_token(path, new_issue)
+    at = NOW + timedelta(hours=21)
+    heartbeat(tmp_path, at)
+    restarted = Monitor(tmp_path, transport, schwab_token_path=path)
+    status = restarted.poll(at)
+    assert len(transport.messages) == 1 and status["delivery_counts"].get("suppressed") == 1
+    at = new_issue + timedelta(days=6)
+    heartbeat(tmp_path, at)
+    restarted.poll(at)
+    assert len(transport.messages) == 2 and "剩余约 24 小时 0 分钟" in transport.messages[-1]
+
+
+def test_schwab_late_monitor_sends_urgent_notice_only(tmp_path):
+    setup(tmp_path)
+    transport = FakeTelegram()
+    path = tmp_path / "schwab.json"
+    path.write_text('{"creation_timestamp":', encoding="utf-8")
+    monitor = Monitor(tmp_path, transport, schwab_token_path=path)
+    monitor.poll(NOW)
+    assert not transport.messages
+    write_schwab_token(path, NOW - timedelta(days=7) + timedelta(minutes=42))
+    monitor.poll(NOW)
+    assert len(transport.messages) == 1 and "紧急" in transport.messages[0]
+    assert "剩余约 42 分钟" in transport.messages[0]
+
+
+@pytest.mark.parametrize("mode,notifies", [("local", True), ("paper", False)])
+def test_monitor_entry_point_uses_configured_schwab_market_data(tmp_path, monkeypatch, mode, notifies):
+    from scripts.autonomous_fund import monitor as monitor_module
+
+    setup(tmp_path)
+    path, transport = tmp_path / "schwab.json", FakeTelegram()
+    write_schwab_token(path, NOW - timedelta(days=6))
+    monkeypatch.setenv("FUND_MODE", mode)
+    monkeypatch.setenv("SCHWAB_APP_KEY", "synthetic-key")
+    monkeypatch.setenv("SCHWAB_APP_SECRET", "synthetic-secret")
+    monkeypatch.setenv("SCHWAB_TOKEN_PATH", str(path))
+    monkeypatch.setattr(monitor_module, "Telegram", lambda: transport)
+    poll = Monitor.poll
+    monkeypatch.setattr(Monitor, "poll", lambda self: poll(self, NOW))
+    config = Path(__file__).resolve().parents[1] / "scripts" / "autonomous_fund" / "config.json"
+    monitor_module.run_monitor(SimpleNamespace(config=config, run_dir=tmp_path, console_only=False,
+                                               heartbeat_seconds=180, agent_seconds=900, once=True))
+    assert bool(transport.messages) is notifies
 
 
 def test_actual_telegram_request_shape_and_redacted_transport_failure():
