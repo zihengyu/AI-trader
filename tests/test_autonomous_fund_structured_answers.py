@@ -111,6 +111,82 @@ def test_postmarket_review_completes_and_reuses_saved_research_with_redundant_no
     assert not strategy.journal.pending()
 
 
+@pytest.mark.parametrize("mode", ["local", "paper"])
+def test_postmarket_keeps_research_and_valid_proposals_when_optional_items_fail_schema(tmp_path, mode):
+    from scripts.autonomous_fund.notifications import daily_document
+    from scripts.autonomous_fund.strategy_lab import StrategyLab
+    from scripts.autonomous_fund.strategy_lab_runtime import research_cycle
+    from .test_autonomous_fund_strategy_lab import policy, proposal
+
+    strategy, calls = review_harness(tmp_path)
+    strategy.mode = mode
+    strategy.strategy_lab = StrategyLab(strategy.journal, policy())
+    original = strategy.agents["researcher"].run
+    body = research_body()
+    body["evidence"][0]["source"] = "Synthetic timestamped observation"  # The review fixture cites this exact source.
+    valid = proposal("valid-revision")
+    body["strategy_proposals"] = [{**proposal("extra-null"), "synthetic-unknown": None}, valid,
+                                  {**proposal("extra-content"), "synthetic-private-key": "synthetic-private-value"}]
+    bad = result_for(body, fenced=True)
+    assert bad.parse_error is not None  # The admission schema stays strict even for a null extra.
+
+    def researcher(**kwargs):
+        original(**kwargs)
+        return bad
+
+    strategy.agents["researcher"].run = researcher
+    strategy.after_market_closes()
+    strategy.after_market_closes()
+
+    assert [role for role, _ in calls] == ["researcher", "manager"]
+    assert not events(strategy, "postmarket_research_retry")
+    [saved] = events(strategy, "postmarket_research")
+    [review] = events(strategy, "postmarket_review")
+    assert saved["research"]["summary"] == body["summary"] and saved["research"]["evidence"] == body["evidence"]
+    assert [row["strategy_id"] for row in saved["research"]["strategy_proposals"]] == [valid["strategy_id"]]
+    assert [row["id"] for row in strategy.strategy_lab.rows()] == [valid["strategy_id"]]
+    receipt = review["strategy_registration"]
+    assert [item["position"] for item in receipt["schema_rejections"]] == [1, 3]
+    assert calls[-1][1]["context"]["strategy_proposal_rejections"] == receipt["schema_rejections"]
+    previous = research_cycle(strategy.journal, CLOSE, strategy.strategy_lab, "premarket_update")["previous_postmarket"]
+    assert previous["strategy_proposal_rejections"] == receipt["schema_rejections"]
+    with strategy.journal.connection() as db:
+        sequence, = db.execute("SELECT sequence FROM events WHERE kind='postmarket_review'").fetchone()
+    _, notice = daily_document(tmp_path, sequence)
+    assert "第 1 条策略提案未登记" in notice and "第 3 条策略提案未登记" in notice
+    assert "synthetic-private" not in notice and "synthetic-private" not in json.dumps(receipt)
+    researcher_event = next(item for item in events(strategy, "agent") if item["name"] == "researcher")
+    assert researcher_event["summary"] == bad.summary and researcher_event["usage"] == bad.usage
+    assert not strategy.journal.pending()
+
+
+@pytest.mark.parametrize("failure", ["bad_evidence", "too_many_items", "historical_future_evidence"])
+def test_isolating_proposals_keeps_required_research_checks(tmp_path, failure):
+    from .test_autonomous_fund_strategy_lab import proposal
+
+    strategy, calls = review_harness(tmp_path)
+    body = research_body()
+    body["strategy_proposals"] = [{**proposal("invalid"), "synthetic-extra": None}]
+    if failure == "bad_evidence":
+        body["evidence"] = []
+    elif failure == "too_many_items":
+        body["strategy_proposals"].extend(proposal(f"candidate-{i}") for i in range(4))
+    else:
+        strategy.mode = "backtest"
+        body["evidence"][0]["available_at"] = (CLOSE + timedelta(days=1)).isoformat()
+
+    strategy.agents["researcher"].run = lambda **kwargs: result_for(body)
+    strategy.after_market_closes()
+    assert not calls and not events(strategy, "postmarket_research") and not events(strategy, "postmarket_review")
+    [notice] = events(strategy, "notification")
+    assert notice["kind"] == "postmarket_review_error"
+    if failure == "historical_future_evidence":
+        assert "after the simulated cutoff" in notice["details"]
+        assert not events(strategy, "postmarket_research_retry")
+    else:
+        assert len(events(strategy, "postmarket_research_retry")) == 1
+
+
 @pytest.mark.parametrize("role,schema,body,path,code", [
     ("researcher", Research, {**research_body(), "evidence": [{
         **research_body()["evidence"][0], "observed_at": 7}]}, "evidence[0].observed_at", "string_type"),

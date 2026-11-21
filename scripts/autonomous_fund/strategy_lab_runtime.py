@@ -56,6 +56,8 @@ def research_cycle(journal, now, lab, mode):
                 previous = {key: packet[key] for key in ("session_date", "market_close", "completed_at")}
                 previous["summary"] = packet["research"]["summary"][:1200]
                 previous["research_direction"] = packet["research"].get("research_direction", "")
+                if rejected := (packet.get("strategy_registration") or {}).get("schema_rejections"):
+                    previous["strategy_proposal_rejections"] = rejected
                 break
         progress = None
         if lab is not None:

@@ -92,6 +92,48 @@ def structured_answer_diagnostic(result, schema):
     return {"kind": "unparsed_answer", "answer_shape": shape}
 
 
+def isolate_invalid_strategy_proposals(result, schema):
+    """Separate invalid optional proposals from a strictly valid postmarket packet."""
+    from pydantic import ValidationError
+    from lumibot.components.agents.structured_output import _extract_json_value
+
+    text = getattr(result, "summary", None) or getattr(result, "text", None)
+    if not isinstance(text, str):
+        return None
+    json_schema = schema.model_json_schema()
+    max_proposals = json_schema["properties"]["strategy_proposals"]["maxItems"]
+    try:
+        value = _extract_json_value(text, "object")
+    except ValueError:
+        return None
+    proposals = value.get("strategy_proposals") if isinstance(value, dict) else None
+    if not isinstance(proposals, list) or not 0 < len(proposals) <= max_proposals:
+        return None
+    try:
+        schema.model_validate(value)
+    except ValidationError as error:
+        failures = error.errors(include_input=False, include_context=False, include_url=False)
+    else:
+        return None
+    rejected = {}
+    for issue in failures:
+        path = issue["loc"]
+        if (len(path) < 2 or path[0] != "strategy_proposals" or type(path[1]) is not int
+                or not 0 <= path[1] < len(proposals)):
+            return None  # Summary, evidence and every other section keep the normal validation path.
+        rejected.setdefault(path[1], []).append({"path": _validation_path(path, json_schema), "type": issue["type"]})
+
+    # Reject items as submitted. Never alter the remaining proposals or trust
+    # any identifier from an invalid item. Revalidate the entire surviving packet.
+    remaining = [item for index, item in enumerate(proposals) if index not in rejected]
+    try:
+        research = schema.model_validate({**value, "strategy_proposals": remaining})
+    except ValidationError:
+        return None
+    return research, [{"position": index + 1, "errors": issues[:5]}
+                      for index, issues in sorted(rejected.items())]
+
+
 def answer_shape(text):
     """What the answer was at its top level, without its content.
 

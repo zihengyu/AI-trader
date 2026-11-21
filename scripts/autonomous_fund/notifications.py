@@ -480,6 +480,9 @@ def strategy_research_lines(research, lab=None, *, registration=None):
     for error in (registration or {}).get("errors", []):
         label = "提案登记失败" if error["action"] == "proposal" else "研究任务更新失败"
         lines.append(f"- {label}：{error['strategy_id']} / {error['version']} · {error['error']}")
+    for rejection in (registration or {}).get("schema_rejections", []):
+        reasons = "，".join(f"{item['path']} ({item['type']})" for item in rejection["errors"])
+        lines.append(f"- 第 {rejection['position']} 条策略提案未登记（格式校验失败） · {reasons}")
     failed_tasks = {(error["strategy_id"], error["version"]) for error in (registration or {}).get("errors", [])
                     if error["action"] == "task"}
     for task in tasks:

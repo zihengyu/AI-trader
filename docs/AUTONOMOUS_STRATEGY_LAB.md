@@ -94,6 +94,11 @@ addresses the gap. If the revision is still blocked, record the specific missing
 input, rule or operation. A submitted revision goes through the same independent
 validation as any other candidate.
 
+In postmarket research, schema errors confined to individual proposal items are
+recorded with their original positions. The remaining research is validated again
+and can finish the review and register any valid proposals. The raw answer stays
+in the call ledger, and the report and next research pass carry the rejections.
+
 ## Executable daily research
 
 An implementation contains independent position rules with Boolean `entry` and

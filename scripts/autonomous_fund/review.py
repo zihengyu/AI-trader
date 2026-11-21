@@ -454,8 +454,8 @@ def review_after_close(strategy):
     saved = next((r["body"] for r in reversed(rows) if r["kind"] == "postmarket_research" and
                   r["body"]["session_date"] == day and _available(r["body"], now)), None)
     if saved is None:
-        from .diagnostics import structured_answer_diagnostic
-        from .strategy import Research
+        from .diagnostics import isolate_invalid_strategy_proposals, structured_answer_diagnostic
+        from .strategy import Research, research_context as dump_research
 
         if not historical:
             from .strategy_lab_runtime import research_cycle
@@ -488,9 +488,12 @@ def review_after_close(strategy):
                                 "新验证结果和 strategy_lab 未结任务，结合当日执行及表现，优先解决最有价值的可检验问题。"
                                 "可以续做、补数、复盘失败或提出新机制。使用 strategy_proposals 提交可证伪的新版本，"
                                 "使用 research_tasks 推进已登记版本；只有方向或数据不足时记录缺口。无新机会时允许留空。"
+                                "提案只使用 schema 中声明的字段，额外说明写入 additional_research；"
+                                "省略自造的注释、修正标记和 null 占位字段。"
                                 "复用已完成的实验，保留失败记录，注明相关费用与样本限制。")
         research_prompt += CASH_MANAGEMENT_GUIDANCE
         research_context = context
+        schema_rejections = []
         for attempt in range(2):
             if attempt and hasattr(strategy, "_with_fund_cost_context"):
                 research_context = strategy._with_fund_cost_context(research_context, strategy.get_datetime())
@@ -501,6 +504,12 @@ def review_after_close(strategy):
                 research = strategy._record_agent("researcher", result, phase="postmarket_review")
             except RiskError:
                 diagnostic = structured_answer_diagnostic(result, Research)
+                if diagnostic["kind"] == "schema_validation" and not strategy.halt_path.exists():
+                    recovered = isolate_invalid_strategy_proposals(result, Research)
+                    if recovered is not None:
+                        parsed, schema_rejections = recovered
+                        research = dump_research(parsed)
+                        break
                 if attempt or diagnostic["kind"] not in {"schema_validation", "invalid_json"}:
                     raise
                 if strategy.halt_path.exists():
@@ -521,6 +530,8 @@ def review_after_close(strategy):
                 break
         validate_evidence(research["evidence"], strategy.get_datetime(), historical)
         registration = strategy._record_strategy_research(research, strategy.get_datetime()) if hasattr(strategy, "_record_strategy_research") else None
+        if schema_rejections:
+            registration = {**(registration or {}), "schema_rejections": schema_rejections}
         # The input the saved research answered (with its refreshed costs), never the format-correction
         # diagnostic of a rejected first answer: the review manager builds on this snapshot.
         packet = {
@@ -544,6 +555,8 @@ def review_after_close(strategy):
     context = {**saved["context"], "as_of": now.isoformat(), "research": saved["research"],
                "research_completed_at": saved["completed_at"], "allowed_evidence_refs": refs,
                "evidence_catalog": catalog}
+    if rejected := (saved.get("strategy_registration") or {}).get("schema_rejections"):
+        context["strategy_proposal_rejections"] = rejected
     # Research may be reused after a restart; current intent has its own clock
     # and must not be mistaken for the earlier research/session snapshot.
     context["post_close_plan"] = _post_close_plan(strategy, session, now)
@@ -562,6 +575,7 @@ def review_after_close(strategy):
     if strategy.mode == "local" and hasattr(getattr(strategy, "broker", None), "ledger_audit"):
         context["current_ledger_audit"] = strategy.broker.ledger_audit(strict=False)
     manager_prompt = ("这是盘后复盘，不是可执行持仓决策。按本次 PostmarketReview schema 用中文回答。"
+                    "strategy_proposal_rejections 中的提案未登记；报告时和已经登记的版本区分。"
                     "post_close_plan 若存在，是收盘后才接受的当前目标意图；单独说明有效期与待执行状态，不能算作盘中决策、下单或成交。"
                     "核对研究和实际账户，评估昨日备忘中的假设是否获得支持或反证。"
                     "引用归因时保留 valuation_window 的终点与同窗基准；用窗口内实际观测来判断事件影响。"
