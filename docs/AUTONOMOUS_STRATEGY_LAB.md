@@ -633,14 +633,21 @@ directory under its lowercase SHA-256 digest as the filename. Byte verification
 works on Windows and Linux and requires regular files. Symbolic links and
 Windows reparse points at artifact filenames are rejected. The following
 commands verify those bytes against the four coverage receipts. The first
-command is read-only. The second records a successful check against the exact
+two commands are read-only. The third records a successful check against the exact
 snapshot and schedules eligible work. A supplied directory with missing or
 mismatched artifacts fails before scheduling.
 
 ```bash
+python -m scripts.autonomous_fund.lab audit-data --dataset path/to/snapshot.json --artifacts-dir path/to/originals
 python -m scripts.autonomous_fund.lab check-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json --strategy-id candidate-id --version v1 --artifacts-dir path/to/originals
 python -m scripts.autonomous_fund.lab import-data --run-dir artifacts/fund-local --dataset path/to/snapshot.json --artifacts-dir path/to/originals
 ```
+
+Use `audit-data` before selecting an account or strategy. It reports the exact
+snapshot digest, declared claims and their source receipts, missing exchange
+sessions between each symbol's first and last supplied bar, and artifact gaps.
+Coverage before the first or after the last bar, including listing changes and
+delistings, still depends on the original records and provider evidence.
 
 For a new data qualification pilot, set `strategy_lab.require_source_artifacts`
 to `true` in the account's approved runner configuration before registering the

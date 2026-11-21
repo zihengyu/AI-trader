@@ -126,6 +126,34 @@ def queue_forward_notice(db, now, opened):
     db.execute("INSERT INTO events(at,kind,body) VALUES(?,?,?)", (now.isoformat(), "notification", payload))
 
 
+def audit_data(data, now, *, artifacts_dir=None):
+    """Check a delivered snapshot before selecting an account or candidate."""
+    from .strategy_validation import (COVERAGE_FIELDS, check_snapshot_as_of, planned_sessions,
+                                      snapshot_limitations, source_artifact_gaps)
+
+    fingerprint = check_snapshot_as_of(data, now)
+    gaps = (source_artifact_gaps(data, artifacts_dir) if artifacts_dir is not None
+            else snapshot_limitations(data, require_receipts=True) + ["source_artifacts_unchecked"])
+    manifest = data.get("provenance")
+    claims = manifest.get("claims") if isinstance(manifest, dict) else None
+    coverage = data.get("coverage")
+    reports = {}
+    for key in COVERAGE_FIELDS:
+        claim = claims.get(key) if isinstance(claims, dict) else None
+        reports[key] = {"declared_complete": isinstance(coverage, dict) and coverage.get(key) is True,
+                        "receipt": {field: claim[field] for field in ("source", "reference", "artifact_sha256")
+                                    if isinstance(claim.get(field), str)} if isinstance(claim, dict) else None}
+    history = {}
+    for symbol, rows in sorted(data["bars"].items()):
+        days = [row["day"] for row in rows]
+        missing = sorted(set(planned_sessions(days)) - set(days))
+        history[symbol] = {"first_session": days[0], "last_session": days[-1], "supplied_sessions": len(days),
+                           "missing_sessions": missing}
+    return {"source": data["source"], "snapshot_digest": fingerprint, "coverage": reports, "history": history,
+            "corporate_action_receipts": len(data.get("actions", [])), "receipt_gaps": gaps,
+            "source_artifacts_matched_this_check": not gaps}
+
+
 def check_data(root, data, key, version, now, *, artifacts_dir=None):
     from .strategy_lab import has_source_artifact_receipt
     from .strategy_evidence import load_reference
@@ -452,10 +480,10 @@ def open_lab(root, config):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=["status", "check-data", "import-data", "run-once", "declare-portfolio",
+    parser.add_argument("action", choices=["status", "audit-data", "check-data", "import-data", "run-once", "declare-portfolio",
                                            "execution-calibration", "forward-audit"],
                         default="status", nargs="?")
-    parser.add_argument("--run-dir", required=True, type=Path)
+    parser.add_argument("--run-dir", type=Path, help="Account journal for all actions except audit-data")
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("config.json"))
     parser.add_argument("--dataset", type=Path, help="Operator-owned JSON snapshot with provenance and coverage receipts")
     parser.add_argument("--strategy-id", help="Existing candidate for check-data or forward-audit")
@@ -465,6 +493,15 @@ def main(argv=None):
     parser.add_argument("--opening-minutes", type=int, default=15, help="Execution calibration window after session open")
     parser.add_argument("--as-of", help="Timezone-aware cutoff for execution-calibration or forward-audit")
     args = parser.parse_args(argv)
+    if args.action == "audit-data":
+        from .strategy_lab import load_snapshot
+        if args.dataset is None:
+            parser.error("audit-data requires --dataset")
+        result = audit_data(load_snapshot(args.dataset), datetime.now(timezone.utc), artifacts_dir=args.artifacts_dir)
+        print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+        return
+    if args.run_dir is None:
+        parser.error(f"{args.action} requires --run-dir")
     if args.action == "status":
         print("\n".join(report(args.run_dir)))
         return

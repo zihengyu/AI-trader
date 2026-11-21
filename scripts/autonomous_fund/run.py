@@ -362,6 +362,9 @@ def main(argv=None):
     parser.add_argument("--expression", help="factor-lab: factor expression; use --expression=-vol(60) when it starts with '-'")
     parser.add_argument("--horizon", type=int, default=5, help="factor-lab: forward horizon in sessions (1-20)")
     parser.add_argument("--min-names", type=int, help="factor-lab: minimum names per date (default from config)")
+    parser.add_argument("--factor-replay", type=Path, help="factor-lab: declared long-only replay plan (JSON)")
+    parser.add_argument("--dataset", type=Path, help="factor-lab --factor-replay: dated Strategy Lab snapshot (JSON)")
+    parser.add_argument("--artifacts-dir", type=Path, help="factor-lab --factor-replay: original source artifacts")
     parser.add_argument("--rebaseline-external", action="store_true",
                         help="adjust-reserve: accept the account's current external holdings as the new baseline")
     parser.add_argument("--check-monitor", action="store_true",
@@ -374,6 +377,11 @@ def main(argv=None):
                         help="status: print only the STOP class (operator, watchdog, service or none)")
     parser.add_argument("--call-id", help="evidence: show one exact archived application request and returned result")
     args = parser.parse_args(argv)
+    if args.factor_replay is not None:
+        if args.mode != "factor-lab" or args.dataset is None or args.data_dir is not None or args.symbols is not None:
+            parser.error("--factor-replay requires factor-lab and --dataset, with instruments declared in the plan")
+    elif args.dataset is not None or args.artifacts_dir is not None:
+        parser.error("--dataset and --artifacts-dir require --factor-replay")
     if args.mode == "quotes" and args.symbol is not None:
         from .quote_diagnostics import symbol_name
         args.symbol = symbol_name(args.symbol)
@@ -736,15 +744,21 @@ def main(argv=None):
 
 
 def factor_lab(args, config):
-    """Offline: test one factor expression on recorded daily CSVs (Date, Close and optional Volume)."""
+    """Offline: test one factor on daily CSVs or a dated replay snapshot."""
     import pandas as pd
     from .factors import SURVIVORSHIP_NOTE, FactorSettings, canonical, evaluate
-    if not args.data_dir or not args.symbols or not args.expression:
-        raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
     section = dict(config.get("factor_lab") or {})
     if args.min_names:
         section["min_names"] = args.min_names
     settings = FactorSettings.from_config(section)
+    if args.factor_replay is not None:
+        from .factor_replay import study
+        from .strategy_lab import load_snapshot
+        return study(args.expression, args.horizon, settings, load_snapshot(args.factor_replay),
+                     load_snapshot(args.dataset), config, datetime.now(timezone.utc),
+                     artifacts_dir=args.artifacts_dir)
+    if not args.data_dir or not args.symbols or not args.expression:
+        raise RiskError("factor-lab needs --data-dir, --symbols SYMBOL,SYMBOL and --expression")
     closes, volumes = {}, {}
     for symbol in [s.strip().upper() for s in args.symbols.split(",") if s.strip()]:
         path = Path(args.data_dir) / f"{symbol}.csv"

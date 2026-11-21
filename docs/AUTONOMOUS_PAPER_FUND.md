@@ -1094,6 +1094,50 @@ AI 仍决定完整目标组合，量化风控和审批规则不变。影子 A/B 
 ```
 
 Linux 用 `--expression=...` 形式（表达式以 `-` 开头时必须如此），例如 `--expression=-vol(20)`。
+
+### 离线多头回放
+
+对价格和成交量因子，可用同一份 [Strategy Lab 日线快照](AUTONOMOUS_STRATEGY_LAB.md)
+同时检验预测力和理论多空，并回放一个独立现金账本中的多头组合。先固定因子方向、标的、
+日期、再平衡间隔、成本、基准和基准的风险匹配理由。以下为计划格式示例，日期和费用需要按研究协议填写。
+
+```json
+{
+  "instruments": ["SPY", "QQQ", "DIA", "IWM", "VTI"],
+  "start": "2025-01-02",
+  "end": "2025-12-31",
+  "capital": "10000",
+  "direction": 1,
+  "top_n": 2,
+  "rebalance_sessions": 5,
+  "benchmark": {"VTI": "0.50", "DIA": "0.50"},
+  "benchmark_rationale": "Both books hold US equities and use the same feasible target exposure.",
+  "target_exposure": "0.30",
+  "cash_annual_rate": "0.04",
+  "fee_bps": "2",
+  "spread_bps": "4",
+  "slippage_bps": "3",
+  "signal_delay_minutes": 60
+}
+```
+
+```bash
+python -m scripts.autonomous_fund.run factor-lab --expression='rank(ret(20))' --horizon 5 --min-names 5 --factor-replay path/to/plan.json --dataset path/to/snapshot.json --artifacts-dir path/to/originals
+```
+
+`direction` 为 `1` 时买入排名最高的标的，为 `-1` 时买入排名最低的标的。信号使用已发布的完成日线，
+按当时已生效的拆股将价格和成交量转换到同一份额基准。两个账本都在下一交易日按原始开盘价、
+半点差、滑点和手续费模拟交易，遵守投资范围、整股、可用现金、仓位、行业、总敞口和订单数上限。
+两组采用共同可实现的目标敞口，报告各自实际敞口。非计划调仓日可触发风控减仓。
+开盘下单容量使用前 20 个交易日的已知美元成交额。快照需要覆盖整个窗口和因子及流动性的预热期。
+股息在到账前计为应收，现金收益按声明的年化情景计入，期末持仓按收盘价估值。
+
+报告的 `long_only_replay` 给出快照和协议摘要、原始证据缺口、两组净收益、相对净收益和每日成交。
+`modeled_long_only` 表示在声明的约束和成本下完成了模拟。固定标的集合、分拆与退市结算、盘中撮合、
+动态风控以及模型和数据费用均有限制。历史回放保持探索性质，`economic_alpha` 仍需另行采集独立的基准相对证据。
+
+### 统计检验实例与数据限制
+
 **实测**：仓库自带的 2019 年 5 只 ETF 日线上，`rank(ret(20))`、`-rank(ret(5))`、`-vol(20)`、`rank(ret(60))` 全部被拒绝
 （样本内 |t| 0.11–1.21，低于 1.96）。5 只证券、一年数据远不足以证明任何因子，这正是检验应有的结论；
 2026-11-05 起默认个股横截面为 56 只可交易个股加 40 只研究股票，ETF 横截面为 19 只 ETF，两年日线（此前是 16 只个股加 40 只研究股票、14 只 ETF）。合成数据测试中，真实存在的动量规律在所有种子下都通过，纯噪声在所有种子下都被拒绝。

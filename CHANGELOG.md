@@ -5,6 +5,7 @@
 Deploy marker: `d326af579d52b2869152e4ee7ff775e0ec1685a3`.
 
 ### Added
+- The Autonomous Fund Factor Lab can replay a declared price or volume factor and a benchmark in paired whole-share, next-open books with matched target exposure, lagged liquidity limits, and explicit trading costs and cash carry. The historical result stays exploratory. Strategy Lab can audit a delivered snapshot and its original artifact bytes before any account or candidate is selected.
 - The Autonomous Fund Factor Lab reports predictive qualification and theoretical long-short results separately from executable and economic evidence. Candidate preflight reports actual independent-sample and coverage gaps before statistical tests, and preserves the existing trial ledger and historical factor states.
 - The Autonomous Fund queues Telegram reminders 24 and 3 hours before an estimated Schwab market-data token expiry. `fund-schwab-auth.sh` runs interactive OAuth and publishes a replacement token after successful authorization.
 - The Autonomous Fund data desk can qualify Schwab stock and ETF quotes against Alpaca IEX and use current completed Twelve Data minutes as an independent research reference. Both are optional and read-only.
