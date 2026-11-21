@@ -1992,9 +1992,13 @@ Flash 成功结果先提交 SQLite；Pro 失败后，下次上述检查复用该
 默认最多八次提供方请求（模型回答前可再次读取工具，最多三轮，记录为 `tool_rounds`；
 第四次要求工具判为 `too_many_tool_rounds`），不自动重试、不连接券商；结果保存在 `artifacts/verification/deepseek-schema-smoke/`。
 `--schemas all` 再检查基金经理决策（`Decision`，含 `Research` 没有的 `exclusiveMinimum`）、反方审查（`Critique`）、
-盘后复盘（`PostmarketReview`，引用必须来自给定清单）和约束探针（故意要求空 `summary`、空 `evidence`、权重 1.5、入场价 0：
+盘后复盘（`PostmarketReview`，引用必须来自给定清单）、嵌套提案和约束探针（故意要求空 `summary`、空 `evidence`、权重 1.5、入场价 0：
 返回了这些值说明 DeepSeek 没有强制该约束，记为 `not_enforced` 并判为失败；入场价可为空，
-模型用 null 代替 0 记为 `held_null`；实际返回值记录在 `constraint_observed`），两个模型最多 18 次请求。
+模型用 null 代替 0 记为 `held_null`；实际返回值记录在 `constraint_observed`），两个模型最多 26 次请求。
+`--schemas nested --model flash` 单独检查 Flash 在两轮工具调用后是否返回合成提案中的违规额外字段，最多 4 次请求。
+用与服务一致的推理强度。服务未指定时，传 `--reasoning-effort default`。
+`not_enforced` 表示额外字段出现在回答里，`held` 表示本次有效提案没有额外字段，提案缺失或工具轮数不足会使本次检查失败。
+报告逐轮记录实际发送的模型、提供方报告的模型版本、官方或自定义接口类别，以及序列化请求中的 schema 指纹和严格模式标志。
 它不代替完整账户策略复现，也不能证明正在运行的服务已经重载新代码；详见 `docs/AGENT_STRUCTURED_OUTPUT.md`。
 真实接口若在第一次请求就返回 HTTP 400，表示请求被拒绝，不能据此声称原生 Schema 已实测可用。
 更新后的诊断会提供 `provider_problem`：区分格式不可用、Schema 关键字／必填项规则被拒绝、

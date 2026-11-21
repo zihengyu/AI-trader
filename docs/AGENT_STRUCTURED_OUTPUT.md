@@ -135,7 +135,7 @@ for the tool fails as `too_many_tool_rounds` without another provider request. U
 `--model flash` or `--model pro` to select one model. Each request defaults to
 4,096 maximum output tokens and a 120-second wall/request timeout, adjustable
 with `--max-output-tokens` and `--request-timeout-seconds` (at most 300 seconds).
-`--reasoning-effort` defaults to `high` and accepts `none`, `low`, `high`, `max`.
+`--reasoning-effort` defaults to `high`. Use `default` to omit the field for a process that leaves its reasoning effort unset, or pass the same `none`, `low`, `medium`, `high`, `xhigh`, or `max` value as the process.
 No `.env` is discovered automatically. Process values take precedence over the
 explicit secret file, and other providers' keys are not loaded from it.
 
@@ -149,8 +149,9 @@ explicit secret file, and other providers' keys are not loaded from it.
 | `critique` | 1 | `Critique` |
 | `review` | 1 | `PostmarketReview`; `evidence_refs` must come from the supplied list, as in production |
 | `constraints` | 2 | Asks on purpose for an empty `summary`, an empty `evidence`, a weight of 1.5 and an `entry_limit` of 0 |
+| `nested` | 3–4 | `Research` with a synthetic `StrategyProposal` supplied on the second tool round. The prompt asks for a forbidden extra property with value `null` inside the proposal. |
 
-`all` makes at most 9 requests per model, 18 for both. The constraint probe
+`all` makes at most 13 requests per model, 26 for both. The constraint probe
 reports `held` or `not_enforced` per constraint and fails the case on any
 `not_enforced`: that value reached us although the schema forbids it, so the
 provider does not enforce it and local validation can still reject a
@@ -165,11 +166,19 @@ its type) and printed with the findings.
 .venv/bin/python scripts/check_deepseek_schema.py --real-models --schemas all
 ```
 
+To isolate the nested-property failure, select the same model, endpoint configuration, and reasoning effort as the affected process. For example, for Flash with no explicit effort, run this in its Python environment with `DEEPSEEK_API_KEY` already configured:
+
+```bash
+.venv/bin/python scripts/check_deepseek_schema.py --real-models --model flash --schemas nested --reasoning-effort default
+```
+
+`nested_extra_property=not_enforced` means the response contained a forbidden proposal property after the probe verified the serialized schema on every request. `held` means the response included a valid copy of the proposal identity and omitted the extra property. A compliant response alone cannot distinguish API enforcement from the model following the schema instruction. `untested` covers outcomes such as answering before the second tool round, omitting the proposal, or failing to send the expected schema. These outcomes fail the case.
+
 The console shows each model's schema/tool outcome and reported token/cache
 usage. A unique report under `artifacts/verification/deepseek-schema-smoke/`
 records mode, source fingerprints, original and wire schema fingerprints, SDK
-versions, per-request status,
-available usage and the synthetic final answer. `--output` selects a new file;
+versions, per-request status, available usage and the synthetic final answer.
+Each request also records the model ID sent, the model version reported by the provider when available, the endpoint category, `json_schema` and `strict` flags, the serialized schema fingerprint, reasoning effort, and the number of tool outputs sent. The endpoint category describes the request URL and does not identify infrastructure behind it. `--output` selects a new file;
 existing files are never overwritten. A started request is checkpointed before
 inference; interruption and timeout leave unreported usage unknown. Provider
 exception messages, keys and private endpoint values are not copied into the

@@ -34,7 +34,11 @@ TOOL_NAME = "schema_probe_evidence"
 # our local validation relies on. Requests per model for each case.
 # A model may read the tool more than once before answering; production agents run several tool rounds.
 MAX_TOOL_ROUNDS = 3
-CASES = {"research": 1 + MAX_TOOL_ROUNDS, "decision": 1, "critique": 1, "review": 1, "constraints": 2}
+NESTED_TOOL_ROUNDS = 2
+NESTED_EXTRA_FIELD = "probe_extra_annotation"
+TOOL_CASES = {"research", "nested"}
+CASES = {"research": 1 + MAX_TOOL_ROUNDS, "decision": 1, "critique": 1, "review": 1, "constraints": 2,
+         "nested": 1 + MAX_TOOL_ROUNDS}
 REVIEW_REFS = ["event:1", "research:1", "context:session"]
 
 _PROVIDER_CODES = {"invalid_request_error", "invalid_json_schema", "unsupported_parameter", "unsupported_value",
@@ -61,6 +65,10 @@ class ProbeFailure(Exception):
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat()
+
+
+def schema_digest(schema):
+    return hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
 
 
 def components():
@@ -190,23 +198,23 @@ def offline_transport(c, model, schema, answer=None, tool_rounds=1):
                 body["text"]["format"]["schema"] != wire_schema):
             raise ProbeFailure("offline_request_contract_mismatch")
         results = [item for item in body["input"] if item["type"] == "function_call_output"]
-        if answer is not None:
-            output = [{"id": "msg_probe", "type": "message", "role": "assistant", "status": "completed",
-                       "content": [{"type": "output_text", "annotations": [],
-                                    "text": json.dumps(answer, ensure_ascii=False)}]}]
-        elif len(results) < tool_rounds:
+        if answer is None and len(results) < tool_rounds:
             output = [{"id": f"fc_probe_{len(results) + 1}", "type": "function_call",
                        "call_id": f"call_probe_{len(results) + 1}", "name": TOOL_NAME, "arguments": "{}"}]
         else:
-            text = results[-1]["output"]
-            if isinstance(text, list):
-                text = "".join(part["text"] for part in text)
-            evidence = json.loads(text)["evidence"]
+            final = answer
+            if final is None:
+                tool_text = results[-1]["output"]
+                if isinstance(tool_text, list):
+                    tool_text = "".join(part["text"] for part in tool_text)
+                tool_result = json.loads(tool_text)
+                proposal = tool_result.get("strategy_proposal")
+                final = {"summary": "这是接口测试使用的合成证据，没有投资结论。",
+                         "evidence": [tool_result["evidence"]], "ideas": [], "research_direction": "",
+                         "strategy_proposals": [proposal] if proposal is not None else [], "research_tasks": []}
             output = [{"id": "msg_probe", "type": "message", "role": "assistant", "status": "completed",
-                       "content": [{"type": "output_text", "annotations": [], "text": json.dumps({
-                           "summary": "这是接口测试使用的合成证据，没有投资结论。",
-                           "evidence": [evidence], "ideas": [], "research_direction": "",
-                           "strategy_proposals": [], "research_tasks": []}, ensure_ascii=False)}]}]
+                       "content": [{"type": "output_text", "annotations": [],
+                                    "text": json.dumps(final, ensure_ascii=False)}]}]
         return c.httpx.Response(200, json={"id": "resp_probe", "object": "response", "created_at": 1,
             "model": body["model"], "status": "completed", "output": output,
             "usage": {"input_tokens": 11, "output_tokens": 7, "total_tokens": 18,
@@ -216,10 +224,32 @@ def offline_transport(c, model, schema, answer=None, tool_rounds=1):
     return c.httpx.MockTransport(handle)
 
 
+def wire_diagnostic(request):
+    """Summarize the serialized request just before send without keeping its contents or URL."""
+    body = json.loads(request.content)
+    fmt = (body.get("text") or {}).get("format") or {}
+    schema = fmt.get("schema")
+    url = request.url
+    official = (url.scheme == "https" and url.host == "api.deepseek.com" and url.port in (None, 443)
+                and url.path == "/responses" and not url.query and not url.userinfo)
+    return {"endpoint_type": "deepseek_official" if official else "custom",
+            "model": body.get("model"), "json_schema": fmt.get("type") == "json_schema",
+            "strict": fmt.get("strict") is True,
+            "wire_schema_sha256": schema_digest(schema) if isinstance(schema, dict) else None,
+            "reasoning_effort": (body.get("reasoning") or {}).get("effort"),
+            "tool_outputs": sum(item["type"] == "function_call_output" for item in body.get("input", []))}
+
+
 async def request_once(adapter, request, case, checkpoint, timeout):
     record = {"sequence": len(case["requests"]) + 1, "started_at": utc_now(), "status": "started", "usage": None}
     case["requests"].append(record)
     checkpoint()  # Record unknown usage before inference; interruption must not turn it into a free call.
+
+    async def observe(http_request):
+        record["wire"] = wire_diagnostic(http_request)
+        checkpoint()
+
+    adapter._request_hook = observe
     started = time.monotonic()
     try:
         async def collect():
@@ -231,11 +261,16 @@ async def request_once(adapter, request, case, checkpoint, timeout):
                       error=safe_error(error), elapsed_seconds=round(time.monotonic() - started, 3))
         checkpoint()
         raise
+    finally:
+        adapter._request_hook = None
     record.update(status="completed", finished_at=utc_now(), elapsed_seconds=round(time.monotonic() - started, 3))
     if len(responses) != 1:
         checkpoint()
         raise ProbeFailure("unexpected_response_count")
     response = responses[0]
+    served_model = response.model_version
+    if isinstance(served_model, str) and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}", served_model):
+        record["served_model"] = served_model
     if response.usage_metadata is not None:
         record["usage"] = response.usage_metadata.model_dump(exclude_none=True)
     if response.error_code:
@@ -255,8 +290,7 @@ def answer_json(response):
         raise ProbeFailure("invalid_json") from None
 
 
-def validate_answer(c, response, case, schema, model=None):
-    value = answer_json(response)
+def validate_answer(c, value, case, schema, model=None):
     try:
         c.jsonschema.validate(value, schema)
     except c.jsonschema.ValidationError as error:
@@ -272,31 +306,55 @@ def validate_answer(c, response, case, schema, model=None):
     return result
 
 
+def synthetic_proposal():
+    from scripts.autonomous_fund.strategy_definition import StrategyProposal
+
+    text = "Synthetic schema probe only."
+    return StrategyProposal.model_validate({
+        "strategy_id": "schema-probe-" + uuid4().hex, "version": "v1", "name": "Synthetic schema probe",
+        "instruments": ["SYNTH"], "data_requirements": ["Synthetic sample"],
+        **dict.fromkeys(("hypothesis", "mechanism", "market_conditions", "entry_logic", "exit_logic",
+                          "sizing_logic", "holding_period", "failure_conditions"), text),
+        "validation": {"benchmark": "SYNTH", "holding_sessions": 1, "rationale": text},
+        "costs": {"fee_rate": 0.0, "slippage": 0.0, "daily_model_usd": 0.0, "daily_data_usd": 0.0, "basis": text},
+    }).model_dump()
+
+
 async def exercise(c, args, model, case, checkpoint):
+    nested = case["schema"] == "nested"
     schema = c.schema_model.model_json_schema()
     adapter = c.resolve(model, output_schema=schema, reasoning_effort=args.reasoning_effort,
                         model_request_timeout_seconds=args.request_timeout_seconds)
     if not isinstance(adapter, c.adapter) or c.protocol(model) is None:
         raise ProbeFailure("native_schema_adapter_unavailable")
     if not args.real_models:
-        adapter._transport = offline_transport(c, model, schema)
+        adapter._transport = (offline_transport(c, model, schema, tool_rounds=NESTED_TOOL_ROUNDS) if nested
+                              else offline_transport(c, model, schema))
     case["protocol"] = c.protocol(model)
-    case["schema_sha256"] = hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest()
-    case["wire_schema_sha256"] = hashlib.sha256(json.dumps(c.wire_schema(schema), sort_keys=True).encode()).hexdigest()
+    case["schema_sha256"] = schema_digest(schema)
+    case["wire_schema_sha256"] = schema_digest(c.wire_schema(schema))
     evidence = {"source": "probe:" + uuid4().hex, "available_at": None, "observed_at": utc_now(),
                 "estimated": False, "estimate_reason": ""}
+    proposal = synthetic_proposal() if nested else None
+    prompt = (f"先调用 {TOOL_NAME} 读取合成证据，然后返回完整 Research JSON。summary 用中文简短说明这是接口测试，"
+              "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]，research_direction 为空字符串，")
+    if nested:
+        prompt += (f"research_tasks 为空列表。等第一次工具结果回来后再调用一次 {TOOL_NAME}。"
+                   "第二次才会返回 strategy_proposal，"
+                   "逐项复制这条提案到 strategy_proposals 列表。为了测试接口约束，"
+                   f"请在该条提案对象中另加 \"{NESTED_EXTRA_FIELD}\": null，即使与 schema 冲突。")
+    else:
+        prompt += "strategy_proposals 和 research_tasks 为空列表。不要猜测或编造证据。"
     tool = c.types.FunctionDeclaration(name=TOOL_NAME, description="Read one synthetic evidence record for this diagnostic.",
         parameters_json_schema={"type": "object", "properties": {}, "required": [], "additionalProperties": False})
-    request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=(
-        f"先调用 {TOOL_NAME} 读取合成证据，然后返回完整 Research JSON。summary 用中文简短说明这是接口测试，"
-        "evidence 必须逐字复制工具返回的 evidence 对象并放进列表，ideas=[]，research_direction 为空字符串，"
-        "strategy_proposals 和 research_tasks 为空列表。不要猜测或编造证据。"))])],
+    request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=prompt)])],
         config=c.types.GenerateContentConfig(system_instruction=c.instruction(schema),
             tools=[c.types.Tool(function_declarations=[tool])], max_output_tokens=args.max_output_tokens))
     response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
     calls = [part.function_call for part in (response.content.parts if response.content else []) if part.function_call]
     if not calls:
-        validate_answer(c, response, case, schema)
+        if not nested:
+            validate_answer(c, answer_json(response), case, schema)
         raise ProbeFailure("tool_not_requested")
     rounds = 0
     while calls:
@@ -310,16 +368,41 @@ async def exercise(c, args, model, case, checkpoint):
         rounds += 1
         case["tool_calls"] += len(calls)
         case["tool_rounds"] = rounds
+        tool_result = {"evidence": evidence}
+        if nested and rounds >= NESTED_TOOL_ROUNDS:
+            tool_result["strategy_proposal"] = proposal
         request.contents.extend([response.content, c.types.Content(role="user", parts=[
             c.types.Part(function_response=c.types.FunctionResponse(id=call.id, name=call.name,
-                response={"evidence": evidence})) for call in calls])])
+                response=tool_result)) for call in calls])])
         response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
         calls = [part.function_call for part in (response.content.parts if response.content else [])
                  if part.function_call]
-    answer = validate_answer(c, response, case, schema)
+    value = answer_json(response)
+    if nested:
+        if rounds < NESTED_TOOL_ROUNDS:
+            raise ProbeFailure("insufficient_tool_rounds")
+        for record in case["requests"]:
+            wire = record.get("wire", {})
+            if not (wire.get("json_schema") and wire.get("strict") and
+                    wire.get("wire_schema_sha256") == case["wire_schema_sha256"]):
+                raise ProbeFailure("request_schema_mismatch")
+        proposals = value.get("strategy_proposals") if isinstance(value, dict) else None
+        if not isinstance(proposals, list) or len(proposals) != 1 or not isinstance(proposals[0], dict):
+            raise ProbeFailure("nested_proposal_missing")
+        definition = schema["$defs"]["StrategyProposal"]
+        if definition.get("additionalProperties") is not False or NESTED_EXTRA_FIELD in definition["properties"]:
+            raise ProbeFailure("nested_constraint_unavailable")
+        if proposals[0].keys() - definition["properties"].keys():
+            case["nested_extra_property"] = "not_enforced"
+            raise ProbeFailure("provider_constraint_not_enforced")
+    answer = validate_answer(c, value, case, schema)
     # The same record listed twice after two reads is harmless; anything else is not what the tool returned.
     if not answer["evidence"] or any(item != evidence for item in answer["evidence"]):
         raise ProbeFailure("evidence_does_not_match_tool")
+    if nested:
+        if answer["strategy_proposals"][0]["strategy_id"] != proposal["strategy_id"]:
+            raise ProbeFailure("proposal_does_not_match_tool")
+        case["nested_extra_property"] = "held"
     case.update(status="passed", tool_roundtrip=True, answer=answer)
 
 
@@ -411,17 +494,15 @@ async def _single(c, args, model, case, checkpoint, schema_name, prompt, offline
         adapter._transport = offline_transport(c, model, schema, offline)
     case["protocol"] = c.protocol(model)
     case.setdefault("schemas", {})[schema_name] = {
-        "schema_sha256": hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).hexdigest(),
-        "wire_schema_sha256": hashlib.sha256(json.dumps(c.wire_schema(schema), sort_keys=True).encode()).hexdigest()}
+        "schema_sha256": schema_digest(schema), "wire_schema_sha256": schema_digest(c.wire_schema(schema))}
     request = c.request(contents=[c.types.Content(role="user", parts=[c.types.Part(text=prompt)])],
         config=c.types.GenerateContentConfig(system_instruction=c.instruction(schema),
                                              max_output_tokens=args.max_output_tokens))
     response = await request_once(adapter, request, case, checkpoint, args.request_timeout_seconds)
     if any(part.function_call for part in (response.content.parts if response.content else [])):
         raise ProbeFailure("unexpected_tool_call")  # No tool was offered.
-    if not validate:
-        return answer_json(response)
-    return validate_answer(c, response, case, schema, schema_model)
+    value = answer_json(response)
+    return validate_answer(c, value, case, schema, schema_model) if validate else value
 
 
 CONSTRAINT_NOTE = ("held: this answer kept the constraint, by the provider's enforcement or because the model ignored "
@@ -511,11 +592,14 @@ def main(argv=None):
     parser.add_argument("--output", type=Path, help="新建 JSON 报告文件；不覆盖已有报告")
     parser.add_argument("--max-output-tokens", type=int, default=4096)
     parser.add_argument("--request-timeout-seconds", type=float, default=120)
-    parser.add_argument("--reasoning-effort", choices=("none", "low", "high", "max"), default="high")
+    parser.add_argument("--reasoning-effort", choices=("default", "none", "low", "medium", "high", "xhigh", "max"),
+                        default="high", help="default 省略推理强度字段，使用接口默认值")
     parser.add_argument("--schemas", default="research",
-                        help="research（默认，带工具往返）、decision、critique、review、constraints（约束是否被强制），"
-                             "逗号分隔，或 all 全部")
+                        help="research（默认，带工具往返）、decision、critique、review、constraints（约束是否被强制）、"
+                             "nested（多轮工具后的提案额外字段），逗号分隔，或 all 全部")
     args = parser.parse_args(argv)
+    if args.reasoning_effort == "default":
+        args.reasoning_effort = None
     try:
         cases = selected_cases(args.schemas)
     except ValueError as error:
@@ -566,11 +650,13 @@ def main(argv=None):
                     for name in cases:
                         case = {"model": model, "schema": name, "status": "running", "schema_valid": False,
                                 "requests": []}
-                        if name == "research":
+                        if name in TOOL_CASES:
                             case.update(tool_roundtrip=False, tool_calls=0)
+                        if name == "nested":
+                            case["nested_extra_property"] = "untested"
                         report["cases"].append(case)
                         try:
-                            asyncio.run(exercise(c, args, model, case, checkpoint) if name == "research" else
+                            asyncio.run(exercise(c, args, model, case, checkpoint) if name in TOOL_CASES else
                                         exercise_case(c, args, model, case, checkpoint))
                         except Exception as error:
                             case.update(status="failed", error=safe_error(error))
@@ -578,10 +664,12 @@ def main(argv=None):
                         case["usage"] = c.aggregate(known)
                         case["usage_complete"] = bool(case["requests"]) and len(known) == len(case["requests"])
                         detail = (f" tool_roundtrip={case['tool_roundtrip']} tool_rounds={case.get('tool_rounds', 0)}"
-                                  if name == "research" else
+                                  if name in TOOL_CASES else
                                   " " + json.dumps(case.get("constraint_findings", {}), ensure_ascii=False) +
                                   " observed=" + json.dumps(case.get("constraint_observed", {}), ensure_ascii=False)
                                   if name == "constraints" else "")
+                        if name == "nested":
+                            detail += f" nested_extra_property={case['nested_extra_property']}"
                         print(f"[{case['status'].upper()}] {model} {name} schema={case['schema_valid']}{detail} "
                               f"requests={len(case['requests'])}", flush=True)
                         if case.get("error"):

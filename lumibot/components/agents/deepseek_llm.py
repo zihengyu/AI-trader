@@ -176,6 +176,7 @@ class DeepSeekResponsesLlm(BaseLlm):
     _timeout: float | None = PrivateAttr()
     _effort: str | None = PrivateAttr()
     _transport: Any = PrivateAttr(default=None)
+    _request_hook: Any = PrivateAttr(default=None)
 
     def __init__(self, *, model, output_schema, model_request_timeout_seconds=None,
                  reasoning_effort=None, transport=None):
@@ -215,7 +216,9 @@ class DeepSeekResponsesLlm(BaseLlm):
         for key in ("temperature", "top_p"):
             if (params or {}).get(key) is not None:
                 body[key] = params[key]
-        async with httpx.AsyncClient(transport=self._transport, timeout=self._timeout) as http_client:
+        event_hooks = {"request": [self._request_hook]} if self._request_hook is not None else None
+        async with httpx.AsyncClient(transport=self._transport, timeout=self._timeout,
+                                     event_hooks=event_hooks) as http_client:
             async with AsyncOpenAI(api_key=self._api_key, base_url=self._api_base,
                                    # Prevent the compatible SDK from borrowing
                                    # another provider's organization/project.

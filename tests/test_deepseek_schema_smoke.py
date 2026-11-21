@@ -37,6 +37,7 @@ def test_default_mode_exercises_both_models_offline_and_reports_known_usage(tmp_
         assert case["protocol"] == "deepseek_responses_json_schema_v2"
         assert len(case["wire_schema_sha256"]) == 64 and case["wire_schema_sha256"] != case["schema_sha256"]
         assert len(case["requests"]) == 2
+        assert {request["wire"]["reasoning_effort"] for request in case["requests"]} == {"high"}
         assert case["usage"]["prompt_token_count"] == 22
         assert case["usage"]["candidates_token_count"] == 14
         assert case["usage"]["cached_content_token_count"] == 10
@@ -64,13 +65,13 @@ def test_existing_report_is_never_overwritten(tmp_path):
     assert output.read_text() == "previous evidence"
 
 
-def mock_real_provider(monkeypatch, mutation):
+def mock_real_provider(monkeypatch, mutation, *, tool_rounds=1):
     c = smoke.components()
     original = c.resolve
 
     def resolve(model, **kwargs):
         adapter = original(model, **kwargs)
-        normal = smoke.offline_transport(c, model, kwargs["output_schema"])
+        normal = smoke.offline_transport(c, model, kwargs["output_schema"], tool_rounds=tool_rounds)
 
         def handle(request):
             response = normal.handle_request(request)
@@ -275,8 +276,9 @@ def test_all_cases_cover_every_production_schema_offline(tmp_path, capsys):
     output = tmp_path / "all.json"
     assert smoke.main(["--schemas", "all", "--output", str(output)]) == 0
     report = json.loads(output.read_text())
-    assert report["schemas"] == ["research", "decision", "critique", "review", "constraints"]
-    assert report["max_provider_requests"] == 2 * (1 + smoke.MAX_TOOL_ROUNDS + 1 + 1 + 1 + 2)
+    # `all` now includes the focused nested-property case and reserves its full request bound.
+    assert report["schemas"] == ["research", "decision", "critique", "review", "constraints", "nested"]
+    assert report["max_provider_requests"] == 2 * (2 * (1 + smoke.MAX_TOOL_ROUNDS) + 1 + 1 + 1 + 2)
     assert [(c["model"], c["schema"]) for c in report["cases"]] == [
         (model, name) for model in smoke.MODELS.values() for name in report["schemas"]]
     assert all(case["status"] == "passed" and case["usage_complete"] for case in report["cases"])
@@ -289,6 +291,84 @@ def test_all_cases_cover_every_production_schema_offline(tmp_path, capsys):
                                                   "Target.weight": 1.0, "Target.entry_limit": 0.01}
     assert set(constraints["schemas"]) == {"research", "decision"}
     assert "约束说明" in capsys.readouterr().out
+
+
+def test_nested_probe_checks_the_serialized_schema_after_each_tool_round(tmp_path):
+    output = tmp_path / "nested.json"
+    # The fund can leave reasoning effort unset, which omits it entirely from the real request.
+    assert smoke.main(["--schemas", "nested", "--model", "pro", "--reasoning-effort", "default",
+                       "--output", str(output)]) == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["max_provider_requests"] == 1 + smoke.MAX_TOOL_ROUNDS
+    [case] = report["cases"]
+    assert case["nested_extra_property"] == "held" and case["schema_valid"] and case["tool_roundtrip"]
+    assert case["tool_rounds"] == 2
+    assert [request["wire"] for request in case["requests"]] == [
+        {"endpoint_type": "deepseek_official", "model": "deepseek-v4-pro", "json_schema": True, "strict": True,
+         "wire_schema_sha256": case["wire_schema_sha256"], "reasoning_effort": None, "tool_outputs": round_number}
+        for round_number in range(3)]
+    assert [request["served_model"] for request in case["requests"]] == ["deepseek-v4-pro"] * 3
+    [proposal] = case["answer"]["strategy_proposals"]
+    assert proposal["strategy_id"].startswith("schema-probe-") and proposal["implementation"] is None
+
+
+def test_nested_probe_does_not_credit_a_response_if_the_final_request_dropped_strict_mode(tmp_path, monkeypatch):
+    send = httpx.AsyncClient.send
+
+    async def drop_final_strict(client, request, **kwargs):
+        body = json.loads(request.content)
+        if sum(item["type"] == "function_call_output" for item in body["input"]) == 2:
+            del body["text"]["format"]["strict"]
+            request = httpx.Request(request.method, request.url, json=body)
+        return await send(client, request, **kwargs)
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", drop_final_strict)
+    output = tmp_path / "missing-strict.json"
+    assert smoke.main(["--schemas", "nested", "--model", "flash", "--output", str(output)]) == 1
+    [case] = json.loads(output.read_text(encoding="utf-8"))["cases"]
+    assert case["error"]["code"] == "request_schema_mismatch" and case["nested_extra_property"] == "untested"
+    assert [request["wire"]["strict"] for request in case["requests"]] == [True, True, False]
+
+
+@pytest.mark.parametrize("behavior,rounds,code,outcome", [
+    ("extra_null", 2, "provider_constraint_not_enforced", "not_enforced"),
+    ("omit_proposal", 2, "nested_proposal_missing", "untested"),
+    ("answer_early", 1, "insufficient_tool_rounds", "untested"),
+])
+def test_nested_probe_distinguishes_a_violation_from_a_missing_test(
+        tmp_path, monkeypatch, behavior, rounds, code, outcome):
+    def mutate(c, body, response):
+        payload = response.json()
+        payload["model"] = "deepseek-flash-synthetic-version"
+        message = payload["output"][0]
+        if message["type"] == "message":
+            content = message["content"][0]
+            answer = json.loads(content["text"])
+            if behavior == "extra_null":
+                answer["strategy_proposals"][0][smoke.NESTED_EXTRA_FIELD] = None
+            elif behavior == "omit_proposal":
+                answer["strategy_proposals"] = []
+            content["text"] = json.dumps(answer)
+        return c.httpx.Response(200, json=payload)
+
+    mock_real_provider(monkeypatch, mutate, tool_rounds=rounds)
+    output = tmp_path / "nested-failure.json"
+    assert smoke.main(["--real-models", "--schemas", "nested", "--model", "flash", "--output", str(output)]) == 1
+    [case] = json.loads(output.read_text(encoding="utf-8"))["cases"]
+    assert case["error"]["code"] == code and case["nested_extra_property"] == outcome
+    assert not case["schema_valid"] and "answer" not in case and case["usage_complete"]
+    assert len(case["requests"]) == rounds + 1
+    assert case["requests"][-1]["served_model"] == "deepseek-flash-synthetic-version"
+    assert smoke.NESTED_EXTRA_FIELD not in output.read_text(encoding="utf-8")
+
+
+def test_wire_diagnostic_classifies_custom_endpoint_without_copying_url_or_content():
+    request = httpx.Request("POST", "https://example.test/private-path?query=private-value",
+                            headers={"authorization": "Bearer private-key"}, json={"model": "synthetic-model",
+                                "input": [{"type": "message", "content": "private-input"}]})
+    diagnostic = smoke.wire_diagnostic(request)
+    assert diagnostic == {"endpoint_type": "custom", "model": "synthetic-model", "json_schema": False,
+                          "strict": False, "wire_schema_sha256": None, "reasoning_effort": None, "tool_outputs": 0}
 
 
 def patched_answers(monkeypatch, mutate):
