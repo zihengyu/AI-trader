@@ -118,6 +118,27 @@ def _alpaca_minute(bar, clock, opened, closed, limits):
     return _minute(raw, clock, opened, closed, limits)
 
 
+def _twelve_reference(bars, checked_at, opened, closed, limits):
+    """Pick the newest usable completed bar and retain the first failure if none qualify."""
+    rejected = None
+    for bar in bars:
+        minute = _minute(bar, checked_at, opened, closed, limits)
+        if minute["status"] == "forming_or_future":
+            continue
+        status = minute["status"]
+        if status == "valid" and number(minute["volume"]) <= 0:
+            status = "zero_volume"
+        mark = {"status": status}
+        if "close" in minute:
+            mark.update(kind="completed_minute_close", price=minute["close"], source_as_of=minute["end"],
+                        received_at=checked_at.isoformat(), age_seconds=minute["age_seconds"])
+        if status == "valid":
+            return mark
+        if rejected is None:
+            rejected = mark
+    return rejected or {"status": "missing"}
+
+
 def _alpaca_row(data, clock, opened, closed, limits):
     data = data if isinstance(data, dict) else {}
     quote, trade, bar = (data.get(key) or {} for key in ("latestQuote", "latestTrade", "minuteBar"))
@@ -246,8 +267,11 @@ class SourceObserver:
                 headers = getattr(exc.response, "headers", {})
                 retry_at = at + timedelta(seconds=INTERVAL_SECONDS)
                 try:
-                    retry_at = max(retry_at, datetime.fromtimestamp(int(headers.get("X-RateLimit-Reset", 0)), timezone.utc),
-                                   at + timedelta(seconds=int(headers.get("Retry-After", 0))))
+                    retry_at = max(retry_at, datetime.fromtimestamp(int(headers.get("X-RateLimit-Reset", 0)), timezone.utc))
+                except (OSError, TypeError, ValueError, OverflowError):
+                    pass
+                try:
+                    retry_at = max(retry_at, at + timedelta(seconds=int(headers.get("Retry-After", 0))))
                 except (OSError, TypeError, ValueError, OverflowError):
                     pass
                 self._next_request[source] = retry_at
@@ -350,19 +374,8 @@ class SourceObserver:
             self._twelve_index += 1
             bars, requests["twelve_data"] = self._request(lambda: self.twelve_data.minutes(symbol),
                                                            instant(self.clock()), source="twelve_data")
-            checked_at = instant(self.clock())
-            mark = {"status": requests["twelve_data"]["status"] if bars is None else "missing"}
-            for bar in bars or []:
-                minute = _minute(bar, checked_at, opened, closed, self.limits)
-                if minute["status"] == "forming_or_future":
-                    continue
-                mark = {"status": minute["status"]}
-                if "close" in minute:
-                    mark.update(kind="completed_minute_close", price=minute["close"], source_as_of=minute["end"],
-                                received_at=checked_at.isoformat(), age_seconds=minute["age_seconds"])
-                    if minute["status"] == "valid" and number(minute["volume"]) <= 0:
-                        mark["status"] = "zero_volume"
-                break
+            mark = ({"status": requests["twelve_data"]["status"]} if bars is None else
+                    _twelve_reference(bars, instant(self.clock()), opened, closed, self.limits))
             readings[symbol]["twelve_data"] = record["symbols"][symbol]["twelve_data"] = mark
         record["reference_requests"] = requests
         self.store.put(record["session"], REFERENCE_DATASET, {"as_of": instant(self.clock()).isoformat(),
@@ -385,7 +398,7 @@ def observation_lines(root, selected_day=None, *, configured=False):
     during_yahoo_minute_errors = defaultdict(Counter)
     actions, invalid, rows = {}, 0, 0
     output = ["行情来源观察（只读）｜Yahoo、Alpaca IEX 与已配置的独立参考"]
-    reference_requests = defaultdict(Counter)
+    reference_requests, reference_failures = defaultdict(Counter), defaultdict(Counter)
     for path in sorted(folder.glob(f"{selected_day or '????-??-??'}.jsonl")):
         with path.open(encoding="utf-8") as handle:
             for line in handle:
@@ -411,6 +424,12 @@ def observation_lines(root, selected_day=None, *, configured=False):
                     sessions[session].add(phase)
                     for feed, request in record.get("reference_requests", {}).items():
                         reference_requests[feed][request["status"]] += 1
+                        if request["status"] in {"request_failed", "rate_limited"}:
+                            code, error_type = request.get("http_status"), request.get("error_type")
+                            if type(code) is int and 100 <= code <= 599:
+                                reference_failures[feed][f"HTTP {code}"] += 1
+                            elif isinstance(error_type, str) and error_type.isascii() and error_type.isidentifier():
+                                reference_failures[feed][error_type] += 1
                     if record["alpaca_request"]["status"] == "rate_limited":
                         limits["alpaca"] += 1
                     if record.get("alpaca_closing_request", {}).get("status") == "rate_limited":
@@ -443,11 +462,20 @@ def observation_lines(root, selected_day=None, *, configured=False):
     if invalid:
         output.append(f"有 {invalid} 条记录无法读取。")
     for provider, counts in sorted(reference_requests.items()):
-        output.append(f"  {provider} 请求 " + "，".join(f"{state} {count}" for state, count in sorted(counts.items())))
+        summary = f"  {provider} 请求 " + "，".join(f"{state} {count}" for state, count in sorted(counts.items()))
+        if errors := reference_failures.get(provider):
+            summary += " ｜ 失败详情 " + "，".join(f"{label} {count}" for label, count in sorted(errors.items()))
+        output.append(summary)
     for (symbol, phase, feed, kind), counts in sorted(totals.items()):
         n = sum(counts.values())
-        output.append(f"  {symbol} {PHASE_NAMES[phase]} {feed} {'报价' if kind == 'quote' else '分钟线'} "
-                      f"有效 {counts['valid']}/{n} ({counts['valid'] / n:.1%})，未观测 {counts['not_observed']}/{n}")
+        summary = (f"  {symbol} {PHASE_NAMES[phase]} {feed} {'报价' if kind == 'quote' else '分钟线'} "
+                   f"有效 {counts['valid']}/{n} ({counts['valid'] / n:.1%})，未观测 {counts['not_observed']}/{n}")
+        if feed in {"schwab", "twelve_data"}:
+            rejected = [f"{state} {count}" for state, count in sorted(counts.items())
+                        if state not in {"valid", "not_observed"}]
+            if rejected:
+                summary += " ｜ 未通过 " + "，".join(rejected)
+        output.append(summary)
     for (symbol, phase, kind), counts in sorted(during_yahoo_minute_errors.items()):
         output.append(f"  {symbol} {PHASE_NAMES[phase]} Yahoo 分钟线报错期间，"
                       f"Alpaca {'报价' if kind == 'quote' else '分钟线'}有效 {counts['valid']}/{sum(counts.values())}")

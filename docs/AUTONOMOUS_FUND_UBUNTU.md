@@ -201,8 +201,8 @@ paper 会检查必需的 Paper 账户凭证。local 只填一项 Alpaca 凭证�
 `TWELVE_DATA_API_KEY` 可选。数据员每轮采样一只跟踪标的的已完成分钟线，优先轮采缺少合格 Schwab 报价的标的。
 研究员可用 `desk_latest("source_reference")` 查看最新研究参考价。同一标的优先使用
 时间合格的 Schwab 买卖中点；该轮有合格的 Twelve Data 分钟线时可补该标的的缺口。
-两者均按源时间判定新鲜度。备用分钟收盘价没有买卖盘含义，模拟撮合仍按原有成交数据验证。
-`fund-logs.sh sources` 显示配对时钟和中点差，适合在调整运行行情路径前核对样本质量。
+两者均按源时间判定新鲜度。Twelve Data 从一次响应的两根分钟线中选择最新、已完成、有成交量且仍符合时效要求的一根。
+限流时使用接口返回的有效等待时间。`fund-logs.sh sources` 显示配对时钟、中点差、可用的 HTTP 错误码及样本未通过原因。
 
 `prepare` 只生成 `artifacts/fund-systemd/` 中的交易、监控、数据员三个服务 unit 文件和每日备份的 service／timer，创建模拟账户目录和 STOP 标记，
 并在 `.env` 不存在时独占创建空值模板。生成的服务不写死模式：每次启动／重启都读取 `.env` 的 `FUND_MODE`

@@ -199,10 +199,12 @@ def test_independent_quotes_reach_read_only_desk_reference_with_freshness_and_fa
     assert strategy.desk_latest("source_reference")["data"] is None
 
 
-def test_twelve_quota_error_does_not_delay_the_other_sources(tmp_path):
+@pytest.mark.parametrize("status_code", [200, 429])
+def test_twelve_quota_error_does_not_delay_the_other_sources(tmp_path, status_code):
     response = Response()
-    response.status_code = 200
+    response.status_code = status_code
     response._content = b'{"status":"error","code":429,"message":"private response"}'
+    response.headers.update({"X-RateLimit-Reset": "invalid", "Retry-After": "180"})
     calls, now = [], NOW
 
     def get(*args, **kwargs):
@@ -212,12 +214,37 @@ def test_twelve_quota_error_does_not_delay_the_other_sources(tmp_path):
     alpaca = AlpacaResponses({SNAPSHOTS_URL: {"ALFA": snapshot(NOW)}, ACTIONS_URL: {"corporate_actions": {}}})
     reader = SourceObserver(tmp_path, AlpacaDailyHistory("synthetic-key", "synthetic-secret", get=alpaca),
                             ("ALFA",), Limits(), lambda: now, twelve_data=TwelveDataMinutes("key", get=get))
-    assert reader.poll(now)["reference_requests"]["twelve_data"]["status"] == "rate_limited"
-    now += timedelta(seconds=30)
+    first = reader.poll(now)["reference_requests"]["twelve_data"]
+    assert first["status"] == "rate_limited"
+    # Both JSON errors and HTTP 429s must honor a usable Retry-After independently of a malformed reset header.
+    assert first["retry_at"] == (NOW + timedelta(minutes=3)).isoformat()
+    now += timedelta(minutes=2)
+    alpaca.payloads[SNAPSHOTS_URL] = {"ALFA": snapshot(now)}
     record = reader.poll(now)
     assert record["reference_requests"]["twelve_data"]["status"] == "rate_limit_cooldown"
     assert record["symbols"]["ALFA"]["alpaca"]["quote"]["status"] == "valid" and len(calls) == 1
     assert "private response" not in json.dumps(record)
+    summary = "\n".join(observation_lines(tmp_path))
+    assert "twelve_data 请求" in summary and "HTTP 429" in summary
+    assert "private response" not in summary
+
+
+@pytest.mark.parametrize("updates,reason", [({"volume": 0}, "zero_volume"), ({"close": 97}, "invalid")])
+@pytest.mark.parametrize("max_age", [60, 90])
+def test_twelve_selects_a_fresh_usable_completed_bar(tmp_path, updates, reason, max_age):
+    start = NOW.replace(second=0) - timedelta(minutes=1)
+    previous = {"start": start - timedelta(minutes=1), "open": 100, "high": 101, "low": 99,
+                "close": 100, "volume": 200}
+    newest = {**previous, "start": start, **updates}
+    source = SimpleNamespace(minutes=lambda _: [newest, previous])
+    reader = SourceObserver(tmp_path, None, ("ALFA",), Limits(quote_max_seconds=max_age), lambda: NOW,
+                            twelve_data=source)
+    mark = reader.poll(NOW)["symbols"]["ALFA"]["twelve_data"]
+    if max_age == 90:
+        assert mark["status"] == "valid" and mark["source_as_of"] == start.isoformat()
+    else:
+        assert mark["status"] == reason  # The earlier bar is already 65 seconds old.
+        assert f"未通过 {reason} 1" in "\n".join(observation_lines(tmp_path))
 
 
 def test_freshness_and_market_phase_are_independent_of_other_symbols(tmp_path):

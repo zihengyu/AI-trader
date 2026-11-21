@@ -25,10 +25,10 @@ class TwelveDataMinutes:
         if not isinstance(payload, dict):
             raise RiskError("Invalid Twelve Data response")
         if payload.get("status") == "error":
-            # Some API errors are returned as JSON. Keep only the numeric status.
+            # JSON errors can arrive with HTTP 200. Retain retry hints without copying the response body.
             code = payload.get("code")
             raise requests.HTTPError("Twelve Data rejected request",
-                                     response=response if type(code) is not int else _status_only(code))
+                                     response=response if type(code) is not int else _error_response(code, response.headers))
         meta = payload.get("meta") or {}
         values = payload.get("values")
         if (not isinstance(meta, dict) or meta.get("symbol") != symbol or meta.get("currency") != "USD" or
@@ -45,7 +45,8 @@ class TwelveDataMinutes:
         return sorted(bars, key=lambda row: row["start"], reverse=True)
 
 
-def _status_only(code):
+def _error_response(code, headers):
     response = requests.Response()
     response.status_code = code
+    response.headers.update({key: headers[key] for key in ("Retry-After", "X-RateLimit-Reset") if key in headers})
     return response
